@@ -1,0 +1,48 @@
+# Local STEM RAG Pipeline — Python Dependencies
+#
+# Install PyTorch separately FIRST with the correct CUDA wheel:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# Then install the rest:
+#   pip install -r requirements.txt
+#
+# After validating the pipeline, pin exact versions with:
+#   pip freeze | grep -E "docling|lightrag|lancedb|ollama|sentence.transformers|torch|numpy|pydantic" >> requirements.txt
+
+# --- Document parsing ---
+docling                  # PDF layout analysis (CUDA-accelerated via PyTorch)
+
+# --- GraphRAG framework ---
+lightrag                 # Knowledge graph construction + hybrid retrieval
+
+# --- Vector database ---
+lancedb                  # Embedded columnar vector DB; memory-mapped ANN index
+
+# --- LLM / VLM serving ---
+ollama                   # Python client for local Ollama REST API
+
+# --- Embeddings ---
+sentence-transformers    # Loads nomic-embed-text-v1.5 on CPU
+
+# --- Tokenizer alignment ---
+transformers             # AutoTokenizer for DeepSeek-R1-Distill-Qwen-32B (Qwen2, 152K vocab)
+
+# --- Numerical ---
+numpy                    # MRL vector truncation and L2 normalization
+
+# --- Data validation ---
+pydantic                 # Ollama GenerateResponse object is a Pydantic model
+
+# --- Graph construction ---
+networkx                 # Reads LightRAG's graphml output for bridge edge and quotient graph construction
+
+# --- Clustering and deduplication ---
+scikit-learn             # KMeans for pre-indexing chunk deduplication and quotient graph partitioning
+
+# --- Utilities (used internally by lightrag and docling) ---
+python-dotenv
+tqdm
+
+# --- Deep learning runtime (install via CUDA wheel URL above, not from here) ---
+torch
+torchvision
