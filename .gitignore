@@ -1,17 +1,74 @@
+# Python bytecode and caches
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyd
 
+# Python environments and local package installs
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Local configuration and secrets
+config.toml
+*.local.toml
+*.secret.toml
+
+# Test, lint, type-check, and coverage output
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
 
+# Build and packaging artifacts
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# RAG pipeline runtime/build outputs
 db/
+processed_docs/
+.tmp_smoke/
+logs/
+*.log
 *.sqlite
+*.sqlite3
 *.sqlite-shm
 *.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
 
-.env
-.venv/
-venv/
+# Local model and embedding artifacts
+models/
+model_cache/
+.cache/
+*.ckpt
+*.gguf
+*.onnx
+*.pt
+*.pth
+*.safetensors
 
+# Local editor, assistant, and OS files
+.vscode/
+.idea/
+.agents/
+.codex/
+.claude/settings.local.json
+.DS_Store
+Thumbs.db
+desktop.ini
