@@ -36,10 +36,6 @@ Implemented behavior described by the old planning docs:
 
 The `processed_docs/` Markdown files are corpus data generated from sample PDFs, not project documentation.
 
-## Important Working Tree Note
-
-At the time this README was consolidated, the `D:` workspace showed several tracked non-document files as deleted, including `main.py`, `requirements.txt`, `config.example.toml`, and newer structured-v1 modules/tests. This README documents the files that are currently visible in `D:\Documents\GitHub\RAG-Pipeline-Windows`. Restore the deleted tracked files before relying on commands that reference them.
-
 ## Expected Repository Layout
 
 ```text
