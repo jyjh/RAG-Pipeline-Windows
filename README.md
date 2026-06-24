@@ -17,7 +17,7 @@ The current source tree contains the LightRAG-based local STEM pipeline:
 - `src/ingestion.py`: parses PDFs with Docling and exports enriched Markdown.
 - `src/indexing.py`: inserts Markdown into LightRAG, builds vector/graph stores, bridge edges, and quotient graph artifacts.
 - `src/query.py`: queries the local LightRAG index.
-- `src/embeddings.py`: loads Nomic embeddings on CPU with document/query prefix handling.
+- `src/embeddings.py`: uses local Ollama embeddings by default, with hash and SentenceTransformers alternatives.
 - `src/utils.py`: manages Ollama model loading/unloading, DeepSeek tokenizer alignment, and LightRAG construction.
 - `src/lancedb_storage.py`: local LanceDB vector-storage adapter for LightRAG.
 
@@ -27,8 +27,8 @@ Implemented behavior described by the old planning docs:
 - Lazy `qwen2.5vl:7b` vision enrichment for figures/charts/diagrams.
 - STEM-focused vision prompt requesting LaTeX equations, chart axes/values, and component labels.
 - Inline vision-description injection so figures remain near surrounding explanatory text.
-- Local Ollama inference using `deepseek-r1:32b`.
-- CPU-bound `nomic-ai/nomic-embed-text-v1.5` embeddings.
+- Local Ollama inference using `gemma4`.
+- Local Ollama embeddings with `nomic-embed-text` by default; hash fallback and optional CPU-bound SentenceTransformers embeddings.
 - 768-dimensional normalized vectors for retrieval.
 - DeepSeek/Qwen tokenizer alignment for chunk sizing.
 - LanceDB-backed vector storage for LightRAG.
@@ -64,8 +64,7 @@ Install PyTorch with a CUDA wheel appropriate for the workstation. Example:
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
-Install required packages. If `requirements.txt` has been restored, use:
-
+Install required packages. 
 ```bash
 pip install -r requirements.txt
 ```
@@ -76,31 +75,88 @@ Otherwise install the core runtime packages manually:
 pip install docling lightrag lancedb ollama sentence-transformers transformers numpy pydantic networkx scikit-learn python-dotenv tqdm
 ```
 
-Install and verify Ollama:
+Install and verify Ollama on Windows:
 
-```bash
-ollama --version
-ollama pull deepseek-r1:32b
-ollama pull qwen2.5vl:7b
+```powershell
+# Use the full path when `ollama` is not on PATH.
+$ollama = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
+& $ollama --version
 ```
 
-The embedding model is loaded through SentenceTransformers:
+Start the local Ollama server. Either launch the Windows tray app:
 
-```python
-from sentence_transformers import SentenceTransformer
-m = SentenceTransformer("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True, device="cpu")
-print(m.encode(["search_document: test"]).shape)
+```powershell
+Start-Process "$env:LOCALAPPDATA\Programs\Ollama\ollama app.exe"
+```
+
+Or run the server in a dedicated terminal:
+
+```powershell
+$env:OLLAMA_HOST = "127.0.0.1:11434"
+$env:OLLAMA_NO_CLOUD = "1"
+$env:OLLAMA_MAX_LOADED_MODELS = "1"
+$env:OLLAMA_NUM_PARALLEL = "1"
+$env:OLLAMA_KEEP_ALIVE = "5m"
+& $ollama serve
+```
+
+In a second terminal, verify that the local server responds:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:11434/api/tags
+```
+
+Download the required local models:
+
+```powershell
+& $ollama pull gemma4
+& $ollama pull nomic-embed-text
+& $ollama pull qwen2.5vl:7b
+& $ollama list
+```
+
+Verify the embedding endpoint before indexing:
+
+```powershell
+$body = @{ model = "nomic-embed-text"; input = "embedding health check" } | ConvertTo-Json
+$response = Invoke-RestMethod `
+  -Uri "http://127.0.0.1:11434/api/embed" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body `
+  -TimeoutSec 30
+$response.embeddings[0].Count
+```
+
+The final command should print an embedding dimension, normally `768`. If `/api/tags` works but `/api/embed` times out, Ollama is running but the embedding model runner is wedged or stalled; use the recovery steps in [Troubleshooting](#troubleshooting).
+
+The pipeline sends single query embeddings to `/api/embed` with `input` as a string, matching this health check. Multi-chunk indexing batches use an array input only when a batch contains more than one text.
+
+For local embeddings without Hugging Face/SentenceTransformers, use Ollama:
+
+```powershell
+python main.py --mode index --md_dir processed_docs --db_dir db --rag_backend local --embedding_batch_size 1 --embedding_timeout 30
+```
+
+The SentenceTransformers backend remains available for a cached Hugging Face model:
+
+```bash
+python main.py --mode index --md_dir processed_docs --db_dir db --embedding_backend sentence-transformers
 ```
 
 ## Usage
 
-If `main.py` is restored, the intended CLI flow is:
+Intended CLI flow is:
 
 ```bash
 python main.py --mode ingest --data_dir data --md_dir processed_docs
 python main.py --mode index --md_dir processed_docs --db_dir db
 python main.py --mode query --db_dir db --question "Explain the bias-variance tradeoff" --query_mode hybrid
 ```
+
+For born-digital PDFs, ingest defaults to pypdf text extraction and does not run Docling asset enrichment unless requested. Use `--asset_triggers images` to enrich pages with embedded images, or `--asset_triggers all` to also enrich table/equation heuristic pages. Ingestion shows per-document and per-page progress bars by default; pass `--no_progress` to disable them.
+
+Indexing defaults to `--rag_backend auto`, `--embedding_backend ollama`, `--embedding_model nomic-embed-text`, and `--tokenizer_backend byte`. Use `--rag_backend local` to bypass LightRAG and use the local vector fallback directly. Use `--embedding_batch_size 1` if Ollama struggles with larger embedding batches, and `--embedding_timeout 30` to fail clearly instead of waiting indefinitely. Use `--embedding_backend hash` as a no-model fallback. Use `--embedding_backend sentence-transformers --embedding_model nomic-ai/nomic-embed-text-v1.5` for the Hugging Face backend; add `--tokenizer_backend deepseek` to use the DeepSeek/Qwen tokenizer; add `--allow_embedding_download` only when network downloads are acceptable.
 
 The module entrypoints can also be used for the default directories:
 
@@ -118,35 +174,122 @@ Query modes:
 ## Architecture
 
 1. **Ingestion**
-   - PDFs are parsed by Docling.
+   - Born-digital PDF text is extracted with pypdf by default.
+   - Docling is used for scanned/image-only PDFs or targeted asset enrichment.
    - Tables and structured items are exported as Markdown where supported.
-   - Figures/charts are cropped in memory and sent to local Qwen2.5-VL through Ollama.
-   - Vision descriptions are inserted inline at the original document position.
+   - Figures/charts can be sent to local Qwen2.5-VL through Ollama.
 
 2. **Embeddings**
-   - Nomic runs on CPU to preserve GPU VRAM for DeepSeek and Qwen.
+   - Ollama embeddings run locally by default with `nomic-embed-text`.
+   - Hash embeddings are available as a no-model fallback.
+   - Optional Nomic embeddings run on CPU to preserve GPU VRAM for inference models.
    - Document chunks use the `search_document:` prefix.
    - Queries use the `search_query:` prefix.
    - Embeddings are L2-normalized.
 
 3. **Indexing**
    - Full Markdown documents are inserted into LightRAG.
-   - LightRAG chunks text using a tokenizer aligned to DeepSeek-R1-Distill-Qwen-32B.
+   - LightRAG chunks text with a byte tokenizer by default; the DeepSeek/Qwen tokenizer is opt-in.
    - LanceDB stores vectors locally.
    - Optional bridge edges and quotient graph artifacts support future cross-domain exploration.
 
 4. **Querying**
    - Questions are embedded locally.
    - LightRAG retrieves vector and graph context.
-   - DeepSeek-R1 synthesizes an answer from retrieved context.
+   - `gemma4` synthesizes an answer from retrieved context.
 
 ## Hardware And Runtime Notes
 
 - DeepSeek-R1 32B at Q4 quantization is close to the RTX 4000 Ada 20GB VRAM limit.
 - Qwen2.5-VL is loaded lazily during ingestion only when figures are detected.
 - Ollama `keep_alive="0"` can be used to evict inactive models between phases.
-- Nomic embeddings run on CPU to avoid competing with inference models for VRAM.
+- Hash embeddings avoid model-loading stalls; optional Nomic embeddings run on CPU to avoid competing with inference models for VRAM.
 - If indexing causes VRAM pressure, reduce LightRAG entity extraction gleaning or lower context/chunk sizes.
+
+## Troubleshooting
+
+### Ollama Embedding Timeout
+
+Symptom:
+
+```text
+Ollama embedding preflight failed
+Ollama request timed out after ... at http://127.0.0.1:11434/api/embed
+```
+
+This means the pipeline is able to reach the Ollama server, but the local embedding endpoint did not return. Fix it in this order:
+
+1. Stop the current indexing command with `Ctrl+C`.
+2. Stop stale Python pipeline processes from prior runs if they are still active.
+3. Restart Ollama:
+
+```powershell
+Get-Process "ollama*" -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Process "$env:LOCALAPPDATA\Programs\Ollama\ollama app.exe"
+```
+
+4. Verify the server and embedding model:
+
+```powershell
+$ollama = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
+& $ollama list
+& $ollama ps
+
+$body = @{ model = "nomic-embed-text"; input = "embedding health check" } | ConvertTo-Json
+$response = Invoke-RestMethod `
+  -Uri "http://127.0.0.1:11434/api/embed" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body `
+  -TimeoutSec 30
+$response.embeddings[0].Count
+```
+
+The pipeline uses the same string-input request shape for single query embeddings. If this health check is fast but query embeddings are slow, verify that the code includes the singleton string-input fix in `src/embeddings.py`.
+
+5. Retry indexing with conservative embedding settings:
+
+```powershell
+python main.py --mode index --md_dir processed_docs --db_dir db --rag_backend local --embedding_batch_size 1 --embedding_timeout 30
+```
+
+If the embedding health check still times out after restarting Ollama, use the hash backend to keep working without Ollama embeddings:
+
+```powershell
+python main.py --mode index --md_dir processed_docs --db_dir db --rag_backend local --embedding_backend hash
+```
+
+Hash embeddings are deterministic and fully local, but retrieval quality is lower than `nomic-embed-text`.
+
+### Ollama Not Found On PATH
+
+If `ollama` is not recognized, use the full Windows install path:
+
+```powershell
+$ollama = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
+& $ollama --version
+```
+
+To add it to the current PowerShell session:
+
+```powershell
+$env:Path = "$env:LOCALAPPDATA\Programs\Ollama;$env:Path"
+```
+
+### Port Or Server Conflicts
+
+Ollama should listen on `127.0.0.1:11434` by default. Check the port:
+
+```powershell
+netstat -ano | findstr 11434
+```
+
+If another stale process owns the port, stop Ollama processes and start the app again:
+
+```powershell
+Get-Process "ollama*" -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Process "$env:LOCALAPPDATA\Programs\Ollama\ollama app.exe"
+```
 
 ## Validation
 
@@ -200,4 +343,3 @@ Graph/advanced retrieval:
 - Do not commit generated `db/`, `processed_docs/` test outputs, model caches, or Python cache files unless intentionally curating a fixture.
 - Keep the README as the only root-level project documentation file.
 - Treat `processed_docs/*.md` as corpus data, not documentation.
-

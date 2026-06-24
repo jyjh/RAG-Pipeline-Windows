@@ -1,0 +1,1 @@
+DEFAULT_LLM_MODEL = "gemma4"

@@ -33,7 +33,8 @@ streamlit
 requests
 
 # Legacy/experimental graph path retained in src/indexing.py
-lightrag
+# Provides the `lightrag` import namespace used by this project.
+lightrag-hku
 networkx
 scikit-learn
 
@@ -44,3 +45,6 @@ torchvision
 # Tests
 pytest
 
+
+# Others
+einops
