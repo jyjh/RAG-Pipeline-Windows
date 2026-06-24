@@ -45,6 +45,9 @@ class SectionChunk:
     tags: list[str]
     chunk_index: int
     source_path: str
+    source_hash: str = ""
+    source_pdf_name: str = ""
+    source_pdf_path: str = ""
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -61,6 +64,9 @@ class SectionChunk:
             "page_end": self.page_end,
             "summary": self.summary,
             "tags": list(self.tags),
+            "source_hash": self.source_hash,
+            "source_pdf_name": self.source_pdf_name,
+            "source_pdf_path": self.source_pdf_path,
         }
 
 
@@ -73,7 +79,14 @@ def build_section_records(
     chunk_overlap_tokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS,
 ) -> list[dict[str, Any]]:
     source_root = source_root or Path.cwd()
-    pdf_path = find_source_pdf(markdown_path, source_root=source_root)
+    from src.pdf_registry import source_entry_for_markdown
+
+    source_entry = source_entry_for_markdown(markdown_path)
+    mapped_pdf_value = str(source_entry.get("source_pdf_path", ""))
+    mapped_pdf_path = Path(mapped_pdf_value) if mapped_pdf_value else None
+    pdf_path = mapped_pdf_path if mapped_pdf_path is not None and mapped_pdf_path.exists() else None
+    if pdf_path is None:
+        pdf_path = find_source_pdf(markdown_path, source_root=source_root)
     max_chars = max(800, chunk_target_tokens * CHARS_PER_TOKEN)
     overlap_chars = max(0, chunk_overlap_tokens * CHARS_PER_TOKEN)
     if pdf_path is not None:
@@ -85,6 +98,10 @@ def build_section_records(
         sections, pages = sections_from_markdown(markdown_path.stem, content)
         source_path = str(markdown_path)
         doc_title = markdown_path.stem
+
+    source_hash = str(source_entry.get("source_hash", ""))
+    source_pdf_name = str(source_entry.get("source_pdf_name", pdf_path.name if pdf_path else ""))
+    source_pdf_path = str(source_entry.get("source_pdf_path", pdf_path if pdf_path else ""))
 
     if not sections:
         content = markdown_path.read_text(encoding="utf-8")
@@ -120,6 +137,9 @@ def build_section_records(
             tags=doc_tags,
             chunk_index=-1,
             source_path=source_path,
+            source_hash=source_hash,
+            source_pdf_name=source_pdf_name,
+            source_pdf_path=source_pdf_path,
         )
     )
 
@@ -138,6 +158,9 @@ def build_section_records(
                 overlap_chars=overlap_chars,
                 summary_mode=summary_mode,
                 top_index=top_index,
+                source_hash=source_hash,
+                source_pdf_name=source_pdf_name,
+                source_pdf_path=source_pdf_path,
             )
         )
 
@@ -158,6 +181,9 @@ def records_for_section(
     overlap_chars: int,
     summary_mode: str,
     top_index: int,
+    source_hash: str = "",
+    source_pdf_name: str = "",
+    source_pdf_path: str = "",
 ) -> list[SectionChunk]:
     section_path_titles = [*path_titles, section.title]
     section_path = " > ".join(section_path_titles)
@@ -191,6 +217,9 @@ def records_for_section(
                 tags=tags,
                 chunk_index=-1,
                 source_path=source_path,
+                source_hash=source_hash,
+                source_pdf_name=source_pdf_name,
+                source_pdf_path=source_pdf_path,
             )
         )
         active_summary_parent = section_summary_id
@@ -211,6 +240,9 @@ def records_for_section(
                 overlap_chars=overlap_chars,
                 summary_mode=summary_mode,
                 top_index=top_index + child_index,
+                source_hash=source_hash,
+                source_pdf_name=source_pdf_name,
+                source_pdf_path=source_pdf_path,
             )
             chunk_counter += len([record for record in child_records if record.node_type == "chunk"])
             records.extend(child_records)
@@ -240,6 +272,9 @@ def records_for_section(
                 tags=tags,
                 chunk_index=chunk_index,
                 source_path=source_path,
+                source_hash=source_hash,
+                source_pdf_name=source_pdf_name,
+                source_pdf_path=source_pdf_path,
             )
         )
     return records

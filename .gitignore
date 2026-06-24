@@ -41,6 +41,7 @@ pip-wheel-metadata/
 # RAG pipeline runtime/build outputs
 db/
 processed_docs/
+data/.pdf_upload_registry.json
 data/uploads/
 data/.upload_queue/
 .tmp_smoke/

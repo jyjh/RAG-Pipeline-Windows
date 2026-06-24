@@ -378,6 +378,9 @@ class LocalVectorIndexer:
             unit="doc",
         ):
             _status(f"Local index: reading {file_path.name}", enabled=self.progress_enabled)
+            if not file_path.read_text(encoding="utf-8").strip():
+                _status(f"Local index: skipping empty Markdown file {file_path.name}", enabled=self.progress_enabled)
+                continue
             file_records = build_section_records(
                 file_path,
                 source_root=Path.cwd(),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import json
 import re
 import shutil
@@ -19,6 +20,7 @@ from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from src.defaults import DEFAULT_LLM_MODEL
+from src.pdf_registry import PdfRegistry, remove_source_entries_by_hash
 from src.vector_store import default_store, lancedb_path, vector_index_path as json_index_path
 
 
@@ -26,6 +28,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 STAGING_DIR = DATA_DIR / ".upload_queue"
+PDF_REGISTRY_PATH = DATA_DIR / ".pdf_upload_registry.json"
 PROCESSED_DIR = ROOT_DIR / "processed_docs"
 DB_DIR = ROOT_DIR / "db"
 WEB_DIR = ROOT_DIR / "web"
@@ -172,6 +175,8 @@ class QueueJob:
     status: str = "queued"
     phase: str = "queued"
     filenames: list[str] = field(default_factory=list)
+    uploads: list[dict[str, Any]] = field(default_factory=list)
+    force_duplicate_hashes: list[str] = field(default_factory=list)
     staging_dir: str | None = None
     upload_dir: str | None = None
     options: dict[str, Any] = field(default_factory=dict)
@@ -187,6 +192,8 @@ class QueueJob:
             "status": self.status,
             "phase": self.phase,
             "filenames": list(self.filenames),
+            "uploads": [dict(item) for item in self.uploads],
+            "force_duplicate_hashes": list(self.force_duplicate_hashes),
             "staging_dir": self.staging_dir,
             "upload_dir": self.upload_dir,
             "options": dict(self.options),
@@ -204,12 +211,14 @@ class RagJobQueue:
         upload_root: Path = UPLOAD_DIR,
         processed_dir: Path = PROCESSED_DIR,
         db_dir: Path = DB_DIR,
+        registry_path: Path = PDF_REGISTRY_PATH,
         run_ingestion_func=None,
         run_indexing_func=None,
     ):
         self.upload_root = Path(upload_root)
         self.processed_dir = Path(processed_dir)
         self.db_dir = Path(db_dir)
+        self.registry = PdfRegistry(registry_path)
         self._run_ingestion_func = run_ingestion_func
         self._run_indexing_func = run_indexing_func
         self._condition = threading.Condition(threading.RLock())
@@ -233,6 +242,8 @@ class RagJobQueue:
         *,
         staging_dir: Path,
         filenames: list[str],
+        uploads: list[dict[str, Any]] | None = None,
+        force_duplicate_hashes: list[str] | None = None,
         job_id: str | None = None,
         options: dict[str, Any] | None = None,
         auto_start: bool = True,
@@ -241,6 +252,8 @@ class RagJobQueue:
             id=job_id or uuid.uuid4().hex,
             kind="upload",
             filenames=filenames,
+            uploads=uploads or [],
+            force_duplicate_hashes=force_duplicate_hashes or [],
             staging_dir=str(staging_dir),
             options=options or {},
         )
@@ -289,6 +302,13 @@ class RagJobQueue:
             try:
                 self._run_job(job)
             except Exception as exc:
+                if job.kind == "upload" and job.uploads:
+                    self.registry.mark_job_status(
+                        job_id=job.id,
+                        files=job.uploads,
+                        status="failed",
+                        error=str(exc),
+                    )
                 with self._condition:
                     job.status = "failed"
                     job.phase = "failed"
@@ -306,9 +326,14 @@ class RagJobQueue:
         if job.kind == "upload":
             upload_dir = self._save_staged_uploads(job)
             self._wait_for_no_queries(job, "ingesting")
+            self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="ingesting")
+            self._prepare_for_forced_duplicates(job)
             self._run_ingestion(str(upload_dir), str(self.processed_dir), job.options)
+            self._mark_processed_paths(job)
+            self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="ingested")
             self._wait_for_no_queries(job, "indexing")
             self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options)
+            self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="indexed")
             return
 
         if job.kind == "reindex":
@@ -345,13 +370,70 @@ class RagJobQueue:
                 continue
             destination = upload_dir / source.name
             destination.write_bytes(source.read_bytes())
+            for item in job.uploads:
+                if item.get("filename") == filename:
+                    item["upload_path"] = str(destination)
             try:
                 source.unlink()
             except PermissionError:
                 pass
         shutil.rmtree(staging_dir, ignore_errors=True)
         job.upload_dir = str(upload_dir)
+        self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="saving_uploads")
         return upload_dir
+
+    def _prepare_for_forced_duplicates(self, job: QueueJob) -> None:
+        hashes = {value for value in job.force_duplicate_hashes if value}
+        if not hashes:
+            return
+        removed_entries = remove_source_entries_by_hash(self.processed_dir, hashes)
+        legacy_paths: list[str] = []
+        legacy_doc_ids: list[str] = []
+        for entry in removed_entries:
+            for key in ("processed_markdown_path", "source_pdf_path", "source_pdf_name"):
+                value = str(entry.get(key, ""))
+                if value:
+                    legacy_paths.append(value)
+            markdown_path = Path(str(entry.get("processed_markdown_path", "")))
+            if markdown_path.name:
+                from src.sectioning import stable_id
+
+                legacy_doc_ids.append(stable_id("doc", markdown_path.stem))
+                self._delete_processed_markdown(markdown_path)
+
+        with INDEX_LOCK:
+            store = _index_store(self.db_dir)
+            if store.exists():
+                store.delete_records_by_source_hash(
+                    source_hashes=list(hashes),
+                    legacy_file_paths=legacy_paths,
+                    legacy_doc_ids=legacy_doc_ids,
+                )
+
+    def _delete_processed_markdown(self, markdown_path: Path) -> None:
+        processed_root = self.processed_dir.resolve()
+        candidate = markdown_path if markdown_path.is_absolute() else self.processed_dir / markdown_path.name
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return
+        try:
+            resolved.relative_to(processed_root)
+        except ValueError:
+            return
+        try:
+            resolved.unlink(missing_ok=True)
+        except PermissionError:
+            try:
+                resolved.write_text("", encoding="utf-8")
+            except OSError:
+                pass
+
+    def _mark_processed_paths(self, job: QueueJob) -> None:
+        for item in job.uploads:
+            filename = str(item.get("filename", ""))
+            if filename:
+                item["processed_markdown_path"] = str(self.processed_dir / f"{Path(filename).stem}.md")
 
     def _run_ingestion(self, input_dir: str, output_dir: str, options: dict[str, Any]) -> None:
         run_ingestion_func = self._run_ingestion_func
@@ -526,11 +608,14 @@ async def upload_files(request: Request):
     staging_dir = STAGING_DIR / job_id
     staging_dir.mkdir(parents=True, exist_ok=True)
     filenames: list[str] = []
+    uploads: list[dict[str, Any]] = []
     used_names: set[str] = set()
     queued = False
+    registered = False
 
     try:
         form = await request.form()
+        force_duplicates = str(form.get("force_duplicates") or "").lower() in {"1", "true", "yes", "on"}
         for _, value in form.multi_items():
             if not isinstance(value, StarletteUploadFile):
                 continue
@@ -548,21 +633,70 @@ async def upload_files(request: Request):
             used_names.add(filename.lower())
 
             destination = staging_dir / filename
+            digest = hashlib.sha256()
             with destination.open("wb") as handle:
                 while True:
                     chunk = await value.read(1024 * 1024)
                     if not chunk:
                         break
+                    digest.update(chunk)
                     handle.write(chunk)
             await value.close()
             filenames.append(filename)
+            uploads.append(
+                {
+                    "filename": filename,
+                    "hash": digest.hexdigest(),
+                    "staging_path": str(destination),
+                }
+            )
 
         if not filenames:
             raise HTTPException(status_code=400, detail="No PDF files were uploaded.")
 
+        batch_duplicate_hashes = {
+            item["hash"]
+            for item in uploads
+            if sum(1 for candidate in uploads if candidate["hash"] == item["hash"]) > 1
+        }
+        if batch_duplicate_hashes:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Duplicate PDFs were selected in the same upload batch.",
+                    "can_force": False,
+                    "duplicates": [
+                        {
+                            "filename": item["filename"],
+                            "hash": item["hash"],
+                            "status": "selected_twice",
+                        }
+                        for item in uploads
+                        if item["hash"] in batch_duplicate_hashes
+                    ],
+                },
+            )
+
+        registry = PdfRegistry(PDF_REGISTRY_PATH)
+        duplicate_entries = registry.blocking_duplicates(uploads)
+        if duplicate_entries and not force_duplicates:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "One or more PDFs have already been uploaded or queued.",
+                    "can_force": True,
+                    "duplicates": duplicate_entries,
+                },
+            )
+
+        forced_hashes = {entry["hash"] for entry in duplicate_entries} if force_duplicates else set()
+        registry.register_queued(job_id=job_id, files=uploads, forced_hashes=forced_hashes)
+        registered = True
         job = job_queue.enqueue_upload(
             staging_dir=staging_dir,
             filenames=filenames,
+            uploads=uploads,
+            force_duplicate_hashes=sorted(forced_hashes),
             job_id=job_id,
             options={
                 "parser_mode": str(form.get("parser_mode") or "hybrid"),
@@ -582,6 +716,13 @@ async def upload_files(request: Request):
         return job.to_dict()
     except Exception:
         if not queued:
+            if registered:
+                PdfRegistry(PDF_REGISTRY_PATH).mark_job_status(
+                    job_id=job_id,
+                    files=uploads,
+                    status="failed",
+                    error="Upload was not queued.",
+                )
             shutil.rmtree(staging_dir, ignore_errors=True)
         raise
 

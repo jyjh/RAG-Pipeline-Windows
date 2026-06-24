@@ -6,6 +6,65 @@ from pathlib import Path
 from src.vector_store import JsonVectorStore, LanceDBVectorStore, default_store
 
 
+def _source_records():
+    return [
+        {
+            "id": "hash-row",
+            "doc_id": "hash-doc",
+            "parent_id": "",
+            "node_type": "chunk",
+            "file_path": "doc-a.pdf",
+            "chunk_index": 0,
+            "content": "hash content",
+            "title": "Doc A",
+            "section_path": "Doc A",
+            "page_start": 1,
+            "page_end": 1,
+            "summary": "summary",
+            "tags": ["a"],
+            "source_hash": "hash-a",
+            "source_pdf_name": "doc-a.pdf",
+            "source_pdf_path": "uploads/doc-a.pdf",
+            "vector": [1.0, 0.0, 0.0],
+        },
+        {
+            "id": "legacy-row",
+            "doc_id": "legacy-doc",
+            "parent_id": "",
+            "node_type": "chunk",
+            "file_path": "processed_docs\\legacy.md",
+            "chunk_index": 1,
+            "content": "legacy content",
+            "title": "Legacy",
+            "section_path": "Legacy",
+            "page_start": 1,
+            "page_end": 1,
+            "summary": "summary",
+            "tags": ["legacy"],
+            "vector": [0.0, 1.0, 0.0],
+        },
+        {
+            "id": "kept-row",
+            "doc_id": "kept-doc",
+            "parent_id": "",
+            "node_type": "chunk",
+            "file_path": "kept.pdf",
+            "chunk_index": 2,
+            "content": "kept content",
+            "title": "Kept",
+            "section_path": "Kept",
+            "page_start": 1,
+            "page_end": 1,
+            "summary": "summary",
+            "tags": ["kept"],
+            "source_hash": "hash-b",
+            "source_pdf_name": "kept.pdf",
+            "source_pdf_path": "uploads/kept.pdf",
+            "vector": [0.0, 0.0, 1.0],
+        },
+    ]
+
+
 def test_lancedb_store_create_query_update_delete():
     tmp_path = Path(tempfile.gettempdir()) / f"rag_test_vector_store_{uuid.uuid4().hex}"
     try:
@@ -111,6 +170,52 @@ def test_lancedb_store_create_query_update_delete():
         assert row["content"] == "edited alpha chunk"
 
         assert store.delete_records(record_ids=["chunk-1"]) == {"deleted": 1, "remaining": 3}
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_json_store_preserves_source_metadata_and_deletes_by_hash_or_legacy_path():
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_vector_store_{uuid.uuid4().hex}"
+    try:
+        store = JsonVectorStore(tmp_path)
+        store.write_records(_source_records(), embedding_model="fake-embed", embedding_dim=3)
+
+        rows = store.list_records()["rows"]
+        assert rows[0]["source_hash"] == "hash-a"
+        assert rows[0]["source_pdf_name"] == "doc-a.pdf"
+
+        assert store.delete_records_by_source_hash(source_hashes=["hash-a"]) == {
+            "deleted": 1,
+            "remaining": 2,
+        }
+        assert store.delete_records_by_source_hash(
+            source_hashes=["missing"],
+            legacy_file_paths=["processed_docs/legacy.md"],
+        ) == {"deleted": 1, "remaining": 1}
+        assert store.get_record("kept-row")["source_hash"] == "hash-b"
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_lancedb_store_preserves_source_metadata_and_deletes_by_hash_or_legacy_path():
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_vector_store_{uuid.uuid4().hex}"
+    try:
+        store = LanceDBVectorStore(tmp_path)
+        store.write_records(_source_records(), embedding_model="fake-embed", embedding_dim=3)
+
+        rows = store.list_records()["rows"]
+        assert rows[0]["source_hash"] == "hash-a"
+        assert rows[0]["source_pdf_path"] == "uploads/doc-a.pdf"
+
+        assert store.delete_records_by_source_hash(source_hashes=["hash-a"]) == {
+            "deleted": 1,
+            "remaining": 2,
+        }
+        assert store.delete_records_by_source_hash(
+            source_hashes=["missing"],
+            legacy_file_paths=["processed_docs/legacy.md"],
+        ) == {"deleted": 1, "remaining": 1}
+        assert store.get_record("kept-row")["source_hash"] == "hash-b"
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 

@@ -912,6 +912,7 @@ def run_ingestion(
     progress_enabled: bool = True,
 ):
     os.makedirs(output_dir, exist_ok=True)
+    from src.pdf_registry import sha256_file, write_source_entry
 
     _progress_status(f"Discovering PDFs in {input_dir}...", enabled=progress_enabled)
     input_paths = _iter_pdf_paths(input_dir)
@@ -939,6 +940,13 @@ def run_ingestion(
         output_path = Path(output_dir) / f"{input_path.stem}.md"
         with output_path.open("w", encoding="utf-8") as handle:
             handle.write(md_content)
+        write_source_entry(
+            processed_dir=output_dir,
+            markdown_path=output_path,
+            source_hash=sha256_file(input_path),
+            source_pdf_name=input_path.name,
+            source_pdf_path=input_path,
+        )
         logger.info("Processed %s -> %s", input_path.name, output_path)
 
 

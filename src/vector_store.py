@@ -24,6 +24,9 @@ REQUIRED_LANCEDB_COLUMNS = {
     "page_end",
     "summary",
     "tags",
+    "source_hash",
+    "source_pdf_name",
+    "source_pdf_path",
     "embedding_model",
     "embedding_dim",
     "vector",
@@ -65,6 +68,14 @@ class VectorStore(Protocol):
 
     def delete_records(self, *, record_ids: list[str]) -> dict[str, Any]: ...
 
+    def delete_records_by_source_hash(
+        self,
+        *,
+        source_hashes: list[str],
+        legacy_file_paths: list[str] | None = None,
+        legacy_doc_ids: list[str] | None = None,
+    ) -> dict[str, Any]: ...
+
     def search(self, vector: list[float], *, top_k: int) -> list[dict[str, Any]]: ...
 
     def child_chunks(self, parent: dict[str, Any], *, limit: int) -> list[dict[str, Any]]: ...
@@ -105,6 +116,9 @@ def record_row(record: dict[str, Any]) -> dict[str, Any]:
         "page_end": record.get("page_end"),
         "summary": str(record.get("summary", "")),
         "tags": list(record.get("tags") or []),
+        "source_hash": str(record.get("source_hash", "")),
+        "source_pdf_name": str(record.get("source_pdf_name", "")),
+        "source_pdf_path": str(record.get("source_pdf_path", "")),
         "char_count": len(content),
     }
 
@@ -120,6 +134,9 @@ def record_matches(record: dict[str, Any], search: str) -> bool:
             str(record.get("file_path", "")),
             str(record.get("title", "")),
             str(record.get("section_path", "")),
+            str(record.get("source_hash", "")),
+            str(record.get("source_pdf_name", "")),
+            str(record.get("source_pdf_path", "")),
             str(record.get("content", "")),
             " ".join(str(tag) for tag in record.get("tags") or []),
         ]
@@ -245,6 +262,30 @@ class LanceDBVectorStore:
         after = self.count()
         return {"deleted": before - after, "remaining": after}
 
+    def delete_records_by_source_hash(
+        self,
+        *,
+        source_hashes: list[str],
+        legacy_file_paths: list[str] | None = None,
+        legacy_doc_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        if not self.exists():
+            return {"deleted": 0, "remaining": 0}
+        clauses = sql_match_clauses(
+            source_hashes=source_hashes,
+            legacy_file_paths=legacy_file_paths,
+            legacy_doc_ids=legacy_doc_ids,
+        )
+        if not clauses:
+            return {"deleted": 0, "remaining": self.count()}
+        where = " OR ".join(clauses)
+        before = self.count()
+        if not self._where(where):
+            return {"deleted": 0, "remaining": before}
+        self._table().delete(where)
+        after = self.count()
+        return {"deleted": before - after, "remaining": after}
+
     def search(self, vector: list[float], *, top_k: int) -> list[dict[str, Any]]:
         if not self.exists():
             return []
@@ -343,6 +384,9 @@ class LanceDBVectorStore:
             "page_end": int(record.get("page_end") or 0),
             "summary": str(record.get("summary", "")),
             "tags": [str(tag) for tag in (record.get("tags") or [])],
+            "source_hash": str(record.get("source_hash", "")),
+            "source_pdf_name": str(record.get("source_pdf_name", "")),
+            "source_pdf_path": str(record.get("source_pdf_path", "")),
             "embedding_model": embedding_model,
             "embedding_dim": int(embedding_dim),
             "vector": [float(value) for value in vector],
@@ -367,6 +411,9 @@ class LanceDBVectorStore:
                 pa.field("page_end", pa.int64()),
                 pa.field("summary", pa.string()),
                 pa.field("tags", pa.list_(pa.string())),
+                pa.field("source_hash", pa.string()),
+                pa.field("source_pdf_name", pa.string()),
+                pa.field("source_pdf_path", pa.string()),
                 pa.field("embedding_model", pa.string()),
                 pa.field("embedding_dim", pa.int64()),
                 pa.field("vector", pa.list_(pa.float32(), embedding_dim)),
@@ -464,6 +511,39 @@ class JsonVectorStore:
         self._write(payload)
         return {"deleted": deleted, "remaining": len(kept)}
 
+    def delete_records_by_source_hash(
+        self,
+        *,
+        source_hashes: list[str],
+        legacy_file_paths: list[str] | None = None,
+        legacy_doc_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        if not self.exists():
+            return {"deleted": 0, "remaining": 0}
+        hashes = {str(value) for value in source_hashes if value}
+        file_paths = path_variants(legacy_file_paths or [])
+        doc_ids = {str(value) for value in legacy_doc_ids or [] if value}
+        if not hashes and not file_paths and not doc_ids:
+            return {"deleted": 0, "remaining": self.count()}
+
+        payload = self._load()
+        original = payload.get("records", [])
+        kept = [
+            record
+            for record in original
+            if not record_matches_source(
+                record,
+                source_hashes=hashes,
+                legacy_file_paths=file_paths,
+                legacy_doc_ids=doc_ids,
+            )
+        ]
+        deleted = len(original) - len(kept)
+        if deleted:
+            payload["records"] = kept
+            self._write(payload)
+        return {"deleted": deleted, "remaining": len(kept)}
+
     def search(self, vector: list[float], *, top_k: int) -> list[dict[str, Any]]:
         if not self.exists():
             return []
@@ -534,6 +614,53 @@ class JsonVectorStore:
                 tmp_path.unlink(missing_ok=True)
             except PermissionError:
                 pass
+
+def path_variants(values: list[str]) -> set[str]:
+    variants: set[str] = set()
+    for value in values:
+        raw = str(value)
+        if not raw:
+            continue
+        variants.add(raw)
+        variants.add(raw.replace("\\", "/"))
+        variants.add(raw.replace("/", "\\"))
+        try:
+            path = Path(raw)
+            variants.add(str(path))
+            variants.add(path.as_posix())
+        except (OSError, ValueError):
+            pass
+    return variants
+
+
+def record_matches_source(
+    record: dict[str, Any],
+    *,
+    source_hashes: set[str],
+    legacy_file_paths: set[str],
+    legacy_doc_ids: set[str],
+) -> bool:
+    if str(record.get("source_hash", "")) in source_hashes:
+        return True
+    if str(record.get("file_path", "")) in legacy_file_paths:
+        return True
+    return str(record.get("doc_id", "")) in legacy_doc_ids
+
+
+def sql_match_clauses(
+    *,
+    source_hashes: list[str],
+    legacy_file_paths: list[str] | None = None,
+    legacy_doc_ids: list[str] | None = None,
+) -> list[str]:
+    clauses: list[str] = []
+    for source_hash in sorted({str(value) for value in source_hashes if value}):
+        clauses.append(f"source_hash = {sql_string(source_hash)}")
+    for file_path in sorted(path_variants(legacy_file_paths or [])):
+        clauses.append(f"file_path = {sql_string(file_path)}")
+    for doc_id in sorted({str(value) for value in legacy_doc_ids or [] if value}):
+        clauses.append(f"doc_id = {sql_string(doc_id)}")
+    return clauses
 
 
 def sql_string(value: str) -> str:

@@ -1,11 +1,17 @@
+import shutil
+import uuid
+from pathlib import Path
+
 from src.sectioning import (
     PageText,
+    build_section_records,
     content_for_section,
     outline_sections,
     parse_toc_entries,
     split_text,
     toc_sections_from_pages,
 )
+from src.pdf_registry import write_source_entry
 
 
 class FakeDestination:
@@ -98,3 +104,26 @@ def test_oversized_section_splits_without_crossing_sections():
 
     assert len(chunks) > 1
     assert all("beta" not in chunk for chunk in chunks)
+
+
+def test_section_records_include_parent_pdf_source_metadata():
+    root = Path.cwd() / f".tmp_test_sectioning_{uuid.uuid4().hex}"
+    try:
+        markdown_path = root / "processed" / "doc.md"
+        markdown_path.parent.mkdir(parents=True)
+        markdown_path.write_text("# Intro\n\nalpha content", encoding="utf-8")
+        write_source_entry(
+            processed_dir=markdown_path.parent,
+            markdown_path=markdown_path,
+            source_hash="hash-a",
+            source_pdf_name="doc.pdf",
+            source_pdf_path=root / "uploads" / "doc.pdf",
+        )
+
+        records = build_section_records(markdown_path, source_root=root)
+
+        assert records
+        assert {record["source_hash"] for record in records} == {"hash-a"}
+        assert {record["source_pdf_name"] for record in records} == {"doc.pdf"}
+    finally:
+        shutil.rmtree(root, ignore_errors=True)

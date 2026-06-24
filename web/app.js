@@ -3,6 +3,10 @@ const state = {
   limit: 20,
   total: 0,
   search: "",
+  chats: [],
+  activeChatId: null,
+  streamingChatId: null,
+  chatSidebarCollapsed: false,
   healthPollIntervalMs: 60000,
   jobsPollIntervalMs: 60000,
   healthTimer: null,
@@ -10,6 +14,8 @@ const state = {
 };
 
 const LIVE_RENDER_INTERVAL_MS = 200;
+const CHAT_STORAGE_KEY = "rag.chatHistory.v1";
+const CHAT_UI_STORAGE_KEY = "rag.chatUi.v1";
 
 const els = {
   statusLine: document.getElementById("statusLine"),
@@ -32,6 +38,12 @@ const els = {
   contextWindowInput: document.getElementById("contextWindowInput"),
   maxOutputInput: document.getElementById("maxOutputInput"),
   sendButton: document.getElementById("sendButton"),
+  chatLayout: document.getElementById("chatLayout"),
+  chatSidebar: document.getElementById("chatSidebar"),
+  collapseChatSidebarButton: document.getElementById("collapseChatSidebarButton"),
+  expandChatSidebarButton: document.getElementById("expandChatSidebarButton"),
+  newChatButton: document.getElementById("newChatButton"),
+  savedChatsList: document.getElementById("savedChatsList"),
   chatMessages: document.getElementById("chatMessages"),
 };
 
@@ -53,11 +65,19 @@ async function requestJson(path, options = {}) {
   if (!response.ok) {
     let detail = await response.text();
     try {
-      detail = JSON.parse(detail).detail || detail;
+      const parsed = JSON.parse(detail);
+      detail = parsed.detail || detail;
     } catch (_) {
       // Keep the raw response text.
     }
-    throw new Error(detail || `${response.status} ${response.statusText}`);
+    const message =
+      typeof detail === "string"
+        ? detail
+        : detail.message || `${response.status} ${response.statusText}`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.detail = detail;
+    throw error;
   }
   return response.json();
 }
@@ -176,6 +196,250 @@ function numericSetting(input, fallback, minimum = 1) {
   return value;
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function newId() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return window.crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function firstFiveWords(text) {
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean).slice(0, 5);
+  return words.join(" ") || "New chat";
+}
+
+function loadChatState() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(CHAT_STORAGE_KEY) || "{}");
+    state.chats = Array.isArray(parsed.chats)
+      ? parsed.chats
+          .filter((chat) => chat && typeof chat === "object")
+          .map((chat) => ({
+            id: String(chat.id || newId()),
+            title: String(chat.title || "New chat"),
+            customTitle: Boolean(chat.customTitle),
+            createdAt: String(chat.createdAt || nowIso()),
+            updatedAt: String(chat.updatedAt || nowIso()),
+            messages: Array.isArray(chat.messages) ? chat.messages : [],
+          }))
+      : [];
+    state.activeChatId = parsed.activeChatId || null;
+  } catch (_) {
+    state.chats = [];
+    state.activeChatId = null;
+  }
+
+  try {
+    const ui = JSON.parse(localStorage.getItem(CHAT_UI_STORAGE_KEY) || "{}");
+    state.chatSidebarCollapsed = Boolean(ui.chatSidebarCollapsed);
+  } catch (_) {
+    state.chatSidebarCollapsed = false;
+  }
+
+  if (!state.chats.some((chat) => chat.id === state.activeChatId)) {
+    state.activeChatId = state.chats[0]?.id || null;
+  }
+  if (!state.activeChatId) {
+    createChat({ activate: true, persist: false });
+  }
+}
+
+function persistChatState() {
+  localStorage.setItem(
+    CHAT_STORAGE_KEY,
+    JSON.stringify({
+      activeChatId: state.activeChatId,
+      chats: state.chats,
+    }),
+  );
+}
+
+function persistChatUiState() {
+  localStorage.setItem(
+    CHAT_UI_STORAGE_KEY,
+    JSON.stringify({ chatSidebarCollapsed: state.chatSidebarCollapsed }),
+  );
+}
+
+function activeChat() {
+  return state.chats.find((chat) => chat.id === state.activeChatId) || null;
+}
+
+function createChat({ activate = true, persist = true } = {}) {
+  const chat = {
+    id: newId(),
+    title: "New chat",
+    customTitle: false,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    messages: [],
+  };
+  state.chats.unshift(chat);
+  if (activate) {
+    state.activeChatId = chat.id;
+  }
+  if (persist) {
+    persistChatState();
+    renderSavedChats();
+    renderActiveChat();
+  }
+  return chat;
+}
+
+function touchChat(chat) {
+  chat.updatedAt = nowIso();
+  state.chats = [chat, ...state.chats.filter((item) => item.id !== chat.id)];
+}
+
+function refreshChatTitle(chat) {
+  if (chat.customTitle) {
+    return;
+  }
+  const firstUserMessage = chat.messages.find((message) => message.role === "user");
+  chat.title = firstUserMessage ? firstFiveWords(firstUserMessage.text) : "New chat";
+}
+
+function setChatSidebarCollapsed(collapsed) {
+  state.chatSidebarCollapsed = collapsed;
+  els.chatLayout.classList.toggle("sidebar-collapsed", collapsed);
+  els.expandChatSidebarButton.hidden = !collapsed;
+  persistChatUiState();
+}
+
+function renderSavedChats() {
+  els.savedChatsList.innerHTML = "";
+  for (const chat of state.chats) {
+    const row = document.createElement("div");
+    row.className = "saved-chat-row";
+    row.dataset.chatId = chat.id;
+
+    const title = document.createElement("button");
+    title.type = "button";
+    title.className = "saved-chat-title";
+    title.classList.toggle("active", chat.id === state.activeChatId);
+    title.textContent = chat.title || "New chat";
+    title.title = chat.title || "New chat";
+    title.addEventListener("click", () => selectChat(chat.id));
+
+    const actions = document.createElement("div");
+    actions.className = "saved-chat-actions";
+
+    const rename = document.createElement("button");
+    rename.type = "button";
+    rename.textContent = "Rename";
+    rename.addEventListener("click", () => renameChat(chat.id));
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Delete";
+    remove.className = "danger";
+    remove.addEventListener("click", () => deleteChat(chat.id));
+
+    actions.append(rename, remove);
+    row.append(title, actions);
+    els.savedChatsList.appendChild(row);
+  }
+}
+
+function selectChat(chatId) {
+  if (state.streamingChatId) {
+    return;
+  }
+  if (!state.chats.some((chat) => chat.id === chatId)) {
+    return;
+  }
+  state.activeChatId = chatId;
+  persistChatState();
+  renderSavedChats();
+  renderActiveChat();
+}
+
+function renameChat(chatId) {
+  if (state.streamingChatId) {
+    return;
+  }
+  const chat = state.chats.find((item) => item.id === chatId);
+  if (!chat) {
+    return;
+  }
+  const nextTitle = window.prompt("Rename chat", chat.title || "New chat");
+  if (nextTitle === null) {
+    return;
+  }
+  const trimmed = nextTitle.trim();
+  if (!trimmed) {
+    return;
+  }
+  chat.title = trimmed;
+  chat.customTitle = true;
+  touchChat(chat);
+  persistChatState();
+  renderSavedChats();
+}
+
+function deleteChat(chatId) {
+  if (state.streamingChatId) {
+    return;
+  }
+  const chat = state.chats.find((item) => item.id === chatId);
+  if (!chat || !window.confirm(`Delete "${chat.title || "New chat"}"?`)) {
+    return;
+  }
+  state.chats = state.chats.filter((item) => item.id !== chatId);
+  if (state.activeChatId === chatId) {
+    state.activeChatId = state.chats[0]?.id || null;
+    if (!state.activeChatId) {
+      createChat({ activate: true, persist: false });
+    }
+  }
+  persistChatState();
+  renderSavedChats();
+  renderActiveChat();
+}
+
+function addUserMessageToChat(chat, text) {
+  chat.messages.push({ role: "user", text, createdAt: nowIso() });
+  refreshChatTitle(chat);
+  touchChat(chat);
+  persistChatState();
+  renderSavedChats();
+}
+
+function addAssistantMessageToChat(chat, parts) {
+  chat.messages.push({
+    role: "assistant",
+    text: parts.rawAnswer,
+    thinking: parts.rawThinking,
+    answerHtml: parts.body.innerHTML,
+    thinkingHtml: parts.rawThinking ? parts.thinkingBody.innerHTML : "",
+    notice: parts.notice.textContent || "",
+    createdAt: nowIso(),
+  });
+  touchChat(chat);
+  persistChatState();
+  renderSavedChats();
+}
+
+function renderActiveChat() {
+  els.chatMessages.innerHTML = "";
+  const chat = activeChat();
+  if (!chat) {
+    return;
+  }
+  for (const message of chat.messages) {
+    if (message.role === "assistant") {
+      addSavedAssistantMessage(message);
+    } else {
+      addMessage("You", message.text || "");
+    }
+  }
+  els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
+}
+
 async function refreshHealth() {
   try {
     const data = await requestJson("/api/health");
@@ -243,7 +507,21 @@ function scheduleJobsPolling() {
   state.jobsTimer = setInterval(refreshJobs, state.jobsPollIntervalMs);
 }
 
-async function uploadFiles() {
+function duplicateUploadMessage(detail) {
+  const duplicates = Array.isArray(detail?.duplicates) ? detail.duplicates : [];
+  if (!duplicates.length) {
+    return detail?.message || "Duplicate PDF upload detected.";
+  }
+  const names = duplicates
+    .map((item) => {
+      const existing = item.existing_filename ? ` matches ${item.existing_filename}` : "";
+      return `${item.filename || item.hash}${existing}`;
+    })
+    .join("\n");
+  return `${detail.message || "Duplicate PDF upload detected."}\n\n${names}`;
+}
+
+async function uploadFiles(forceDuplicates = false) {
   const files = Array.from(els.fileInput.files || []);
   if (!files.length) {
     setStatus(els.uploadStatus, "Choose one or more PDF files.", true);
@@ -254,15 +532,36 @@ async function uploadFiles() {
   for (const file of files) {
     body.append("files", file);
   }
+  if (forceDuplicates) {
+    body.append("force_duplicates", "true");
+  }
 
   els.uploadButton.disabled = true;
-  setStatus(els.uploadStatus, "Queueing upload...");
+  setStatus(els.uploadStatus, forceDuplicates ? "Queueing forced upload..." : "Queueing upload...");
   try {
     const job = await requestJson("/api/uploads", { method: "POST", body });
     els.fileInput.value = "";
     setStatus(els.uploadStatus, `Queued job ${job.id.slice(0, 8)}.`);
     await refreshJobs();
   } catch (error) {
+    if (
+      !forceDuplicates &&
+      error.status === 409 &&
+      error.detail &&
+      error.detail.can_force !== false
+    ) {
+      const confirmed = window.confirm(`${duplicateUploadMessage(error.detail)}\n\nForce re-upload?`);
+      if (confirmed) {
+        await uploadFiles(true);
+        return;
+      }
+      setStatus(els.uploadStatus, "Duplicate upload cancelled.", true);
+      return;
+    }
+    if (error.status === 409 && error.detail) {
+      setStatus(els.uploadStatus, duplicateUploadMessage(error.detail), true);
+      return;
+    }
     setStatus(els.uploadStatus, error.message, true);
   } finally {
     els.uploadButton.disabled = false;
@@ -437,6 +736,28 @@ function addAssistantMessage() {
   };
 }
 
+function addSavedAssistantMessage(saved) {
+  const parts = addAssistantMessage();
+  parts.finalized = true;
+  parts.rawAnswer = saved.text || "";
+  parts.rawThinking = saved.thinking || "";
+  if (parts.rawThinking) {
+    parts.thinking.hidden = false;
+    parts.thinking.open = false;
+    parts.thinkingBody.innerHTML = saved.thinkingHtml || escapeHtml(parts.rawThinking);
+  }
+  if (saved.notice) {
+    parts.notice.textContent = saved.notice;
+    parts.notice.hidden = false;
+  }
+  if (saved.answerHtml) {
+    parts.body.innerHTML = saved.answerHtml;
+  } else {
+    parts.body.textContent = parts.rawAnswer;
+  }
+  return parts;
+}
+
 function isTransientNotice(text) {
   return (
     text === "Embedding query and retrieving context..." ||
@@ -527,15 +848,23 @@ async function formatAssistantMessage(parts) {
 
 async function sendQuestion(event) {
   event.preventDefault();
+  if (state.streamingChatId) {
+    return;
+  }
   const question = els.questionInput.value.trim();
   if (!question) {
     return;
   }
 
+  const chat = activeChat() || createChat({ activate: true });
+  state.activeChatId = chat.id;
+  state.streamingChatId = chat.id;
+  addUserMessageToChat(chat, question);
   addMessage("You", question);
   const assistantParts = addAssistantMessage();
   els.questionInput.value = "";
   els.sendButton.disabled = true;
+  renderSavedChats();
 
   try {
     const response = await fetch("/api/chat/stream", {
@@ -587,7 +916,10 @@ async function sendQuestion(event) {
     appendStreamEvent(assistantParts, { type: "error", text: error.message });
   } finally {
     await formatAssistantMessage(assistantParts);
+    addAssistantMessageToChat(chat, assistantParts);
+    state.streamingChatId = null;
     els.sendButton.disabled = false;
+    renderSavedChats();
     await refreshHealth();
   }
 }
@@ -628,7 +960,20 @@ els.nextPageButton.addEventListener("click", () => {
 });
 els.indexBody.addEventListener("click", handleIndexAction);
 els.chatForm.addEventListener("submit", sendQuestion);
+els.newChatButton.addEventListener("click", () => {
+  if (state.streamingChatId) {
+    return;
+  }
+  createChat({ activate: true });
+});
+els.collapseChatSidebarButton.addEventListener("click", () => setChatSidebarCollapsed(true));
+els.expandChatSidebarButton.addEventListener("click", () => setChatSidebarCollapsed(false));
 
+loadChatState();
+setChatSidebarCollapsed(state.chatSidebarCollapsed);
+renderSavedChats();
+renderActiveChat();
+persistChatState();
 refreshHealth();
 refreshJobs();
 scheduleHealthPolling();

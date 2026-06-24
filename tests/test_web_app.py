@@ -11,6 +11,8 @@ from fastapi.testclient import TestClient
 
 import src.query as query
 import src.web_app as web_app
+from src.pdf_registry import load_source_map, write_source_entry
+from src.vector_store import JsonVectorStore
 
 
 @pytest.fixture
@@ -243,6 +245,87 @@ def test_queue_pauses_new_work_while_query_is_active(workspace_tmp):
     assert (workspace_tmp / "uploads" / job.id / "doc.pdf").exists()
 
 
+def test_force_duplicate_cleanup_waits_until_ingestion_phase(workspace_tmp):
+    calls = []
+    processed_dir = workspace_tmp / "processed"
+    db_dir = workspace_tmp / "db"
+    processed_dir.mkdir()
+    old_markdown = processed_dir / "old.md"
+    old_markdown.write_text("old content", encoding="utf-8")
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=old_markdown,
+        source_hash="hash-a",
+        source_pdf_name="old.pdf",
+        source_pdf_path=workspace_tmp / "old.pdf",
+    )
+    JsonVectorStore(db_dir).write_records(
+        [
+            {
+                "id": "old",
+                "doc_id": "old-doc",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": str(old_markdown),
+                "chunk_index": 0,
+                "content": "old",
+                "source_hash": "hash-a",
+                "vector": [1.0, 0.0, 0.0],
+            },
+            {
+                "id": "kept",
+                "doc_id": "kept-doc",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": "kept.md",
+                "chunk_index": 1,
+                "content": "kept",
+                "source_hash": "hash-b",
+                "vector": [0.0, 1.0, 0.0],
+            },
+        ],
+        embedding_model="fake-embed",
+        embedding_dim=3,
+    )
+
+    def fake_ingest(input_dir, output_dir, **kwargs):
+        old_content = old_markdown.read_text(encoding="utf-8") if old_markdown.exists() else ""
+        calls.append(("ingest", bool(old_content), JsonVectorStore(db_dir).count()))
+
+    def fake_index(md_dir, db_dir_arg, **kwargs):
+        calls.append(("index", Path(md_dir).name, Path(db_dir_arg).name))
+
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=processed_dir,
+        db_dir=db_dir,
+        registry_path=workspace_tmp / "registry.json",
+        run_ingestion_func=fake_ingest,
+        run_indexing_func=fake_index,
+    )
+    staging = workspace_tmp / "staging"
+    staging.mkdir()
+    staging.joinpath("new.pdf").write_bytes(b"%PDF-1.4")
+
+    queue.begin_query()
+    job = queue.enqueue_upload(
+        staging_dir=staging,
+        filenames=["new.pdf"],
+        uploads=[{"filename": "new.pdf", "hash": "hash-a", "staging_path": str(staging / "new.pdf")}],
+        force_duplicate_hashes=["hash-a"],
+    )
+
+    _wait_for(lambda: queue.get_job(job.id)["status"] == "paused_for_queries")
+    assert old_markdown.exists()
+    assert JsonVectorStore(db_dir).count() == 2
+
+    queue.finish_query()
+    _wait_for(lambda: queue.get_job(job.id)["status"] == "done")
+
+    assert calls[0] == ("ingest", False, 1)
+    assert load_source_map(processed_dir)["documents"] == {}
+
+
 def test_upload_endpoint_enqueues_pdf_batch(monkeypatch, workspace_tmp):
     captured = {}
 
@@ -257,6 +340,7 @@ def test_upload_endpoint_enqueues_pdf_batch(monkeypatch, workspace_tmp):
             )
 
     monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
     monkeypatch.setattr(web_app, "job_queue", FakeQueue())
 
     client = TestClient(web_app.app)
@@ -268,7 +352,77 @@ def test_upload_endpoint_enqueues_pdf_batch(monkeypatch, workspace_tmp):
     assert response.status_code == 200
     assert response.json()["filenames"] == ["notes.pdf"]
     assert captured["filenames"] == ["notes.pdf"]
+    assert captured["uploads"][0]["filename"] == "notes.pdf"
+    assert len(captured["uploads"][0]["hash"]) == 64
     assert Path(captured["staging_dir"]).joinpath("notes.pdf").exists()
+
+
+def test_upload_endpoint_rejects_duplicate_pdf_without_force(monkeypatch, workspace_tmp):
+    class FakeQueue:
+        def enqueue_upload(self, **kwargs):
+            return web_app.QueueJob(
+                id=kwargs["job_id"],
+                kind="upload",
+                filenames=kwargs["filenames"],
+                uploads=kwargs["uploads"],
+                staging_dir=str(kwargs["staging_dir"]),
+            )
+
+    monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    client = TestClient(web_app.app)
+    first = client.post(
+        "/api/uploads",
+        files=[("files", ("notes.pdf", b"%PDF-1.4 same", "application/pdf"))],
+    )
+    second = client.post(
+        "/api/uploads",
+        files=[("files", ("copy.pdf", b"%PDF-1.4 same", "application/pdf"))],
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    detail = second.json()["detail"]
+    assert detail["can_force"] is True
+    assert detail["duplicates"][0]["filename"] == "copy.pdf"
+    assert detail["duplicates"][0]["existing_filename"] == "notes.pdf"
+
+
+def test_upload_endpoint_allows_forced_duplicate(monkeypatch, workspace_tmp):
+    captured = {}
+
+    class FakeQueue:
+        def enqueue_upload(self, **kwargs):
+            captured.update(kwargs)
+            return web_app.QueueJob(
+                id=kwargs["job_id"],
+                kind="upload",
+                filenames=kwargs["filenames"],
+                uploads=kwargs["uploads"],
+                force_duplicate_hashes=kwargs["force_duplicate_hashes"],
+                staging_dir=str(kwargs["staging_dir"]),
+            )
+
+    monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    client = TestClient(web_app.app)
+    client.post(
+        "/api/uploads",
+        files=[("files", ("notes.pdf", b"%PDF-1.4 same", "application/pdf"))],
+    )
+    response = client.post(
+        "/api/uploads",
+        data={"force_duplicates": "true"},
+        files=[("files", ("copy.pdf", b"%PDF-1.4 same", "application/pdf"))],
+    )
+
+    assert response.status_code == 200
+    assert response.json()["force_duplicate_hashes"] == captured["force_duplicate_hashes"]
+    assert captured["force_duplicate_hashes"] == [captured["uploads"][0]["hash"]]
 
 
 def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
