@@ -149,7 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--context_token_fraction",
         type=float,
         default=0.60,
-        help="Fraction of the model context window allowed for retrieved context.",
+        help="Fraction of the model context window allowed for input prompt context, capped at 0.60.",
     )
     parser.add_argument(
         "--no_web_search",

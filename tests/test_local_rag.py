@@ -381,6 +381,143 @@ def test_retrieval_stops_at_context_token_budget_after_first_match(monkeypatch):
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
+def test_retrieval_truncates_oversized_first_match_to_context_budget(monkeypatch):
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+            return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+    class FakeStore:
+        def exists(self):
+            return True
+
+        def count(self):
+            return 1
+
+        def search(self, vector, *, top_k):
+            return [
+                {"id": "a", "node_type": "chunk", "content": "alpha " * 2000, "score": 1.0},
+            ]
+
+        def child_chunks(self, parent, *, limit):
+            return []
+
+    monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    try:
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            context_window=1024,
+            context_token_fraction=0.25,
+            progress_enabled=False,
+        )
+        engine.store = FakeStore()
+        engine.record_count = 1
+
+        matches = engine._retrieve("alpha?")
+
+        assert len(matches) == 1
+        assert matches[0]["estimated_tokens"] <= engine._context_token_budget()
+        assert matches[0]["content_truncated"] is True
+        assert matches[0]["content"].endswith(local_rag.CONTEXT_TRUNCATION_NOTICE)
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_forced_local_tool_call_keeps_final_prompt_under_input_context_budget(monkeypatch):
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+            return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+    class FakeStore:
+        def exists(self):
+            return True
+
+        def count(self):
+            return 1
+
+        def search(self, vector, *, top_k):
+            return [
+                {"id": "a", "node_type": "chunk", "content": "alpha " * 4000, "score": 1.0},
+            ]
+
+        def child_chunks(self, parent, *, limit):
+            return []
+
+    monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    try:
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            context_window=4096,
+            context_token_fraction=0.95,
+            progress_enabled=False,
+        )
+        engine.store = FakeStore()
+        engine.record_count = 1
+        messages = engine._tool_messages("alpha?")
+        citations = local_rag.CitationRegistry()
+
+        result, _ = engine._forced_local_tool_call(messages, question="alpha?", citations=citations)
+        messages.append({"role": "user", "content": engine._final_answer_instruction()})
+
+        assert result["result_count"] == 1
+        assert result["context_truncated"] is True
+        assert engine._context_token_budget() == int(4096 * 0.60)
+        assert local_rag.estimate_prompt_tokens(messages) <= engine._context_token_budget()
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_web_search_skips_when_prompt_already_exceeds_input_context_budget(monkeypatch):
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+            return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+    monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+
+    def fail_web_search(*args, **kwargs):
+        raise AssertionError("web search should not be called")
+
+    monkeypatch.setattr(local_rag, "web_search_duckduckgo_lite", fail_web_search)
+
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    try:
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            context_window=1024,
+            context_token_fraction=0.60,
+            progress_enabled=False,
+        )
+        messages = engine._tool_messages("alpha?")
+        messages.append({"role": "tool", "tool_name": "search_local_context", "content": "x" * 4000})
+
+        tools = engine._tool_definitions(include_web_search=engine._web_search_allowed(messages))
+        _, result, text = engine._execute_tool_call(
+            _tool_call(name="web_search", arguments={"query": "current alpha"}),
+            question="alpha?",
+            citations=local_rag.CitationRegistry(),
+            messages=messages,
+        )
+
+        assert all(tool["function"]["name"] != "web_search" for tool in tools)
+        assert result["result_count"] == 0
+        assert "current prompt" in result["error"]
+        assert text == result["error"]
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def test_repeated_local_tool_call_excludes_already_returned_chunks(monkeypatch):
     class FakeEngine:
         def __init__(self, **kwargs):

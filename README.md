@@ -185,8 +185,8 @@ Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/
 4. **Querying**
    - Questions are embedded locally through Ollama.
    - Summary hits are expanded to child chunks, while direct chunk hits are used as answer context.
-   - Context selection uses a stricter relevance floor plus a context-token budget instead of a fixed chunk count.
-   - Ollama native tool calls let the model pull additional local context and optional keyless web-search results before final answer streaming.
+   - Context selection uses a stricter relevance floor plus an input-prompt budget capped at 60% of the model context window instead of a fixed chunk count.
+   - Ollama native tool calls let the model pull additional local context and optional keyless web-search results before final answer streaming; web search is skipped once the current prompt already exceeds the input-prompt budget.
    - The default chat system prompt can be set in `config.toml` under `[chat] system_prompt` or overridden with `--system_prompt`.
    - `gemma4` synthesizes an answer from tool-returned sources and cites `[S#]` local chunks or `[W#]` web results shown in the Sources panel.
 

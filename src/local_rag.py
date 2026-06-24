@@ -38,6 +38,8 @@ DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL = 5.0
 DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS = 5
 CONTEXT_METADATA_TOKEN_OVERHEAD = 64
+CONTEXT_TRUNCATION_NOTICE = "\n\n[Context truncated to fit prompt budget.]"
+MIN_CONTEXT_BLOCK_TOKENS = 96
 DEFAULT_QUERY_SYSTEM_PROMPT = (
     "You are a retrieval-augmented assistant. Before answering, you must call "
     "search_local_context at least once. You may call search_local_context again "
@@ -395,7 +397,98 @@ def chunk_markdown(text: str, *, max_chars: int = 3000, overlap: int = 400) -> l
 
 
 def estimate_context_tokens(text: str) -> int:
-    return math.ceil(len(text or "") / 4) + CONTEXT_METADATA_TOKEN_OVERHEAD
+    return estimate_text_tokens(text) + CONTEXT_METADATA_TOKEN_OVERHEAD
+
+
+def estimate_text_tokens(text: str) -> int:
+    return math.ceil(len(text or "") / 4)
+
+
+def estimate_json_tokens(value: Any) -> int:
+    return estimate_context_tokens(json.dumps(value, ensure_ascii=False))
+
+
+def estimate_prompt_tokens(
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None = None,
+) -> int:
+    total = 0
+    for message in messages:
+        total += CONTEXT_METADATA_TOKEN_OVERHEAD
+        for key in ("role", "content", "name", "tool_name"):
+            if key in message:
+                total += estimate_text_tokens(str(message.get(key) or ""))
+        if message.get("tool_calls"):
+            total += estimate_text_tokens(json.dumps(message["tool_calls"], ensure_ascii=False))
+    if tools:
+        total += estimate_json_tokens(tools)
+    return total
+
+
+def _fit_text_to_context_budget(text: str, token_budget: int) -> tuple[str, bool, int]:
+    token_budget = max(0, int(token_budget))
+    current_tokens = estimate_context_tokens(text)
+    if current_tokens <= token_budget:
+        return text, False, current_tokens
+    if token_budget < MIN_CONTEXT_BLOCK_TOKENS:
+        return "", True, 0
+
+    source = text or ""
+    best = ""
+    best_tokens = 0
+    low = 0
+    high = len(source)
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = source[:middle].rstrip()
+        if candidate:
+            candidate = f"{candidate}{CONTEXT_TRUNCATION_NOTICE}"
+        candidate_tokens = estimate_context_tokens(candidate)
+        if candidate and candidate_tokens <= token_budget:
+            best = candidate
+            best_tokens = candidate_tokens
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best, True, best_tokens
+
+
+def _fit_text_field_to_json_budget(
+    item: dict[str, Any],
+    field: str,
+    token_budget: int,
+    *,
+    truncated_field: str,
+) -> tuple[dict[str, Any] | None, bool, int]:
+    token_budget = max(0, int(token_budget))
+    current_tokens = estimate_json_tokens(item)
+    if current_tokens <= token_budget:
+        return item, False, current_tokens
+    if token_budget < MIN_CONTEXT_BLOCK_TOKENS:
+        return None, True, 0
+
+    source = str(item.get(field) or "")
+    best: dict[str, Any] | None = None
+    best_tokens = 0
+    low = 0
+    high = len(source)
+    while low <= high:
+        middle = (low + high) // 2
+        candidate_text = source[:middle].rstrip()
+        if candidate_text:
+            candidate_text = f"{candidate_text}{CONTEXT_TRUNCATION_NOTICE}"
+        candidate = dict(item)
+        candidate[field] = candidate_text
+        candidate[truncated_field] = True
+        candidate_tokens = estimate_json_tokens(candidate)
+        if candidate_text and candidate_tokens <= token_budget:
+            best = candidate
+            best_tokens = candidate_tokens
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best, True, best_tokens
 
 
 def _source_pdf_name(record: dict[str, Any]) -> str:
@@ -433,15 +526,13 @@ class CitationRegistry:
         self._local_sources: list[dict[str, Any]] = []
         self._web_sources: list[dict[str, Any]] = []
 
-    def add_local(self, record: dict[str, Any]) -> dict[str, Any]:
+    def _local_source(self, record: dict[str, Any], index: int) -> dict[str, Any]:
         record_id = str(record.get("id") or "")
-        if record_id in self._local_by_record_id:
-            return self._local_by_record_id[record_id]
         source_hash = str(record.get("source_hash") or "")
-        source = {
-            "id": f"S{len(self._local_sources) + 1}",
+        return {
+            "id": f"S{index}",
             "kind": "local",
-            "label": f"[S{len(self._local_sources) + 1}]",
+            "label": f"[S{index}]",
             "chunk_id": record_id,
             "doc_id": str(record.get("doc_id") or ""),
             "source_hash": source_hash,
@@ -456,23 +547,45 @@ class CitationRegistry:
             "snippet": _short_snippet(str(record.get("content") or "")),
             "download_url": f"/api/pdfs/{source_hash}/download" if source_hash else "",
         }
+
+    def preview_local(self, record: dict[str, Any]) -> dict[str, Any]:
+        record_id = str(record.get("id") or "")
+        if record_id in self._local_by_record_id:
+            return self._local_by_record_id[record_id]
+        return self._local_source(record, len(self._local_sources) + 1)
+
+    def add_local(self, record: dict[str, Any]) -> dict[str, Any]:
+        record_id = str(record.get("id") or "")
+        if record_id in self._local_by_record_id:
+            return self._local_by_record_id[record_id]
+        source = self._local_source(record, len(self._local_sources) + 1)
         self._local_by_record_id[record_id] = source
         self._local_sources.append(source)
         return source
 
-    def add_web(self, result: dict[str, Any]) -> dict[str, Any]:
+    def _web_source(self, result: dict[str, Any], index: int) -> dict[str, Any]:
         url = str(result.get("url") or "")
-        if url in self._web_by_url:
-            return self._web_by_url[url]
-        source = {
-            "id": f"W{len(self._web_sources) + 1}",
+        return {
+            "id": f"W{index}",
             "kind": "web",
-            "label": f"[W{len(self._web_sources) + 1}]",
+            "label": f"[W{index}]",
             "title": str(result.get("title") or url),
             "url": url,
             "snippet": _short_snippet(str(result.get("snippet") or ""), limit=300),
             "provider": str(result.get("provider") or "duckduckgo_lite"),
         }
+
+    def preview_web(self, result: dict[str, Any]) -> dict[str, Any]:
+        url = str(result.get("url") or "")
+        if url in self._web_by_url:
+            return self._web_by_url[url]
+        return self._web_source(result, len(self._web_sources) + 1)
+
+    def add_web(self, result: dict[str, Any]) -> dict[str, Any]:
+        url = str(result.get("url") or "")
+        if url in self._web_by_url:
+            return self._web_by_url[url]
+        source = self._web_source(result, len(self._web_sources) + 1)
         self._web_by_url[url] = source
         self._web_sources.append(source)
         return source
@@ -843,7 +956,8 @@ class LocalQueryEngine:
 
     def _tool_messages(self, question: str) -> list[dict[str, Any]]:
         web_instruction = (
-            "Use web_search only when local context is insufficient or the user asks for current/external facts."
+            "Use web_search only when local context is insufficient or the user asks for current/external facts, "
+            "and only while the prompt remains under the input-context budget."
             if self.web_search_enabled
             else "Do not use web_search; it is disabled for this request."
         )
@@ -860,7 +974,7 @@ class LocalQueryEngine:
             {"role": "user", "content": question},
         ]
 
-    def _tool_definitions(self) -> list[dict[str, Any]]:
+    def _tool_definitions(self, *, include_web_search: bool | None = None) -> list[dict[str, Any]]:
         tools = [
             {
                 "type": "function",
@@ -888,7 +1002,8 @@ class LocalQueryEngine:
                 },
             }
         ]
-        if self.web_search_enabled:
+        web_search_available = self.web_search_enabled if include_web_search is None else include_web_search
+        if web_search_available:
             tools.append(
                 {
                     "type": "function",
@@ -929,9 +1044,50 @@ class LocalQueryEngine:
         return count
 
     def _context_token_budget(self) -> int:
-        return max(256, int(math.floor(self.context_window * min(self.context_token_fraction, 0.95))))
+        effective_fraction = min(self.context_token_fraction, DEFAULT_CONTEXT_TOKEN_FRACTION)
+        return max(1, int(math.floor(self.context_window * effective_fraction)))
 
-    def _retrieve(self, question: str, *, exclude_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    def _prompt_token_count(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> int:
+        return estimate_prompt_tokens(messages, tools=tools)
+
+    def _final_answer_instruction(self) -> str:
+        return (
+            "Write the final answer now using only the tool results above. "
+            "Cite every factual claim with the source IDs in square brackets. "
+            "If the sources are insufficient, say what information is missing."
+        )
+
+    def _final_answer_reserve_tokens(self) -> int:
+        return estimate_prompt_tokens([{"role": "user", "content": self._final_answer_instruction()}])
+
+    def _tool_result_token_budget(self, messages: list[dict[str, Any]] | None) -> int:
+        if messages is None:
+            return self._context_token_budget()
+        remaining = (
+            self._context_token_budget()
+            - self._final_answer_reserve_tokens()
+            - self._prompt_token_count(messages)
+        )
+        return max(0, remaining)
+
+    def _web_search_allowed(self, messages: list[dict[str, Any]]) -> bool:
+        if not self.web_search_enabled:
+            return False
+        tools_with_web = self._tool_definitions(include_web_search=True)
+        return self._prompt_token_count(messages, tools=tools_with_web) <= self._context_token_budget()
+
+    def _retrieve(
+        self,
+        question: str,
+        *,
+        exclude_ids: set[str] | None = None,
+        token_budget: int | None = None,
+    ) -> list[dict[str, Any]]:
         if not self.record_count:
             return []
         exclude_ids = exclude_ids or set()
@@ -950,7 +1106,9 @@ class LocalQueryEngine:
 
         best_score = max(float(candidate.get("score") or 0.0) for candidate in candidates)
         score_cutoff = max(self.retrieval_min_score, best_score * self.retrieval_relative_cutoff)
-        token_budget = self._context_token_budget()
+        token_budget = self._context_token_budget() if token_budget is None else max(0, int(token_budget))
+        if token_budget <= 0:
+            return []
         used_tokens = 0
         seen: set[str] = set()
         results: list[dict[str, Any]] = []
@@ -963,12 +1121,24 @@ class LocalQueryEngine:
             score = float(record.get("score") or inherited_score or 0.0)
             if score < score_cutoff:
                 return False
-            tokens = estimate_context_tokens(str(record.get("content") or ""))
-            if results and used_tokens + tokens > token_budget:
+            content = str(record.get("content") or "")
+            tokens = estimate_context_tokens(content)
+            original_tokens = tokens
+            content_truncated = False
+            remaining_tokens = token_budget - used_tokens
+            if remaining_tokens <= 0:
                 return False
+            if tokens > remaining_tokens:
+                content, content_truncated, tokens = _fit_text_to_context_budget(content, remaining_tokens)
+                if not content:
+                    return False
             item = dict(record)
+            item["content"] = content
             item["score"] = score
             item["estimated_tokens"] = tokens
+            if content_truncated:
+                item["content_truncated"] = True
+                item["original_estimated_tokens"] = original_tokens
             seen.add(record_id)
             results.append(item)
             used_tokens += tokens
@@ -996,11 +1166,31 @@ class LocalQueryEngine:
         query: str,
         exclude_ids: set[str],
         citations: CitationRegistry,
+        token_budget: int | None = None,
     ) -> dict[str, Any]:
-        matches = self._retrieve(query, exclude_ids=exclude_ids)
+        token_budget = self._context_token_budget() if token_budget is None else max(0, int(token_budget))
+        result = {
+            "tool": "search_local_context",
+            "query": query,
+            "result_count": 0,
+            "context_token_budget": self._context_token_budget(),
+            "results": [],
+            "instructions": (
+                "Use these source IDs for citations. Do not cite local context that is not listed here."
+            ),
+        }
+        base_tokens = estimate_json_tokens(result)
+        if token_budget <= base_tokens:
+            result["error"] = "Local context skipped because the prompt token budget is exhausted."
+            return result
+
+        result_budget = token_budget - base_tokens
+        matches = self._retrieve(query, exclude_ids=exclude_ids, token_budget=result_budget)
         context_blocks = []
+        used_tokens = 0
+        truncated = False
         for match in matches:
-            source = citations.add_local(match)
+            source = citations.preview_local(match)
             location = " :: ".join(
                 part
                 for part in [
@@ -1010,26 +1200,40 @@ class LocalQueryEngine:
                 ]
                 if part
             )
-            context_blocks.append(
-                {
-                    "source_id": source["id"],
-                    "citation": source["label"],
-                    "chunk_id": source["chunk_id"],
-                    "score": source["score"],
-                    "location": location,
-                    "content": str(match.get("content") or ""),
-                }
+            block = {
+                "source_id": source["id"],
+                "citation": source["label"],
+                "chunk_id": source["chunk_id"],
+                "score": source["score"],
+                "location": location,
+                "content": str(match.get("content") or ""),
+            }
+            remaining_tokens = result_budget - used_tokens
+            fitted, block_truncated, block_tokens = _fit_text_field_to_json_budget(
+                block,
+                "content",
+                remaining_tokens,
+                truncated_field="content_truncated",
             )
-        return {
-            "tool": "search_local_context",
-            "query": query,
-            "result_count": len(context_blocks),
-            "context_token_budget": self._context_token_budget(),
-            "results": context_blocks,
-            "instructions": (
-                "Use these source IDs for citations. Do not cite local context that is not listed here."
-            ),
-        }
+            if fitted is None:
+                if context_blocks:
+                    break
+                continue
+            citations.add_local(match)
+            if bool(match.get("content_truncated")) and not block_truncated:
+                fitted["content_truncated"] = True
+            context_blocks.append(fitted)
+            used_tokens += block_tokens
+            truncated = truncated or block_truncated or bool(match.get("content_truncated"))
+            if used_tokens >= result_budget:
+                break
+        result["results"] = context_blocks
+        result["result_count"] = len(context_blocks)
+        if truncated:
+            result["context_truncated"] = True
+        if not context_blocks and matches:
+            result["error"] = "Retrieved local context did not fit within the prompt token budget."
+        return result
 
     def _web_tool_result(
         self,
@@ -1037,28 +1241,64 @@ class LocalQueryEngine:
         query: str,
         max_results: int | None,
         citations: CitationRegistry,
+        token_budget: int | None = None,
     ) -> dict[str, Any]:
         if not self.web_search_enabled:
             return {"tool": "web_search", "query": query, "result_count": 0, "error": "Web search is disabled."}
+        token_budget = self._context_token_budget() if token_budget is None else max(0, int(token_budget))
+        result = {
+            "tool": "web_search",
+            "query": query,
+            "result_count": 0,
+            "provider": "duckduckgo_lite",
+            "error": "",
+            "results": [],
+            "instructions": "Use these web source IDs for citations. Do not cite URLs that are not listed here.",
+        }
+        base_tokens = estimate_json_tokens(result)
+        if token_budget <= base_tokens:
+            result["error"] = "Web search skipped because the prompt token budget is exhausted."
+            return result
+
         response = web_search_duckduckgo_lite(
             query,
             max_results=_positive_int(max_results, self.web_search_max_results),
             timeout=self.web_search_timeout,
         )
         results = []
-        for result in response.get("results", []):
-            source = citations.add_web(result)
-            results.append(
-                {
-                    "source_id": source["id"],
-                    "citation": source["label"],
-                    "title": source["title"],
-                    "url": source["url"],
-                    "snippet": source["snippet"],
-                    "provider": source["provider"],
-                }
+        used_tokens = 0
+        result_budget = token_budget - base_tokens
+        truncated = False
+        for raw_result in response.get("results", []):
+            source = citations.preview_web(raw_result)
+            block = {
+                "source_id": source["id"],
+                "citation": source["label"],
+                "title": source["title"],
+                "url": source["url"],
+                "snippet": source["snippet"],
+                "provider": source["provider"],
+            }
+            remaining_tokens = result_budget - used_tokens
+            fitted, snippet_truncated, block_tokens = _fit_text_field_to_json_budget(
+                block,
+                "snippet",
+                remaining_tokens,
+                truncated_field="snippet_truncated",
             )
-        return {
+            if fitted is None:
+                if results:
+                    break
+                continue
+            citation_result = dict(raw_result)
+            citation_result["snippet"] = fitted.get("snippet", "")
+            citations.add_web(citation_result)
+            results.append(fitted)
+            used_tokens += block_tokens
+            truncated = truncated or snippet_truncated
+            if used_tokens >= result_budget:
+                break
+        result = {
             "tool": "web_search",
             "query": query,
             "result_count": len(results),
@@ -1067,6 +1307,11 @@ class LocalQueryEngine:
             "results": results,
             "instructions": "Use these web source IDs for citations. Do not cite URLs that are not listed here.",
         }
+        if truncated:
+            result["context_truncated"] = True
+        if not results and response.get("results") and not result.get("error"):
+            result["error"] = "Web results did not fit within the prompt token budget."
+        return result
 
     def _execute_tool_call(
         self,
@@ -1074,6 +1319,7 @@ class LocalQueryEngine:
         *,
         question: str,
         citations: CitationRegistry,
+        messages: list[dict[str, Any]] | None = None,
     ) -> tuple[str, dict[str, Any], str]:
         function = call.get("function") if isinstance(call.get("function"), dict) else {}
         name = str(function.get("name") or "")
@@ -1091,16 +1337,41 @@ class LocalQueryEngine:
             raw_excludes = arguments.get("exclude_ids", [])
             requested_excludes = {str(value) for value in raw_excludes} if isinstance(raw_excludes, list) else set()
             exclude_ids = citations.local_record_ids() | requested_excludes
-            result = self._local_tool_result(query=query, exclude_ids=exclude_ids, citations=citations)
+            result = self._local_tool_result(
+                query=query,
+                exclude_ids=exclude_ids,
+                citations=citations,
+                token_budget=self._tool_result_token_budget(messages),
+            )
             text = f"Retrieved {result['result_count']} local source chunk(s)."
+            if result.get("error"):
+                text = str(result["error"])
             return name, result, text
 
         if name == "web_search":
             query = str(arguments.get("query") or question).strip() or question
+            if messages is not None:
+                current_tokens = self._prompt_token_count(
+                    messages,
+                    tools=self._tool_definitions(include_web_search=True),
+                )
+                context_budget = self._context_token_budget()
+                if current_tokens > context_budget:
+                    result = {
+                        "tool": "web_search",
+                        "query": query,
+                        "result_count": 0,
+                        "error": (
+                            "Web search skipped because the current prompt is already "
+                            f"estimated at {current_tokens} token(s), above the {context_budget} token input-context budget."
+                        ),
+                    }
+                    return name, result, str(result["error"])
             result = self._web_tool_result(
                 query=query,
                 max_results=arguments.get("max_results"),
                 citations=citations,
+                token_budget=self._tool_result_token_budget(messages),
             )
             text = f"Retrieved {result['result_count']} web result(s)."
             if result.get("error"):
@@ -1138,18 +1409,23 @@ class LocalQueryEngine:
             }
         }
         messages.append({"role": "assistant", "content": "", "tool_calls": [call]})
-        tool_name, result, text = self._execute_tool_call(call, question=question, citations=citations)
+        tool_name, result, text = self._execute_tool_call(
+            call,
+            question=question,
+            citations=citations,
+            messages=messages,
+        )
         self._append_tool_result(messages, tool_name=tool_name, result=result)
         return result, text
 
     def _run_tool_rounds(self, question: str):
         citations = CitationRegistry()
         messages = self._tool_messages(question)
-        tools = self._tool_definitions()
         local_search_used = False
         tool_calls_used = 0
 
         for _ in range(self.tool_max_rounds):
+            tools = self._tool_definitions(include_web_search=self._web_search_allowed(messages))
             response = _ollama_chat(
                 model=self.model,
                 messages=messages,
@@ -1207,6 +1483,7 @@ class LocalQueryEngine:
                     call,
                     question=question,
                     citations=citations,
+                    messages=messages,
                 )
                 tool_calls_used += 1
                 if tool_name == "search_local_context":
@@ -1229,11 +1506,7 @@ class LocalQueryEngine:
         messages.append(
             {
                 "role": "user",
-                "content": (
-                    "Write the final answer now using only the tool results above. "
-                    "Cite every factual claim with the source IDs in square brackets. "
-                    "If the sources are insufficient, say what information is missing."
-                ),
+                "content": self._final_answer_instruction(),
             }
         )
         yield {
