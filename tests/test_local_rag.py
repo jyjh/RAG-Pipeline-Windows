@@ -1,7 +1,6 @@
 import json
 import shutil
-import sys
-import types
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -21,8 +20,74 @@ def test_chunk_markdown_splits_long_text_without_empty_chunks():
     assert len(chunks) > 2
 
 
+def test_ollama_chat_posts_directly_to_api_chat(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, *, body=b"", lines=None):
+            self.body = body
+            self.lines = lines or []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self):
+            return self.body
+
+        def __iter__(self):
+            return iter(self.lines)
+
+    def fake_urlopen(request, timeout):
+        payload = json.loads(request.data.decode("utf-8"))
+        calls.append(
+            {
+                "url": request.full_url,
+                "timeout": timeout,
+                "payload": payload,
+                "content_type": request.get_header("Content-type"),
+            }
+        )
+        if payload["stream"]:
+            return FakeResponse(lines=[b'{"message":{"content":"streamed"},"done":true}\n'])
+        return FakeResponse(body=b'{"message":{"content":"answer"}}')
+
+    monkeypatch.setenv("OLLAMA_HOST", "127.0.0.1:11434")
+    monkeypatch.setattr(local_rag.urllib.request, "urlopen", fake_urlopen)
+
+    response = local_rag._ollama_chat(
+        model="gemma4",
+        messages=[{"role": "user", "content": "hi"}],
+        options={"num_predict": 1},
+        stream=False,
+        timeout=7.5,
+    )
+    events = list(
+        local_rag._ollama_chat(
+            model="gemma4",
+            messages=[{"role": "user", "content": "hi"}],
+            options={"num_predict": 1},
+            stream=True,
+            timeout=8.5,
+        )
+    )
+
+    assert response["message"]["content"] == "answer"
+    assert events == [{"message": {"content": "streamed"}, "done": True}]
+    assert [call["url"] for call in calls] == [
+        "http://127.0.0.1:11434/api/chat",
+        "http://127.0.0.1:11434/api/chat",
+    ]
+    assert calls[0]["timeout"] == 7.5
+    assert calls[1]["timeout"] == 8.5
+    assert calls[0]["payload"]["model"] == "gemma4"
+    assert calls[1]["payload"]["stream"] is True
+
+
 def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
-    tmp_path = Path.cwd() / f".tmp_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
     tmp_path.mkdir()
     try:
         index = {
@@ -63,11 +128,7 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
             calls["kwargs"] = kwargs
             return {"message": {"content": "answer"}}
 
-        monkeypatch.setitem(
-            sys.modules,
-            "ollama",
-            types.SimpleNamespace(chat=fake_chat),
-        )
+        monkeypatch.setattr(local_rag, "_ollama_chat", fake_chat)
         monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
 
         engine = local_rag.LocalQueryEngine(
@@ -90,7 +151,7 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
 
 
 def test_local_query_engine_streams_ollama_chunks(monkeypatch):
-    tmp_path = Path.cwd() / f".tmp_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
     tmp_path.mkdir()
     try:
         index = {
@@ -130,11 +191,7 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
                 ]
             )
 
-        monkeypatch.setitem(
-            sys.modules,
-            "ollama",
-            types.SimpleNamespace(chat=fake_chat),
-        )
+        monkeypatch.setattr(local_rag, "_ollama_chat", fake_chat)
         monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
 
         engine = local_rag.LocalQueryEngine(
@@ -153,6 +210,8 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
 
         events = list(engine.ask_stream_events("alpha?"))
         assert events == [
+            {"type": "notice", "text": "Embedding query and retrieving context..."},
+            {"type": "notice", "text": "Retrieved 1 context chunk(s). Requesting answer from gemma4..."},
             {"type": "thinking", "text": "considering "},
             {"type": "answer", "text": "chunk "},
             {"type": "answer", "text": "two"},
@@ -162,7 +221,7 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
 
 
 def test_local_query_engine_reports_thinking_only_cutoff(monkeypatch):
-    tmp_path = Path.cwd() / f".tmp_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
     tmp_path.mkdir()
     try:
         index = {
@@ -198,11 +257,7 @@ def test_local_query_engine_reports_thinking_only_cutoff(monkeypatch):
                 ]
             )
 
-        monkeypatch.setitem(
-            sys.modules,
-            "ollama",
-            types.SimpleNamespace(chat=fake_chat),
-        )
+        monkeypatch.setattr(local_rag, "_ollama_chat", fake_chat)
         monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
 
         engine = local_rag.LocalQueryEngine(
@@ -212,15 +267,93 @@ def test_local_query_engine_reports_thinking_only_cutoff(monkeypatch):
         )
         events = list(engine.ask_stream_events("alpha?"))
 
-        assert events[0] == {"type": "thinking", "text": "still thinking"}
+        assert events[0] == {"type": "notice", "text": "Embedding query and retrieving context..."}
+        assert events[1] == {"type": "notice", "text": "Retrieved 1 context chunk(s). Requesting answer from gemma4..."}
+        assert events[2] == {"type": "thinking", "text": "still thinking"}
         assert events[-1]["type"] == "notice"
         assert "token limit" in events[-1]["text"]
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
+def test_local_query_engine_expands_lancedb_summary_hits(monkeypatch):
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path.mkdir()
+    try:
+        from src.vector_store import LanceDBVectorStore
+
+        LanceDBVectorStore(tmp_path).write_records(
+            [
+                {
+                    "id": "doc-summary",
+                    "doc_id": "doc",
+                    "parent_id": "",
+                    "node_type": "document_summary",
+                    "file_path": "doc.pdf",
+                    "chunk_index": -1,
+                    "content": "document summary only",
+                    "title": "Doc",
+                    "section_path": "Doc",
+                    "page_start": 1,
+                    "page_end": 2,
+                    "summary": "summary",
+                    "tags": ["alpha"],
+                    "vector": [1.0, 0.0, 0.0],
+                },
+                {
+                    "id": "chunk-1",
+                    "doc_id": "doc",
+                    "parent_id": "doc-summary",
+                    "node_type": "chunk",
+                    "file_path": "doc.pdf",
+                    "chunk_index": 0,
+                    "content": "alpha leaf context",
+                    "title": "Alpha",
+                    "section_path": "Doc > Alpha",
+                    "page_start": 2,
+                    "page_end": 2,
+                    "summary": "summary",
+                    "tags": ["alpha"],
+                    "vector": [0.0, 1.0, 0.0],
+                },
+            ],
+            embedding_model="fake-embed",
+            embedding_dim=3,
+        )
+
+        class FakeEngine:
+            def __init__(self, **kwargs):
+                pass
+
+            def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+                return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+        calls = {}
+
+        def fake_chat(**kwargs):
+            calls["kwargs"] = kwargs
+            return {"message": {"content": "answer"}}
+
+        monkeypatch.setattr(local_rag, "_ollama_chat", fake_chat)
+        monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            progress_enabled=False,
+            model="gemma4",
+            top_k=1,
+        )
+
+        assert engine.ask("alpha?") == "answer"
+        user_prompt = calls["kwargs"]["messages"][1]["content"]
+        assert "alpha leaf context" in user_prompt
+        assert "document summary only" not in user_prompt
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def test_local_indexer_batches_chunk_embeddings(monkeypatch):
-    tmp_path = Path.cwd() / f".tmp_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
     md_dir = tmp_path / "md"
     db_dir = tmp_path / "db"
     md_dir.mkdir(parents=True)
@@ -240,7 +373,28 @@ def test_local_indexer_batches_chunk_embeddings(monkeypatch):
                 return np.asarray([[1.0, 0.0, 0.0] for _ in texts], dtype=np.float32)
 
         monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
-        monkeypatch.setattr(local_rag, "chunk_markdown", lambda content: [f"chunk {i}" for i in range(5)])
+
+        def fake_build_section_records(*args, **kwargs):
+            return [
+                {
+                    "id": f"record-{i}",
+                    "doc_id": "doc",
+                    "parent_id": "doc" if i else "",
+                    "node_type": "chunk" if i else "document_summary",
+                    "file_path": "doc.md",
+                    "chunk_index": i,
+                    "content": f"chunk {i}",
+                    "title": f"Section {i}",
+                    "section_path": f"Doc > Section {i}",
+                    "page_start": i + 1,
+                    "page_end": i + 1,
+                    "summary": f"summary {i}",
+                    "tags": ["chunk"],
+                }
+                for i in range(5)
+            ]
+
+        monkeypatch.setattr(local_rag, "build_section_records", fake_build_section_records)
 
         indexer = local_rag.LocalVectorIndexer(
             working_dir=str(db_dir),
@@ -255,14 +409,15 @@ def test_local_indexer_batches_chunk_embeddings(monkeypatch):
             if kind == "embed" and payload != ["embedding health check"]
         ]
         assert [len(payload) for payload in embed_calls] == [2, 2, 1]
-        index = json.loads(db_dir.joinpath(local_rag.INDEX_FILENAME).read_text(encoding="utf-8"))
-        assert len(index["records"]) == 5
+        from src.vector_store import LanceDBVectorStore
+
+        assert LanceDBVectorStore(db_dir).count() == 5
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
 def test_local_indexer_fails_fast_when_ollama_preflight_fails(monkeypatch):
-    tmp_path = Path.cwd() / f".tmp_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
     md_dir = tmp_path / "md"
     db_dir = tmp_path / "db"
     md_dir.mkdir(parents=True)

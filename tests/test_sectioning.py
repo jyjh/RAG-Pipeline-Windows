@@ -1,0 +1,100 @@
+from src.sectioning import (
+    PageText,
+    content_for_section,
+    outline_sections,
+    parse_toc_entries,
+    split_text,
+    toc_sections_from_pages,
+)
+
+
+class FakeDestination:
+    def __init__(self, title):
+        self.title = title
+
+
+class FakeReader:
+    def __init__(self, pages_by_item):
+        self.pages_by_item = pages_by_item
+
+    def get_destination_page_number(self, item):
+        return self.pages_by_item[item]
+
+
+def test_parse_toc_entries_handles_dot_leaders():
+    entries = parse_toc_entries("7.2 Changes at test time . . . . . . . . . 206")
+
+    assert entries == [("7.2", "Changes at test time", 206)]
+
+
+def test_outline_extraction_builds_nested_page_ranges():
+    overview = FakeDestination("Overview")
+    review = FakeDestination("Review")
+    test_time = FakeDestination("Changes at test time")
+    next_major = FakeDestination("Appendix")
+    reader = FakeReader(
+        {
+            overview: 3,
+            review: 3,
+            test_time: 5,
+            next_major: 9,
+        }
+    )
+
+    sections = outline_sections(
+        reader,
+        [overview, [review, test_time], next_major],
+        page_count=12,
+    )
+
+    assert sections[0].title == "Overview"
+    assert sections[0].page_start == 4
+    assert sections[0].page_end == 9
+    assert sections[0].children[0].page_start == 4
+    assert sections[0].children[0].page_end == 5
+    assert sections[0].children[1].page_start == 6
+    assert sections[0].children[1].page_end == 9
+
+
+def test_toc_sections_exclude_front_matter_pages():
+    pages = [
+        PageText(1, "Title page\nContents\n1 Intro . . . . . 3\n1.1 Scope . . . . . 4"),
+        PageText(2, "More contents"),
+        PageText(3, "1 Intro\nreal content"),
+        PageText(4, "1.1 Scope\nscoped content"),
+    ]
+
+    sections = toc_sections_from_pages(pages, doc_id_seed="doc")
+
+    assert sections[0].page_start == 3
+    assert sections[0].children[0].page_start == 4
+
+
+def test_content_for_section_trims_before_next_same_page_heading():
+    section = toc_sections_from_pages(
+        [PageText(1, "Contents\n7.1 Review . . . . . 5\n7.2 Changes at test time . . . . . 5")],
+        doc_id_seed="doc",
+    )[0]
+    section.page_start = 5
+    section.page_end = 5
+    section.next_title = "7.2 Changes at test time"
+    pages = [
+        PageText(
+            5,
+            "7.1 Review\nfirst section details\n7.2 Changes at test time\nsecond section details",
+        )
+    ]
+
+    content = content_for_section(section, pages)
+
+    assert "first section details" in content
+    assert "second section details" not in content
+
+
+def test_oversized_section_splits_without_crossing_sections():
+    text = "alpha " * 500
+
+    chunks = split_text(text, max_chars=200, overlap_chars=20)
+
+    assert len(chunks) > 1
+    assert all("beta" not in chunk for chunk in chunks)

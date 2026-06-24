@@ -62,6 +62,10 @@ def test_main_index_dispatches_to_current_indexing(monkeypatch):
         embedding_model,
         embedding_batch_size,
         embedding_timeout,
+        index_backend,
+        summary_mode,
+        chunk_target_tokens,
+        chunk_overlap_tokens,
     ):
         calls["md_dir"] = md_dir
         calls["db_dir"] = db_dir
@@ -69,6 +73,10 @@ def test_main_index_dispatches_to_current_indexing(monkeypatch):
         calls["embedding_model"] = embedding_model
         calls["embedding_batch_size"] = embedding_batch_size
         calls["embedding_timeout"] = embedding_timeout
+        calls["index_backend"] = index_backend
+        calls["summary_mode"] = summary_mode
+        calls["chunk_target_tokens"] = chunk_target_tokens
+        calls["chunk_overlap_tokens"] = chunk_overlap_tokens
 
     monkeypatch.setattr(main, "run_indexing", fake_run_indexing)
 
@@ -82,6 +90,10 @@ def test_main_index_dispatches_to_current_indexing(monkeypatch):
         "embedding_model": "nomic-embed-text",
         "embedding_batch_size": 8,
         "embedding_timeout": 30.0,
+        "index_backend": "lancedb",
+        "summary_mode": "hybrid",
+        "chunk_target_tokens": 900,
+        "chunk_overlap_tokens": 120,
     }
 
 
@@ -97,6 +109,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
             embedding_batch_size,
             embedding_timeout,
             llm_num_predict,
+            llm_timeout,
             temperature,
             sampler_top_k,
             context_window,
@@ -108,6 +121,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
             calls["embedding_batch_size"] = embedding_batch_size
             calls["embedding_timeout"] = embedding_timeout
             calls["llm_num_predict"] = llm_num_predict
+            calls["llm_timeout"] = llm_timeout
             calls["temperature"] = temperature
             calls["sampler_top_k"] = sampler_top_k
             calls["context_window"] = context_window
@@ -140,6 +154,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
         "embedding_batch_size": 8,
         "embedding_timeout": 30.0,
         "llm_num_predict": 4096,
+        "llm_timeout": 120.0,
         "temperature": 0.9,
         "sampler_top_k": 40,
         "context_window": 8192,

@@ -18,6 +18,10 @@ def run_indexing(
     embedding_model: str = "nomic-embed-text",
     embedding_batch_size: int | None = None,
     embedding_timeout: float | None = None,
+    index_backend: str = "lancedb",
+    summary_mode: str = "hybrid",
+    chunk_target_tokens: int = 900,
+    chunk_overlap_tokens: int = 120,
 ):
     _progress_status("Starting Ollama local indexing pipeline...", enabled=progress_enabled)
     _progress_status(f"Checking Markdown directory: {md_dir}", enabled=progress_enabled)
@@ -39,6 +43,10 @@ def run_indexing(
         embedding_model=embedding_model,
         embedding_batch_size=embedding_batch_size,
         embedding_timeout=embedding_timeout,
+        index_backend=index_backend,
+        summary_mode=summary_mode,
+        chunk_target_tokens=chunk_target_tokens,
+        chunk_overlap_tokens=chunk_overlap_tokens,
         progress_enabled=progress_enabled,
     )
     indexer.index_markdown(md_dir)

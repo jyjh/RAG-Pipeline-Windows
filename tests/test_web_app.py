@@ -1,5 +1,6 @@
 import json
 import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -105,6 +106,108 @@ def test_delete_index_records_persists_remaining_records(workspace_tmp):
     payload = json.loads(web_app.vector_index_path(db_dir).read_text(encoding="utf-8"))
     assert result == {"deleted": 1, "remaining": 1}
     assert [record["id"] for record in payload["records"]] == ["doc.md:0"]
+
+
+def test_web_index_helpers_work_with_lancedb(monkeypatch):
+    db_dir = Path(tempfile.gettempdir()) / f"rag_test_web_app_{uuid.uuid4().hex}" / "db"
+    try:
+        from src.vector_store import LanceDBVectorStore
+
+        store = LanceDBVectorStore(db_dir)
+        store.write_records(
+            [
+                {
+                    "id": "chunk-1",
+                    "doc_id": "doc",
+                    "parent_id": "doc-summary",
+                    "node_type": "chunk",
+                    "file_path": "doc.pdf",
+                    "chunk_index": 0,
+                    "content": "alpha context",
+                    "title": "Alpha",
+                    "section_path": "Doc > Alpha",
+                    "page_start": 2,
+                    "page_end": 2,
+                    "summary": "summary",
+                    "tags": ["alpha"],
+                    "vector": [1.0, 0.0, 0.0],
+                }
+            ],
+            embedding_model="fake-embed",
+            embedding_dim=3,
+        )
+
+        class FakeEmbeddingEngine:
+            def __init__(self, **kwargs):
+                pass
+
+            def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+                return np.asarray([[0.0, 1.0, 0.0]], dtype=np.float32)
+
+        monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEmbeddingEngine)
+
+        result = web_app.list_index_rows(search="alpha", db_dir=db_dir)
+
+        assert result["total"] == 1
+        assert result["rows"][0]["id"] == "chunk-1"
+        assert "vector" not in result["rows"][0]
+        assert result["rows"][0]["section_path"] == "Doc > Alpha"
+
+        row = web_app.update_index_record(
+            record_id="chunk-1",
+            content="edited alpha context",
+            db_dir=db_dir,
+        )
+        assert row["content"] == "edited alpha context"
+        assert store.get_record("chunk-1")["content"] == "edited alpha context"
+
+        assert web_app.delete_index_records(record_ids=["chunk-1"], db_dir=db_dir) == {
+            "deleted": 1,
+            "remaining": 0,
+        }
+    finally:
+        shutil.rmtree(db_dir.parents[0], ignore_errors=True)
+
+
+def test_server_config_defaults_to_minute_when_missing(workspace_tmp):
+    config = web_app._load_server_config(workspace_tmp / "missing.toml")
+
+    assert config == {
+        "health_poll_interval_ms": 60000,
+        "jobs_poll_interval_ms": 60000,
+    }
+
+
+def test_server_config_reads_polling_intervals(workspace_tmp):
+    config_path = workspace_tmp / "config.toml"
+    config_path.write_text(
+        "[server]\nhealth_poll_interval_ms = 120000\njobs_poll_interval_ms = 90000\n",
+        encoding="utf-8",
+    )
+
+    config = web_app._load_server_config(config_path)
+
+    assert config == {
+        "health_poll_interval_ms": 120000,
+        "jobs_poll_interval_ms": 90000,
+    }
+
+
+def test_health_exposes_server_polling_config(monkeypatch):
+    monkeypatch.setattr(
+        web_app,
+        "SERVER_CONFIG",
+        {"health_poll_interval_ms": 60000, "jobs_poll_interval_ms": 60000},
+    )
+
+    client = TestClient(web_app.app)
+    response = client.get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json()["server"] == {
+        "health_poll_interval_ms": 60000,
+        "jobs_poll_interval_ms": 60000,
+    }
 
 
 def test_queue_pauses_new_work_while_query_is_active(workspace_tmp):
@@ -214,6 +317,7 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
     assert events[1][1]["sampler_top_k"] == 25
     assert events[1][1]["context_window"] == 4096
     assert events[1][1]["llm_num_predict"] == 512
+    assert events[1][1]["llm_timeout"] == 120.0
     assert events[-1] == "finish"
 
 

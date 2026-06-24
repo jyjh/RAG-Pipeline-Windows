@@ -18,6 +18,9 @@ numpy
 pydantic
 python-dotenv
 tqdm
+lancedb
+pylance
+pyarrow
 
 # API and browser UI
 fastapi

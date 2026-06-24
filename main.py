@@ -72,12 +72,42 @@ def build_parser() -> argparse.ArgumentParser:
         default=30.0,
         help="Seconds before one Ollama embedding HTTP request fails.",
     )
+    parser.add_argument(
+        "--index_backend",
+        choices=["lancedb", "json"],
+        default="lancedb",
+        help="Vector index storage backend for index mode.",
+    )
+    parser.add_argument(
+        "--summary_mode",
+        choices=["hybrid", "deterministic", "llm"],
+        default="hybrid",
+        help="How to derive document and section summary records during indexing.",
+    )
+    parser.add_argument(
+        "--chunk_target_tokens",
+        type=int,
+        default=900,
+        help="Target chunk size used within one detected section.",
+    )
+    parser.add_argument(
+        "--chunk_overlap_tokens",
+        type=int,
+        default=120,
+        help="Overlap used only when splitting an oversized detected section.",
+    )
     parser.add_argument("--question", help="Question to ask in query mode")
     parser.add_argument(
         "--llm_num_predict",
         type=int,
         default=4096,
         help="Maximum answer tokens to request from Ollama in query mode.",
+    )
+    parser.add_argument(
+        "--llm_timeout",
+        type=float,
+        default=120.0,
+        help="Seconds before one Ollama chat request fails in query mode.",
     )
     parser.add_argument(
         "--temperature",
@@ -154,6 +184,10 @@ def main(argv: list[str] | None = None) -> int:
                 embedding_model=args.embedding_model,
                 embedding_batch_size=args.embedding_batch_size,
                 embedding_timeout=args.embedding_timeout,
+                index_backend=args.index_backend,
+                summary_mode=args.summary_mode,
+                chunk_target_tokens=args.chunk_target_tokens,
+                chunk_overlap_tokens=args.chunk_overlap_tokens,
             )
             return 0
 
@@ -167,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
                 embedding_batch_size=args.embedding_batch_size,
                 embedding_timeout=args.embedding_timeout,
                 llm_num_predict=args.llm_num_predict,
+                llm_timeout=args.llm_timeout,
                 temperature=args.temperature,
                 sampler_top_k=args.max_k,
                 context_window=args.context_window,

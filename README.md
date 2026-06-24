@@ -13,8 +13,8 @@ Local retrieval-augmented generation pipeline for NUS FSAE knowledge transfer. T
 ## Current Capabilities
 
 - `src/ingestion.py`: parses PDFs with pypdf/Docling and exports enriched Markdown.
-- `src/indexing.py`: chunks Markdown and writes `db/local_vector_index.json`.
-- `src/local_rag.py`: performs vector retrieval over the local JSON index and asks Ollama to answer from retrieved context.
+- `src/indexing.py`: builds section-aware summary/chunk records and writes the local vector store.
+- `src/local_rag.py`: performs two-tier retrieval over the local LanceDB index and asks Ollama to answer from retrieved context.
 - `src/query.py`: thin query wrapper around the local Ollama RAG path.
 - `src/web_app.py`: local FastAPI browser UI for uploads, queued indexing, index edits, and chat.
 - `src/embeddings.py`: calls Ollama `/api/embed` with `nomic-embed-text` by default.
@@ -30,6 +30,8 @@ Implemented behavior:
 - Local Ollama embeddings using `nomic-embed-text` by default.
 - 768-dimensional normalized vectors for retrieval.
 - Document chunks use the `search_document:` prefix; queries use `search_query:`.
+- Section-aware chunking from PDF outlines/bookmarks, table-of-contents parsing, or heading fallback.
+- LanceDB-backed vector storage in `db/lancedb` by default, with legacy JSON fallback/export support.
 
 The `processed_docs/` Markdown files are corpus data generated from sample PDFs, not project documentation.
 
@@ -134,7 +136,7 @@ python main.py --mode query --db_dir db --question "Explain the bias-variance tr
 
 For born-digital PDFs, ingest defaults to pypdf text extraction and does not run Docling asset enrichment unless requested. Use `--asset_triggers images` to enrich pages with embedded images, or `--asset_triggers all` to also enrich table/equation heuristic pages. Ingestion shows per-document and per-page progress bars by default; pass `--no_progress` to disable them.
 
-Indexing and query use Ollama embeddings only. Use `--embedding_model` to select a different Ollama embedding model, `--embedding_batch_size 1` if Ollama struggles with larger embedding batches, and `--embedding_timeout 30` to fail clearly instead of waiting indefinitely. Query mode requests `--llm_num_predict 2048` by default; increase it if your local model needs more room for long answers.
+Indexing and query use Ollama embeddings only. Use `--embedding_model` to select a different Ollama embedding model, `--embedding_batch_size 1` if Ollama struggles with larger embedding batches, and `--embedding_timeout 30` to fail clearly instead of waiting indefinitely. Indexing defaults to `--index_backend lancedb`, `--summary_mode hybrid`, `--chunk_target_tokens 900`, and `--chunk_overlap_tokens 120`; the overlap is only used when a detected section is too large. Query mode requests `--llm_num_predict 4096` by default; increase it if your local model needs more room for long answers. Ollama answer generation is bounded by `--llm_timeout 120` or `LOCAL_RAG_LLM_TIMEOUT`.
 
 The module entrypoints can also be used for the default directories:
 
@@ -147,6 +149,15 @@ Run the local browser UI:
 
 ```bash
 uvicorn src.web_app:app --host 127.0.0.1 --port 8000
+```
+
+The browser UI reads server polling intervals from `config.toml` under `[server]`.
+By default, `/api/health` and `/api/jobs` are polled once per minute:
+
+```toml
+[server]
+health_poll_interval_ms = 60000
+jobs_poll_interval_ms = 60000
 ```
 
 Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/indexing work in the background, lets users inspect/edit/delete index records, and streams chat answers as Ollama produces them. The chat panel exposes sampler controls for temperature, top-k (`Max K`), context window, and maximum output tokens. When Ollama returns model thinking, the chat UI shows it in a collapsible block above the answer and reports clearly if the model stops before producing final answer text. Chat output is rendered as Markdown with local LaTeX-to-MathML formatting. Queued ingestion/indexing waits before expensive phases while chat queries are active; a phase already running is not forcibly interrupted. Query generation defaults to temperature `0.9`, top-k `40`, context window `8192`, and max output `4096`.
@@ -166,14 +177,15 @@ Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/
    - Embeddings are L2-normalized.
 
 3. **Indexing**
-   - Markdown documents are split into overlapping chunks.
-   - Chunks are embedded through Ollama.
-   - The local index is written to `db/local_vector_index.json`.
+   - PDFs are partitioned by outline/bookmark, contents-page entries, or Markdown heading fallback.
+   - Title/cover and contents pages are excluded from retrieval records.
+   - Document and section summary rows plus leaf chunk rows are embedded through Ollama.
+   - The local index is written to LanceDB under `db/lancedb` by default.
 
 4. **Querying**
    - Questions are embedded locally through Ollama.
-   - The nearest chunks are retrieved from the local JSON vector index.
-   - `gemma4` synthesizes an answer from retrieved context and cites source numbers.
+   - Summary hits are expanded to child chunks, while direct chunk hits are used as answer context.
+   - `gemma4` synthesizes an answer from retrieved context and cites source numbers with section/page metadata.
 
 ## Hardware And Runtime Notes
 

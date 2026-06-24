@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import html
 import json
-import os
 import re
 import shutil
 import threading
@@ -20,7 +19,7 @@ from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from src.defaults import DEFAULT_LLM_MODEL
-from src.local_rag import INDEX_FILENAME
+from src.vector_store import default_store, lancedb_path, vector_index_path as json_index_path
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -38,6 +37,13 @@ DEFAULT_TEMPERATURE = 0.9
 DEFAULT_MAX_K = 40
 DEFAULT_CONTEXT_WINDOW = 8192
 DEFAULT_LLM_NUM_PREDICT = 4096
+DEFAULT_LLM_TIMEOUT = 120.0
+DEFAULT_INDEX_BACKEND = "lancedb"
+DEFAULT_SUMMARY_MODE = "hybrid"
+DEFAULT_CHUNK_TARGET_TOKENS = 900
+DEFAULT_CHUNK_OVERLAP_TOKENS = 120
+DEFAULT_HEALTH_POLL_INTERVAL_MS = 60_000
+DEFAULT_JOBS_POLL_INTERVAL_MS = 60_000
 
 INDEX_LOCK = threading.RLock()
 
@@ -52,61 +58,49 @@ def _safe_filename(filename: str) -> str:
     return name or f"upload-{uuid.uuid4().hex}.pdf"
 
 
-def vector_index_path(db_dir: Path | None = None) -> Path:
-    return (db_dir or DB_DIR) / INDEX_FILENAME
-
-
-def _load_index_payload(db_dir: Path | None = None) -> dict[str, Any]:
-    path = vector_index_path(db_dir)
-    if not path.exists():
-        raise FileNotFoundError(f"Index file not found at {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _write_index_payload(payload: dict[str, Any], db_dir: Path | None = None) -> None:
-    path = vector_index_path(db_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-    data = json.dumps(payload, indent=2)
+def _positive_int(value: Any, default: int) -> int:
     try:
-        tmp_path.write_text(data, encoding="utf-8")
-        try:
-            os.replace(tmp_path, path)
-        except PermissionError:
-            try:
-                path.unlink(missing_ok=True)
-                os.replace(tmp_path, path)
-            except PermissionError:
-                path.write_text(data, encoding="utf-8")
-    finally:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except PermissionError:
-            pass
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
-def _record_row(record: dict[str, Any]) -> dict[str, Any]:
-    content = str(record.get("content", ""))
+def _load_server_config(config_path: Path | None = None) -> dict[str, int]:
+    config_path = config_path or (ROOT_DIR / "config.toml")
+    server_config: dict[str, Any] = {}
+    if config_path.exists():
+        try:
+            import tomllib
+
+            with config_path.open("rb") as handle:
+                payload = tomllib.load(handle)
+            if isinstance(payload.get("server"), dict):
+                server_config = payload["server"]
+        except Exception:
+            server_config = {}
+
     return {
-        "id": str(record.get("id", "")),
-        "file_path": str(record.get("file_path", "")),
-        "chunk_index": record.get("chunk_index"),
-        "content": content,
-        "char_count": len(content),
+        "health_poll_interval_ms": _positive_int(
+            server_config.get("health_poll_interval_ms"),
+            DEFAULT_HEALTH_POLL_INTERVAL_MS,
+        ),
+        "jobs_poll_interval_ms": _positive_int(
+            server_config.get("jobs_poll_interval_ms"),
+            DEFAULT_JOBS_POLL_INTERVAL_MS,
+        ),
     }
 
 
-def _record_matches(record: dict[str, Any], search: str) -> bool:
-    if not search:
-        return True
-    haystack = "\n".join(
-        [
-            str(record.get("id", "")),
-            str(record.get("file_path", "")),
-            str(record.get("content", "")),
-        ]
-    ).lower()
-    return search.lower() in haystack
+SERVER_CONFIG = _load_server_config()
+
+
+def vector_index_path(db_dir: Path | None = None) -> Path:
+    return json_index_path(db_dir or DB_DIR)
+
+
+def _index_store(db_dir: Path | None = None):
+    return default_store(db_dir or DB_DIR, prefer_lancedb=True)
 
 
 def list_index_rows(
@@ -119,17 +113,7 @@ def list_index_rows(
     offset = max(0, int(offset))
     limit = min(max(1, int(limit)), 200)
     with INDEX_LOCK:
-        payload = _load_index_payload(db_dir)
-        records = [record for record in payload.get("records", []) if _record_matches(record, search)]
-        rows = [_record_row(record) for record in records[offset : offset + limit]]
-        return {
-            "offset": offset,
-            "limit": limit,
-            "total": len(records),
-            "rows": rows,
-            "embedding_model": payload.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
-            "embedding_dim": payload.get("embedding_dim", 768),
-        }
+        return _index_store(db_dir).list_records(offset=offset, limit=limit, search=search)
 
 
 def update_index_record(
@@ -145,14 +129,10 @@ def update_index_record(
         raise ValueError("Record content cannot be empty.")
 
     with INDEX_LOCK:
-        payload = _load_index_payload(db_dir)
-        records = payload.get("records", [])
-        record = next((item for item in records if item.get("id") == record_id), None)
-        if record is None:
-            raise KeyError(record_id)
-
-        model = embedding_model or payload.get("embedding_model") or DEFAULT_EMBEDDING_MODEL
-        embedding_dim = int(payload.get("embedding_dim") or 768)
+        store = _index_store(db_dir)
+        record = store.get_record(record_id)
+        model = embedding_model or record.get("embedding_model") or DEFAULT_EMBEDDING_MODEL
+        embedding_dim = int(record.get("embedding_dim") or len(record.get("vector") or []) or 768)
 
         from src.embeddings import EmbeddingEngine
 
@@ -167,12 +147,13 @@ def update_index_record(
             prefix="search_document: ",
         )[0]
 
-        record["content"] = content
-        record["vector"] = vector.tolist()
-        payload["embedding_model"] = model
-        payload["embedding_dim"] = embedding_dim
-        _write_index_payload(payload, db_dir)
-        return _record_row(record)
+        return store.update_record(
+            record_id=record_id,
+            content=content,
+            vector=vector.tolist(),
+            embedding_model=model,
+            embedding_dim=embedding_dim,
+        )
 
 
 def delete_index_records(*, record_ids: list[str], db_dir: Path | None = None) -> dict[str, Any]:
@@ -181,15 +162,7 @@ def delete_index_records(*, record_ids: list[str], db_dir: Path | None = None) -
         raise ValueError("At least one record ID is required.")
 
     with INDEX_LOCK:
-        payload = _load_index_payload(db_dir)
-        original_records = payload.get("records", [])
-        kept_records = [record for record in original_records if record.get("id") not in ids]
-        deleted_count = len(original_records) - len(kept_records)
-        if deleted_count == 0:
-            raise KeyError(", ".join(sorted(ids)))
-        payload["records"] = kept_records
-        _write_index_payload(payload, db_dir)
-        return {"deleted": deleted_count, "remaining": len(kept_records)}
+        return _index_store(db_dir).delete_records(record_ids=list(ids))
 
 
 @dataclass
@@ -406,6 +379,10 @@ class RagJobQueue:
             embedding_model=options.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
             embedding_batch_size=options.get("embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE),
             embedding_timeout=options.get("embedding_timeout", DEFAULT_EMBEDDING_TIMEOUT),
+            index_backend=options.get("index_backend", DEFAULT_INDEX_BACKEND),
+            summary_mode=options.get("summary_mode", DEFAULT_SUMMARY_MODE),
+            chunk_target_tokens=options.get("chunk_target_tokens", DEFAULT_CHUNK_TARGET_TOKENS),
+            chunk_overlap_tokens=options.get("chunk_overlap_tokens", DEFAULT_CHUNK_OVERLAP_TOKENS),
         )
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
@@ -442,6 +419,7 @@ class ChatRequest(BaseModel):
     max_k: int | None = DEFAULT_MAX_K
     context_window: int | None = DEFAULT_CONTEXT_WINDOW
     llm_num_predict: int | None = DEFAULT_LLM_NUM_PREDICT
+    llm_timeout: float | None = DEFAULT_LLM_TIMEOUT
 
 
 class IndexUpdateRequest(BaseModel):
@@ -460,6 +438,10 @@ class ReindexRequest(BaseModel):
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_batch_size: int | None = DEFAULT_EMBEDDING_BATCH_SIZE
     embedding_timeout: float | None = DEFAULT_EMBEDDING_TIMEOUT
+    index_backend: str = DEFAULT_INDEX_BACKEND
+    summary_mode: str = DEFAULT_SUMMARY_MODE
+    chunk_target_tokens: int = DEFAULT_CHUNK_TARGET_TOKENS
+    chunk_overlap_tokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS
 
 
 class RenderRequest(BaseModel):
@@ -506,12 +488,14 @@ def root():
 
 @app.get("/api/health")
 def health():
-    path = vector_index_path()
+    path = lancedb_path(DB_DIR)
+    store = _index_store()
     record_count = 0
-    if path.exists():
+    index_exists = store.exists()
+    if index_exists:
         try:
             with INDEX_LOCK:
-                record_count = len(_load_index_payload().get("records", []))
+                record_count = store.count()
         except Exception:
             record_count = 0
     return {
@@ -522,9 +506,11 @@ def health():
             "processed_dir": str(PROCESSED_DIR),
             "db_dir": str(DB_DIR),
             "index_file": str(path),
+            "legacy_json_index_file": str(vector_index_path()),
         },
-        "index_exists": path.exists(),
+        "index_exists": index_exists,
         "record_count": record_count,
+        "server": dict(SERVER_CONFIG),
         "queue": job_queue.summary(),
     }
 
@@ -585,6 +571,10 @@ async def upload_files(request: Request):
                 "embedding_model": str(form.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
                 "embedding_batch_size": int(form.get("embedding_batch_size") or DEFAULT_EMBEDDING_BATCH_SIZE),
                 "embedding_timeout": float(form.get("embedding_timeout") or DEFAULT_EMBEDDING_TIMEOUT),
+                "index_backend": str(form.get("index_backend") or DEFAULT_INDEX_BACKEND),
+                "summary_mode": str(form.get("summary_mode") or DEFAULT_SUMMARY_MODE),
+                "chunk_target_tokens": int(form.get("chunk_target_tokens") or DEFAULT_CHUNK_TARGET_TOKENS),
+                "chunk_overlap_tokens": int(form.get("chunk_overlap_tokens") or DEFAULT_CHUNK_OVERLAP_TOKENS),
                 "progress_enabled": False,
             },
         )
@@ -690,6 +680,7 @@ def chat_stream(payload: ChatRequest):
                 embedding_batch_size=payload.embedding_batch_size,
                 embedding_timeout=payload.embedding_timeout,
                 llm_num_predict=payload.llm_num_predict,
+                llm_timeout=payload.llm_timeout,
                 temperature=payload.temperature,
                 sampler_top_k=payload.max_k,
                 context_window=payload.context_window,

@@ -27,6 +27,8 @@ progress_enabled = true
 max_tokens = 900
 overlap_tokens = 120
 adjacent_block_window = 1
+summary_mode = "hybrid"
+index_backend = "lancedb"
 
 [retrieval]
 top_k = 8
@@ -40,3 +42,5 @@ host = "127.0.0.1"
 port = 8000
 lan = false
 api_token = ""
+health_poll_interval_ms = 60000
+jobs_poll_interval_ms = 60000

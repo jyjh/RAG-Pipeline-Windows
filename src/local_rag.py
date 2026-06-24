@@ -4,16 +4,25 @@ import json
 import os
 import re
 import shutil
+import socket
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
+from src.sectioning import (
+    DEFAULT_CHUNK_OVERLAP_TOKENS,
+    DEFAULT_CHUNK_TARGET_TOKENS,
+    build_section_records,
+)
+from src.vector_store import INDEX_FILENAME, JsonVectorStore, LanceDBVectorStore, default_store
 
-INDEX_FILENAME = "local_vector_index.json"
 QUERY_TEMPERATURE = 0.9
 DEFAULT_NUM_PREDICT = 4096
 DEFAULT_SAMPLER_TOP_K = 40
 DEFAULT_CONTEXT_WINDOW = 8192
+DEFAULT_LLM_TIMEOUT = 120.0
 
 
 def _status(message: str, *, enabled: bool = True) -> None:
@@ -61,6 +70,78 @@ def _ollama_pull_command(model: str) -> str:
     if " " in executable:
         executable = f'"{executable}"'
     return f"{executable} pull {model}"
+
+
+def _ollama_host() -> str:
+    host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").strip()
+    if not host:
+        return "http://127.0.0.1:11434"
+    if host.startswith(("http://", "https://")):
+        return host.rstrip("/")
+    return f"http://{host.rstrip('/')}"
+
+
+def _ollama_chat(
+    *,
+    model: str,
+    messages: list[dict[str, str]],
+    options: dict[str, int | float],
+    stream: bool,
+    timeout: float,
+):
+    payload = {
+        "model": model,
+        "messages": messages,
+        "options": options,
+        "stream": stream,
+    }
+    if stream:
+        return _ollama_chat_stream(payload, timeout=timeout)
+    return _ollama_chat_once(payload, timeout=timeout)
+
+
+def _ollama_chat_request(payload: dict[str, Any]):
+    data = json.dumps(payload).encode("utf-8")
+    return urllib.request.Request(
+        f"{_ollama_host()}/api/chat",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+
+def _ollama_chat_once(payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+    try:
+        with urllib.request.urlopen(_ollama_chat_request(payload), timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (TimeoutError, socket.timeout) as exc:
+        raise RuntimeError(
+            f"Ollama chat request timed out after {timeout:g}s at {_ollama_host()}/api/chat."
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Ollama chat request failed at {_ollama_host()}/api/chat: {exc}") from exc
+
+
+def _ollama_chat_stream(payload: dict[str, Any], *, timeout: float):
+    def events():
+        try:
+            with urllib.request.urlopen(_ollama_chat_request(payload), timeout=timeout) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line:
+                        continue
+                    event = json.loads(line)
+                    if event.get("error"):
+                        raise RuntimeError(str(event["error"]))
+                    yield event
+        except (TimeoutError, socket.timeout) as exc:
+            raise RuntimeError(
+                f"Ollama chat stream timed out after {timeout:g}s at {_ollama_host()}/api/chat."
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Ollama chat stream failed at {_ollama_host()}/api/chat: {exc}") from exc
+
+    return events()
 
 
 def _positive_int(value: int | str | None, default: int) -> int:
@@ -208,12 +289,20 @@ class LocalVectorIndexer:
         embedding_model: str = "nomic-embed-text",
         embedding_batch_size: int | None = None,
         embedding_timeout: float | None = None,
+        index_backend: str = "lancedb",
+        summary_mode: str = "hybrid",
+        chunk_target_tokens: int = DEFAULT_CHUNK_TARGET_TOKENS,
+        chunk_overlap_tokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS,
         progress_enabled: bool = True,
     ):
         from src.embeddings import EmbeddingEngine
 
         self.working_dir = working_dir
         self.progress_enabled = progress_enabled
+        self.index_backend = index_backend
+        self.summary_mode = summary_mode
+        self.chunk_target_tokens = _positive_int(chunk_target_tokens, DEFAULT_CHUNK_TARGET_TOKENS)
+        self.chunk_overlap_tokens = _positive_int(chunk_overlap_tokens, DEFAULT_CHUNK_OVERLAP_TOKENS)
         self.embedding_model = (
             "nomic-embed-text"
             if embedding_model == "nomic-ai/nomic-embed-text-v1.5"
@@ -249,21 +338,21 @@ class LocalVectorIndexer:
             ) from exc
         _status("Local index: Ollama embedding endpoint responded.", enabled=self.progress_enabled)
 
-    def _embed_chunks(self, chunks: list[str], *, file_name: str):
+    def _embed_texts(self, texts: list[str], *, file_name: str):
         import numpy as np
 
         vectors = []
-        total_batches = (len(chunks) + self.embedding_batch_size - 1) // self.embedding_batch_size
+        total_batches = (len(texts) + self.embedding_batch_size - 1) // self.embedding_batch_size
         for batch_number, start in enumerate(
-            range(0, len(chunks), self.embedding_batch_size),
+            range(0, len(texts), self.embedding_batch_size),
             start=1,
         ):
-            batch = chunks[start : start + self.embedding_batch_size]
+            batch = texts[start : start + self.embedding_batch_size]
             end = start + len(batch)
             _status(
                 f"Local index: embedding batch {batch_number}/{total_batches} "
-                f"for {file_name} chunks {start + 1}-{end}/{len(chunks)} "
-                f"({len(batch)} chunk(s), {sum(len(chunk) for chunk in batch)} chars)",
+                f"for {file_name} records {start + 1}-{end}/{len(texts)} "
+                f"({len(batch)} record(s), {sum(len(text) for text in batch)} chars)",
                 enabled=self.progress_enabled,
             )
             batch_vectors = self.engine.get_mrl_embeddings(
@@ -289,37 +378,61 @@ class LocalVectorIndexer:
             unit="doc",
         ):
             _status(f"Local index: reading {file_path.name}", enabled=self.progress_enabled)
-            content = file_path.read_text(encoding="utf-8")
-            chunks = chunk_markdown(content)
-            if not chunks:
+            file_records = build_section_records(
+                file_path,
+                source_root=Path.cwd(),
+                summary_mode=self.summary_mode,
+                chunk_target_tokens=self.chunk_target_tokens,
+                chunk_overlap_tokens=self.chunk_overlap_tokens,
+            )
+            if not file_records:
                 continue
 
             _status(
-                f"Local index: embedding {len(chunks)} chunk(s) from {file_path.name}",
+                f"Local index: embedding {len(file_records)} structured record(s) from {file_path.name}",
                 enabled=self.progress_enabled,
             )
-            vectors = self._embed_chunks(chunks, file_name=file_path.name)
-            for chunk_index, (chunk, vector) in enumerate(zip(chunks, vectors)):
-                records.append(
-                    {
-                        "id": f"{file_path.name}:{chunk_index}",
-                        "file_path": str(file_path),
-                        "chunk_index": chunk_index,
-                        "content": chunk,
-                        "vector": vector.tolist(),
-                    }
-                )
+            vectors = self._embed_texts(
+                [record["content"] for record in file_records],
+                file_name=file_path.name,
+            )
+            for record, vector in zip(file_records, vectors):
+                record["vector"] = vector.tolist()
+                records.append(record)
 
-        payload = {
-            "backend": "local_vector",
-            "embedding_model": self.embedding_model,
-            "embedding_dim": 768,
-            "records": records,
-        }
-        output_path = _index_path(self.working_dir)
-        output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        backend = (self.index_backend or "lancedb").lower()
+        if backend == "json":
+            store = JsonVectorStore(self.working_dir)
+            output_target = _index_path(self.working_dir)
+        elif backend == "lancedb":
+            store = LanceDBVectorStore(self.working_dir)
+            output_target = store.db_path / "chunks"
+        else:
+            raise ValueError("index_backend must be one of: lancedb, json")
+
+        try:
+            store.write_records(
+                records,
+                embedding_model=self.embedding_model,
+                embedding_dim=768,
+            )
+        except RuntimeError as exc:
+            if backend != "lancedb" or "Access is denied" not in str(exc):
+                raise
+            _status(
+                "Local index: LanceDB write was denied by the filesystem; "
+                "falling back to the legacy JSON store for this run.",
+                enabled=self.progress_enabled,
+            )
+            store = JsonVectorStore(self.working_dir)
+            output_target = _index_path(self.working_dir)
+            store.write_records(
+                records,
+                embedding_model=self.embedding_model,
+                embedding_dim=768,
+            )
         _status(
-            f"Local index: wrote {len(records)} chunk(s) to {output_path}",
+            f"Local index: wrote {len(records)} structured record(s) to {output_target}",
             enabled=self.progress_enabled,
         )
 
@@ -336,6 +449,7 @@ class LocalQueryEngine:
         progress_enabled: bool = True,
         top_k: int = 5,
         num_predict: int | None = None,
+        llm_timeout: float | None = None,
         temperature: float | None = None,
         sampler_top_k: int | None = None,
         context_window: int | None = None,
@@ -362,12 +476,17 @@ class LocalQueryEngine:
             context_window or os.environ.get("LOCAL_RAG_NUM_CTX"),
             DEFAULT_CONTEXT_WINDOW,
         )
+        self.llm_timeout = _positive_float(
+            llm_timeout if llm_timeout is not None else os.environ.get("LOCAL_RAG_LLM_TIMEOUT"),
+            DEFAULT_LLM_TIMEOUT,
+        )
         self.engine = EmbeddingEngine(
             model_name=embedding_model,
             ollama_batch_size=embedding_batch_size,
             ollama_timeout=embedding_timeout,
         )
-        self.records = self._load_records()
+        self.store = default_store(working_dir, prefer_lancedb=True)
+        self.record_count = self._load_record_count()
 
     def _ollama_options(self) -> dict[str, int | float]:
         return {
@@ -380,8 +499,17 @@ class LocalQueryEngine:
     def _chat_messages(self, question: str, matches: list[dict[str, Any]]) -> list[dict[str, str]]:
         context_blocks = []
         for i, match in enumerate(matches, start=1):
+            section_path = match.get("section_path") or f"chunk-{match.get('chunk_index')}"
+            page_start = int(match.get("page_start") or 0)
+            page_end = int(match.get("page_end") or 0)
+            page_label = ""
+            if page_start and page_end and page_start != page_end:
+                page_label = f" pages {page_start}-{page_end}"
+            elif page_start:
+                page_label = f" page {page_start}"
             context_blocks.append(
-                f"[{i}] {match['file_path']}#chunk-{match['chunk_index']}\n{match['content']}"
+                f"[{i}] {match.get('file_path', '')} :: {section_path}{page_label}\n"
+                f"{match.get('content', '')}"
             )
         prompt = (
             "Answer the question using only the context below. "
@@ -403,36 +531,48 @@ class LocalQueryEngine:
             {"role": "user", "content": prompt},
         ]
 
-    def _load_records(self) -> list[dict[str, Any]]:
-        path = _index_path(self.working_dir)
-        if not path.exists():
-            _status(f"Local query: index not found at {path}", enabled=self.progress_enabled)
-            return []
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        records = payload.get("records", [])
-        _status(f"Local query: loaded {len(records)} chunk(s).", enabled=self.progress_enabled)
-        return records
+    def _load_record_count(self) -> int:
+        if not self.store.exists():
+            _status(
+                f"Local query: LanceDB index not found in {self.working_dir}",
+                enabled=self.progress_enabled,
+            )
+            return 0
+        count = self.store.count()
+        _status(f"Local query: loaded {count} structured record(s).", enabled=self.progress_enabled)
+        return count
 
     def _retrieve(self, question: str) -> list[dict[str, Any]]:
-        if not self.records:
+        if not self.record_count:
             return []
-
-        import numpy as np
 
         query_vector = self.engine.get_mrl_embeddings(
             [question],
             truncate_dim=768,
             prefix="search_query: ",
         )[0]
-        vectors = np.asarray([record["vector"] for record in self.records], dtype=np.float32)
-        scores = vectors @ query_vector
-        top_indices = np.argsort(scores)[::-1][: self.top_k]
-
+        candidates = self.store.search(
+            query_vector.tolist(),
+            top_k=max(self.top_k * 4, self.top_k + 8),
+        )
         results: list[dict[str, Any]] = []
-        for index in top_indices:
-            record = dict(self.records[int(index)])
-            record["score"] = float(scores[int(index)])
-            results.append(record)
+        seen: set[str] = set()
+        for candidate in candidates:
+            node_type = str(candidate.get("node_type", "chunk"))
+            if node_type == "chunk":
+                if candidate.get("id") not in seen:
+                    seen.add(str(candidate.get("id")))
+                    results.append(candidate)
+            else:
+                for child in self.store.child_chunks(candidate, limit=self.top_k):
+                    if child.get("id") in seen:
+                        continue
+                    seen.add(str(child.get("id")))
+                    results.append(child)
+                    if len(results) >= self.top_k:
+                        break
+            if len(results) >= self.top_k:
+                break
         return results
 
     def ask(self, question: str) -> str:
@@ -441,16 +581,17 @@ class LocalQueryEngine:
             return "No local index records were found. Run index mode first."
 
         try:
-            import ollama
-
             _status(
-                f"Local query: requesting answer from Ollama model {self.model}",
+                f"Local query: requesting answer from Ollama model {self.model} "
+                f"(timeout={self.llm_timeout:g}s)",
                 enabled=self.progress_enabled,
             )
-            response = ollama.chat(
+            response = _ollama_chat(
                 model=self.model,
                 messages=self._chat_messages(question, matches),
                 options=self._ollama_options(),
+                stream=False,
+                timeout=self.llm_timeout,
             )
         except Exception as exc:
             raise RuntimeError(
@@ -473,23 +614,32 @@ class LocalQueryEngine:
                 yield event["text"]
 
     def ask_stream_events(self, question: str):
+        yield {"type": "notice", "text": "Embedding query and retrieving context..."}
         matches = self._retrieve(question)
         if not matches:
             yield {"type": "answer", "text": "No local index records were found. Run index mode first."}
             return
 
-        try:
-            import ollama
+        yield {
+            "type": "notice",
+            "text": (
+                f"Retrieved {len(matches)} context chunk(s). "
+                f"Requesting answer from {self.model}..."
+            ),
+        }
 
+        try:
             _status(
-                f"Local query: streaming answer from Ollama model {self.model}",
+                f"Local query: streaming answer from Ollama model {self.model} "
+                f"(timeout={self.llm_timeout:g}s)",
                 enabled=self.progress_enabled,
             )
-            stream = ollama.chat(
+            stream = _ollama_chat(
                 model=self.model,
                 messages=self._chat_messages(question, matches),
                 options=self._ollama_options(),
                 stream=True,
+                timeout=self.llm_timeout,
             )
             emitted = False
             answer_emitted = False

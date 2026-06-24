@@ -3,7 +3,13 @@ const state = {
   limit: 20,
   total: 0,
   search: "",
+  healthPollIntervalMs: 60000,
+  jobsPollIntervalMs: 60000,
+  healthTimer: null,
+  jobsTimer: null,
 };
+
+const LIVE_RENDER_INTERVAL_MS = 200;
 
 const els = {
   statusLine: document.getElementById("statusLine"),
@@ -68,6 +74,100 @@ async function renderMarkdown(text) {
   return data.html || "";
 }
 
+function renderKeys(kind) {
+  if (kind === "thinking") {
+    return {
+      element: "thinkingBody",
+      raw: "rawThinking",
+      version: "thinkingRenderVersion",
+      timer: "thinkingRenderTimer",
+      inFlight: "thinkingRenderInFlight",
+      lastAt: "thinkingLastRenderAt",
+    };
+  }
+  return {
+    element: "body",
+    raw: "rawAnswer",
+    version: "answerRenderVersion",
+    timer: "answerRenderTimer",
+    inFlight: "answerRenderInFlight",
+    lastAt: "answerLastRenderAt",
+  };
+}
+
+function renderDelay(parts, keys) {
+  return Math.max(0, LIVE_RENDER_INTERVAL_MS - (Date.now() - parts[keys.lastAt]));
+}
+
+function scheduleMarkdownRender(parts, kind, immediate = false) {
+  if (parts.finalized) {
+    return;
+  }
+  const keys = renderKeys(kind);
+  if (parts[keys.timer] || parts[keys.inFlight]) {
+    return;
+  }
+  parts[keys.timer] = setTimeout(
+    () => runMarkdownRender(parts, kind),
+    immediate ? 0 : renderDelay(parts, keys),
+  );
+}
+
+function queueMarkdownRender(parts, kind) {
+  const keys = renderKeys(kind);
+  parts[keys.version] += 1;
+  scheduleMarkdownRender(parts, kind);
+}
+
+function addPersistentNotice(parts, text) {
+  if (!text) {
+    return;
+  }
+  parts.persistentNotices.push(text);
+  updateNotice(parts);
+}
+
+function addFormattingNotice(parts, error) {
+  if (parts.formattingErrorShown) {
+    return;
+  }
+  parts.formattingErrorShown = true;
+  addPersistentNotice(parts, `Formatting failed: ${error.message}`);
+}
+
+async function runMarkdownRender(parts, kind) {
+  const keys = renderKeys(kind);
+  if (parts[keys.inFlight]) {
+    return;
+  }
+  if (parts[keys.timer]) {
+    clearTimeout(parts[keys.timer]);
+    parts[keys.timer] = null;
+  }
+
+  const version = parts[keys.version];
+  const text = parts[keys.raw];
+  if (!text) {
+    return;
+  }
+
+  parts[keys.inFlight] = true;
+  try {
+    const html = await renderMarkdown(text);
+    if (!parts.finalized && parts[keys.version] === version) {
+      parts[keys.element].innerHTML = html;
+    }
+  } catch (error) {
+    addFormattingNotice(parts, error);
+  } finally {
+    parts[keys.inFlight] = false;
+    parts[keys.lastAt] = Date.now();
+    if (!parts.finalized && parts[keys.version] !== version) {
+      scheduleMarkdownRender(parts, kind);
+    }
+  }
+}
+
 function numericSetting(input, fallback, minimum = 1) {
   const value = Number(input.value);
   if (!Number.isFinite(value) || value < minimum) {
@@ -79,6 +179,7 @@ function numericSetting(input, fallback, minimum = 1) {
 async function refreshHealth() {
   try {
     const data = await requestJson("/api/health");
+    applyServerConfig(data.server || {});
     const queue = data.queue || {};
     els.statusLine.textContent =
       `${data.record_count} indexed chunks | ` +
@@ -86,6 +187,25 @@ async function refreshHealth() {
       `${queue.queued_count || 0} queued jobs`;
   } catch (error) {
     els.statusLine.textContent = `Health check failed: ${error.message}`;
+  }
+}
+
+function positiveInterval(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function applyServerConfig(config) {
+  const nextHealth = positiveInterval(config.health_poll_interval_ms, state.healthPollIntervalMs);
+  const nextJobs = positiveInterval(config.jobs_poll_interval_ms, state.jobsPollIntervalMs);
+
+  if (nextHealth !== state.healthPollIntervalMs) {
+    state.healthPollIntervalMs = nextHealth;
+    scheduleHealthPolling();
+  }
+  if (nextJobs !== state.jobsPollIntervalMs) {
+    state.jobsPollIntervalMs = nextJobs;
+    scheduleJobsPolling();
   }
 }
 
@@ -107,6 +227,20 @@ async function refreshJobs() {
   } catch (error) {
     setStatus(els.uploadStatus, error.message, true);
   }
+}
+
+function scheduleHealthPolling() {
+  if (state.healthTimer) {
+    clearInterval(state.healthTimer);
+  }
+  state.healthTimer = setInterval(refreshHealth, state.healthPollIntervalMs);
+}
+
+function scheduleJobsPolling() {
+  if (state.jobsTimer) {
+    clearInterval(state.jobsTimer);
+  }
+  state.jobsTimer = setInterval(refreshJobs, state.jobsPollIntervalMs);
 }
 
 async function uploadFiles() {
@@ -266,8 +400,8 @@ function addAssistantMessage() {
   const summary = document.createElement("summary");
   summary.textContent = "Model thinking";
 
-  const thinkingBody = document.createElement("pre");
-  thinkingBody.className = "thinking-body";
+  const thinkingBody = document.createElement("div");
+  thinkingBody.className = "thinking-body rendered";
   thinking.append(summary, thinkingBody);
 
   const notice = document.createElement("div");
@@ -287,8 +421,43 @@ function addAssistantMessage() {
     notice,
     rawAnswer: "",
     rawThinking: "",
-    rawNotice: "",
+    transientNotices: [],
+    persistentNotices: [],
+    gemmaResponseStarted: false,
+    formattingErrorShown: false,
+    finalized: false,
+    answerRenderVersion: 0,
+    answerRenderTimer: null,
+    answerRenderInFlight: false,
+    answerLastRenderAt: 0,
+    thinkingRenderVersion: 0,
+    thinkingRenderTimer: null,
+    thinkingRenderInFlight: false,
+    thinkingLastRenderAt: 0,
   };
+}
+
+function isTransientNotice(text) {
+  return (
+    text === "Embedding query and retrieving context..." ||
+    /^Retrieved \d+ context chunk\(s\)\. Requesting answer from .+\.\.\.$/.test(text)
+  );
+}
+
+function updateNotice(parts) {
+  const notices = [
+    ...(parts.gemmaResponseStarted ? [] : parts.transientNotices),
+    ...parts.persistentNotices,
+  ];
+  parts.notice.textContent = notices.join("\n");
+  parts.notice.hidden = notices.length === 0;
+}
+
+function markGemmaResponseStarted(parts) {
+  if (!parts.gemmaResponseStarted) {
+    parts.gemmaResponseStarted = true;
+    updateNotice(parts);
+  }
 }
 
 function appendStreamEvent(parts, event) {
@@ -299,45 +468,60 @@ function appendStreamEvent(parts, event) {
   }
 
   if (type === "thinking") {
+    markGemmaResponseStarted(parts);
     parts.thinking.hidden = false;
     parts.thinking.open = true;
     parts.rawThinking += text;
     parts.thinkingBody.textContent = parts.rawThinking;
+    queueMarkdownRender(parts, "thinking");
     return;
   }
 
   if (type === "error") {
-    parts.rawNotice += `${parts.rawNotice ? "\n" : ""}[Error] ${text}`;
-    parts.notice.hidden = false;
-    parts.notice.textContent = parts.rawNotice;
+    addPersistentNotice(parts, `[Error] ${text}`);
     return;
   }
 
   if (type === "notice") {
-    parts.rawNotice += `${parts.rawNotice ? "\n" : ""}${text}`;
-    parts.notice.hidden = false;
-    parts.notice.textContent = parts.rawNotice;
+    if (isTransientNotice(text)) {
+      parts.transientNotices.push(text);
+    } else {
+      parts.persistentNotices.push(text);
+    }
+    updateNotice(parts);
     return;
   }
 
+  markGemmaResponseStarted(parts);
   parts.rawAnswer += text;
   parts.body.textContent = parts.rawAnswer;
+  queueMarkdownRender(parts, "answer");
 }
 
 async function formatAssistantMessage(parts) {
+  parts.finalized = true;
+  for (const kind of ["answer", "thinking"]) {
+    const keys = renderKeys(kind);
+    if (parts[keys.timer]) {
+      clearTimeout(parts[keys.timer]);
+      parts[keys.timer] = null;
+    }
+    parts[keys.version] += 1;
+  }
+
   try {
+    const [thinkingHtml, answerHtml] = await Promise.all([
+      parts.rawThinking ? renderMarkdown(parts.rawThinking) : "",
+      parts.rawAnswer ? renderMarkdown(parts.rawAnswer) : "",
+    ]);
     if (parts.rawThinking) {
-      parts.thinkingBody.outerHTML = `<div class="thinking-body rendered"></div>`;
-      parts.thinkingBody = parts.thinking.querySelector(".thinking-body");
-      parts.thinkingBody.innerHTML = await renderMarkdown(parts.rawThinking);
+      parts.thinkingBody.innerHTML = thinkingHtml;
     }
     if (parts.rawAnswer) {
-      parts.body.innerHTML = await renderMarkdown(parts.rawAnswer);
+      parts.body.innerHTML = answerHtml;
     }
   } catch (error) {
-    parts.rawNotice += `${parts.rawNotice ? "\n" : ""}Formatting failed: ${error.message}`;
-    parts.notice.hidden = false;
-    parts.notice.textContent = parts.rawNotice;
+    addFormattingNotice(parts, error);
   }
 }
 
@@ -447,5 +631,5 @@ els.chatForm.addEventListener("submit", sendQuestion);
 
 refreshHealth();
 refreshJobs();
-setInterval(refreshHealth, 4000);
-setInterval(refreshJobs, 3000);
+scheduleHealthPolling();
+scheduleJobsPolling();
