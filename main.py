@@ -100,7 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm_num_predict",
         type=int,
-        default=4096,
+        default=20032,
         help="Maximum answer tokens to request from Ollama in query mode.",
     )
     parser.add_argument(
@@ -124,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--context_window",
         type=int,
-        default=8192,
+        default=100352,
         help="Ollama num_ctx context window in query mode.",
     )
     parser.add_argument(

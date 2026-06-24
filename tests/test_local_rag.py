@@ -185,8 +185,8 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
         assert calls[-1]["stream"] is True
         assert calls[-1]["options"]["temperature"] == 0.9
         assert calls[-1]["options"]["top_k"] == 40
-        assert calls[-1]["options"]["num_ctx"] == 8192
-        assert calls[-1]["options"]["num_predict"] == 4096
+        assert calls[-1]["options"]["num_ctx"] == 100352
+        assert calls[-1]["options"]["num_predict"] == 20032
         tool_messages = [message for message in calls[-1]["messages"] if message.get("role") == "tool"]
         assert tool_messages
         assert "alpha context" in tool_messages[0]["content"]
@@ -247,8 +247,8 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
         assert calls[-1]["stream"] is True
         assert calls[-1]["options"]["temperature"] == 0.9
         assert calls[-1]["options"]["top_k"] == 40
-        assert calls[-1]["options"]["num_ctx"] == 8192
-        assert calls[-1]["options"]["num_predict"] == 4096
+        assert calls[-1]["options"]["num_ctx"] == 100352
+        assert calls[-1]["options"]["num_predict"] == 20032
 
         events = list(engine.ask_stream_events("alpha?"))
         assert events[0] == {"type": "notice", "text": "Planning retrieval tool calls..."}

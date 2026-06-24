@@ -107,6 +107,7 @@ main {
 }
 
 input[type="search"],
+select,
 textarea {
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -118,6 +119,20 @@ input[type="search"] {
   width: min(460px, 100%);
   min-height: 36px;
   padding: 7px 10px;
+}
+
+select {
+  min-height: 36px;
+  padding: 7px 10px;
+}
+
+.inline-select-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 650;
 }
 
 input[type="file"] {

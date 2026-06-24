@@ -207,14 +207,14 @@ def test_server_config_defaults_to_minute_when_missing(workspace_tmp):
 def test_server_config_reads_polling_intervals(workspace_tmp):
     config_path = workspace_tmp / "config.toml"
     config_path.write_text(
-        "[server]\nhealth_poll_interval_ms = 120000\njobs_poll_interval_ms = 90000\n",
+        "[server]\nhealth_poll_interval_ms = 120032\njobs_poll_interval_ms = 90000\n",
         encoding="utf-8",
     )
 
     config = web_app._load_server_config(config_path)
 
     assert config == {
-        "health_poll_interval_ms": 120000,
+        "health_poll_interval_ms": 120032,
         "jobs_poll_interval_ms": 90000,
     }
 
@@ -475,6 +475,14 @@ def test_pdf_documents_list_and_download_endpoint(monkeypatch, workspace_tmp):
     download = client.get("/api/pdfs/hash-download/download")
     assert download.status_code == 200
     assert download.content.startswith(b"%PDF")
+
+    by_title = client.get("/api/pdfs", params={"search": "ST231"})
+    by_hash = client.get("/api/pdfs", params={"search": "hash-download"})
+    no_match = client.get("/api/pdfs", params={"search": "no-match"})
+
+    assert by_title.json()["total"] == 1
+    assert by_hash.json()["total"] == 1
+    assert no_match.json()["total"] == 0
 
 
 def test_pdf_download_reports_missing_hash_and_missing_file(monkeypatch, workspace_tmp):

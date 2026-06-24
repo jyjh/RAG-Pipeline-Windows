@@ -27,6 +27,10 @@
           <button id="reindexButton" type="button">Reindex</button>
         </div>
         <div id="uploadStatus" class="status"></div>
+        <div class="toolbar">
+          <input id="pdfSearchInput" type="search" placeholder="Search PDFs by title or hash" />
+          <button id="pdfSearchButton" type="button">Search PDFs</button>
+        </div>
         <table class="data-table pdf-table">
           <thead>
             <tr>
@@ -55,6 +59,15 @@
         <div class="toolbar">
           <input id="searchInput" type="search" placeholder="Search index" />
           <button id="searchButton" type="button">Search</button>
+          <label class="inline-select-label">
+            Rows
+            <select id="indexPageSizeSelect">
+              <option value="20" selected>20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+              <option value="all">All</option>
+            </select>
+          </label>
           <button id="prevPageButton" type="button">Prev</button>
           <span id="pageLabel"></span>
           <button id="nextPageButton" type="button">Next</button>
@@ -99,11 +112,11 @@
                 </label>
                 <label>
                   Context
-                  <input id="contextWindowInput" type="number" min="1024" max="131072" step="1024" value="8192" />
+                  <input id="contextWindowInput" type="number" min="1024" max="131072" step="1024" value="100352" />
                 </label>
                 <label>
                   Max Output
-                  <input id="maxOutputInput" type="number" min="64" max="32768" step="64" value="4096" />
+                  <input id="maxOutputInput" type="number" min="64" max="32768" step="64" value="20032" />
                 </label>
                 <label class="checkbox-label">
                   Web search

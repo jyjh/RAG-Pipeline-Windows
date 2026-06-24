@@ -38,8 +38,8 @@ DEFAULT_EMBEDDING_BATCH_SIZE = 8
 DEFAULT_EMBEDDING_TIMEOUT = 30.0
 DEFAULT_TEMPERATURE = 0.9
 DEFAULT_MAX_K = 40
-DEFAULT_CONTEXT_WINDOW = 8192
-DEFAULT_LLM_NUM_PREDICT = 4096
+DEFAULT_CONTEXT_WINDOW = 100352
+DEFAULT_LLM_NUM_PREDICT = 20032
 DEFAULT_LLM_TIMEOUT = 120.0
 DEFAULT_RETRIEVAL_CANDIDATE_K = 80
 DEFAULT_RETRIEVAL_MIN_SCORE = 0.36
@@ -231,6 +231,7 @@ def _pdf_entry_for_response(
 
 def list_pdf_documents(
     *,
+    search: str = "",
     registry_path: Path | None = None,
     processed_dir: Path | None = None,
     root_dir: Path = ROOT_DIR,
@@ -276,6 +277,14 @@ def list_pdf_documents(
         )
 
     rows = sorted(entries.values(), key=lambda item: (item.get("filename", ""), item.get("hash", "")))
+    query = search.strip().lower()
+    if query:
+        rows = [
+            item
+            for item in rows
+            if query in str(item.get("filename", "")).lower()
+            or query in str(item.get("hash", "")).lower()
+        ]
     return {"pdfs": rows, "total": len(rows)}
 
 
@@ -288,6 +297,7 @@ def resolve_pdf_download_path(
     data_dir: Path = DATA_DIR,
 ) -> tuple[Path, str]:
     documents = list_pdf_documents(
+        search="",
         registry_path=registry_path,
         processed_dir=processed_dir,
         root_dir=root_dir,
@@ -902,8 +912,8 @@ def get_job(job_id: str):
 
 
 @app.get("/api/pdfs")
-def pdf_documents():
-    return list_pdf_documents()
+def pdf_documents(search: str = ""):
+    return list_pdf_documents(search=search)
 
 
 @app.get("/api/pdfs/{source_hash}/download")

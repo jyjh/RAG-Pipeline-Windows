@@ -1,8 +1,10 @@
 const state = {
   offset: 0,
   limit: 20,
+  indexPageSize: "20",
   total: 0,
   search: "",
+  pdfSearch: "",
   chats: [],
   activeChatId: null,
   streamingChatId: null,
@@ -23,10 +25,13 @@ const els = {
   uploadButton: document.getElementById("uploadButton"),
   reindexButton: document.getElementById("reindexButton"),
   uploadStatus: document.getElementById("uploadStatus"),
+  pdfSearchInput: document.getElementById("pdfSearchInput"),
+  pdfSearchButton: document.getElementById("pdfSearchButton"),
   pdfsBody: document.getElementById("pdfsBody"),
   jobsBody: document.getElementById("jobsBody"),
   searchInput: document.getElementById("searchInput"),
   searchButton: document.getElementById("searchButton"),
+  indexPageSizeSelect: document.getElementById("indexPageSizeSelect"),
   prevPageButton: document.getElementById("prevPageButton"),
   nextPageButton: document.getElementById("nextPageButton"),
   pageLabel: document.getElementById("pageLabel"),
@@ -498,7 +503,8 @@ async function refreshJobs() {
 
 async function refreshPdfs() {
   try {
-    const data = await requestJson("/api/pdfs");
+    const params = new URLSearchParams({ search: state.pdfSearch });
+    const data = await requestJson(`/api/pdfs?${params}`);
     els.pdfsBody.innerHTML = "";
     for (const item of data.pdfs || []) {
       const row = document.createElement("tr");
@@ -612,6 +618,10 @@ async function enqueueReindex() {
 }
 
 async function loadIndex() {
+  if (state.indexPageSize === "all") {
+    return loadAllIndexRows();
+  }
+  state.limit = Number(state.indexPageSize) || 20;
   const params = new URLSearchParams({
     offset: String(state.offset),
     limit: String(state.limit),
@@ -627,6 +637,44 @@ async function loadIndex() {
     els.prevPageButton.disabled = state.offset <= 0;
     els.nextPageButton.disabled = state.offset + state.limit >= state.total;
     setStatus(els.indexStatus, `Embedding model: ${data.embedding_model || "unknown"}`);
+  } catch (error) {
+    els.indexBody.innerHTML = "";
+    els.pageLabel.textContent = "";
+    setStatus(els.indexStatus, error.message, true);
+  }
+}
+
+async function loadAllIndexRows() {
+  const batchSize = 100;
+  const rows = [];
+  let offset = 0;
+  let total = 0;
+  let embeddingModel = "unknown";
+  try {
+    while (true) {
+      const params = new URLSearchParams({
+        offset: String(offset),
+        limit: String(batchSize),
+        search: state.search,
+      });
+      const data = await requestJson(`/api/index?${params}`);
+      const batch = data.rows || [];
+      if (offset === 0) {
+        total = data.total || 0;
+        embeddingModel = data.embedding_model || "unknown";
+      }
+      rows.push(...batch);
+      offset += batch.length;
+      if (!batch.length || rows.length >= total) {
+        break;
+      }
+    }
+    state.total = total;
+    renderIndexRows(rows);
+    els.pageLabel.textContent = `All ${rows.length} of ${total}`;
+    els.prevPageButton.disabled = true;
+    els.nextPageButton.disabled = true;
+    setStatus(els.indexStatus, `Embedding model: ${embeddingModel}`);
   } catch (error) {
     els.indexBody.innerHTML = "";
     els.pageLabel.textContent = "";
@@ -990,8 +1038,8 @@ async function sendQuestion(event) {
         question,
         temperature: numericSetting(els.temperatureInput, 0.9, 0),
         max_k: Math.trunc(numericSetting(els.maxKInput, 40, 1)),
-        context_window: Math.trunc(numericSetting(els.contextWindowInput, 8192, 1)),
-        llm_num_predict: Math.trunc(numericSetting(els.maxOutputInput, 4096, 1)),
+        context_window: Math.trunc(numericSetting(els.contextWindowInput, 100000, 1)),
+        llm_num_predict: Math.trunc(numericSetting(els.maxOutputInput, 20032, 1)),
         web_search_enabled: Boolean(els.webSearchInput.checked),
       }),
     });
@@ -1055,6 +1103,16 @@ document.querySelectorAll("[data-tab-target]").forEach((button) => {
 
 els.uploadButton.addEventListener("click", uploadFiles);
 els.reindexButton.addEventListener("click", enqueueReindex);
+els.pdfSearchButton.addEventListener("click", () => {
+  state.pdfSearch = els.pdfSearchInput.value.trim();
+  refreshPdfs();
+});
+els.pdfSearchInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    state.pdfSearch = els.pdfSearchInput.value.trim();
+    refreshPdfs();
+  }
+});
 els.searchButton.addEventListener("click", () => {
   state.offset = 0;
   state.search = els.searchInput.value.trim();
@@ -1067,11 +1125,22 @@ els.searchInput.addEventListener("keydown", (event) => {
     loadIndex();
   }
 });
+els.indexPageSizeSelect.addEventListener("change", () => {
+  state.indexPageSize = els.indexPageSizeSelect.value;
+  state.offset = 0;
+  loadIndex();
+});
 els.prevPageButton.addEventListener("click", () => {
+  if (state.indexPageSize === "all") {
+    return;
+  }
   state.offset = Math.max(0, state.offset - state.limit);
   loadIndex();
 });
 els.nextPageButton.addEventListener("click", () => {
+  if (state.indexPageSize === "all") {
+    return;
+  }
   state.offset += state.limit;
   loadIndex();
 });
