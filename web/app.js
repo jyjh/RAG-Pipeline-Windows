@@ -52,6 +52,18 @@ async function requestJson(path, options = {}) {
   return response.json();
 }
 
+async function renderMarkdown(text) {
+  if (!text) {
+    return "";
+  }
+  const data = await requestJson("/api/render", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  return data.html || "";
+}
+
 async function refreshHealth() {
   try {
     const data = await requestJson("/api/health");
@@ -243,15 +255,28 @@ function addAssistantMessage() {
   summary.textContent = "Model thinking";
 
   const thinkingBody = document.createElement("pre");
+  thinkingBody.className = "thinking-body";
   thinking.append(summary, thinkingBody);
 
-  const body = document.createElement("span");
-  body.className = "body";
+  const notice = document.createElement("div");
+  notice.className = "stream-notice";
+  notice.hidden = true;
 
-  message.append(roleLabel, thinking, body);
+  const body = document.createElement("div");
+  body.className = "body rendered";
+
+  message.append(roleLabel, thinking, notice, body);
   els.chatMessages.appendChild(message);
   els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
-  return { body, thinking, thinkingBody };
+  return {
+    body,
+    thinking,
+    thinkingBody,
+    notice,
+    rawAnswer: "",
+    rawThinking: "",
+    rawNotice: "",
+  };
 }
 
 function appendStreamEvent(parts, event) {
@@ -263,16 +288,45 @@ function appendStreamEvent(parts, event) {
 
   if (type === "thinking") {
     parts.thinking.hidden = false;
-    parts.thinkingBody.textContent += text;
+    parts.thinking.open = true;
+    parts.rawThinking += text;
+    parts.thinkingBody.textContent = parts.rawThinking;
     return;
   }
 
   if (type === "error") {
-    parts.body.textContent += `\n\n[Error] ${text}`;
+    parts.rawNotice += `${parts.rawNotice ? "\n" : ""}[Error] ${text}`;
+    parts.notice.hidden = false;
+    parts.notice.textContent = parts.rawNotice;
     return;
   }
 
-  parts.body.textContent += text;
+  if (type === "notice") {
+    parts.rawNotice += `${parts.rawNotice ? "\n" : ""}${text}`;
+    parts.notice.hidden = false;
+    parts.notice.textContent = parts.rawNotice;
+    return;
+  }
+
+  parts.rawAnswer += text;
+  parts.body.textContent = parts.rawAnswer;
+}
+
+async function formatAssistantMessage(parts) {
+  try {
+    if (parts.rawThinking) {
+      parts.thinkingBody.outerHTML = `<div class="thinking-body rendered"></div>`;
+      parts.thinkingBody = parts.thinking.querySelector(".thinking-body");
+      parts.thinkingBody.innerHTML = await renderMarkdown(parts.rawThinking);
+    }
+    if (parts.rawAnswer) {
+      parts.body.innerHTML = await renderMarkdown(parts.rawAnswer);
+    }
+  } catch (error) {
+    parts.rawNotice += `${parts.rawNotice ? "\n" : ""}Formatting failed: ${error.message}`;
+    parts.notice.hidden = false;
+    parts.notice.textContent = parts.rawNotice;
+  }
 }
 
 async function sendQuestion(event) {
@@ -330,6 +384,7 @@ async function sendQuestion(event) {
   } catch (error) {
     appendStreamEvent(assistantParts, { type: "error", text: error.message });
   } finally {
+    await formatAssistantMessage(assistantParts);
     els.sendButton.disabled = false;
     await refreshHealth();
   }

@@ -11,6 +11,7 @@ from typing import Any
 
 INDEX_FILENAME = "local_vector_index.json"
 QUERY_TEMPERATURE = 0.9
+DEFAULT_NUM_PREDICT = 2048
 
 
 def _status(message: str, *, enabled: bool = True) -> None:
@@ -112,6 +113,12 @@ def _ollama_response_thinking(response: Any) -> str:
         if value:
             return str(value)
     return ""
+
+
+def _ollama_done_reason(response: Any) -> str:
+    if isinstance(response, dict):
+        return str(response.get("done_reason") or "")
+    return str(getattr(response, "done_reason", "") or "")
 
 
 def _split_think_tag_events(content: str, *, in_thinking: bool) -> tuple[list[dict[str, str]], bool]:
@@ -326,7 +333,7 @@ class LocalQueryEngine:
         self.top_k = top_k
         self.num_predict = _positive_int(
             num_predict or os.environ.get("LOCAL_RAG_NUM_PREDICT"),
-            768,
+            DEFAULT_NUM_PREDICT,
         )
         self.engine = EmbeddingEngine(
             model_name=embedding_model,
@@ -354,7 +361,8 @@ class LocalQueryEngine:
                 "role": "system",
                 "content": (
                     "You answer from the supplied local context only. "
-                    "Write a complete answer in plain text and cite source numbers."
+                    "Keep any thinking concise, then write a complete final answer "
+                    "in plain text and cite source numbers."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -449,11 +457,16 @@ class LocalQueryEngine:
                 stream=True,
             )
             emitted = False
+            answer_emitted = False
+            thinking_emitted = False
             in_thinking = False
+            done_reason = ""
             for chunk in stream:
+                done_reason = _ollama_done_reason(chunk) or done_reason
                 thinking = _ollama_response_thinking(chunk)
                 if thinking:
                     emitted = True
+                    thinking_emitted = True
                     yield {"type": "thinking", "text": thinking}
 
                 content = _ollama_response_content(chunk)
@@ -464,6 +477,10 @@ class LocalQueryEngine:
                     )
                     for event in events:
                         emitted = True
+                        if event["type"] == "thinking":
+                            thinking_emitted = True
+                        if event["type"] == "answer":
+                            answer_emitted = True
                         yield event
         except Exception as exc:
             raise RuntimeError(
@@ -477,3 +494,23 @@ class LocalQueryEngine:
                 f"Ollama returned an empty streamed answer for model '{self.model}'. "
                 "Check the model response in Ollama logs or retry with a different --llm_model."
             )
+        if thinking_emitted and not answer_emitted:
+            if done_reason == "length":
+                yield {
+                    "type": "notice",
+                    "text": (
+                        "The model reached its token limit while still producing its thinking. "
+                        "The token budget has been raised for future requests; retry the question "
+                        "or increase LOCAL_RAG_NUM_PREDICT for longer answers."
+                    ),
+                }
+            else:
+                yield {
+                    "type": "notice",
+                    "text": "The model ended before producing final answer text.",
+                }
+        elif done_reason == "length":
+            yield {
+                "type": "notice",
+                "text": "The model reached its token limit, so the answer may be incomplete.",
+            }

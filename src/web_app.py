@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -33,7 +34,7 @@ WEB_DIR = ROOT_DIR / "web"
 DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
 DEFAULT_EMBEDDING_BATCH_SIZE = 8
 DEFAULT_EMBEDDING_TIMEOUT = 30.0
-DEFAULT_LLM_NUM_PREDICT = 768
+DEFAULT_LLM_NUM_PREDICT = 2048
 
 INDEX_LOCK = threading.RLock()
 
@@ -455,6 +456,38 @@ class ReindexRequest(BaseModel):
     embedding_timeout: float | None = DEFAULT_EMBEDDING_TIMEOUT
 
 
+class RenderRequest(BaseModel):
+    text: str
+
+
+def render_markdown_text(text: str) -> str:
+    from latex2mathml.converter import convert as latex_to_mathml
+    from markdown_it import MarkdownIt
+
+    math_blocks: list[str] = []
+
+    def replace_math(match: re.Match[str]) -> str:
+        latex = next(group for group in match.groups() if group is not None)
+        display = "block" if match.group(1) is not None or match.group(2) is not None else "inline"
+        placeholder = f"@@RAG_MATH_{len(math_blocks)}@@"
+        try:
+            math_blocks.append(latex_to_mathml(latex.strip(), display=display))
+        except Exception:
+            math_blocks.append(html.escape(match.group(0)))
+        return placeholder
+
+    protected = re.sub(
+        r"(?s)\$\$(.+?)\$\$|\\\[(.+?)\\\]|\\\((.+?)\\\)|(?<!\\)\$(?!\s)(.+?)(?<!\s)(?<!\\)\$",
+        replace_math,
+        text,
+    )
+    markdown = MarkdownIt("commonmark", {"html": False, "linkify": False})
+    rendered = markdown.render(protected)
+    for index, math_html in enumerate(math_blocks):
+        rendered = rendered.replace(f"@@RAG_MATH_{index}@@", math_html)
+    return rendered
+
+
 job_queue = RagJobQueue()
 app = FastAPI(title="Local FSAE RAG Pipeline")
 app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
@@ -488,6 +521,11 @@ def health():
         "record_count": record_count,
         "queue": job_queue.summary(),
     }
+
+
+@app.post("/api/render")
+def render_markdown(payload: RenderRequest):
+    return {"html": render_markdown_text(payload.text)}
 
 
 @app.post("/api/uploads")

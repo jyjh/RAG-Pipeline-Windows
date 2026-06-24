@@ -202,3 +202,18 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
     ]
     assert events[0] == "begin"
     assert events[-1] == "finish"
+
+
+def test_render_endpoint_formats_markdown_and_latex():
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/render",
+        json={"text": "**Synthesize the Explanation** and $\\sigma^2$"},
+    )
+
+    assert response.status_code == 200
+    html = response.json()["html"]
+    assert "<strong>" in html
+    assert "Synthesize the Explanation" in html
+    assert "<math" in html
+    assert "sigma" not in html

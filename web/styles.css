@@ -202,6 +202,28 @@ input[type="file"] {
   white-space: pre-wrap;
 }
 
+.message .rendered {
+  white-space: normal;
+}
+
+.rendered p {
+  margin: 0 0 10px;
+  color: var(--text);
+}
+
+.rendered p:last-child {
+  margin-bottom: 0;
+}
+
+.rendered strong {
+  font-weight: 700;
+  font-style: italic;
+}
+
+.rendered math {
+  font-size: 1.05em;
+}
+
 .message .role {
   display: block;
   margin-bottom: 4px;
@@ -230,12 +252,10 @@ input[type="file"] {
   font-weight: 650;
 }
 
-.thinking-block pre {
+.thinking-body {
   margin: 0;
   padding: 0 10px 10px;
-  white-space: pre-wrap;
   word-break: break-word;
-  font-family: Consolas, "Liberation Mono", monospace;
   font-size: 13px;
 }
 

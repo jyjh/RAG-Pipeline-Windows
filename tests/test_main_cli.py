@@ -133,7 +133,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
         "embedding_model": "nomic-embed-text",
         "embedding_batch_size": 8,
         "embedding_timeout": 30.0,
-        "llm_num_predict": 768,
+        "llm_num_predict": 2048,
         "progress_enabled": True,
         "question": "What is regularization?",
     }

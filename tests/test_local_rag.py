@@ -80,7 +80,7 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
         assert answer == "answer"
         assert calls["kwargs"]["model"] == "gemma4"
         assert calls["kwargs"]["options"]["temperature"] == 0.9
-        assert calls["kwargs"]["options"]["num_predict"] == 768
+        assert calls["kwargs"]["options"]["num_predict"] == 2048
         user_prompt = calls["kwargs"]["messages"][1]["content"]
         assert "alpha context" in user_prompt
     finally:
@@ -145,7 +145,7 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
         assert chunks == ["chunk ", "two"]
         assert calls["kwargs"]["stream"] is True
         assert calls["kwargs"]["options"]["temperature"] == 0.9
-        assert calls["kwargs"]["options"]["num_predict"] == 768
+        assert calls["kwargs"]["options"]["num_predict"] == 2048
 
         events = list(engine.ask_stream_events("alpha?"))
         assert events == [
@@ -153,6 +153,64 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
             {"type": "answer", "text": "chunk "},
             {"type": "answer", "text": "two"},
         ]
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_local_query_engine_reports_thinking_only_cutoff(monkeypatch):
+    tmp_path = Path.cwd() / f".tmp_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path.mkdir()
+    try:
+        index = {
+            "backend": "local_vector",
+            "embedding_dim": 3,
+            "records": [
+                {
+                    "id": "a:0",
+                    "file_path": "a.md",
+                    "chunk_index": 0,
+                    "content": "alpha context",
+                    "vector": [1.0, 0.0, 0.0],
+                }
+            ],
+        }
+        tmp_path.joinpath(local_rag.INDEX_FILENAME).write_text(
+            json.dumps(index),
+            encoding="utf-8",
+        )
+
+        class FakeEngine:
+            def __init__(self, **kwargs):
+                pass
+
+            def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+                return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+        def fake_chat(**kwargs):
+            return iter(
+                [
+                    {"message": {"content": "<think>still thinking"}},
+                    {"done": True, "done_reason": "length", "message": {"content": ""}},
+                ]
+            )
+
+        monkeypatch.setitem(
+            sys.modules,
+            "ollama",
+            types.SimpleNamespace(chat=fake_chat),
+        )
+        monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            progress_enabled=False,
+            model="gemma4",
+        )
+        events = list(engine.ask_stream_events("alpha?"))
+
+        assert events[0] == {"type": "thinking", "text": "still thinking"}
+        assert events[-1]["type"] == "notice"
+        assert "token limit" in events[-1]["text"]
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 

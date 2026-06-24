@@ -76,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm_num_predict",
         type=int,
-        default=768,
+        default=2048,
         help="Maximum answer tokens to request from Ollama in query mode.",
     )
     parser.add_argument(

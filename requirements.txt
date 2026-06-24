@@ -25,6 +25,8 @@ uvicorn[standard]
 streamlit
 requests
 python-multipart
+markdown-it-py
+latex2mathml
 
 # Deep learning runtime, install CUDA wheels explicitly where possible
 torch
