@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 import src.query as query
 import src.web_app as web_app
 from src.pdf_registry import load_source_map, write_source_entry
-from src.vector_store import JsonVectorStore
+from src.vector_store import LanceDBVectorStore
 
 
 @pytest.fixture
@@ -25,30 +25,55 @@ def workspace_tmp():
         shutil.rmtree(path, ignore_errors=True)
 
 
+@pytest.fixture
+def lancedb_tmp():
+    path = Path(tempfile.gettempdir()) / f"rag_test_web_app_{uuid.uuid4().hex}"
+    path.mkdir()
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def _write_index(db_dir: Path):
-    db_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "backend": "local_vector",
-        "embedding_model": "nomic-embed-text",
-        "embedding_dim": 3,
-        "records": [
+    LanceDBVectorStore(db_dir).write_records(
+        [
             {
                 "id": "doc.md:0",
+                "doc_id": "doc",
+                "parent_id": "",
+                "node_type": "chunk",
                 "file_path": "processed_docs/doc.md",
                 "chunk_index": 0,
                 "content": "alpha context",
+                "title": "Doc",
+                "section_path": "Doc",
+                "page_start": 1,
+                "page_end": 1,
+                "summary": "summary",
+                "tags": ["alpha"],
                 "vector": [1.0, 0.0, 0.0],
             },
             {
                 "id": "doc.md:1",
+                "doc_id": "doc",
+                "parent_id": "",
+                "node_type": "chunk",
                 "file_path": "processed_docs/doc.md",
                 "chunk_index": 1,
                 "content": "beta context",
+                "title": "Doc",
+                "section_path": "Doc",
+                "page_start": 1,
+                "page_end": 1,
+                "summary": "summary",
+                "tags": ["beta"],
                 "vector": [0.0, 1.0, 0.0],
             },
         ],
-    }
-    web_app.vector_index_path(db_dir).write_text(json.dumps(payload), encoding="utf-8")
+        embedding_model="nomic-embed-text",
+        embedding_dim=3,
+    )
 
 
 def _wait_for(predicate, timeout=3.0):
@@ -60,8 +85,8 @@ def _wait_for(predicate, timeout=3.0):
     raise AssertionError("Timed out waiting for condition")
 
 
-def test_index_rows_hide_vectors_and_support_search(workspace_tmp):
-    db_dir = workspace_tmp / "db"
+def test_index_rows_hide_vectors_and_support_search(lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
     _write_index(db_dir)
 
     result = web_app.list_index_rows(search="beta", db_dir=db_dir)
@@ -71,8 +96,8 @@ def test_index_rows_hide_vectors_and_support_search(workspace_tmp):
     assert "vector" not in result["rows"][0]
 
 
-def test_update_index_record_reembeds_and_saves(monkeypatch, workspace_tmp):
-    db_dir = workspace_tmp / "db"
+def test_update_index_record_reembeds_and_saves(monkeypatch, lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
     _write_index(db_dir)
     calls = {}
 
@@ -92,22 +117,21 @@ def test_update_index_record_reembeds_and_saves(monkeypatch, workspace_tmp):
         db_dir=db_dir,
     )
 
-    payload = json.loads(web_app.vector_index_path(db_dir).read_text(encoding="utf-8"))
     assert row["content"] == "edited context"
-    assert payload["records"][0]["content"] == "edited context"
-    assert payload["records"][0]["vector"] == [0.0, 0.0, 1.0]
+    record = LanceDBVectorStore(db_dir).get_record("doc.md:0")
+    assert record["content"] == "edited context"
+    assert record["vector"] == [0.0, 0.0, 1.0]
     assert calls["embed"] == (["edited context"], 3, "search_document: ")
 
 
-def test_delete_index_records_persists_remaining_records(workspace_tmp):
-    db_dir = workspace_tmp / "db"
+def test_delete_index_records_persists_remaining_records(lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
     _write_index(db_dir)
 
     result = web_app.delete_index_records(record_ids=["doc.md:1"], db_dir=db_dir)
 
-    payload = json.loads(web_app.vector_index_path(db_dir).read_text(encoding="utf-8"))
     assert result == {"deleted": 1, "remaining": 1}
-    assert [record["id"] for record in payload["records"]] == ["doc.md:0"]
+    assert [row["id"] for row in LanceDBVectorStore(db_dir).list_records()["rows"]] == ["doc.md:0"]
 
 
 def test_web_index_helpers_work_with_lancedb(monkeypatch):
@@ -245,10 +269,10 @@ def test_queue_pauses_new_work_while_query_is_active(workspace_tmp):
     assert (workspace_tmp / "uploads" / job.id / "doc.pdf").exists()
 
 
-def test_force_duplicate_cleanup_waits_until_ingestion_phase(workspace_tmp):
+def test_force_duplicate_cleanup_waits_until_ingestion_phase(workspace_tmp, lancedb_tmp):
     calls = []
     processed_dir = workspace_tmp / "processed"
-    db_dir = workspace_tmp / "db"
+    db_dir = lancedb_tmp / "db"
     processed_dir.mkdir()
     old_markdown = processed_dir / "old.md"
     old_markdown.write_text("old content", encoding="utf-8")
@@ -259,7 +283,7 @@ def test_force_duplicate_cleanup_waits_until_ingestion_phase(workspace_tmp):
         source_pdf_name="old.pdf",
         source_pdf_path=workspace_tmp / "old.pdf",
     )
-    JsonVectorStore(db_dir).write_records(
+    LanceDBVectorStore(db_dir).write_records(
         [
             {
                 "id": "old",
@@ -290,7 +314,7 @@ def test_force_duplicate_cleanup_waits_until_ingestion_phase(workspace_tmp):
 
     def fake_ingest(input_dir, output_dir, **kwargs):
         old_content = old_markdown.read_text(encoding="utf-8") if old_markdown.exists() else ""
-        calls.append(("ingest", bool(old_content), JsonVectorStore(db_dir).count()))
+        calls.append(("ingest", bool(old_content), LanceDBVectorStore(db_dir).count()))
 
     def fake_index(md_dir, db_dir_arg, **kwargs):
         calls.append(("index", Path(md_dir).name, Path(db_dir_arg).name))
@@ -317,7 +341,7 @@ def test_force_duplicate_cleanup_waits_until_ingestion_phase(workspace_tmp):
 
     _wait_for(lambda: queue.get_job(job.id)["status"] == "paused_for_queries")
     assert old_markdown.exists()
-    assert JsonVectorStore(db_dir).count() == 2
+    assert LanceDBVectorStore(db_dir).count() == 2
 
     queue.finish_query()
     _wait_for(lambda: queue.get_job(job.id)["status"] == "done")

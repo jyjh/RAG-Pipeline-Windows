@@ -7,6 +7,35 @@ from pathlib import Path
 import numpy as np
 
 import src.local_rag as local_rag
+from src.vector_store import LanceDBVectorStore
+
+
+def _write_lancedb_records(db_dir: Path, records: list[dict]):
+    enriched = []
+    for index, record in enumerate(records):
+        item = {
+            "id": record.get("id", f"record-{index}"),
+            "doc_id": record.get("doc_id", f"doc-{index}"),
+            "parent_id": record.get("parent_id", ""),
+            "node_type": record.get("node_type", "chunk"),
+            "file_path": record.get("file_path", "doc.md"),
+            "chunk_index": record.get("chunk_index", index),
+            "content": record.get("content", ""),
+            "title": record.get("title", "Doc"),
+            "section_path": record.get("section_path", "Doc"),
+            "page_start": record.get("page_start", 1),
+            "page_end": record.get("page_end", 1),
+            "summary": record.get("summary", "summary"),
+            "tags": record.get("tags", []),
+            "vector": record.get("vector", [1.0, 0.0, 0.0]),
+        }
+        item.update(record)
+        enriched.append(item)
+    LanceDBVectorStore(db_dir).write_records(
+        enriched,
+        embedding_model="fake-embed",
+        embedding_dim=3,
+    )
 
 
 def test_chunk_markdown_splits_long_text_without_empty_chunks():
@@ -90,12 +119,12 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
     tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
     tmp_path.mkdir()
     try:
-        index = {
-            "backend": "local_vector",
-            "embedding_dim": 3,
-            "records": [
+        _write_lancedb_records(
+            tmp_path,
+            [
                 {
                     "id": "a:0",
+                    "doc_id": "a",
                     "file_path": "a.md",
                     "chunk_index": 0,
                     "content": "alpha context",
@@ -103,16 +132,13 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
                 },
                 {
                     "id": "b:0",
+                    "doc_id": "b",
                     "file_path": "b.md",
                     "chunk_index": 0,
                     "content": "beta context",
                     "vector": [0.0, 1.0, 0.0],
                 },
             ],
-        }
-        tmp_path.joinpath(local_rag.INDEX_FILENAME).write_text(
-            json.dumps(index),
-            encoding="utf-8",
         )
 
         class FakeEngine:
@@ -154,22 +180,18 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
     tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
     tmp_path.mkdir()
     try:
-        index = {
-            "backend": "local_vector",
-            "embedding_dim": 3,
-            "records": [
+        _write_lancedb_records(
+            tmp_path,
+            [
                 {
                     "id": "a:0",
+                    "doc_id": "a",
                     "file_path": "a.md",
                     "chunk_index": 0,
                     "content": "alpha context",
                     "vector": [1.0, 0.0, 0.0],
                 }
             ],
-        }
-        tmp_path.joinpath(local_rag.INDEX_FILENAME).write_text(
-            json.dumps(index),
-            encoding="utf-8",
         )
 
         class FakeEngine:
@@ -224,22 +246,18 @@ def test_local_query_engine_reports_thinking_only_cutoff(monkeypatch):
     tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
     tmp_path.mkdir()
     try:
-        index = {
-            "backend": "local_vector",
-            "embedding_dim": 3,
-            "records": [
+        _write_lancedb_records(
+            tmp_path,
+            [
                 {
                     "id": "a:0",
+                    "doc_id": "a",
                     "file_path": "a.md",
                     "chunk_index": 0,
                     "content": "alpha context",
                     "vector": [1.0, 0.0, 0.0],
                 }
             ],
-        }
-        tmp_path.joinpath(local_rag.INDEX_FILENAME).write_text(
-            json.dumps(index),
-            encoding="utf-8",
         )
 
         class FakeEngine:

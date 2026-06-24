@@ -74,9 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--index_backend",
-        choices=["lancedb", "json"],
+        choices=["lancedb"],
         default="lancedb",
-        help="Vector index storage backend for index mode.",
+        help="Vector index storage backend for index mode. LanceDB is the only supported backend.",
     )
     parser.add_argument(
         "--summary_mode",

@@ -21,7 +21,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from src.defaults import DEFAULT_LLM_MODEL
 from src.pdf_registry import PdfRegistry, remove_source_entries_by_hash
-from src.vector_store import default_store, lancedb_path, vector_index_path as json_index_path
+from src.vector_store import default_store, lancedb_path
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -98,12 +98,8 @@ def _load_server_config(config_path: Path | None = None) -> dict[str, int]:
 SERVER_CONFIG = _load_server_config()
 
 
-def vector_index_path(db_dir: Path | None = None) -> Path:
-    return json_index_path(db_dir or DB_DIR)
-
-
 def _index_store(db_dir: Path | None = None):
-    return default_store(db_dir or DB_DIR, prefer_lancedb=True)
+    return default_store(db_dir or DB_DIR)
 
 
 def list_index_rows(
@@ -588,7 +584,6 @@ def health():
             "processed_dir": str(PROCESSED_DIR),
             "db_dir": str(DB_DIR),
             "index_file": str(path),
-            "legacy_json_index_file": str(vector_index_path()),
         },
         "index_exists": index_exists,
         "record_count": record_count,

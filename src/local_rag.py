@@ -16,7 +16,7 @@ from src.sectioning import (
     DEFAULT_CHUNK_TARGET_TOKENS,
     build_section_records,
 )
-from src.vector_store import INDEX_FILENAME, JsonVectorStore, LanceDBVectorStore, default_store
+from src.vector_store import LanceDBVectorStore, default_store
 
 QUERY_TEMPERATURE = 0.9
 DEFAULT_NUM_PREDICT = 4096
@@ -277,10 +277,6 @@ def chunk_markdown(text: str, *, max_chars: int = 3000, overlap: int = 400) -> l
     return chunks
 
 
-def _index_path(working_dir: str) -> Path:
-    return Path(working_dir) / INDEX_FILENAME
-
-
 class LocalVectorIndexer:
     def __init__(
         self,
@@ -404,36 +400,16 @@ class LocalVectorIndexer:
                 records.append(record)
 
         backend = (self.index_backend or "lancedb").lower()
-        if backend == "json":
-            store = JsonVectorStore(self.working_dir)
-            output_target = _index_path(self.working_dir)
-        elif backend == "lancedb":
-            store = LanceDBVectorStore(self.working_dir)
-            output_target = store.db_path / "chunks"
-        else:
-            raise ValueError("index_backend must be one of: lancedb, json")
+        if backend != "lancedb":
+            raise ValueError("index_backend must be lancedb; JSON chunk storage has been removed.")
 
-        try:
-            store.write_records(
-                records,
-                embedding_model=self.embedding_model,
-                embedding_dim=768,
-            )
-        except RuntimeError as exc:
-            if backend != "lancedb" or "Access is denied" not in str(exc):
-                raise
-            _status(
-                "Local index: LanceDB write was denied by the filesystem; "
-                "falling back to the legacy JSON store for this run.",
-                enabled=self.progress_enabled,
-            )
-            store = JsonVectorStore(self.working_dir)
-            output_target = _index_path(self.working_dir)
-            store.write_records(
-                records,
-                embedding_model=self.embedding_model,
-                embedding_dim=768,
-            )
+        store = LanceDBVectorStore(self.working_dir)
+        output_target = store.db_path / "chunks"
+        store.write_records(
+            records,
+            embedding_model=self.embedding_model,
+            embedding_dim=768,
+        )
         _status(
             f"Local index: wrote {len(records)} structured record(s) to {output_target}",
             enabled=self.progress_enabled,

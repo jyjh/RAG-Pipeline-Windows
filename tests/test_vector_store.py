@@ -3,7 +3,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from src.vector_store import JsonVectorStore, LanceDBVectorStore, default_store
+from src.vector_store import LanceDBVectorStore, default_store
 
 
 def _source_records():
@@ -174,29 +174,6 @@ def test_lancedb_store_create_query_update_delete():
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
-def test_json_store_preserves_source_metadata_and_deletes_by_hash_or_legacy_path():
-    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_vector_store_{uuid.uuid4().hex}"
-    try:
-        store = JsonVectorStore(tmp_path)
-        store.write_records(_source_records(), embedding_model="fake-embed", embedding_dim=3)
-
-        rows = store.list_records()["rows"]
-        assert rows[0]["source_hash"] == "hash-a"
-        assert rows[0]["source_pdf_name"] == "doc-a.pdf"
-
-        assert store.delete_records_by_source_hash(source_hashes=["hash-a"]) == {
-            "deleted": 1,
-            "remaining": 2,
-        }
-        assert store.delete_records_by_source_hash(
-            source_hashes=["missing"],
-            legacy_file_paths=["processed_docs/legacy.md"],
-        ) == {"deleted": 1, "remaining": 1}
-        assert store.get_record("kept-row")["source_hash"] == "hash-b"
-    finally:
-        shutil.rmtree(tmp_path, ignore_errors=True)
-
-
 def test_lancedb_store_preserves_source_metadata_and_deletes_by_hash_or_legacy_path():
     tmp_path = Path(tempfile.gettempdir()) / f"rag_test_vector_store_{uuid.uuid4().hex}"
     try:
@@ -220,7 +197,7 @@ def test_lancedb_store_preserves_source_metadata_and_deletes_by_hash_or_legacy_p
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
-def test_default_store_ignores_incompatible_legacy_lancedb_schema():
+def test_default_store_never_falls_back_to_legacy_json():
     tmp_path = Path(tempfile.gettempdir()) / f"rag_test_vector_store_{uuid.uuid4().hex}"
     try:
         import lancedb
@@ -239,25 +216,15 @@ def test_default_store_ignores_incompatible_legacy_lancedb_schema():
             ],
             mode="overwrite",
         )
-        JsonVectorStore(tmp_path).write_records(
-            [
-                {
-                    "id": "json-chunk",
-                    "doc_id": "doc",
-                    "parent_id": "",
-                    "node_type": "chunk",
-                    "file_path": "doc.md",
-                    "chunk_index": 0,
-                    "content": "json context",
-                    "vector": [1.0, 0.0, 0.0],
-                }
-            ],
-            embedding_model="fake-embed",
-            embedding_dim=3,
-        )
+        tmp_path.joinpath("local_vector_index.json").write_text('{"records": []}', encoding="utf-8")
 
         assert not LanceDBVectorStore(tmp_path).exists()
-        assert isinstance(default_store(tmp_path), JsonVectorStore)
-        assert default_store(tmp_path).list_records()["rows"][0]["id"] == "json-chunk"
+        assert isinstance(default_store(tmp_path), LanceDBVectorStore)
+        try:
+            default_store(tmp_path).list_records()
+        except FileNotFoundError as exc:
+            assert "LanceDB table not found" in str(exc)
+        else:
+            raise AssertionError("Expected incompatible LanceDB to remain unavailable")
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)

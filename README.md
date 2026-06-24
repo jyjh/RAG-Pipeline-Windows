@@ -31,7 +31,7 @@ Implemented behavior:
 - 768-dimensional normalized vectors for retrieval.
 - Document chunks use the `search_document:` prefix; queries use `search_query:`.
 - Section-aware chunking from PDF outlines/bookmarks, table-of-contents parsing, or heading fallback.
-- LanceDB-backed vector storage in `db/lancedb` by default, with legacy JSON fallback/export support.
+- LanceDB-backed vector storage in `db/lancedb`.
 
 The `processed_docs/` Markdown files are corpus data generated from sample PDFs, not project documentation.
 
@@ -136,7 +136,7 @@ python main.py --mode query --db_dir db --question "Explain the bias-variance tr
 
 For born-digital PDFs, ingest defaults to pypdf text extraction and does not run Docling asset enrichment unless requested. Use `--asset_triggers images` to enrich pages with embedded images, or `--asset_triggers all` to also enrich table/equation heuristic pages. Ingestion shows per-document and per-page progress bars by default; pass `--no_progress` to disable them.
 
-Indexing and query use Ollama embeddings only. Use `--embedding_model` to select a different Ollama embedding model, `--embedding_batch_size 1` if Ollama struggles with larger embedding batches, and `--embedding_timeout 30` to fail clearly instead of waiting indefinitely. Indexing defaults to `--index_backend lancedb`, `--summary_mode hybrid`, `--chunk_target_tokens 900`, and `--chunk_overlap_tokens 120`; the overlap is only used when a detected section is too large. Query mode requests `--llm_num_predict 4096` by default; increase it if your local model needs more room for long answers. Ollama answer generation is bounded by `--llm_timeout 120` or `LOCAL_RAG_LLM_TIMEOUT`.
+Indexing and query use Ollama embeddings only. Use `--embedding_model` to select a different Ollama embedding model, `--embedding_batch_size 1` if Ollama struggles with larger embedding batches, and `--embedding_timeout 30` to fail clearly instead of waiting indefinitely. Indexing writes chunks to LanceDB, with `--summary_mode hybrid`, `--chunk_target_tokens 900`, and `--chunk_overlap_tokens 120` by default; the overlap is only used when a detected section is too large. Query mode requests `--llm_num_predict 4096` by default; increase it if your local model needs more room for long answers. Ollama answer generation is bounded by `--llm_timeout 120` or `LOCAL_RAG_LLM_TIMEOUT`.
 
 The module entrypoints can also be used for the default directories:
 
