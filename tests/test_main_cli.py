@@ -97,6 +97,9 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
             embedding_batch_size,
             embedding_timeout,
             llm_num_predict,
+            temperature,
+            sampler_top_k,
+            context_window,
             progress_enabled,
         ):
             calls["working_dir"] = working_dir
@@ -105,6 +108,9 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
             calls["embedding_batch_size"] = embedding_batch_size
             calls["embedding_timeout"] = embedding_timeout
             calls["llm_num_predict"] = llm_num_predict
+            calls["temperature"] = temperature
+            calls["sampler_top_k"] = sampler_top_k
+            calls["context_window"] = context_window
             calls["progress_enabled"] = progress_enabled
 
         def ask(self, question):
@@ -133,7 +139,10 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
         "embedding_model": "nomic-embed-text",
         "embedding_batch_size": 8,
         "embedding_timeout": 30.0,
-        "llm_num_predict": 2048,
+        "llm_num_predict": 4096,
+        "temperature": 0.9,
+        "sampler_top_k": 40,
+        "context_window": 8192,
         "progress_enabled": True,
         "question": "What is regularization?",
     }

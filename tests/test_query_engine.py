@@ -21,6 +21,9 @@ def test_query_engine_delegates_to_local_query_engine(monkeypatch):
         embedding_batch_size=4,
         embedding_timeout=12.0,
         llm_num_predict=256,
+        temperature=0.7,
+        sampler_top_k=24,
+        context_window=4096,
         progress_enabled=False,
     )
 
@@ -33,6 +36,9 @@ def test_query_engine_delegates_to_local_query_engine(monkeypatch):
             "embedding_batch_size": 4,
             "embedding_timeout": 12.0,
             "num_predict": 256,
+            "temperature": 0.7,
+            "sampler_top_k": 24,
+            "context_window": 4096,
             "progress_enabled": False,
         },
         "question": "What is aero balance?",

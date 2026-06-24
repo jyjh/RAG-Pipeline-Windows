@@ -21,6 +21,10 @@ const els = {
   indexBody: document.getElementById("indexBody"),
   chatForm: document.getElementById("chatForm"),
   questionInput: document.getElementById("questionInput"),
+  temperatureInput: document.getElementById("temperatureInput"),
+  maxKInput: document.getElementById("maxKInput"),
+  contextWindowInput: document.getElementById("contextWindowInput"),
+  maxOutputInput: document.getElementById("maxOutputInput"),
   sendButton: document.getElementById("sendButton"),
   chatMessages: document.getElementById("chatMessages"),
 };
@@ -62,6 +66,14 @@ async function renderMarkdown(text) {
     body: JSON.stringify({ text }),
   });
   return data.html || "";
+}
+
+function numericSetting(input, fallback, minimum = 1) {
+  const value = Number(input.value);
+  if (!Number.isFinite(value) || value < minimum) {
+    return fallback;
+  }
+  return value;
 }
 
 async function refreshHealth() {
@@ -345,7 +357,13 @@ async function sendQuestion(event) {
     const response = await fetch("/api/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({
+        question,
+        temperature: numericSetting(els.temperatureInput, 0.9, 0),
+        max_k: Math.trunc(numericSetting(els.maxKInput, 40, 1)),
+        context_window: Math.trunc(numericSetting(els.contextWindowInput, 8192, 1)),
+        llm_num_predict: Math.trunc(numericSetting(els.maxOutputInput, 4096, 1)),
+      }),
     });
     if (!response.ok || !response.body) {
       throw new Error(await response.text());

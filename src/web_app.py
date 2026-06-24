@@ -34,7 +34,10 @@ WEB_DIR = ROOT_DIR / "web"
 DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
 DEFAULT_EMBEDDING_BATCH_SIZE = 8
 DEFAULT_EMBEDDING_TIMEOUT = 30.0
-DEFAULT_LLM_NUM_PREDICT = 2048
+DEFAULT_TEMPERATURE = 0.9
+DEFAULT_MAX_K = 40
+DEFAULT_CONTEXT_WINDOW = 8192
+DEFAULT_LLM_NUM_PREDICT = 4096
 
 INDEX_LOCK = threading.RLock()
 
@@ -435,6 +438,9 @@ class ChatRequest(BaseModel):
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_batch_size: int | None = DEFAULT_EMBEDDING_BATCH_SIZE
     embedding_timeout: float | None = DEFAULT_EMBEDDING_TIMEOUT
+    temperature: float | None = DEFAULT_TEMPERATURE
+    max_k: int | None = DEFAULT_MAX_K
+    context_window: int | None = DEFAULT_CONTEXT_WINDOW
     llm_num_predict: int | None = DEFAULT_LLM_NUM_PREDICT
 
 
@@ -684,6 +690,9 @@ def chat_stream(payload: ChatRequest):
                 embedding_batch_size=payload.embedding_batch_size,
                 embedding_timeout=payload.embedding_timeout,
                 llm_num_predict=payload.llm_num_predict,
+                temperature=payload.temperature,
+                sampler_top_k=payload.max_k,
+                context_window=payload.context_window,
                 progress_enabled=False,
             )
             if hasattr(engine, "ask_stream_events"):

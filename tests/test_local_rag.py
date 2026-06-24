@@ -80,7 +80,9 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
         assert answer == "answer"
         assert calls["kwargs"]["model"] == "gemma4"
         assert calls["kwargs"]["options"]["temperature"] == 0.9
-        assert calls["kwargs"]["options"]["num_predict"] == 2048
+        assert calls["kwargs"]["options"]["top_k"] == 40
+        assert calls["kwargs"]["options"]["num_ctx"] == 8192
+        assert calls["kwargs"]["options"]["num_predict"] == 4096
         user_prompt = calls["kwargs"]["messages"][1]["content"]
         assert "alpha context" in user_prompt
     finally:
@@ -145,7 +147,9 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
         assert chunks == ["chunk ", "two"]
         assert calls["kwargs"]["stream"] is True
         assert calls["kwargs"]["options"]["temperature"] == 0.9
-        assert calls["kwargs"]["options"]["num_predict"] == 2048
+        assert calls["kwargs"]["options"]["top_k"] == 40
+        assert calls["kwargs"]["options"]["num_ctx"] == 8192
+        assert calls["kwargs"]["options"]["num_predict"] == 4096
 
         events = list(engine.ask_stream_events("alpha?"))
         assert events == [

@@ -266,6 +266,31 @@ input[type="file"] {
   margin-top: 12px;
 }
 
+.sampler-settings {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  gap: 10px;
+}
+
+.sampler-settings label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.sampler-settings input {
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--text);
+}
+
 #questionInput {
   min-height: 72px;
   padding: 10px;
@@ -294,5 +319,9 @@ input[type="file"] {
 
   .chat-form {
     grid-template-columns: 1fr;
+  }
+
+  .sampler-settings {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

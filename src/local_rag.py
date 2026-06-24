@@ -11,7 +11,9 @@ from typing import Any
 
 INDEX_FILENAME = "local_vector_index.json"
 QUERY_TEMPERATURE = 0.9
-DEFAULT_NUM_PREDICT = 2048
+DEFAULT_NUM_PREDICT = 4096
+DEFAULT_SAMPLER_TOP_K = 40
+DEFAULT_CONTEXT_WINDOW = 8192
 
 
 def _status(message: str, *, enabled: bool = True) -> None:
@@ -69,6 +71,16 @@ def _positive_int(value: int | str | None, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, parsed)
+
+
+def _positive_float(value: float | str | None, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, parsed)
 
 
 def _ollama_response_content(response: Any) -> str:
@@ -324,6 +336,9 @@ class LocalQueryEngine:
         progress_enabled: bool = True,
         top_k: int = 5,
         num_predict: int | None = None,
+        temperature: float | None = None,
+        sampler_top_k: int | None = None,
+        context_window: int | None = None,
     ):
         from src.embeddings import EmbeddingEngine
 
@@ -335,12 +350,32 @@ class LocalQueryEngine:
             num_predict or os.environ.get("LOCAL_RAG_NUM_PREDICT"),
             DEFAULT_NUM_PREDICT,
         )
+        self.temperature = _positive_float(
+            temperature if temperature is not None else os.environ.get("LOCAL_RAG_TEMPERATURE"),
+            QUERY_TEMPERATURE,
+        )
+        self.sampler_top_k = _positive_int(
+            sampler_top_k or os.environ.get("LOCAL_RAG_SAMPLER_TOP_K"),
+            DEFAULT_SAMPLER_TOP_K,
+        )
+        self.context_window = _positive_int(
+            context_window or os.environ.get("LOCAL_RAG_NUM_CTX"),
+            DEFAULT_CONTEXT_WINDOW,
+        )
         self.engine = EmbeddingEngine(
             model_name=embedding_model,
             ollama_batch_size=embedding_batch_size,
             ollama_timeout=embedding_timeout,
         )
         self.records = self._load_records()
+
+    def _ollama_options(self) -> dict[str, int | float]:
+        return {
+            "temperature": self.temperature,
+            "top_k": self.sampler_top_k,
+            "num_ctx": self.context_window,
+            "num_predict": self.num_predict,
+        }
 
     def _chat_messages(self, question: str, matches: list[dict[str, Any]]) -> list[dict[str, str]]:
         context_blocks = []
@@ -415,7 +450,7 @@ class LocalQueryEngine:
             response = ollama.chat(
                 model=self.model,
                 messages=self._chat_messages(question, matches),
-                options={"temperature": QUERY_TEMPERATURE, "num_predict": self.num_predict},
+                options=self._ollama_options(),
             )
         except Exception as exc:
             raise RuntimeError(
@@ -453,7 +488,7 @@ class LocalQueryEngine:
             stream = ollama.chat(
                 model=self.model,
                 messages=self._chat_messages(question, matches),
-                options={"temperature": QUERY_TEMPERATURE, "num_predict": self.num_predict},
+                options=self._ollama_options(),
                 stream=True,
             )
             emitted = False

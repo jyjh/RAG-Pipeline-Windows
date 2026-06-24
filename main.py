@@ -76,8 +76,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm_num_predict",
         type=int,
-        default=2048,
+        default=4096,
         help="Maximum answer tokens to request from Ollama in query mode.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.9,
+        help="Ollama sampling temperature in query mode.",
+    )
+    parser.add_argument(
+        "--max_k",
+        type=int,
+        default=40,
+        help="Ollama top_k sampler setting in query mode.",
+    )
+    parser.add_argument(
+        "--context_window",
+        type=int,
+        default=8192,
+        help="Ollama num_ctx context window in query mode.",
     )
     parser.add_argument(
         "--parser_mode",
@@ -149,6 +167,9 @@ def main(argv: list[str] | None = None) -> int:
                 embedding_batch_size=args.embedding_batch_size,
                 embedding_timeout=args.embedding_timeout,
                 llm_num_predict=args.llm_num_predict,
+                temperature=args.temperature,
+                sampler_top_k=args.max_k,
+                context_window=args.context_window,
                 progress_enabled=not args.no_progress,
             ).ask(args.question)
             print(answer)

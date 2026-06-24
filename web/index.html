@@ -65,6 +65,24 @@
       <section id="chat" class="panel chat-panel">
         <div id="chatMessages" class="chat-messages" aria-live="polite"></div>
         <form id="chatForm" class="chat-form">
+          <div class="sampler-settings" aria-label="Sampler settings">
+            <label>
+              Temperature
+              <input id="temperatureInput" type="number" min="0" max="2" step="0.05" value="0.9" />
+            </label>
+            <label>
+              Max K
+              <input id="maxKInput" type="number" min="1" max="200" step="1" value="40" />
+            </label>
+            <label>
+              Context
+              <input id="contextWindowInput" type="number" min="1024" max="131072" step="1024" value="8192" />
+            </label>
+            <label>
+              Max Output
+              <input id="maxOutputInput" type="number" min="64" max="32768" step="64" value="4096" />
+            </label>
+          </div>
           <textarea id="questionInput" rows="3" placeholder="Ask a question"></textarea>
           <button id="sendButton" type="submit">Send</button>
         </form>

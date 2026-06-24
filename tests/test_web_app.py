@@ -180,7 +180,7 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
 
     class FakeQueryEngine:
         def __init__(self, **kwargs):
-            events.append(("engine", kwargs["working_dir"], kwargs["model"]))
+            events.append(("engine", kwargs))
 
         def ask_stream_events(self, question):
             assert question == "alpha?"
@@ -192,7 +192,16 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
     monkeypatch.setattr(query, "QueryEngine", FakeQueryEngine)
 
     client = TestClient(web_app.app)
-    response = client.post("/api/chat/stream", json={"question": "alpha?"})
+    response = client.post(
+        "/api/chat/stream",
+        json={
+            "question": "alpha?",
+            "temperature": 0.65,
+            "max_k": 25,
+            "context_window": 4096,
+            "llm_num_predict": 512,
+        },
+    )
 
     assert response.status_code == 200
     assert [json.loads(line) for line in response.text.splitlines()] == [
@@ -201,6 +210,10 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
         {"type": "answer", "text": "two"},
     ]
     assert events[0] == "begin"
+    assert events[1][1]["temperature"] == 0.65
+    assert events[1][1]["sampler_top_k"] == 25
+    assert events[1][1]["context_window"] == 4096
+    assert events[1][1]["llm_num_predict"] == 512
     assert events[-1] == "finish"
 
 

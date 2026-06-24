@@ -13,6 +13,9 @@ class QueryEngine:
         embedding_batch_size: int | None = None,
         embedding_timeout: float | None = None,
         llm_num_predict: int | None = None,
+        temperature: float | None = None,
+        sampler_top_k: int | None = None,
+        context_window: int | None = None,
         progress_enabled: bool = True,
     ):
         from src.local_rag import LocalQueryEngine
@@ -24,6 +27,9 @@ class QueryEngine:
             embedding_batch_size=embedding_batch_size,
             embedding_timeout=embedding_timeout,
             num_predict=llm_num_predict,
+            temperature=temperature,
+            sampler_top_k=sampler_top_k,
+            context_window=context_window,
             progress_enabled=progress_enabled,
         )
 

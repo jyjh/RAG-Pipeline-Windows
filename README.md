@@ -149,7 +149,7 @@ Run the local browser UI:
 uvicorn src.web_app:app --host 127.0.0.1 --port 8000
 ```
 
-Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/indexing work in the background, lets users inspect/edit/delete index records, and streams chat answers as Ollama produces them. When Ollama returns model thinking, the chat UI shows it in a collapsible block above the answer and reports clearly if the model stops before producing final answer text. Chat output is rendered as Markdown with local LaTeX-to-MathML formatting. Queued ingestion/indexing waits before expensive phases while chat queries are active; a phase already running is not forcibly interrupted. Query generation uses temperature `0.9`.
+Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/indexing work in the background, lets users inspect/edit/delete index records, and streams chat answers as Ollama produces them. The chat panel exposes sampler controls for temperature, top-k (`Max K`), context window, and maximum output tokens. When Ollama returns model thinking, the chat UI shows it in a collapsible block above the answer and reports clearly if the model stops before producing final answer text. Chat output is rendered as Markdown with local LaTeX-to-MathML formatting. Queued ingestion/indexing waits before expensive phases while chat queries are active; a phase already running is not forcibly interrupted. Query generation defaults to temperature `0.9`, top-k `40`, context window `8192`, and max output `4096`.
 
 ## Architecture
 
