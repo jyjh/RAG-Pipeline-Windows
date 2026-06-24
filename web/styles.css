@@ -52,6 +52,14 @@ p {
   flex-wrap: wrap;
 }
 
+.app-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 button,
 input,
 textarea {
@@ -84,6 +92,44 @@ button:disabled {
   border-color: var(--accent);
   background: var(--accent);
   color: #ffffff;
+}
+
+.update-button {
+  min-width: 104px;
+  white-space: nowrap;
+}
+
+.update-current {
+  border-color: #a9d6b8;
+  background: #eaf7ee;
+  color: var(--good);
+  font-weight: 650;
+}
+
+.update-current::before {
+  content: "\2713";
+  margin-right: 6px;
+}
+
+.update-available {
+  border-color: #d9b456;
+  background: #fff4cb;
+  color: #6e4a0d;
+  font-weight: 650;
+}
+
+.update-warning,
+.update-error {
+  border-color: #e0baba;
+  background: #fff0f0;
+  color: var(--danger);
+  font-weight: 650;
+}
+
+.update-restarting,
+.update-checking {
+  background: #fbfcfd;
+  color: var(--muted);
 }
 
 main {
@@ -469,6 +515,15 @@ input[type="file"] {
   .app-header {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .app-header-actions {
+    align-items: stretch;
+    justify-content: flex-start;
+  }
+
+  .update-button {
+    flex: 0 0 auto;
   }
 
   main {

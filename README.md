@@ -151,16 +151,20 @@ Run the local browser UI:
 uvicorn src.web_app:app --host 127.0.0.1 --port 8000
 ```
 
-The browser UI reads server polling intervals from `config.toml` under `[server]`.
+The browser UI reads server host, port, polling intervals, and update target from `config.toml` under `[server]`.
 By default, `/api/health` and `/api/jobs` are polled once per minute:
 
 ```toml
 [server]
+host = "127.0.0.1"
+port = 8000
+update_remote = "origin"
+update_branch = "main"
 health_poll_interval_ms = 60000
 jobs_poll_interval_ms = 60000
 ```
 
-Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/indexing work in the background, lets users inspect/edit/delete index records, and streams chat answers as Ollama produces them. Uploaded and indexed PDFs are searchable by title/hash and listed with download links for source verification. The Index page defaults to 20 rows, can show 50 or 100 rows per page, and can load all matching rows in 100-row HTTP batches. The chat panel saves conversations in the browser's `localStorage` and includes a collapsible saved-chat sidebar with rename/delete controls. Uploads are tracked by PDF SHA-256 hash across queued and ingested files; duplicate uploads are rejected unless the browser confirmation prompt is accepted for a forced re-upload. Forced re-upload cleanup waits until the job reaches ingestion, then removes existing indexed records for that parent PDF before fresh ingestion/indexing. The chat panel exposes sampler controls for temperature, top-k (`Max K`), context window, relevance floor, maximum output tokens, and web-search enablement. When Ollama returns model thinking, the chat UI shows it in a collapsible block above the answer and reports clearly if the model stops before producing final answer text. Chat output is rendered as Markdown with local LaTeX-to-MathML formatting and includes a Sources panel populated from retrieved chunks and web results. Queued ingestion/indexing waits before expensive phases while chat queries are active; a phase already running is not forcibly interrupted.
+Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/indexing work in the background, lets users inspect/edit/delete index records, and streams chat answers as Ollama produces them. Uploaded and indexed PDFs are searchable by title/hash and listed with download links for source verification. The top-right update button checks the configured remote branch, pulls fast-forward updates when available, and restarts the uvicorn server. It blocks updates if tracked files are dirty, the server is not running the configured branch, Git history diverged, or chat/indexing work is active. The Index page defaults to 20 rows, can show 50 or 100 rows per page, and can load all matching rows in 100-row HTTP batches. The chat panel saves conversations in the browser's `localStorage` and includes a collapsible saved-chat sidebar with rename/delete controls. Uploads are tracked by PDF SHA-256 hash across queued and ingested files; duplicate uploads are rejected unless the browser confirmation prompt is accepted for a forced re-upload. Forced re-upload cleanup waits until the job reaches ingestion, then removes existing indexed records for that parent PDF before fresh ingestion/indexing. The chat panel exposes sampler controls for temperature, top-k (`Max K`), context window, relevance floor, maximum output tokens, and web-search enablement. When Ollama returns model thinking, the chat UI shows it in a collapsible block above the answer and reports clearly if the model stops before producing final answer text. Chat output is rendered as Markdown with local LaTeX-to-MathML formatting and includes a Sources panel populated from retrieved chunks and web results. Queued ingestion/indexing waits before expensive phases while chat queries are active; a phase already running is not forcibly interrupted.
 
 ## Architecture
 

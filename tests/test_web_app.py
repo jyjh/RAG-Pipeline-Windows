@@ -1,5 +1,6 @@
 import json
 import shutil
+import subprocess
 import tempfile
 import time
 import uuid
@@ -13,6 +14,70 @@ import src.query as query
 import src.web_app as web_app
 from src.pdf_registry import load_source_map, write_source_entry
 from src.vector_store import LanceDBVectorStore
+
+
+def _completed(args, *, stdout="", stderr="", returncode=0):
+    return subprocess.CompletedProcess(["git", *args], returncode, stdout=stdout, stderr=stderr)
+
+
+def _set_update_config(monkeypatch, *, branch="main"):
+    monkeypatch.setattr(
+        web_app,
+        "SERVER_CONFIG",
+        {
+            "host": "127.0.0.1",
+            "port": 8000,
+            "health_poll_interval_ms": 60000,
+            "jobs_poll_interval_ms": 60000,
+            "update_remote": "origin",
+            "update_branch": branch,
+        },
+    )
+
+
+class IdleQueue:
+    def summary(self):
+        return {"active_query_count": 0, "queued_count": 0, "running_job_ids": [], "job_count": 0}
+
+
+def _install_update_git(
+    monkeypatch,
+    *,
+    current_branch="main",
+    current_sha=None,
+    latest_sha=None,
+    dirty="",
+    current_is_ancestor=True,
+    latest_is_ancestor=False,
+    fetch_returncode=0,
+):
+    calls = []
+    current_sha = current_sha or ("a" * 40)
+    latest_sha = latest_sha or current_sha
+
+    def fake_run_git(args, *, timeout=web_app.GIT_TIMEOUT_SECONDS):
+        calls.append(args)
+        if args == ["branch", "--show-current"]:
+            return _completed(args, stdout=f"{current_branch}\n")
+        if args == ["rev-parse", "HEAD"]:
+            return _completed(args, stdout=f"{current_sha}\n")
+        if args == ["status", "--porcelain", "--untracked-files=no"]:
+            return _completed(args, stdout=dirty)
+        if args[0:2] == ["fetch", "--quiet"]:
+            if fetch_returncode:
+                return _completed(args, stderr="network unavailable", returncode=fetch_returncode)
+            return _completed(args)
+        if args == ["rev-parse", "--verify", "refs/remotes/origin/main"]:
+            return _completed(args, stdout=f"{latest_sha}\n")
+        if args[0:2] == ["merge-base", "--is-ancestor"]:
+            if args[2:] == [current_sha, latest_sha]:
+                return _completed(args, returncode=0 if current_is_ancestor else 1)
+            if args[2:] == [latest_sha, current_sha]:
+                return _completed(args, returncode=0 if latest_is_ancestor else 1)
+        return _completed(args, stderr=f"unexpected git args: {args}", returncode=1)
+
+    monkeypatch.setattr(web_app, "_run_git", fake_run_git)
+    return calls
 
 
 @pytest.fixture
@@ -199,23 +264,41 @@ def test_server_config_defaults_to_minute_when_missing(workspace_tmp):
     config = web_app._load_server_config(workspace_tmp / "missing.toml")
 
     assert config == {
+        "host": "127.0.0.1",
+        "port": 8000,
         "health_poll_interval_ms": 60000,
         "jobs_poll_interval_ms": 60000,
+        "update_remote": "origin",
+        "update_branch": "main",
     }
 
 
 def test_server_config_reads_polling_intervals(workspace_tmp):
     config_path = workspace_tmp / "config.toml"
     config_path.write_text(
-        "[server]\nhealth_poll_interval_ms = 120032\njobs_poll_interval_ms = 90000\n",
+        "\n".join(
+            [
+                "[server]",
+                'host = "0.0.0.0"',
+                "port = 8081",
+                'update_remote = "upstream"',
+                'update_branch = "web-ui"',
+                "health_poll_interval_ms = 120032",
+                "jobs_poll_interval_ms = 90000",
+            ]
+        ),
         encoding="utf-8",
     )
 
     config = web_app._load_server_config(config_path)
 
     assert config == {
+        "host": "0.0.0.0",
+        "port": 8081,
         "health_poll_interval_ms": 120032,
         "jobs_poll_interval_ms": 90000,
+        "update_remote": "upstream",
+        "update_branch": "web-ui",
     }
 
 
@@ -254,7 +337,14 @@ def test_health_exposes_server_polling_config(monkeypatch):
     monkeypatch.setattr(
         web_app,
         "SERVER_CONFIG",
-        {"health_poll_interval_ms": 60000, "jobs_poll_interval_ms": 60000},
+        {
+            "host": "127.0.0.1",
+            "port": 8000,
+            "health_poll_interval_ms": 60000,
+            "jobs_poll_interval_ms": 60000,
+            "update_remote": "origin",
+            "update_branch": "main",
+        },
     )
 
     client = TestClient(web_app.app)
@@ -262,14 +352,206 @@ def test_health_exposes_server_polling_config(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["server"] == {
+        "host": "127.0.0.1",
+        "port": 8000,
         "health_poll_interval_ms": 60000,
         "jobs_poll_interval_ms": 60000,
+        "update_remote": "origin",
+        "update_branch": "main",
     }
     assert response.json()["chat"] == {
         "context_window": web_app.CHAT_CONFIG["context_window"],
         "llm_num_predict": web_app.CHAT_CONFIG["llm_num_predict"],
         "retrieval_min_score": web_app.CHAT_CONFIG["retrieval_min_score"],
     }
+
+
+def test_update_status_reports_current(monkeypatch):
+    _set_update_config(monkeypatch)
+    monkeypatch.setattr(web_app, "job_queue", IdleQueue())
+    calls = _install_update_git(monkeypatch, current_sha="a" * 40, latest_sha="a" * 40)
+
+    status = web_app.get_update_status()
+
+    assert status["state"] == "current"
+    assert status["can_update"] is False
+    assert status["current_sha"] == "a" * 40
+    assert any(call[0:2] == ["fetch", "--quiet"] for call in calls)
+
+
+def test_update_status_reports_available(monkeypatch):
+    _set_update_config(monkeypatch)
+    monkeypatch.setattr(web_app, "job_queue", IdleQueue())
+    _install_update_git(
+        monkeypatch,
+        current_sha="a" * 40,
+        latest_sha="b" * 40,
+        current_is_ancestor=True,
+    )
+
+    status = web_app.get_update_status()
+
+    assert status["state"] == "available"
+    assert status["can_update"] is True
+    assert status["current_sha"] == "a" * 40
+    assert status["latest_sha"] == "b" * 40
+
+
+def test_update_status_blocks_dirty_tracked_files(monkeypatch):
+    _set_update_config(monkeypatch)
+    monkeypatch.setattr(web_app, "job_queue", IdleQueue())
+    calls = _install_update_git(monkeypatch, dirty=" M src/web_app.py\n")
+
+    status = web_app.get_update_status()
+
+    assert status["state"] == "blocked"
+    assert "Tracked files" in status["message"]
+    assert not any(call[0:2] == ["fetch", "--quiet"] for call in calls)
+
+
+def test_update_status_blocks_wrong_branch(monkeypatch):
+    _set_update_config(monkeypatch)
+    monkeypatch.setattr(web_app, "job_queue", IdleQueue())
+    _install_update_git(monkeypatch, current_branch="web-ui")
+
+    status = web_app.get_update_status()
+
+    assert status["state"] == "blocked"
+    assert status["current_branch"] == "web-ui"
+    assert "origin/main" in status["message"]
+
+
+def test_update_status_blocks_diverged_history(monkeypatch):
+    _set_update_config(monkeypatch)
+    monkeypatch.setattr(web_app, "job_queue", IdleQueue())
+    _install_update_git(
+        monkeypatch,
+        current_sha="a" * 40,
+        latest_sha="b" * 40,
+        current_is_ancestor=False,
+        latest_is_ancestor=False,
+    )
+
+    status = web_app.get_update_status()
+
+    assert status["state"] == "blocked"
+    assert "diverged" in status["message"]
+
+
+def test_update_status_reports_fetch_error(monkeypatch):
+    _set_update_config(monkeypatch)
+    monkeypatch.setattr(web_app, "job_queue", IdleQueue())
+    _install_update_git(monkeypatch, fetch_returncode=128)
+
+    status = web_app.get_update_status()
+
+    assert status["state"] == "error"
+    assert "Unable to fetch" in status["message"]
+
+
+def test_update_apply_pull_failure_does_not_restart(monkeypatch):
+    _set_update_config(monkeypatch)
+    spawned = []
+    monkeypatch.setattr(
+        web_app,
+        "get_update_status",
+        lambda fetch=True: {
+            "state": "available",
+            "can_update": True,
+            "current_sha": "a" * 40,
+            "latest_sha": "b" * 40,
+            "current_branch": "main",
+            "target_remote": "origin",
+            "target_branch": "main",
+            "message": "Update available.",
+        },
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_run_git",
+        lambda args, *, timeout=web_app.GIT_TIMEOUT_SECONDS: _completed(
+            args,
+            stderr="fast-forward failed",
+            returncode=1,
+        ),
+    )
+    monkeypatch.setattr(web_app, "_spawn_restart_helper", lambda **kwargs: spawned.append(kwargs))
+
+    with pytest.raises(web_app.HTTPException) as exc_info:
+        web_app.apply_available_update()
+
+    assert exc_info.value.status_code == 500
+    assert "fast-forward failed" in exc_info.value.detail["message"]
+    assert spawned == []
+
+
+def test_update_apply_endpoint_pulls_spawns_restart_and_schedules_exit(monkeypatch):
+    _set_update_config(monkeypatch)
+    git_calls = []
+    spawned = []
+    scheduled = []
+    monkeypatch.setattr(web_app, "_require_loopback_request", lambda request: None)
+    monkeypatch.setattr(
+        web_app,
+        "get_update_status",
+        lambda fetch=True: {
+            "state": "available",
+            "can_update": True,
+            "current_sha": "a" * 40,
+            "latest_sha": "b" * 40,
+            "current_branch": "main",
+            "target_remote": "origin",
+            "target_branch": "main",
+            "message": "Update available.",
+        },
+    )
+
+    def fake_run_git(args, *, timeout=web_app.GIT_TIMEOUT_SECONDS):
+        git_calls.append(args)
+        if args == ["pull", "--ff-only", "origin", "main"]:
+            return _completed(args)
+        if args == ["rev-parse", "HEAD"]:
+            return _completed(args, stdout=f"{'b' * 40}\n")
+        return _completed(args, stderr=f"unexpected git args: {args}", returncode=1)
+
+    monkeypatch.setattr(web_app, "_run_git", fake_run_git)
+    monkeypatch.setattr(web_app, "_spawn_restart_helper", lambda **kwargs: spawned.append(kwargs))
+    monkeypatch.setattr(web_app, "_schedule_process_exit", lambda: scheduled.append(True))
+
+    client = TestClient(web_app.app)
+    response = client.post("/api/update/apply")
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "restarting"
+    assert response.json()["previous_sha"] == "a" * 40
+    assert response.json()["current_sha"] == "b" * 40
+    assert git_calls[0] == ["pull", "--ff-only", "origin", "main"]
+    assert spawned == [{"old_pid": web_app.os.getpid(), "host": "127.0.0.1", "port": 8000}]
+    assert scheduled == [True]
+
+
+def test_update_apply_rejects_active_query(monkeypatch):
+    class ActiveQueue:
+        def summary(self):
+            return {"active_query_count": 1, "queued_count": 0, "running_job_ids": [], "job_count": 0}
+
+    _set_update_config(monkeypatch)
+    monkeypatch.setattr(web_app, "job_queue", ActiveQueue())
+    _install_update_git(monkeypatch)
+
+    with pytest.raises(web_app.HTTPException) as exc_info:
+        web_app.apply_available_update()
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["state"] == "blocked"
+    assert "active chat query" in exc_info.value.detail["message"]
+
+
+def test_update_apply_requires_loopback_request():
+    assert web_app._is_loopback_host("127.0.0.1") is True
+    assert web_app._is_loopback_host("127.10.1.2") is True
+    assert web_app._is_loopback_host("::1") is True
+    assert web_app._is_loopback_host("192.168.1.20") is False
 
 
 def test_queue_pauses_new_work_while_query_is_active(workspace_tmp):

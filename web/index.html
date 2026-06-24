@@ -12,11 +12,16 @@
         <h1>Local FSAE RAG</h1>
         <p id="statusLine">Checking local index...</p>
       </div>
-      <nav class="tabs" aria-label="Views">
-        <button class="tab active" data-tab-target="upload">Upload</button>
-        <button class="tab" data-tab-target="index">Index</button>
-        <button class="tab" data-tab-target="chat">Chat</button>
-      </nav>
+      <div class="app-header-actions">
+        <nav class="tabs" aria-label="Views">
+          <button class="tab active" data-tab-target="upload">Upload</button>
+          <button class="tab" data-tab-target="index">Index</button>
+          <button class="tab" data-tab-target="chat">Chat</button>
+        </nav>
+        <button id="updateButton" class="update-button update-checking" type="button" title="Checking for updates">
+          Checking
+        </button>
+      </div>
     </header>
 
     <main>

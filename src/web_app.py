@@ -3,8 +3,11 @@ from __future__ import annotations
 import html
 import hashlib
 import json
+import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
 import uuid
 from collections import deque
@@ -13,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -62,6 +65,12 @@ DEFAULT_CHUNK_TARGET_TOKENS = 900
 DEFAULT_CHUNK_OVERLAP_TOKENS = 120
 DEFAULT_HEALTH_POLL_INTERVAL_MS = 60_000
 DEFAULT_JOBS_POLL_INTERVAL_MS = 60_000
+DEFAULT_SERVER_HOST = "127.0.0.1"
+DEFAULT_SERVER_PORT = 8000
+DEFAULT_UPDATE_REMOTE = "origin"
+DEFAULT_UPDATE_BRANCH = "main"
+GIT_TIMEOUT_SECONDS = 30.0
+GIT_PULL_TIMEOUT_SECONDS = 300.0
 
 INDEX_LOCK = threading.RLock()
 
@@ -92,6 +101,11 @@ def _positive_float(value: Any, default: float) -> float:
     return parsed if parsed > 0 else default
 
 
+def _nonempty_str(value: Any, default: str) -> str:
+    text = str(value or "").strip()
+    return text or default
+
+
 def _load_toml_config(config_path: Path) -> dict[str, Any]:
     if not config_path.exists():
         return {}
@@ -105,12 +119,14 @@ def _load_toml_config(config_path: Path) -> dict[str, Any]:
         return {}
 
 
-def _load_server_config(config_path: Path | None = None) -> dict[str, int]:
+def _load_server_config(config_path: Path | None = None) -> dict[str, Any]:
     config_path = config_path or (ROOT_DIR / "config.toml")
     payload = _load_toml_config(config_path)
     server_config = payload.get("server", {}) if isinstance(payload.get("server"), dict) else {}
 
     return {
+        "host": _nonempty_str(server_config.get("host"), DEFAULT_SERVER_HOST),
+        "port": _positive_int(server_config.get("port"), DEFAULT_SERVER_PORT),
         "health_poll_interval_ms": _positive_int(
             server_config.get("health_poll_interval_ms"),
             DEFAULT_HEALTH_POLL_INTERVAL_MS,
@@ -119,6 +135,8 @@ def _load_server_config(config_path: Path | None = None) -> dict[str, int]:
             server_config.get("jobs_poll_interval_ms"),
             DEFAULT_JOBS_POLL_INTERVAL_MS,
         ),
+        "update_remote": _nonempty_str(server_config.get("update_remote"), DEFAULT_UPDATE_REMOTE),
+        "update_branch": _nonempty_str(server_config.get("update_branch"), DEFAULT_UPDATE_BRANCH),
     }
 
 
@@ -160,6 +178,286 @@ CHAT_CONFIG = _load_chat_config()
 
 def _index_store(db_dir: Path | None = None):
     return default_store(db_dir or DB_DIR)
+
+
+def _git_target_valid(value: str) -> bool:
+    if not value or value.startswith(("-", "/", "\\")):
+        return False
+    if value.endswith(("/", ".", ".lock")):
+        return False
+    if ".." in value or "@{" in value or "\\" in value:
+        return False
+    return re.fullmatch(r"[A-Za-z0-9._/-]+", value) is not None
+
+
+def _run_git(args: list[str], *, timeout: float = GIT_TIMEOUT_SECONDS) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=ROOT_DIR,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _git_failure_message(args: list[str], result: subprocess.CompletedProcess[str]) -> str:
+    detail = (result.stderr or result.stdout or "").strip()
+    if detail:
+        return detail
+    return f"git {' '.join(args)} failed with exit code {result.returncode}"
+
+
+def _git_output(args: list[str], *, timeout: float = GIT_TIMEOUT_SECONDS) -> str:
+    result = _run_git(args, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(_git_failure_message(args, result))
+    return result.stdout.strip()
+
+
+def _git_is_ancestor(ancestor_sha: str, descendant_sha: str) -> bool:
+    result = _run_git(["merge-base", "--is-ancestor", ancestor_sha, descendant_sha])
+    if result.returncode in {0, 1}:
+        return result.returncode == 0
+    raise RuntimeError(_git_failure_message(["merge-base", "--is-ancestor", ancestor_sha, descendant_sha], result))
+
+
+def _update_target() -> tuple[str, str]:
+    return str(SERVER_CONFIG["update_remote"]), str(SERVER_CONFIG["update_branch"])
+
+
+def _update_response(
+    *,
+    state: str,
+    message: str,
+    current_sha: str = "",
+    latest_sha: str = "",
+    current_branch: str = "",
+    can_update: bool = False,
+) -> dict[str, Any]:
+    remote, branch = _update_target()
+    return {
+        "state": state,
+        "can_update": can_update,
+        "current_sha": current_sha,
+        "latest_sha": latest_sha,
+        "current_branch": current_branch,
+        "target_remote": remote,
+        "target_branch": branch,
+        "message": message,
+    }
+
+
+def _active_update_blocker() -> str:
+    summary = job_queue.summary()
+    if int(summary.get("active_query_count") or 0) > 0:
+        return "An active chat query is running. Try updating after it finishes."
+    if summary.get("running_job_ids"):
+        return "An ingestion or indexing job is running. Try updating after it finishes."
+    if int(summary.get("queued_count") or 0) > 0:
+        return "Queued ingestion or indexing work is pending. Try updating after the queue finishes."
+    return ""
+
+
+def get_update_status(*, fetch: bool = True) -> dict[str, Any]:
+    remote, branch = _update_target()
+    current_branch = ""
+    current_sha = ""
+    latest_sha = ""
+
+    if not _git_target_valid(remote) or not _git_target_valid(branch):
+        return _update_response(
+            state="blocked",
+            message="Update remote or branch contains unsupported characters.",
+        )
+
+    try:
+        current_branch = _git_output(["branch", "--show-current"])
+        current_sha = _git_output(["rev-parse", "HEAD"])
+
+        if current_branch != branch:
+            return _update_response(
+                state="blocked",
+                current_branch=current_branch,
+                current_sha=current_sha,
+                message=f"Auto-update is configured for {remote}/{branch}, but the server is running {current_branch or 'detached HEAD'}.",
+            )
+
+        dirty = _git_output(["status", "--porcelain", "--untracked-files=no"])
+        if dirty:
+            return _update_response(
+                state="blocked",
+                current_branch=current_branch,
+                current_sha=current_sha,
+                message="Tracked files have local changes. Commit or stash them before updating.",
+            )
+
+        blocker = _active_update_blocker()
+        if blocker:
+            return _update_response(
+                state="blocked",
+                current_branch=current_branch,
+                current_sha=current_sha,
+                message=blocker,
+            )
+
+        remote_ref = f"refs/remotes/{remote}/{branch}"
+        if fetch:
+            refspec = f"+refs/heads/{branch}:{remote_ref}"
+            fetch_result = _run_git(["fetch", "--quiet", remote, refspec])
+            if fetch_result.returncode != 0:
+                return _update_response(
+                    state="error",
+                    current_branch=current_branch,
+                    current_sha=current_sha,
+                    message=f"Unable to fetch {remote}/{branch}: {_git_failure_message(['fetch', remote, branch], fetch_result)}",
+                )
+
+        latest_sha = _git_output(["rev-parse", "--verify", remote_ref])
+        if current_sha == latest_sha:
+            return _update_response(
+                state="current",
+                current_branch=current_branch,
+                current_sha=current_sha,
+                latest_sha=latest_sha,
+                message=f"Already on the latest {remote}/{branch} commit.",
+            )
+
+        if _git_is_ancestor(current_sha, latest_sha):
+            return _update_response(
+                state="available",
+                can_update=True,
+                current_branch=current_branch,
+                current_sha=current_sha,
+                latest_sha=latest_sha,
+                message=f"Update available from {current_sha[:7]} to {latest_sha[:7]}.",
+            )
+
+        if _git_is_ancestor(latest_sha, current_sha):
+            return _update_response(
+                state="current",
+                current_branch=current_branch,
+                current_sha=current_sha,
+                latest_sha=latest_sha,
+                message=f"Local {branch} is ahead of {remote}/{branch}; no update is required.",
+            )
+
+        return _update_response(
+            state="blocked",
+            current_branch=current_branch,
+            current_sha=current_sha,
+            latest_sha=latest_sha,
+            message=f"Local {branch} and {remote}/{branch} have diverged. Resolve Git history manually.",
+        )
+    except subprocess.TimeoutExpired:
+        return _update_response(
+            state="error",
+            current_branch=current_branch,
+            current_sha=current_sha,
+            latest_sha=latest_sha,
+            message="Timed out while checking for updates.",
+        )
+    except Exception as exc:
+        return _update_response(
+            state="error",
+            current_branch=current_branch,
+            current_sha=current_sha,
+            latest_sha=latest_sha,
+            message=str(exc),
+        )
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    value = str(host or "").strip().lower()
+    if value == "localhost":
+        return True
+    if value.startswith("127."):
+        return True
+    return value in {"::1", "0:0:0:0:0:0:0:1"}
+
+
+def _require_loopback_request(request: Request) -> None:
+    client_host = request.client.host if request.client else ""
+    if not _is_loopback_host(client_host):
+        raise HTTPException(status_code=403, detail="Updates can only be started from the local machine.")
+
+
+def _spawn_restart_helper(*, old_pid: int, host: str, port: int) -> None:
+    command = [
+        sys.executable,
+        "-m",
+        "src.restart_server",
+        "--root",
+        str(ROOT_DIR),
+        "--old-pid",
+        str(old_pid),
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--app",
+        "src.web_app:app",
+    ]
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess,
+            "CREATE_NEW_PROCESS_GROUP",
+            0,
+        )
+    subprocess.Popen(
+        command,
+        cwd=ROOT_DIR,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=creationflags,
+    )
+
+
+def _schedule_process_exit(delay_seconds: float = 0.5) -> None:
+    timer = threading.Timer(delay_seconds, lambda: os._exit(0))
+    timer.daemon = True
+    timer.start()
+
+
+def apply_available_update() -> dict[str, Any]:
+    status = get_update_status(fetch=True)
+    if not status.get("can_update"):
+        raise HTTPException(status_code=409, detail=status)
+
+    remote = str(status["target_remote"])
+    branch = str(status["target_branch"])
+    previous_sha = str(status["current_sha"])
+
+    pull_result = _run_git(["pull", "--ff-only", remote, branch], timeout=GIT_PULL_TIMEOUT_SECONDS)
+    if pull_result.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=_update_response(
+                state="error",
+                current_branch=str(status.get("current_branch") or ""),
+                current_sha=previous_sha,
+                latest_sha=str(status.get("latest_sha") or ""),
+                message=f"Unable to pull {remote}/{branch}: {_git_failure_message(['pull', '--ff-only', remote, branch], pull_result)}",
+            ),
+        )
+
+    current_sha = _git_output(["rev-parse", "HEAD"])
+    _spawn_restart_helper(
+        old_pid=os.getpid(),
+        host=str(SERVER_CONFIG["host"]),
+        port=int(SERVER_CONFIG["port"]),
+    )
+    return {
+        "state": "restarting",
+        "previous_sha": previous_sha,
+        "current_sha": current_sha,
+        "target_remote": remote,
+        "target_branch": branch,
+        "message": f"Updated to {current_sha[:7]}. Restarting server.",
+    }
 
 
 def list_index_rows(
@@ -807,6 +1105,19 @@ def health():
         },
         "queue": job_queue.summary(),
     }
+
+
+@app.get("/api/update/status")
+def update_status():
+    return get_update_status(fetch=True)
+
+
+@app.post("/api/update/apply")
+def update_apply(request: Request, background_tasks: BackgroundTasks):
+    _require_loopback_request(request)
+    response = apply_available_update()
+    background_tasks.add_task(_schedule_process_exit)
+    return response
 
 
 @app.post("/api/render")

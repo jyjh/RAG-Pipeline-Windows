@@ -13,14 +13,20 @@ const state = {
   jobsPollIntervalMs: 60000,
   healthTimer: null,
   jobsTimer: null,
+  updateTimer: null,
+  updateApplying: false,
 };
 
 const LIVE_RENDER_INTERVAL_MS = 200;
+const UPDATE_POLL_INTERVAL_MS = 5 * 60 * 1000;
+const RESTART_POLL_INTERVAL_MS = 1000;
+const RESTART_POLL_TIMEOUT_MS = 120000;
 const CHAT_STORAGE_KEY = "rag.chatHistory.v1";
 const CHAT_UI_STORAGE_KEY = "rag.chatUi.v1";
 
 const els = {
   statusLine: document.getElementById("statusLine"),
+  updateButton: document.getElementById("updateButton"),
   fileInput: document.getElementById("fileInput"),
   uploadButton: document.getElementById("uploadButton"),
   reindexButton: document.getElementById("reindexButton"),
@@ -88,6 +94,10 @@ async function requestJson(path, options = {}) {
     throw error;
   }
   return response.json();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function renderMarkdown(text) {
@@ -498,6 +508,87 @@ function applyServerConfig(config) {
   }
 }
 
+function setUpdateButton(kind, text, title, disabled = false) {
+  els.updateButton.className = `update-button update-${kind}`;
+  els.updateButton.textContent = text;
+  els.updateButton.title = title || text;
+  els.updateButton.disabled = disabled;
+}
+
+function shortSha(value) {
+  return value ? String(value).slice(0, 7) : "";
+}
+
+function renderUpdateStatus(data) {
+  const message = data.message || "Update status unavailable.";
+  if (data.state === "current") {
+    const sha = shortSha(data.current_sha);
+    setUpdateButton("current", sha ? `Current ${sha}` : "Current", message, true);
+    return;
+  }
+  if (data.state === "available" && data.can_update) {
+    const latest = shortSha(data.latest_sha);
+    setUpdateButton("available", latest ? `Update ${latest}` : "Update", message);
+    return;
+  }
+  if (data.state === "blocked") {
+    setUpdateButton("warning", "Blocked", message, true);
+    return;
+  }
+  if (data.state === "error") {
+    setUpdateButton("error", "Update error", message, true);
+    return;
+  }
+  setUpdateButton("warning", "Update", message, true);
+}
+
+async function refreshUpdateStatus() {
+  if (state.updateApplying) {
+    return;
+  }
+  setUpdateButton("checking", "Checking", "Checking for updates", true);
+  try {
+    const data = await requestJson("/api/update/status");
+    renderUpdateStatus(data);
+  } catch (error) {
+    setUpdateButton("error", "Update error", error.message, true);
+  }
+}
+
+async function waitForRestart() {
+  const startedAt = Date.now();
+  let sawServerDown = false;
+  while (Date.now() - startedAt < RESTART_POLL_TIMEOUT_MS) {
+    await sleep(RESTART_POLL_INTERVAL_MS);
+    try {
+      const response = await fetch("/api/health", { cache: "no-store" });
+      if (response.ok && (sawServerDown || Date.now() - startedAt > 3000)) {
+        return;
+      }
+    } catch (_) {
+      sawServerDown = true;
+    }
+  }
+  throw new Error("Timed out waiting for the restarted server.");
+}
+
+async function applyUpdate() {
+  if (state.updateApplying) {
+    return;
+  }
+  state.updateApplying = true;
+  setUpdateButton("restarting", "Updating", "Pulling latest commit and restarting", true);
+  try {
+    const data = await requestJson("/api/update/apply", { method: "POST" });
+    setUpdateButton("restarting", "Restarting", data.message || "Restarting server", true);
+    await waitForRestart();
+    window.location.reload();
+  } catch (error) {
+    state.updateApplying = false;
+    setUpdateButton("error", "Update error", error.message, true);
+  }
+}
+
 async function refreshJobs() {
   try {
     const data = await requestJson("/api/jobs");
@@ -555,6 +646,13 @@ function scheduleJobsPolling() {
     clearInterval(state.jobsTimer);
   }
   state.jobsTimer = setInterval(refreshJobs, state.jobsPollIntervalMs);
+}
+
+function scheduleUpdatePolling() {
+  if (state.updateTimer) {
+    clearInterval(state.updateTimer);
+  }
+  state.updateTimer = setInterval(refreshUpdateStatus, UPDATE_POLL_INTERVAL_MS);
 }
 
 function duplicateUploadMessage(detail) {
@@ -1119,6 +1217,7 @@ document.querySelectorAll("[data-tab-target]").forEach((button) => {
   });
 });
 
+els.updateButton.addEventListener("click", applyUpdate);
 els.uploadButton.addEventListener("click", uploadFiles);
 els.reindexButton.addEventListener("click", enqueueReindex);
 els.pdfSearchButton.addEventListener("click", () => {
@@ -1179,7 +1278,9 @@ renderSavedChats();
 renderActiveChat();
 persistChatState();
 refreshHealth();
+refreshUpdateStatus();
 refreshJobs();
 refreshPdfs();
 scheduleHealthPolling();
+scheduleUpdatePolling();
 scheduleJobsPolling();
