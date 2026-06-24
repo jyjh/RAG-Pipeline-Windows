@@ -1,1 +1,0 @@
-{"backend": "local_vector", "embedding_dim": 3, "records": [{"id": "a:0", "file_path": "a.md", "chunk_index": 0, "content": "alpha context", "vector": [1.0, 0.0, 0.0]}, {"id": "b:0", "file_path": "b.md", "chunk_index": 0, "content": "beta context", "vector": [0.0, 1.0, 0.0]}]}
