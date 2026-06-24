@@ -1,10 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-import contextvars
 import json
 import hashlib
 import logging
-import re
 import os
 import shutil
 import socket
@@ -63,35 +61,24 @@ def _ollama_host() -> str:
         return host.rstrip("/")
     return f"http://{host.rstrip('/')}"
 
-# Thread-safe flag for asymmetric Nomic prefix switching.
-# Set to "query" before rag.query(), leave as "document" (default) during indexing.
-# contextvars propagates correctly through asyncio.to_thread().
-embedding_mode = contextvars.ContextVar("embedding_mode", default="document")
-
-
 class EmbeddingEngine:
     """
-    CPU-bound Nomic MRL embedding engine with an internal cache to avoid
-    double-embedding during chunking_func dedup + LightRAG indexing.
+    Ollama-backed embedding engine with an internal cache.
 
     The cache is keyed on (text, truncate_dim, prefix) and stores the
-    computed numpy vector. When the custom chunking_func embeds chunks for
-    ANN dedup, results are cached. When LightRAG subsequently calls
-    mrl_embedding_func on the same text, the cache returns the precomputed
-    vector — zero redundant computation.
+    computed numpy vector. When the local index or query path requests
+    the same text again, the cache returns the precomputed
+    vector and avoids redundant computation.
     """
 
     def __init__(
         self,
         model_name="nomic-embed-text",
         *,
-        backend: str = "ollama",
-        local_files_only: bool = True,
         ollama_batch_size: int | None = None,
         ollama_timeout: float | None = None,
     ):
         self.model_name = model_name
-        self.backend = self._normalize_backend(backend)
         self.ollama_batch_size = _positive_int(
             ollama_batch_size or os.environ.get("OLLAMA_EMBED_BATCH_SIZE"),
             8,
@@ -100,55 +87,16 @@ class EmbeddingEngine:
             ollama_timeout or os.environ.get("OLLAMA_EMBED_TIMEOUT"),
             30.0,
         )
-        self.model = None
         self._cache: dict[tuple[int, int, str], Any] = {}
 
-        if self.backend == "hash":
-            logger.warning("Using deterministic hash embeddings; retrieval quality is degraded.")
-            return
-        if self.backend == "ollama":
-            if model_name == "nomic-ai/nomic-embed-text-v1.5":
-                model_name = "nomic-embed-text"
-                self.model_name = model_name
-            logger.info("Using Ollama embedding model: %s", model_name)
-            _status(
-                f"Using Ollama embedding model: {model_name} "
-                f"(batch_size={self.ollama_batch_size}, timeout={self.ollama_timeout:g}s)"
-            )
-            return
-
-        logger.info(f"Loading embedding model on CPU: {model_name}")
-        logger.info("SentenceTransformer local_files_only=%s", local_files_only)
-        model_source = model_name
-        if local_files_only:
-            _status(f"Resolving local Hugging Face snapshot for {model_name}...")
-            from huggingface_hub import snapshot_download
-
-            model_source = snapshot_download(repo_id=model_name, local_files_only=True)
-            _status(f"Using local embedding snapshot: {model_source}")
-
-        _status("Importing sentence_transformers package...")
-        from sentence_transformers import SentenceTransformer
-
-        _status("Constructing SentenceTransformer model...")
-        self.model = SentenceTransformer(
-            model_source,
-            trust_remote_code=True,
-            device="cpu",
-            local_files_only=local_files_only,
+        if model_name == "nomic-ai/nomic-embed-text-v1.5":
+            model_name = "nomic-embed-text"
+            self.model_name = model_name
+        logger.info("Using Ollama embedding model: %s", model_name)
+        _status(
+            f"Using Ollama embedding model: {model_name} "
+            f"(batch_size={self.ollama_batch_size}, timeout={self.ollama_timeout:g}s)"
         )
-        _status("SentenceTransformer embedding model loaded.")
-
-    @staticmethod
-    def _normalize_backend(backend: str) -> str:
-        normalized = backend.lower().replace("_", "-")
-        if normalized in {"sentence-transformer", "sentence-transformers", "st"}:
-            return "sentence-transformers"
-        if normalized == "ollama":
-            return "ollama"
-        if normalized in {"hash", "hashed"}:
-            return "hash"
-        raise ValueError("embedding backend must be one of: hash, ollama, sentence-transformers")
 
     def _cache_key(self, text: str, truncate_dim: int, prefix: str) -> tuple[int, int, str]:
         digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
@@ -161,10 +109,10 @@ class EmbeddingEngine:
         prefix: str = "search_document: ",
     ):
         """
-        Generates Matryoshka embeddings truncated to truncate_dim and L2-normalized.
+        Generates Ollama embeddings truncated to truncate_dim and L2-normalized.
 
-        Cache-aware: checks _cache first per text; only computes misses.
-        Returns a single (N, truncate_dim) array.
+        Use `search_document: ` during indexing and `search_query: ` during retrieval
+        with `nomic-embed-text`.
         """
         import numpy as np
 
@@ -182,27 +130,10 @@ class EmbeddingEngine:
                 to_compute_texts.append(text)
 
         if to_compute_texts:
-            if self.backend == "hash":
-                truncated = np.array(
-                    [
-                        self._hash_embedding(f"{prefix}{text}", truncate_dim)
-                        for text in to_compute_texts
-                    ],
-                    dtype=np.float32,
-                )
-            elif self.backend == "ollama":
-                truncated = self._ollama_embeddings(
-                    [f"{prefix}{text}" for text in to_compute_texts],
-                    truncate_dim,
-                )
-            else:
-                assert self.model is not None
-                prefixed = [f"{prefix}{t}" for t in to_compute_texts]
-                full = self.model.encode(prefixed, convert_to_numpy=True)
-                truncated = full[:, :truncate_dim].copy()
-                norms = np.linalg.norm(truncated, axis=1, keepdims=True)
-                norms = np.where(norms == 0, 1, norms)
-                truncated = truncated / norms
+            truncated = self._ollama_embeddings(
+                [f"{prefix}{text}" for text in to_compute_texts],
+                truncate_dim,
+            )
 
             for j, idx in enumerate(to_compute_indices):
                 key = self._cache_key(texts[idx], truncate_dim, prefix)
@@ -302,23 +233,3 @@ class EmbeddingEngine:
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Ollama request failed at {url}: {exc}") from exc
 
-    @staticmethod
-    def _hash_embedding(text: str, dim: int):
-        import numpy as np
-
-        vec = np.zeros(dim, dtype=np.float32)
-        tokens = re.findall(r"\w+|[^\w\s]", text.lower())
-        if not tokens:
-            tokens = [text]
-
-        for token in tokens:
-            digest = hashlib.blake2b(token.encode("utf-8", errors="ignore"), digest_size=16).digest()
-            index = int.from_bytes(digest[:4], "little") % dim
-            sign = 1.0 if digest[4] & 1 else -1.0
-            weight = 1.0 + digest[5] / 255.0
-            vec[index] += sign * weight
-
-        norm = np.linalg.norm(vec)
-        if norm == 0:
-            return vec
-        return vec / norm

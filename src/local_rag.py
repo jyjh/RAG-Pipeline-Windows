@@ -10,6 +10,7 @@ from typing import Any
 
 
 INDEX_FILENAME = "local_vector_index.json"
+QUERY_TEMPERATURE = 0.9
 
 
 def _status(message: str, *, enabled: bool = True) -> None:
@@ -69,6 +70,78 @@ def _positive_int(value: int | str | None, default: int) -> int:
     return max(1, parsed)
 
 
+def _ollama_response_content(response: Any) -> str:
+    if isinstance(response, dict):
+        message = response.get("message") or {}
+        if isinstance(message, dict):
+            return message.get("content") or ""
+        return getattr(message, "content", "") or ""
+
+    message = getattr(response, "message", None)
+    if isinstance(message, dict):
+        return message.get("content") or ""
+    return getattr(message, "content", "") or ""
+
+
+def _ollama_response_thinking(response: Any) -> str:
+    fields = ("thinking", "reasoning", "reasoning_content")
+    if isinstance(response, dict):
+        message = response.get("message") or {}
+        if isinstance(message, dict):
+            for field in fields:
+                if message.get(field):
+                    return str(message[field])
+        for field in fields:
+            if response.get(field):
+                return str(response[field])
+        return ""
+
+    message = getattr(response, "message", None)
+    if isinstance(message, dict):
+        for field in fields:
+            if message.get(field):
+                return str(message[field])
+    else:
+        for field in fields:
+            value = getattr(message, field, None)
+            if value:
+                return str(value)
+
+    for field in fields:
+        value = getattr(response, field, None)
+        if value:
+            return str(value)
+    return ""
+
+
+def _split_think_tag_events(content: str, *, in_thinking: bool) -> tuple[list[dict[str, str]], bool]:
+    events: list[dict[str, str]] = []
+    text = content
+    while text:
+        if in_thinking:
+            end = text.find("</think>")
+            if end == -1:
+                if text:
+                    events.append({"type": "thinking", "text": text})
+                return events, True
+            if end > 0:
+                events.append({"type": "thinking", "text": text[:end]})
+            text = text[end + len("</think>") :]
+            in_thinking = False
+            continue
+
+        start = text.find("<think>")
+        if start == -1:
+            if text:
+                events.append({"type": "answer", "text": text})
+            return events, False
+        if start > 0:
+            events.append({"type": "answer", "text": text[:start]})
+        text = text[start + len("<think>") :]
+        in_thinking = True
+    return events, in_thinking
+
+
 def chunk_markdown(text: str, *, max_chars: int = 3000, overlap: int = 400) -> list[str]:
     paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
     chunks: list[str] = []
@@ -113,9 +186,7 @@ class LocalVectorIndexer:
         self,
         working_dir: str = "./db",
         *,
-        embedding_backend: str = "ollama",
         embedding_model: str = "nomic-embed-text",
-        embedding_local_files_only: bool = True,
         embedding_batch_size: int | None = None,
         embedding_timeout: float | None = None,
         progress_enabled: bool = True,
@@ -124,27 +195,27 @@ class LocalVectorIndexer:
 
         self.working_dir = working_dir
         self.progress_enabled = progress_enabled
-        self.embedding_backend = embedding_backend.lower()
+        self.embedding_model = (
+            "nomic-embed-text"
+            if embedding_model == "nomic-ai/nomic-embed-text-v1.5"
+            else embedding_model
+        )
         self.embedding_batch_size = _positive_int(
             embedding_batch_size or os.environ.get("LOCAL_RAG_EMBED_BATCH_SIZE"),
             8,
         )
         _status(
-            f"Local index: using embedding backend {embedding_backend} with model {embedding_model} "
+            f"Local index: using Ollama embedding model {self.embedding_model} "
             f"(batch_size={self.embedding_batch_size})",
             enabled=progress_enabled,
         )
         self.engine = EmbeddingEngine(
-            model_name=embedding_model,
-            backend=embedding_backend,
-            local_files_only=embedding_local_files_only,
+            model_name=self.embedding_model,
             ollama_batch_size=self.embedding_batch_size,
             ollama_timeout=embedding_timeout,
         )
 
     def _preflight_embeddings(self) -> None:
-        if self.embedding_backend != "ollama":
-            return
         _status("Local index: checking Ollama embedding endpoint...", enabled=self.progress_enabled)
         try:
             self.engine.get_mrl_embeddings(
@@ -155,7 +226,6 @@ class LocalVectorIndexer:
         except Exception as exc:
             raise RuntimeError(
                 "Ollama embedding preflight failed. Restart Ollama, then retry. "
-                "To bypass Ollama embeddings, rerun with `--embedding_backend hash`. "
                 f"Original error: {exc}"
             ) from exc
         _status("Local index: Ollama embedding endpoint responded.", enabled=self.progress_enabled)
@@ -223,6 +293,7 @@ class LocalVectorIndexer:
 
         payload = {
             "backend": "local_vector",
+            "embedding_model": self.embedding_model,
             "embedding_dim": 768,
             "records": records,
         }
@@ -240,13 +311,12 @@ class LocalQueryEngine:
         working_dir: str = "./db",
         *,
         model: str = "gemma4",
-        embedding_backend: str = "ollama",
         embedding_model: str = "nomic-embed-text",
-        embedding_local_files_only: bool = True,
         embedding_batch_size: int | None = None,
         embedding_timeout: float | None = None,
         progress_enabled: bool = True,
         top_k: int = 5,
+        num_predict: int | None = None,
     ):
         from src.embeddings import EmbeddingEngine
 
@@ -254,14 +324,41 @@ class LocalQueryEngine:
         self.model = model
         self.progress_enabled = progress_enabled
         self.top_k = top_k
+        self.num_predict = _positive_int(
+            num_predict or os.environ.get("LOCAL_RAG_NUM_PREDICT"),
+            768,
+        )
         self.engine = EmbeddingEngine(
             model_name=embedding_model,
-            backend=embedding_backend,
-            local_files_only=embedding_local_files_only,
             ollama_batch_size=embedding_batch_size,
             ollama_timeout=embedding_timeout,
         )
         self.records = self._load_records()
+
+    def _chat_messages(self, question: str, matches: list[dict[str, Any]]) -> list[dict[str, str]]:
+        context_blocks = []
+        for i, match in enumerate(matches, start=1):
+            context_blocks.append(
+                f"[{i}] {match['file_path']}#chunk-{match['chunk_index']}\n{match['content']}"
+            )
+        prompt = (
+            "Answer the question using only the context below. "
+            "Cite source numbers like [1] when relevant. "
+            "If the context is insufficient, say what is missing.\n\n"
+            f"Question: {question}\n\n"
+            "Context:\n"
+            + "\n\n".join(context_blocks)
+        )
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You answer from the supplied local context only. "
+                    "Write a complete answer in plain text and cite source numbers."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
 
     def _load_records(self) -> list[dict[str, Any]]:
         path = _index_path(self.working_dir)
@@ -295,24 +392,10 @@ class LocalQueryEngine:
             results.append(record)
         return results
 
-    def ask(self, question: str, mode: str = "hybrid") -> str:
+    def ask(self, question: str) -> str:
         matches = self._retrieve(question)
         if not matches:
             return "No local index records were found. Run index mode first."
-
-        context_blocks = []
-        for i, match in enumerate(matches, start=1):
-            context_blocks.append(
-                f"[{i}] {match['file_path']}#chunk-{match['chunk_index']}\n{match['content']}"
-            )
-        prompt = (
-            "Answer the question using only the context below. "
-            "Cite source numbers like [1] when relevant. "
-            "If the context is insufficient, say what is missing.\n\n"
-            f"Question: {question}\n\n"
-            "Context:\n"
-            + "\n\n".join(context_blocks)
-        )
 
         try:
             import ollama
@@ -323,14 +406,8 @@ class LocalQueryEngine:
             )
             response = ollama.chat(
                 model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You answer from the supplied local context only.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                options={"temperature": 0.1},
+                messages=self._chat_messages(question, matches),
+                options={"temperature": QUERY_TEMPERATURE, "num_predict": self.num_predict},
             )
         except Exception as exc:
             raise RuntimeError(
@@ -339,10 +416,64 @@ class LocalQueryEngine:
                 f"Original error: {exc}"
             ) from exc
 
-        if isinstance(response, dict):
-            message = response.get("message") or {}
-            return message.get("content") or ""
-        message = getattr(response, "message", None)
-        if isinstance(message, dict):
-            return message.get("content") or ""
-        return getattr(message, "content", "") or ""
+        content = _ollama_response_content(response).strip()
+        if not content:
+            raise RuntimeError(
+                f"Ollama returned an empty answer for model '{self.model}'. "
+                "Check the model response in Ollama logs or retry with a different --llm_model."
+            )
+        return content
+
+    def ask_stream(self, question: str):
+        for event in self.ask_stream_events(question):
+            if event["type"] == "answer":
+                yield event["text"]
+
+    def ask_stream_events(self, question: str):
+        matches = self._retrieve(question)
+        if not matches:
+            yield {"type": "answer", "text": "No local index records were found. Run index mode first."}
+            return
+
+        try:
+            import ollama
+
+            _status(
+                f"Local query: streaming answer from Ollama model {self.model}",
+                enabled=self.progress_enabled,
+            )
+            stream = ollama.chat(
+                model=self.model,
+                messages=self._chat_messages(question, matches),
+                options={"temperature": QUERY_TEMPERATURE, "num_predict": self.num_predict},
+                stream=True,
+            )
+            emitted = False
+            in_thinking = False
+            for chunk in stream:
+                thinking = _ollama_response_thinking(chunk)
+                if thinking:
+                    emitted = True
+                    yield {"type": "thinking", "text": thinking}
+
+                content = _ollama_response_content(chunk)
+                if content:
+                    events, in_thinking = _split_think_tag_events(
+                        content,
+                        in_thinking=in_thinking,
+                    )
+                    for event in events:
+                        emitted = True
+                        yield event
+        except Exception as exc:
+            raise RuntimeError(
+                f"Local Ollama streaming query failed for model '{self.model}'. "
+                f"Run `{_ollama_pull_command(self.model)}` and ensure Ollama is running. "
+                f"Original error: {exc}"
+            ) from exc
+
+        if not emitted:
+            raise RuntimeError(
+                f"Ollama returned an empty streamed answer for model '{self.model}'. "
+                "Check the model response in Ollama logs or retry with a different --llm_model."
+            )

@@ -91,7 +91,7 @@ class _LegacyDocumentProcessor:
 
         Inline injection is critical for RAG context quality: a figure describing
         a "Boltzmann probability density plot" must appear in the same chunk as the
-        surrounding text about "Boltzmann distribution" so that LightRAG's NER and
+        surrounding text about "Boltzmann distribution" so that local retrieval and
         the vector embeddings capture the relationship. Appending figures at the end
         of the document breaks this — vision descriptions would land in isolated chunks
         disconnected from the text that gives them meaning.

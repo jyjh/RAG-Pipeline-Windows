@@ -8,12 +8,8 @@ asset_dir = "db/assets"
 llm_model = "gemma4"
 vision_model = "qwen2.5vl:7b"
 embedding_model = "nomic-embed-text"
-embedding_backend = "ollama"
-embedding_local_files_only = true
-tokenizer_backend = "byte"
 reranker_model = ""
 embedding_dim = 768
-allow_hash_embeddings = true
 
 [ingestion]
 ocr_backend = "tesseract_cli"

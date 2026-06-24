@@ -10,15 +10,8 @@
 docling
 pypdf
 
-# Vector and metadata stores
-lancedb
-
 # Local LLM/VLM serving
 ollama
-
-# Embeddings and optional reranking
-sentence-transformers
-transformers
 
 # Numeric/runtime support
 numpy
@@ -31,12 +24,7 @@ fastapi
 uvicorn[standard]
 streamlit
 requests
-
-# Legacy/experimental graph path retained in src/indexing.py
-# Provides the `lightrag` import namespace used by this project.
-lightrag-hku
-networkx
-scikit-learn
+python-multipart
 
 # Deep learning runtime, install CUDA wheels explicitly where possible
 torch

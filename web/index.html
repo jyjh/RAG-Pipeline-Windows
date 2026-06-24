@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Local FSAE RAG</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <h1>Local FSAE RAG</h1>
+        <p id="statusLine">Checking local index...</p>
+      </div>
+      <nav class="tabs" aria-label="Views">
+        <button class="tab active" data-tab-target="upload">Upload</button>
+        <button class="tab" data-tab-target="index">Index</button>
+        <button class="tab" data-tab-target="chat">Chat</button>
+      </nav>
+    </header>
+
+    <main>
+      <section id="upload" class="panel active">
+        <div class="toolbar">
+          <input id="fileInput" type="file" accept="application/pdf,.pdf" multiple />
+          <button id="uploadButton" type="button">Upload + index</button>
+          <button id="reindexButton" type="button">Reindex</button>
+        </div>
+        <div id="uploadStatus" class="status"></div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Job</th>
+              <th>Status</th>
+              <th>Phase</th>
+              <th>Files</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody id="jobsBody"></tbody>
+        </table>
+      </section>
+
+      <section id="index" class="panel">
+        <div class="toolbar">
+          <input id="searchInput" type="search" placeholder="Search index" />
+          <button id="searchButton" type="button">Search</button>
+          <button id="prevPageButton" type="button">Prev</button>
+          <span id="pageLabel"></span>
+          <button id="nextPageButton" type="button">Next</button>
+        </div>
+        <div id="indexStatus" class="status"></div>
+        <table class="data-table index-table">
+          <thead>
+            <tr>
+              <th>Source</th>
+              <th>Content</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="indexBody"></tbody>
+        </table>
+      </section>
+
+      <section id="chat" class="panel chat-panel">
+        <div id="chatMessages" class="chat-messages" aria-live="polite"></div>
+        <form id="chatForm" class="chat-form">
+          <textarea id="questionInput" rows="3" placeholder="Ask a question"></textarea>
+          <button id="sendButton" type="submit">Send</button>
+        </form>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

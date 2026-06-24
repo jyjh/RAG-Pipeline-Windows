@@ -16,14 +16,6 @@ def default_llm_model() -> str:
     return DEFAULT_LLM_MODEL
 
 
-def is_lightrag_dependency_error(exc: BaseException) -> bool:
-    try:
-        from src.lightrag_compat import LightRAGDependencyError
-    except Exception:
-        return False
-    return isinstance(exc, LightRAGDependencyError)
-
-
 def run_ingestion(*args, **kwargs):
     print("Importing ingestion module...", file=sys.stderr, flush=True)
     from src.ingestion import run_ingestion as _run_ingestion
@@ -61,23 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=["ingest", "index", "query"], required=True)
     parser.add_argument("--data_dir", default="data", help="Input PDF directory or PDF file")
     parser.add_argument("--md_dir", default="processed_docs", help="Generated Markdown directory")
-    parser.add_argument("--db_dir", default="db", help="LightRAG working directory")
+    parser.add_argument("--db_dir", default="db", help="Local vector index directory")
     parser.add_argument("--llm_model", default=default_llm_model(), help="Ollama LLM model")
-    parser.add_argument(
-        "--embedding_backend",
-        choices=["hash", "ollama", "sentence-transformers"],
-        default="ollama",
-        help="Embedding backend for index/query setup",
-    )
     parser.add_argument(
         "--embedding_model",
         default="nomic-embed-text",
-        help="Embedding model name for the selected backend",
-    )
-    parser.add_argument(
-        "--allow_embedding_download",
-        action="store_true",
-        help="Allow SentenceTransformers to download the embedding model if it is not cached",
+        help="Ollama embedding model name",
     )
     parser.add_argument(
         "--embedding_batch_size",
@@ -91,30 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=30.0,
         help="Seconds before one Ollama embedding HTTP request fails.",
     )
-    parser.add_argument(
-        "--tokenizer_backend",
-        choices=["byte", "deepseek"],
-        default="byte",
-        help="Tokenizer backend for LightRAG chunking",
-    )
-    parser.add_argument(
-        "--rag_backend",
-        choices=["auto", "lightrag", "local"],
-        default="auto",
-        help="RAG backend for index/query. 'auto' falls back to local vector RAG if LightRAG import stalls.",
-    )
-    parser.add_argument(
-        "--lightrag_import_timeout",
-        type=int,
-        default=10,
-        help="Seconds to wait for LightRAG core import in auto backend mode.",
-    )
     parser.add_argument("--question", help="Question to ask in query mode")
     parser.add_argument(
-        "--query_mode",
-        choices=["local", "global", "hybrid"],
-        default="hybrid",
-        help="LightRAG query mode",
+        "--llm_num_predict",
+        type=int,
+        default=768,
+        help="Maximum answer tokens to request from Ollama in query mode.",
     )
     parser.add_argument(
         "--parser_mode",
@@ -169,16 +132,10 @@ def main(argv: list[str] | None = None) -> int:
             run_indexing(
                 args.md_dir,
                 args.db_dir,
-                model=args.llm_model,
                 progress_enabled=not args.no_progress,
-                embedding_backend=args.embedding_backend,
                 embedding_model=args.embedding_model,
-                embedding_local_files_only=not args.allow_embedding_download,
                 embedding_batch_size=args.embedding_batch_size,
                 embedding_timeout=args.embedding_timeout,
-                tokenizer_backend=args.tokenizer_backend,
-                rag_backend=args.rag_backend,
-                lightrag_import_timeout=args.lightrag_import_timeout,
             )
             return 0
 
@@ -188,25 +145,15 @@ def main(argv: list[str] | None = None) -> int:
             answer = QueryEngine(
                 working_dir=args.db_dir,
                 model=args.llm_model,
-                embedding_backend=args.embedding_backend,
                 embedding_model=args.embedding_model,
-                embedding_local_files_only=not args.allow_embedding_download,
                 embedding_batch_size=args.embedding_batch_size,
                 embedding_timeout=args.embedding_timeout,
-                tokenizer_backend=args.tokenizer_backend,
-                rag_backend=args.rag_backend,
-                lightrag_import_timeout=args.lightrag_import_timeout,
+                llm_num_predict=args.llm_num_predict,
                 progress_enabled=not args.no_progress,
-            ).ask(
-                args.question,
-                mode=args.query_mode,
-            )
+            ).ask(args.question)
             print(answer)
             return 0
     except Exception as exc:
-        if is_lightrag_dependency_error(exc):
-            print(str(exc), file=sys.stderr)
-            return 2
         if isinstance(exc, RuntimeError):
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1

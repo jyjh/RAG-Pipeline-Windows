@@ -2,28 +2,8 @@ import numpy as np
 from src.embeddings import EmbeddingEngine
 
 
-def test_hash_embeddings_are_deterministic_and_normalized():
-    engine = EmbeddingEngine(backend="hash")
-
-    first = engine.get_mrl_embeddings(["alpha beta"], truncate_dim=16)
-    second = engine.get_mrl_embeddings(["alpha beta"], truncate_dim=16)
-
-    assert first.shape == (1, 16)
-    assert np.allclose(first, second)
-    assert np.isclose(np.linalg.norm(first[0]), 1.0)
-
-
-def test_hash_embeddings_separate_texts():
-    engine = EmbeddingEngine(backend="hash")
-
-    vectors = engine.get_mrl_embeddings(["alpha beta", "gamma delta"], truncate_dim=16)
-
-    assert vectors.shape == (2, 16)
-    assert not np.allclose(vectors[0], vectors[1])
-
-
-def test_ollama_embeddings_use_local_ollama_backend(monkeypatch):
-    engine = EmbeddingEngine(backend="ollama", model_name="nomic-embed-text")
+def test_ollama_embeddings_use_local_ollama_api(monkeypatch):
+    engine = EmbeddingEngine(model_name="nomic-embed-text")
     monkeypatch.setattr(
         engine,
         "_ollama_api",
@@ -42,7 +22,6 @@ def test_ollama_embeddings_use_local_ollama_backend(monkeypatch):
 def test_ollama_embeddings_are_batched(monkeypatch):
     calls = []
     engine = EmbeddingEngine(
-        backend="ollama",
         model_name="nomic-embed-text",
         ollama_batch_size=2,
     )
@@ -67,7 +46,6 @@ def test_ollama_embeddings_are_batched(monkeypatch):
 def test_ollama_single_embedding_uses_string_input(monkeypatch):
     calls = []
     engine = EmbeddingEngine(
-        backend="ollama",
         model_name="nomic-embed-text",
         ollama_batch_size=1,
     )

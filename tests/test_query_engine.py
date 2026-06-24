@@ -1,31 +1,39 @@
-import asyncio
-
 import src.query as query
 
 
-class FakeQueryParam:
-    def __init__(self, mode):
-        self.mode = mode
+def test_query_engine_delegates_to_local_query_engine(monkeypatch):
+    calls = {}
 
+    class FakeLocalQueryEngine:
+        def __init__(self, **kwargs):
+            calls["init"] = kwargs
 
-class FakeRag:
-    def __init__(self):
-        self.initialized = False
+        def ask(self, question):
+            calls["question"] = question
+            return "answer"
 
-    async def initialize_storages(self):
-        self.initialized = True
+    monkeypatch.setattr("src.local_rag.LocalQueryEngine", FakeLocalQueryEngine)
 
-    async def aquery(self, question, param):
-        assert self.initialized
-        return f"{question}:{param.mode}"
+    engine = query.QueryEngine(
+        working_dir="db",
+        model="gemma4",
+        embedding_model="nomic-embed-text",
+        embedding_batch_size=4,
+        embedding_timeout=12.0,
+        llm_num_predict=256,
+        progress_enabled=False,
+    )
 
-
-def test_query_engine_uses_lazy_query_param(monkeypatch):
-    monkeypatch.setattr(query, "make_query_param", FakeQueryParam)
-
-    engine = query.QueryEngine.__new__(query.QueryEngine)
-    engine.rag = FakeRag()
-
-    result = asyncio.run(engine._async_ask("question", "hybrid"))
-
-    assert result == "question:hybrid"
+    assert engine.ask("What is aero balance?") == "answer"
+    assert calls == {
+        "init": {
+            "working_dir": "db",
+            "model": "gemma4",
+            "embedding_model": "nomic-embed-text",
+            "embedding_batch_size": 4,
+            "embedding_timeout": 12.0,
+            "num_predict": 256,
+            "progress_enabled": False,
+        },
+        "question": "What is aero balance?",
+    }

@@ -1,38 +1,35 @@
-# Local FSAE RAG Pipeline
+﻿# Local FSAE RAG Pipeline
 
-Local retrieval-augmented generation pipeline for NUS FSAE knowledge transfer. The project ingests technical PDFs and notes, extracts text/tables/equations/figures, builds a local retrieval index, and answers questions without cloud APIs.
+Local retrieval-augmented generation pipeline for NUS FSAE knowledge transfer. The project ingests technical PDFs and notes, extracts text/tables/equations/figures, builds a local vector index, and answers questions through Ollama without cloud APIs.
 
 ## Goals And Constraints
 
 - Keep all document processing, embeddings, retrieval, and generation local.
+- Use Ollama for both text generation and embeddings.
 - Support STEM and engineering documents: textbooks, lecture notes, research papers, reports, scanned PDFs, tables, figures, charts, and equations.
 - Preserve enough source context for users to inspect where an answer came from.
 - Target workstation: Ryzen 9 9950X3D, RTX 4000 Ada 20GB VRAM, 128GB RAM, Windows 11 or WSL2.
-- Optimize for reliable technical knowledge transfer between FSAE batches.
 
 ## Current Capabilities
 
-The current source tree contains the LightRAG-based local STEM pipeline:
+- `src/ingestion.py`: parses PDFs with pypdf/Docling and exports enriched Markdown.
+- `src/indexing.py`: chunks Markdown and writes `db/local_vector_index.json`.
+- `src/local_rag.py`: performs vector retrieval over the local JSON index and asks Ollama to answer from retrieved context.
+- `src/query.py`: thin query wrapper around the local Ollama RAG path.
+- `src/web_app.py`: local FastAPI browser UI for uploads, queued indexing, index edits, and chat.
+- `src/embeddings.py`: calls Ollama `/api/embed` with `nomic-embed-text` by default.
+- `src/utils.py`: optional Ollama model load/unload helpers.
 
-- `src/ingestion.py`: parses PDFs with Docling and exports enriched Markdown.
-- `src/indexing.py`: inserts Markdown into LightRAG, builds vector/graph stores, bridge edges, and quotient graph artifacts.
-- `src/query.py`: queries the local LightRAG index.
-- `src/embeddings.py`: uses local Ollama embeddings by default, with hash and SentenceTransformers alternatives.
-- `src/utils.py`: manages Ollama model loading/unloading, DeepSeek tokenizer alignment, and LightRAG construction.
-- `src/lancedb_storage.py`: local LanceDB vector-storage adapter for LightRAG.
+Implemented behavior:
 
-Implemented behavior described by the old planning docs:
-
+- Born-digital PDF text extraction with pypdf.
 - Docling PDF layout parsing with CUDA acceleration where available.
 - Lazy `qwen2.5vl:7b` vision enrichment for figures/charts/diagrams.
-- STEM-focused vision prompt requesting LaTeX equations, chart axes/values, and component labels.
 - Inline vision-description injection so figures remain near surrounding explanatory text.
-- Local Ollama inference using `gemma4`.
-- Local Ollama embeddings with `nomic-embed-text` by default; hash fallback and optional CPU-bound SentenceTransformers embeddings.
+- Local Ollama inference using `gemma4` by default.
+- Local Ollama embeddings using `nomic-embed-text` by default.
 - 768-dimensional normalized vectors for retrieval.
-- DeepSeek/Qwen tokenizer alignment for chunk sizing.
-- LanceDB-backed vector storage for LightRAG.
-- MRL bridge-edge and quotient-graph experiments for future cross-document synthesis.
+- Document chunks use the `search_document:` prefix; queries use `search_query:`.
 
 The `processed_docs/` Markdown files are corpus data generated from sample PDFs, not project documentation.
 
@@ -41,9 +38,10 @@ The `processed_docs/` Markdown files are corpus data generated from sample PDFs,
 ```text
 data/                 Input PDFs
 processed_docs/       Generated/enriched Markdown corpus files
-db/                   Generated local database/index artifacts
+db/                   Generated local vector index artifacts
+web/                  Static browser UI for the local FastAPI app
 src/                  Pipeline source modules
-tests/                Tests, if restored in the working tree
+tests/                Unit tests
 README.md             Canonical project documentation
 ```
 
@@ -64,21 +62,15 @@ Install PyTorch with a CUDA wheel appropriate for the workstation. Example:
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
-Install required packages. 
+Install required packages:
+
 ```bash
 pip install -r requirements.txt
-```
-
-Otherwise install the core runtime packages manually:
-
-```bash
-pip install docling lightrag lancedb ollama sentence-transformers transformers numpy pydantic networkx scikit-learn python-dotenv tqdm
 ```
 
 Install and verify Ollama on Windows:
 
 ```powershell
-# Use the full path when `ollama` is not on PATH.
 $ollama = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
 & $ollama --version
 ```
@@ -130,33 +122,19 @@ $response.embeddings[0].Count
 
 The final command should print an embedding dimension, normally `768`. If `/api/tags` works but `/api/embed` times out, Ollama is running but the embedding model runner is wedged or stalled; use the recovery steps in [Troubleshooting](#troubleshooting).
 
-The pipeline sends single query embeddings to `/api/embed` with `input` as a string, matching this health check. Multi-chunk indexing batches use an array input only when a batch contains more than one text.
-
-For local embeddings without Hugging Face/SentenceTransformers, use Ollama:
-
-```powershell
-python main.py --mode index --md_dir processed_docs --db_dir db --rag_backend local --embedding_batch_size 1 --embedding_timeout 30
-```
-
-The SentenceTransformers backend remains available for a cached Hugging Face model:
-
-```bash
-python main.py --mode index --md_dir processed_docs --db_dir db --embedding_backend sentence-transformers
-```
-
 ## Usage
 
-Intended CLI flow is:
+Intended CLI flow:
 
 ```bash
 python main.py --mode ingest --data_dir data --md_dir processed_docs
 python main.py --mode index --md_dir processed_docs --db_dir db
-python main.py --mode query --db_dir db --question "Explain the bias-variance tradeoff" --query_mode hybrid
+python main.py --mode query --db_dir db --question "Explain the bias-variance tradeoff"
 ```
 
 For born-digital PDFs, ingest defaults to pypdf text extraction and does not run Docling asset enrichment unless requested. Use `--asset_triggers images` to enrich pages with embedded images, or `--asset_triggers all` to also enrich table/equation heuristic pages. Ingestion shows per-document and per-page progress bars by default; pass `--no_progress` to disable them.
 
-Indexing defaults to `--rag_backend auto`, `--embedding_backend ollama`, `--embedding_model nomic-embed-text`, and `--tokenizer_backend byte`. Use `--rag_backend local` to bypass LightRAG and use the local vector fallback directly. Use `--embedding_batch_size 1` if Ollama struggles with larger embedding batches, and `--embedding_timeout 30` to fail clearly instead of waiting indefinitely. Use `--embedding_backend hash` as a no-model fallback. Use `--embedding_backend sentence-transformers --embedding_model nomic-ai/nomic-embed-text-v1.5` for the Hugging Face backend; add `--tokenizer_backend deepseek` to use the DeepSeek/Qwen tokenizer; add `--allow_embedding_download` only when network downloads are acceptable.
+Indexing and query use Ollama embeddings only. Use `--embedding_model` to select a different Ollama embedding model, `--embedding_batch_size 1` if Ollama struggles with larger embedding batches, and `--embedding_timeout 30` to fail clearly instead of waiting indefinitely. Query mode requests `--llm_num_predict 768` by default; increase it if your local model needs more room for long answers.
 
 The module entrypoints can also be used for the default directories:
 
@@ -165,11 +143,13 @@ python -m src.ingestion
 python -m src.indexing
 ```
 
-Query modes:
+Run the local browser UI:
 
-- `local`: vector search over chunks.
-- `global`: graph/relationship search.
-- `hybrid`: combined retrieval path; this is the default intended mode.
+```bash
+uvicorn src.web_app:app --host 127.0.0.1 --port 8000
+```
+
+Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/indexing work in the background, lets users inspect/edit/delete index records, and streams chat answers as Ollama produces them. When Ollama returns model thinking, the chat UI shows it in a collapsible block above the answer. Queued ingestion/indexing waits before expensive phases while chat queries are active; a phase already running is not forcibly interrupted. Query generation uses temperature `0.9`.
 
 ## Architecture
 
@@ -180,31 +160,26 @@ Query modes:
    - Figures/charts can be sent to local Qwen2.5-VL through Ollama.
 
 2. **Embeddings**
-   - Ollama embeddings run locally by default with `nomic-embed-text`.
-   - Hash embeddings are available as a no-model fallback.
-   - Optional Nomic embeddings run on CPU to preserve GPU VRAM for inference models.
+   - Ollama embeddings run locally with `nomic-embed-text` by default.
    - Document chunks use the `search_document:` prefix.
    - Queries use the `search_query:` prefix.
    - Embeddings are L2-normalized.
 
 3. **Indexing**
-   - Full Markdown documents are inserted into LightRAG.
-   - LightRAG chunks text with a byte tokenizer by default; the DeepSeek/Qwen tokenizer is opt-in.
-   - LanceDB stores vectors locally.
-   - Optional bridge edges and quotient graph artifacts support future cross-domain exploration.
+   - Markdown documents are split into overlapping chunks.
+   - Chunks are embedded through Ollama.
+   - The local index is written to `db/local_vector_index.json`.
 
 4. **Querying**
-   - Questions are embedded locally.
-   - LightRAG retrieves vector and graph context.
-   - `gemma4` synthesizes an answer from retrieved context.
+   - Questions are embedded locally through Ollama.
+   - The nearest chunks are retrieved from the local JSON vector index.
+   - `gemma4` synthesizes an answer from retrieved context and cites source numbers.
 
 ## Hardware And Runtime Notes
 
-- DeepSeek-R1 32B at Q4 quantization is close to the RTX 4000 Ada 20GB VRAM limit.
 - Qwen2.5-VL is loaded lazily during ingestion only when figures are detected.
 - Ollama `keep_alive="0"` can be used to evict inactive models between phases.
-- Hash embeddings avoid model-loading stalls; optional Nomic embeddings run on CPU to avoid competing with inference models for VRAM.
-- If indexing causes VRAM pressure, reduce LightRAG entity extraction gleaning or lower context/chunk sizes.
+- If indexing causes VRAM pressure, reduce Ollama parallelism or lower the embedding batch size.
 
 ## Troubleshooting
 
@@ -245,21 +220,11 @@ $response = Invoke-RestMethod `
 $response.embeddings[0].Count
 ```
 
-The pipeline uses the same string-input request shape for single query embeddings. If this health check is fast but query embeddings are slow, verify that the code includes the singleton string-input fix in `src/embeddings.py`.
-
 5. Retry indexing with conservative embedding settings:
 
 ```powershell
-python main.py --mode index --md_dir processed_docs --db_dir db --rag_backend local --embedding_batch_size 1 --embedding_timeout 30
+python main.py --mode index --md_dir processed_docs --db_dir db --embedding_batch_size 1 --embedding_timeout 30
 ```
-
-If the embedding health check still times out after restarting Ollama, use the hash backend to keep working without Ollama embeddings:
-
-```powershell
-python main.py --mode index --md_dir processed_docs --db_dir db --rag_backend local --embedding_backend hash
-```
-
-Hash embeddings are deterministic and fully local, but retrieval quality is lower than `nomic-embed-text`.
 
 ### Ollama Not Found On PATH
 
@@ -293,10 +258,11 @@ Start-Process "$env:LOCALAPPDATA\Programs\Ollama\ollama app.exe"
 
 ## Validation
 
-Recommended validation once the working tree is restored:
+Recommended validation:
 
 ```bash
 python -m compileall src
+pytest
 python -m src.ingestion
 python -m src.indexing
 python main.py --mode query --question "What sources discuss regularization?"
@@ -312,14 +278,12 @@ Validation scenarios to maintain:
 - Figure/chart-heavy pages.
 - Duplicate or near-duplicate content across documents.
 - Query answers with inspectable source evidence.
-- Offline execution after model weights and Python packages are cached locally.
+- Offline execution after Ollama models and Python packages are cached locally.
 
 ## Roadmap
 
 Near term:
 
-- Restore or regenerate missing tracked runtime files in the `D:` workspace if needed.
-- Validate the current LightRAG path end to end on the target workstation.
 - Pin package versions after successful validation.
 - Add real golden PDF fixtures for scanned, mixed, table, equation, and figure-heavy documents.
 - Benchmark pages/minute, indexing time, query latency, VRAM/RAM usage, and retrieval quality.
@@ -330,12 +294,6 @@ Medium term:
 - Add a local FastAPI service and browser UI for team members.
 - Add local reranking and retrieval evaluation.
 - Preserve all source block/page references through chunking and deduplication.
-
-Graph/advanced retrieval:
-
-- Keep LightRAG graph retrieval as an optional synthesis layer.
-- Ensure any bridge edges are injected into retrieval paths actually used at query time.
-- Use quotient graph artifacts only through a deliberate query preprocessor, not by polluting entity namespaces.
 
 ## Development Notes
 
