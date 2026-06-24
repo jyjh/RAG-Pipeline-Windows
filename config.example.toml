@@ -36,7 +36,7 @@ vector_top_k = 24
 bm25_top_k = 24
 rrf_k = 60
 rerank_top_k = 12
-min_relevance_score = 0.36
+min_relevance_score = 0.50
 relative_relevance_cutoff = 0.72
 candidate_top_k = 80
 context_token_fraction = 0.60
@@ -46,6 +46,15 @@ enabled = true
 provider = "duckduckgo_lite"
 timeout_seconds = 8.0
 max_results = 5
+
+[ollama]
+chat_health_check_interval_seconds = 5.0
+chat_max_lost_health_checks = 5
+
+[chat]
+context_window = 8192
+llm_num_predict = 4096
+system_prompt = """You are a retrieval-augmented assistant. Before answering, you must call search_local_context at least once. You may call search_local_context again with a narrower query when more evidence is needed. {web_instruction} Use only information returned by tools. In the final answer, cite every factual claim with source IDs exactly as provided, such as [S1] or [W1]. If the available sources are insufficient, say what is missing."""
 
 [server]
 host = "127.0.0.1"

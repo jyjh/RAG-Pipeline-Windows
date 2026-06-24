@@ -7,6 +7,7 @@ import re
 import shutil
 import socket
 import sys
+import time
 import urllib.parse
 import urllib.error
 import urllib.request
@@ -22,19 +23,29 @@ from src.sectioning import (
 from src.vector_store import LanceDBVectorStore, default_store
 
 QUERY_TEMPERATURE = 0.9
-DEFAULT_NUM_PREDICT = 20032
+DEFAULT_NUM_PREDICT = 4096
 DEFAULT_SAMPLER_TOP_K = 40
-DEFAULT_CONTEXT_WINDOW = 100352
+DEFAULT_CONTEXT_WINDOW = 8192
 DEFAULT_LLM_TIMEOUT = 120.0
 DEFAULT_RETRIEVAL_CANDIDATE_K = 80
-DEFAULT_RETRIEVAL_MIN_SCORE = 0.36
+DEFAULT_RETRIEVAL_MIN_SCORE = 0.50
 DEFAULT_RETRIEVAL_RELATIVE_CUTOFF = 0.72
 DEFAULT_CONTEXT_TOKEN_FRACTION = 0.60
 DEFAULT_TOOL_MAX_ROUNDS = 4
 DEFAULT_TOOL_MAX_CALLS = 8
 DEFAULT_WEB_SEARCH_TIMEOUT = 8.0
 DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
+DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL = 5.0
+DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS = 5
 CONTEXT_METADATA_TOKEN_OVERHEAD = 64
+DEFAULT_QUERY_SYSTEM_PROMPT = (
+    "You are a retrieval-augmented assistant. Before answering, you must call "
+    "search_local_context at least once. You may call search_local_context again "
+    "with a narrower query when more evidence is needed. {web_instruction} "
+    "Use only information returned by tools. In the final answer, cite every "
+    "factual claim with source IDs exactly as provided, such as [S1] or [W1]. "
+    "If the available sources are insufficient, say what is missing."
+)
 
 
 def _status(message: str, *, enabled: bool = True) -> None:
@@ -99,7 +110,9 @@ def _ollama_chat(
     messages: list[dict[str, Any]],
     options: dict[str, int | float],
     stream: bool,
-    timeout: float,
+    timeout: float | None = None,
+    health_check_interval: float = DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL,
+    max_lost_health_checks: int = DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
     tools: list[dict[str, Any]] | None = None,
 ):
     payload = {
@@ -111,8 +124,16 @@ def _ollama_chat(
     if tools:
         payload["tools"] = tools
     if stream:
-        return _ollama_chat_stream(payload, timeout=timeout)
-    return _ollama_chat_once(payload, timeout=timeout)
+        return _ollama_chat_stream(
+            payload,
+            health_check_interval=health_check_interval,
+            max_lost_health_checks=max_lost_health_checks,
+        )
+    return _ollama_chat_once(
+        payload,
+        health_check_interval=health_check_interval,
+        max_lost_health_checks=max_lost_health_checks,
+    )
 
 
 def _ollama_chat_request(payload: dict[str, Any]):
@@ -125,36 +146,103 @@ def _ollama_chat_request(payload: dict[str, Any]):
     )
 
 
-def _ollama_chat_once(payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+def _ollama_health_request():
+    return urllib.request.Request(f"{_ollama_host()}/api/version", method="GET")
+
+
+def _ollama_server_healthy(*, timeout: float) -> bool:
     try:
-        with urllib.request.urlopen(_ollama_chat_request(payload), timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except (TimeoutError, socket.timeout) as exc:
-        raise RuntimeError(
-            f"Ollama chat request timed out after {timeout:g}s at {_ollama_host()}/api/chat."
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Ollama chat request failed at {_ollama_host()}/api/chat: {exc}") from exc
+        with urllib.request.urlopen(_ollama_health_request(), timeout=timeout) as response:
+            return int(getattr(response, "status", 200) or 200) < 500
+    except Exception:
+        return False
 
 
-def _ollama_chat_stream(payload: dict[str, Any], *, timeout: float):
-    def events():
+def _wait_for_ollama_recovery(
+    *,
+    health_check_interval: float,
+    max_lost_health_checks: int,
+) -> bool:
+    interval = max(0.1, float(health_check_interval))
+    cycles = max(1, int(max_lost_health_checks))
+    health_timeout = min(max(interval, 0.1), 10.0)
+    for _ in range(cycles):
+        time.sleep(interval)
+        if _ollama_server_healthy(timeout=health_timeout):
+            return True
+    return False
+
+
+def _connection_lost_error(kind: str, exc: BaseException, *, max_lost_health_checks: int) -> RuntimeError:
+    return RuntimeError(
+        f"Ollama {kind} lost connection to {_ollama_host()} and did not recover "
+        f"within {max_lost_health_checks} health check cycle(s). Original error: {exc}"
+    )
+
+
+def _ollama_chat_once(
+    payload: dict[str, Any],
+    *,
+    health_check_interval: float,
+    max_lost_health_checks: int,
+) -> dict[str, Any]:
+    retries_after_recovery = 0
+    while True:
         try:
-            with urllib.request.urlopen(_ollama_chat_request(payload), timeout=timeout) as response:
-                for raw_line in response:
-                    line = raw_line.decode("utf-8").strip()
-                    if not line:
-                        continue
-                    event = json.loads(line)
-                    if event.get("error"):
-                        raise RuntimeError(str(event["error"]))
-                    yield event
-        except (TimeoutError, socket.timeout) as exc:
-            raise RuntimeError(
-                f"Ollama chat stream timed out after {timeout:g}s at {_ollama_host()}/api/chat."
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Ollama chat stream failed at {_ollama_host()}/api/chat: {exc}") from exc
+            with urllib.request.urlopen(_ollama_chat_request(payload), timeout=None) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (TimeoutError, socket.timeout, urllib.error.URLError, OSError) as exc:
+            recovered = _wait_for_ollama_recovery(
+                health_check_interval=health_check_interval,
+                max_lost_health_checks=max_lost_health_checks,
+            )
+            if not recovered:
+                raise _connection_lost_error("chat request", exc, max_lost_health_checks=max_lost_health_checks) from exc
+            retries_after_recovery += 1
+            if retries_after_recovery > max(1, int(max_lost_health_checks)):
+                raise RuntimeError(
+                    f"Ollama chat request repeatedly failed even though {_ollama_host()} recovered. "
+                    f"Original error: {exc}"
+                ) from exc
+
+
+def _ollama_chat_stream(
+    payload: dict[str, Any],
+    *,
+    health_check_interval: float,
+    max_lost_health_checks: int,
+):
+    def events():
+        retries_after_recovery = 0
+        while True:
+            try:
+                with urllib.request.urlopen(_ollama_chat_request(payload), timeout=None) as response:
+                    for raw_line in response:
+                        line = raw_line.decode("utf-8").strip()
+                        if not line:
+                            continue
+                        event = json.loads(line)
+                        if event.get("error"):
+                            raise RuntimeError(str(event["error"]))
+                        yield event
+                    return
+            except (TimeoutError, socket.timeout, urllib.error.URLError, OSError) as exc:
+                recovered = _wait_for_ollama_recovery(
+                    health_check_interval=health_check_interval,
+                    max_lost_health_checks=max_lost_health_checks,
+                )
+                if not recovered:
+                    raise _connection_lost_error(
+                        "chat stream",
+                        exc,
+                        max_lost_health_checks=max_lost_health_checks,
+                    ) from exc
+                retries_after_recovery += 1
+                if retries_after_recovery > max(1, int(max_lost_health_checks)):
+                    raise RuntimeError(
+                        f"Ollama chat stream repeatedly failed even though {_ollama_host()} recovered. "
+                        f"Original error: {exc}"
+                    ) from exc
 
     return events()
 
@@ -657,6 +745,9 @@ class LocalQueryEngine:
         web_search_max_results: int | None = None,
         tool_max_rounds: int = DEFAULT_TOOL_MAX_ROUNDS,
         tool_max_calls: int = DEFAULT_TOOL_MAX_CALLS,
+        ollama_health_check_interval: float | None = None,
+        ollama_max_lost_health_checks: int | None = None,
+        system_prompt: str | None = None,
     ):
         from src.embeddings import EmbeddingEngine
 
@@ -684,6 +775,21 @@ class LocalQueryEngine:
             llm_timeout if llm_timeout is not None else os.environ.get("LOCAL_RAG_LLM_TIMEOUT"),
             DEFAULT_LLM_TIMEOUT,
         )
+        self.ollama_health_check_interval = _positive_float(
+            ollama_health_check_interval
+            if ollama_health_check_interval is not None
+            else os.environ.get("LOCAL_RAG_OLLAMA_HEALTH_CHECK_INTERVAL"),
+            DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL,
+        )
+        self.ollama_max_lost_health_checks = _positive_int(
+            ollama_max_lost_health_checks or os.environ.get("LOCAL_RAG_OLLAMA_MAX_LOST_HEALTH_CHECKS"),
+            DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
+        )
+        self.system_prompt = str(
+            system_prompt
+            if system_prompt is not None
+            else os.environ.get("LOCAL_RAG_SYSTEM_PROMPT") or DEFAULT_QUERY_SYSTEM_PROMPT
+        ).strip()
         self.retrieval_candidate_k = _positive_int(
             retrieval_candidate_k or os.environ.get("LOCAL_RAG_RETRIEVAL_CANDIDATE_K"),
             DEFAULT_RETRIEVAL_CANDIDATE_K,
@@ -741,18 +847,15 @@ class LocalQueryEngine:
             if self.web_search_enabled
             else "Do not use web_search; it is disabled for this request."
         )
+        system_prompt = self.system_prompt or DEFAULT_QUERY_SYSTEM_PROMPT
+        if "{web_instruction}" in system_prompt:
+            system_prompt = system_prompt.replace("{web_instruction}", web_instruction)
+        else:
+            system_prompt = f"{system_prompt}\n\n{web_instruction}"
         return [
             {
                 "role": "system",
-                "content": (
-                    "You are a retrieval-augmented assistant. Before answering, you must call "
-                    "search_local_context at least once. You may call search_local_context again "
-                    "with a narrower query when more evidence is needed. "
-                    f"{web_instruction} "
-                    "Use only information returned by tools. In the final answer, cite every "
-                    "factual claim with source IDs exactly as provided, such as [S1] or [W1]. "
-                    "If the available sources are insufficient, say what is missing."
-                ),
+                "content": system_prompt,
             },
             {"role": "user", "content": question},
         ]
@@ -1053,6 +1156,8 @@ class LocalQueryEngine:
                 options=self._ollama_options(),
                 stream=False,
                 timeout=self.llm_timeout,
+                health_check_interval=self.ollama_health_check_interval,
+                max_lost_health_checks=self.ollama_max_lost_health_checks,
                 tools=tools,
             )
             thinking = _ollama_response_thinking(response)
@@ -1162,7 +1267,8 @@ class LocalQueryEngine:
             citations: CitationRegistry = tool_state["citations"]
             _status(
                 f"Local query: streaming answer from Ollama model {self.model} "
-                f"(timeout={self.llm_timeout:g}s)",
+                f"(lost_connection_cycles={self.ollama_max_lost_health_checks}, "
+                f"health_interval={self.ollama_health_check_interval:g}s)",
                 enabled=self.progress_enabled,
             )
             stream = _ollama_chat(
@@ -1171,6 +1277,8 @@ class LocalQueryEngine:
                 options=self._ollama_options(),
                 stream=True,
                 timeout=self.llm_timeout,
+                health_check_interval=self.ollama_health_check_interval,
+                max_lost_health_checks=self.ollama_max_lost_health_checks,
             )
             emitted = False
             answer_emitted = False

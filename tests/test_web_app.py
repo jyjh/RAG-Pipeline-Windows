@@ -219,6 +219,37 @@ def test_server_config_reads_polling_intervals(workspace_tmp):
     }
 
 
+def test_chat_config_reads_prompt_retrieval_and_ollama_health_settings(workspace_tmp):
+    config_path = workspace_tmp / "config.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[chat]",
+                'system_prompt = "Configured prompt {web_instruction}"',
+                "context_window = 120000",
+                "llm_num_predict = 24000",
+                "[retrieval]",
+                "min_relevance_score = 0.62",
+                "[ollama]",
+                "chat_health_check_interval_seconds = 3.5",
+                "chat_max_lost_health_checks = 9",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = web_app._load_chat_config(config_path)
+
+    assert config == {
+        "system_prompt": "Configured prompt {web_instruction}",
+        "context_window": 120000,
+        "llm_num_predict": 24000,
+        "retrieval_min_score": 0.62,
+        "ollama_health_check_interval": 3.5,
+        "ollama_max_lost_health_checks": 9,
+    }
+
+
 def test_health_exposes_server_polling_config(monkeypatch):
     monkeypatch.setattr(
         web_app,
@@ -233,6 +264,11 @@ def test_health_exposes_server_polling_config(monkeypatch):
     assert response.json()["server"] == {
         "health_poll_interval_ms": 60000,
         "jobs_poll_interval_ms": 60000,
+    }
+    assert response.json()["chat"] == {
+        "context_window": web_app.CHAT_CONFIG["context_window"],
+        "llm_num_predict": web_app.CHAT_CONFIG["llm_num_predict"],
+        "retrieval_min_score": web_app.CHAT_CONFIG["retrieval_min_score"],
     }
 
 
@@ -559,6 +595,7 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
             "context_window": 4096,
             "llm_num_predict": 512,
             "web_search_enabled": False,
+            "retrieval_min_score": 0.73,
         },
     )
 
@@ -577,9 +614,12 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
     assert events[1][1]["llm_timeout"] == 120.0
     assert events[1][1]["web_search_enabled"] is False
     assert events[1][1]["retrieval_candidate_k"] == 80
-    assert events[1][1]["retrieval_min_score"] == 0.36
+    assert events[1][1]["retrieval_min_score"] == 0.73
     assert events[1][1]["retrieval_relative_cutoff"] == 0.72
     assert events[1][1]["context_token_fraction"] == 0.60
+    assert events[1][1]["ollama_health_check_interval"] == 5.0
+    assert events[1][1]["ollama_max_lost_health_checks"] == 5
+    assert "search_local_context" in events[1][1]["system_prompt"]
     assert events[-1] == "finish"
 
 

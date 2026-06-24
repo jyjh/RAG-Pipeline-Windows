@@ -100,14 +100,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm_num_predict",
         type=int,
-        default=20032,
+        default=4096,
         help="Maximum answer tokens to request from Ollama in query mode.",
     )
     parser.add_argument(
         "--llm_timeout",
         type=float,
         default=120.0,
-        help="Seconds before one Ollama chat request fails in query mode.",
+        help="Deprecated compatibility option; Ollama chat generation no longer uses a request timeout.",
     )
     parser.add_argument(
         "--temperature",
@@ -124,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--context_window",
         type=int,
-        default=100352,
+        default=8192,
         help="Ollama num_ctx context window in query mode.",
     )
     parser.add_argument(
@@ -136,7 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--retrieval_min_score",
         type=float,
-        default=0.36,
+        default=0.50,
         help="Minimum normalized relevance score for local context chunks.",
     )
     parser.add_argument(
@@ -167,6 +167,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="Maximum web-search results returned to the model per call.",
+    )
+    parser.add_argument(
+        "--ollama_health_check_interval",
+        type=float,
+        default=5.0,
+        help="Seconds between Ollama health checks after chat connection loss.",
+    )
+    parser.add_argument(
+        "--ollama_max_lost_health_checks",
+        type=int,
+        default=5,
+        help="Cancel chat only after this many failed Ollama health checks after connection loss.",
+    )
+    parser.add_argument(
+        "--system_prompt",
+        default=None,
+        help="Override the default RAG chat system prompt. Use {web_instruction} to place the web-search instruction.",
     )
     parser.add_argument(
         "--parser_mode",
@@ -253,6 +270,9 @@ def main(argv: list[str] | None = None) -> int:
                 web_search_enabled=not args.no_web_search,
                 web_search_timeout=args.web_search_timeout,
                 web_search_max_results=args.web_search_max_results,
+                ollama_health_check_interval=args.ollama_health_check_interval,
+                ollama_max_lost_health_checks=args.ollama_max_lost_health_checks,
+                system_prompt=args.system_prompt,
                 progress_enabled=not args.no_progress,
             ).ask(args.question)
             print(answer)

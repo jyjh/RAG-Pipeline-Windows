@@ -112,11 +112,15 @@
                 </label>
                 <label>
                   Context
-                  <input id="contextWindowInput" type="number" min="1024" max="131072" step="1024" value="100352" />
+                  <input id="contextWindowInput" type="number" min="1024" max="131072" step="1024" value="8192" />
                 </label>
                 <label>
                   Max Output
-                  <input id="maxOutputInput" type="number" min="64" max="32768" step="64" value="20032" />
+                  <input id="maxOutputInput" type="number" min="64" max="32768" step="64" value="4096" />
+                </label>
+                <label>
+                  Relevance Floor
+                  <input id="relevanceFloorInput" type="number" min="0" max="1" step="0.01" value="0.5" />
                 </label>
                 <label class="checkbox-label">
                   Web search

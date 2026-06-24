@@ -20,6 +20,11 @@ from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from src.defaults import DEFAULT_LLM_MODEL
+from src.local_rag import (
+    DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL,
+    DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
+    DEFAULT_QUERY_SYSTEM_PROMPT,
+)
 from src.pdf_registry import PdfRegistry, load_source_map, remove_source_entries_by_hash
 from src.vector_store import default_store, lancedb_path
 
@@ -38,16 +43,19 @@ DEFAULT_EMBEDDING_BATCH_SIZE = 8
 DEFAULT_EMBEDDING_TIMEOUT = 30.0
 DEFAULT_TEMPERATURE = 0.9
 DEFAULT_MAX_K = 40
-DEFAULT_CONTEXT_WINDOW = 100352
-DEFAULT_LLM_NUM_PREDICT = 20032
+DEFAULT_CONTEXT_WINDOW = 8192
+DEFAULT_LLM_NUM_PREDICT = 4096
 DEFAULT_LLM_TIMEOUT = 120.0
 DEFAULT_RETRIEVAL_CANDIDATE_K = 80
-DEFAULT_RETRIEVAL_MIN_SCORE = 0.36
+DEFAULT_RETRIEVAL_MIN_SCORE = 0.50
 DEFAULT_RETRIEVAL_RELATIVE_CUTOFF = 0.72
 DEFAULT_CONTEXT_TOKEN_FRACTION = 0.60
 DEFAULT_WEB_SEARCH_ENABLED = True
 DEFAULT_WEB_SEARCH_TIMEOUT = 8.0
 DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
+DEFAULT_SYSTEM_PROMPT = DEFAULT_QUERY_SYSTEM_PROMPT
+DEFAULT_OLLAMA_CHAT_HEALTH_CHECK_INTERVAL = DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL
+DEFAULT_OLLAMA_CHAT_MAX_LOST_HEALTH_CHECKS = DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS
 DEFAULT_INDEX_BACKEND = "lancedb"
 DEFAULT_SUMMARY_MODE = "hybrid"
 DEFAULT_CHUNK_TARGET_TOKENS = 900
@@ -76,19 +84,31 @@ def _positive_int(value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _load_toml_config(config_path: Path) -> dict[str, Any]:
+    if not config_path.exists():
+        return {}
+    try:
+        import tomllib
+
+        with config_path.open("rb") as handle:
+            payload = tomllib.load(handle)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
 def _load_server_config(config_path: Path | None = None) -> dict[str, int]:
     config_path = config_path or (ROOT_DIR / "config.toml")
-    server_config: dict[str, Any] = {}
-    if config_path.exists():
-        try:
-            import tomllib
-
-            with config_path.open("rb") as handle:
-                payload = tomllib.load(handle)
-            if isinstance(payload.get("server"), dict):
-                server_config = payload["server"]
-        except Exception:
-            server_config = {}
+    payload = _load_toml_config(config_path)
+    server_config = payload.get("server", {}) if isinstance(payload.get("server"), dict) else {}
 
     return {
         "health_poll_interval_ms": _positive_int(
@@ -102,7 +122,40 @@ def _load_server_config(config_path: Path | None = None) -> dict[str, int]:
     }
 
 
+def _load_chat_config(config_path: Path | None = None) -> dict[str, Any]:
+    config_path = config_path or (ROOT_DIR / "config.toml")
+    payload = _load_toml_config(config_path)
+    chat_config = payload.get("chat", {}) if isinstance(payload.get("chat"), dict) else {}
+    retrieval_config = payload.get("retrieval", {}) if isinstance(payload.get("retrieval"), dict) else {}
+    ollama_config = payload.get("ollama", {}) if isinstance(payload.get("ollama"), dict) else {}
+
+    return {
+        "system_prompt": str(chat_config.get("system_prompt") or DEFAULT_SYSTEM_PROMPT),
+        "context_window": _positive_int(
+            chat_config.get("context_window"),
+            DEFAULT_CONTEXT_WINDOW,
+        ),
+        "llm_num_predict": _positive_int(
+            chat_config.get("llm_num_predict"),
+            DEFAULT_LLM_NUM_PREDICT,
+        ),
+        "retrieval_min_score": _positive_float(
+            retrieval_config.get("min_relevance_score"),
+            DEFAULT_RETRIEVAL_MIN_SCORE,
+        ),
+        "ollama_health_check_interval": _positive_float(
+            ollama_config.get("chat_health_check_interval_seconds"),
+            DEFAULT_OLLAMA_CHAT_HEALTH_CHECK_INTERVAL,
+        ),
+        "ollama_max_lost_health_checks": _positive_int(
+            ollama_config.get("chat_max_lost_health_checks"),
+            DEFAULT_OLLAMA_CHAT_MAX_LOST_HEALTH_CHECKS,
+        ),
+    }
+
+
 SERVER_CONFIG = _load_server_config()
+CHAT_CONFIG = _load_chat_config()
 
 
 def _index_store(db_dir: Path | None = None):
@@ -644,16 +697,19 @@ class ChatRequest(BaseModel):
     embedding_timeout: float | None = DEFAULT_EMBEDDING_TIMEOUT
     temperature: float | None = DEFAULT_TEMPERATURE
     max_k: int | None = DEFAULT_MAX_K
-    context_window: int | None = DEFAULT_CONTEXT_WINDOW
-    llm_num_predict: int | None = DEFAULT_LLM_NUM_PREDICT
+    context_window: int | None = CHAT_CONFIG["context_window"]
+    llm_num_predict: int | None = CHAT_CONFIG["llm_num_predict"]
     llm_timeout: float | None = DEFAULT_LLM_TIMEOUT
     web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED
     retrieval_candidate_k: int | None = DEFAULT_RETRIEVAL_CANDIDATE_K
-    retrieval_min_score: float | None = DEFAULT_RETRIEVAL_MIN_SCORE
+    retrieval_min_score: float | None = CHAT_CONFIG["retrieval_min_score"]
     retrieval_relative_cutoff: float | None = DEFAULT_RETRIEVAL_RELATIVE_CUTOFF
     context_token_fraction: float | None = DEFAULT_CONTEXT_TOKEN_FRACTION
     web_search_timeout: float | None = DEFAULT_WEB_SEARCH_TIMEOUT
     web_search_max_results: int | None = DEFAULT_WEB_SEARCH_MAX_RESULTS
+    ollama_health_check_interval: float | None = CHAT_CONFIG["ollama_health_check_interval"]
+    ollama_max_lost_health_checks: int | None = CHAT_CONFIG["ollama_max_lost_health_checks"]
+    system_prompt: str | None = CHAT_CONFIG["system_prompt"]
 
 
 class IndexUpdateRequest(BaseModel):
@@ -744,6 +800,11 @@ def health():
         "index_exists": index_exists,
         "record_count": record_count,
         "server": dict(SERVER_CONFIG),
+        "chat": {
+            "context_window": CHAT_CONFIG["context_window"],
+            "llm_num_predict": CHAT_CONFIG["llm_num_predict"],
+            "retrieval_min_score": CHAT_CONFIG["retrieval_min_score"],
+        },
         "queue": job_queue.summary(),
     }
 
@@ -1001,6 +1062,9 @@ def chat_stream(payload: ChatRequest):
                 web_search_enabled=payload.web_search_enabled,
                 web_search_timeout=payload.web_search_timeout,
                 web_search_max_results=payload.web_search_max_results,
+                ollama_health_check_interval=payload.ollama_health_check_interval,
+                ollama_max_lost_health_checks=payload.ollama_max_lost_health_checks,
+                system_prompt=payload.system_prompt,
                 progress_enabled=False,
             )
             if hasattr(engine, "ask_stream_events"):

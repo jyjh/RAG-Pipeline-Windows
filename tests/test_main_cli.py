@@ -120,6 +120,9 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
             web_search_enabled,
             web_search_timeout,
             web_search_max_results,
+            ollama_health_check_interval,
+            ollama_max_lost_health_checks,
+            system_prompt,
             progress_enabled,
         ):
             calls["working_dir"] = working_dir
@@ -139,6 +142,9 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
             calls["web_search_enabled"] = web_search_enabled
             calls["web_search_timeout"] = web_search_timeout
             calls["web_search_max_results"] = web_search_max_results
+            calls["ollama_health_check_interval"] = ollama_health_check_interval
+            calls["ollama_max_lost_health_checks"] = ollama_max_lost_health_checks
+            calls["system_prompt"] = system_prompt
             calls["progress_enabled"] = progress_enabled
 
         def ask(self, question):
@@ -167,18 +173,21 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
         "embedding_model": "nomic-embed-text",
         "embedding_batch_size": 8,
         "embedding_timeout": 30.0,
-        "llm_num_predict": 20032,
+        "llm_num_predict": 4096,
         "llm_timeout": 120.0,
         "temperature": 0.9,
         "sampler_top_k": 40,
-        "context_window": 100352,
+        "context_window": 8192,
         "retrieval_candidate_k": 80,
-        "retrieval_min_score": 0.36,
+        "retrieval_min_score": 0.5,
         "retrieval_relative_cutoff": 0.72,
         "context_token_fraction": 0.6,
         "web_search_enabled": True,
         "web_search_timeout": 8.0,
         "web_search_max_results": 5,
+        "ollama_health_check_interval": 5.0,
+        "ollama_max_lost_health_checks": 5,
+        "system_prompt": None,
         "progress_enabled": True,
         "question": "What is regularization?",
     }

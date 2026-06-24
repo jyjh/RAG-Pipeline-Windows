@@ -24,6 +24,9 @@ class QueryEngine:
         web_search_enabled: bool = True,
         web_search_timeout: float | None = None,
         web_search_max_results: int | None = None,
+        ollama_health_check_interval: float | None = None,
+        ollama_max_lost_health_checks: int | None = None,
+        system_prompt: str | None = None,
         progress_enabled: bool = True,
     ):
         from src.local_rag import LocalQueryEngine
@@ -46,6 +49,9 @@ class QueryEngine:
             web_search_enabled=web_search_enabled,
             web_search_timeout=web_search_timeout,
             web_search_max_results=web_search_max_results,
+            ollama_health_check_interval=ollama_health_check_interval,
+            ollama_max_lost_health_checks=ollama_max_lost_health_checks,
+            system_prompt=system_prompt,
             progress_enabled=progress_enabled,
         )
 

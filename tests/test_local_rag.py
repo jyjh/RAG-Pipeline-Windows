@@ -1,6 +1,7 @@
 import json
 import shutil
 import tempfile
+import urllib.error
 import uuid
 from pathlib import Path
 
@@ -128,10 +129,44 @@ def test_ollama_chat_posts_directly_to_api_chat(monkeypatch):
         "http://127.0.0.1:11434/api/chat",
         "http://127.0.0.1:11434/api/chat",
     ]
-    assert calls[0]["timeout"] == 7.5
-    assert calls[1]["timeout"] == 8.5
+    assert calls[0]["timeout"] is None
+    assert calls[1]["timeout"] is None
     assert calls[0]["payload"]["model"] == "gemma4"
     assert calls[1]["payload"]["stream"] is True
+
+
+def test_ollama_chat_cancels_after_lost_health_check_cycles(monkeypatch):
+    calls = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append({"url": request.full_url, "timeout": timeout})
+        raise urllib.error.URLError("server down")
+
+    monkeypatch.setenv("OLLAMA_HOST", "127.0.0.1:11434")
+    monkeypatch.setattr(local_rag.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(local_rag.time, "sleep", lambda seconds: None)
+
+    try:
+        local_rag._ollama_chat(
+            model="gemma4",
+            messages=[{"role": "user", "content": "hi"}],
+            options={"num_predict": 1},
+            stream=False,
+            timeout=7.5,
+            health_check_interval=0.1,
+            max_lost_health_checks=2,
+        )
+    except RuntimeError as exc:
+        assert "did not recover within 2 health check cycle" in str(exc)
+    else:
+        raise AssertionError("Expected connection loss failure")
+
+    assert calls[0]["url"] == "http://127.0.0.1:11434/api/chat"
+    assert calls[0]["timeout"] is None
+    assert [call["url"] for call in calls[1:]] == [
+        "http://127.0.0.1:11434/api/version",
+        "http://127.0.0.1:11434/api/version",
+    ]
 
 
 def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
@@ -185,8 +220,8 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
         assert calls[-1]["stream"] is True
         assert calls[-1]["options"]["temperature"] == 0.9
         assert calls[-1]["options"]["top_k"] == 40
-        assert calls[-1]["options"]["num_ctx"] == 100352
-        assert calls[-1]["options"]["num_predict"] == 20032
+        assert calls[-1]["options"]["num_ctx"] == 8192
+        assert calls[-1]["options"]["num_predict"] == 4096
         tool_messages = [message for message in calls[-1]["messages"] if message.get("role") == "tool"]
         assert tool_messages
         assert "alpha context" in tool_messages[0]["content"]
@@ -247,8 +282,8 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
         assert calls[-1]["stream"] is True
         assert calls[-1]["options"]["temperature"] == 0.9
         assert calls[-1]["options"]["top_k"] == 40
-        assert calls[-1]["options"]["num_ctx"] == 100352
-        assert calls[-1]["options"]["num_predict"] == 20032
+        assert calls[-1]["options"]["num_ctx"] == 8192
+        assert calls[-1]["options"]["num_predict"] == 4096
 
         events = list(engine.ask_stream_events("alpha?"))
         assert events[0] == {"type": "notice", "text": "Planning retrieval tool calls..."}
@@ -392,6 +427,38 @@ def test_repeated_local_tool_call_excludes_already_returned_chunks(monkeypatch):
 
         assert [result["chunk_id"] for result in first["results"]] == ["a", "b"]
         assert second["results"] == []
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_local_query_engine_uses_configurable_system_prompt(monkeypatch):
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+            return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+    captured = {}
+
+    def fake_chat(**kwargs):
+        captured["messages"] = kwargs["messages"]
+        return {"message": {"content": ""}}
+
+    monkeypatch.setattr(local_rag, "_ollama_chat", fake_chat)
+    monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    try:
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            progress_enabled=False,
+            web_search_enabled=False,
+            system_prompt="Custom system. {web_instruction}",
+        )
+        list(engine._run_tool_rounds("alpha?"))
+
+        assert captured["messages"][0]["content"] == "Custom system. Do not use web_search; it is disabled for this request."
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 

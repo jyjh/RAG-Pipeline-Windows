@@ -32,6 +32,9 @@ def test_query_engine_delegates_to_local_query_engine(monkeypatch):
         web_search_enabled=False,
         web_search_timeout=6.0,
         web_search_max_results=3,
+        ollama_health_check_interval=2.5,
+        ollama_max_lost_health_checks=7,
+        system_prompt="Custom prompt {web_instruction}",
         progress_enabled=False,
     )
 
@@ -55,6 +58,9 @@ def test_query_engine_delegates_to_local_query_engine(monkeypatch):
             "web_search_enabled": False,
             "web_search_timeout": 6.0,
             "web_search_max_results": 3,
+            "ollama_health_check_interval": 2.5,
+            "ollama_max_lost_health_checks": 7,
+            "system_prompt": "Custom prompt {web_instruction}",
             "progress_enabled": False,
         },
         "question": "What is aero balance?",

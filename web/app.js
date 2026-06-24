@@ -43,6 +43,7 @@ const els = {
   maxKInput: document.getElementById("maxKInput"),
   contextWindowInput: document.getElementById("contextWindowInput"),
   maxOutputInput: document.getElementById("maxOutputInput"),
+  relevanceFloorInput: document.getElementById("relevanceFloorInput"),
   webSearchInput: document.getElementById("webSearchInput"),
   sendButton: document.getElementById("sendButton"),
   chatLayout: document.getElementById("chatLayout"),
@@ -452,6 +453,7 @@ async function refreshHealth() {
   try {
     const data = await requestJson("/api/health");
     applyServerConfig(data.server || {});
+    applyChatConfig(data.chat || {});
     const queue = data.queue || {};
     els.statusLine.textContent =
       `${data.record_count} indexed chunks | ` +
@@ -459,6 +461,21 @@ async function refreshHealth() {
       `${queue.queued_count || 0} queued jobs`;
   } catch (error) {
     els.statusLine.textContent = `Health check failed: ${error.message}`;
+  }
+}
+
+function applyChatConfig(config) {
+  if (config.context_window && !els.contextWindowInput.dataset.configApplied) {
+    els.contextWindowInput.value = String(config.context_window);
+    els.contextWindowInput.dataset.configApplied = "true";
+  }
+  if (config.llm_num_predict && !els.maxOutputInput.dataset.configApplied) {
+    els.maxOutputInput.value = String(config.llm_num_predict);
+    els.maxOutputInput.dataset.configApplied = "true";
+  }
+  if (config.retrieval_min_score !== undefined && !els.relevanceFloorInput.dataset.configApplied) {
+    els.relevanceFloorInput.value = String(config.retrieval_min_score);
+    els.relevanceFloorInput.dataset.configApplied = "true";
   }
 }
 
@@ -1038,8 +1055,9 @@ async function sendQuestion(event) {
         question,
         temperature: numericSetting(els.temperatureInput, 0.9, 0),
         max_k: Math.trunc(numericSetting(els.maxKInput, 40, 1)),
-        context_window: Math.trunc(numericSetting(els.contextWindowInput, 100000, 1)),
-        llm_num_predict: Math.trunc(numericSetting(els.maxOutputInput, 20032, 1)),
+        context_window: Math.trunc(numericSetting(els.contextWindowInput, 8192, 1)),
+        llm_num_predict: Math.trunc(numericSetting(els.maxOutputInput, 4096, 1)),
+        retrieval_min_score: numericSetting(els.relevanceFloorInput, 0.5, 0),
         web_search_enabled: Boolean(els.webSearchInput.checked),
       }),
     });
