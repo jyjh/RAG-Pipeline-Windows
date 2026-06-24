@@ -38,6 +38,25 @@ def _write_lancedb_records(db_dir: Path, records: list[dict]):
     )
 
 
+def _tool_call(name="search_local_context", arguments=None):
+    return {"function": {"name": name, "arguments": arguments or {"query": "alpha?"}}}
+
+
+def _fake_local_tool_chat(calls, *, final_events=None):
+    final_events = final_events or [{"message": {"content": "answer [S1]"}}]
+
+    def fake_chat(**kwargs):
+        calls.append(kwargs)
+        if kwargs["stream"]:
+            return iter(final_events)
+        has_tool_result = any(message.get("role") == "tool" for message in kwargs["messages"])
+        if not has_tool_result:
+            return {"message": {"tool_calls": [_tool_call()]}}
+        return {"message": {"content": ""}}
+
+    return fake_chat
+
+
 def test_chunk_markdown_splits_long_text_without_empty_chunks():
     text = "alpha\n\n" + ("beta " * 1000)
 
@@ -148,13 +167,9 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
             def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
                 return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
 
-        calls = {}
+        calls = []
 
-        def fake_chat(**kwargs):
-            calls["kwargs"] = kwargs
-            return {"message": {"content": "answer"}}
-
-        monkeypatch.setattr(local_rag, "_ollama_chat", fake_chat)
+        monkeypatch.setattr(local_rag, "_ollama_chat", _fake_local_tool_chat(calls))
         monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
 
         engine = local_rag.LocalQueryEngine(
@@ -164,14 +179,18 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
         )
         answer = engine.ask("alpha?")
 
-        assert answer == "answer"
-        assert calls["kwargs"]["model"] == "gemma4"
-        assert calls["kwargs"]["options"]["temperature"] == 0.9
-        assert calls["kwargs"]["options"]["top_k"] == 40
-        assert calls["kwargs"]["options"]["num_ctx"] == 8192
-        assert calls["kwargs"]["options"]["num_predict"] == 4096
-        user_prompt = calls["kwargs"]["messages"][1]["content"]
-        assert "alpha context" in user_prompt
+        assert answer == "answer [S1]"
+        assert calls[0]["model"] == "gemma4"
+        assert calls[0]["tools"][0]["function"]["name"] == "search_local_context"
+        assert calls[-1]["stream"] is True
+        assert calls[-1]["options"]["temperature"] == 0.9
+        assert calls[-1]["options"]["top_k"] == 40
+        assert calls[-1]["options"]["num_ctx"] == 8192
+        assert calls[-1]["options"]["num_predict"] == 4096
+        tool_messages = [message for message in calls[-1]["messages"] if message.get("role") == "tool"]
+        assert tool_messages
+        assert "alpha context" in tool_messages[0]["content"]
+        assert '"citation": "[S1]"' in tool_messages[0]["content"]
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -201,19 +220,20 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
             def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
                 return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
 
-        calls = {}
+        calls = []
 
-        def fake_chat(**kwargs):
-            calls["kwargs"] = kwargs
-            return iter(
-                [
+        monkeypatch.setattr(
+            local_rag,
+            "_ollama_chat",
+            _fake_local_tool_chat(
+                calls,
+                final_events=[
                     {"message": {"thinking": "considering "}},
                     {"message": {"content": "chunk "}},
-                    {"message": {"content": "two"}},
-                ]
-            )
-
-        monkeypatch.setattr(local_rag, "_ollama_chat", fake_chat)
+                    {"message": {"content": "two [S1]"}},
+                ],
+            ),
+        )
         monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
 
         engine = local_rag.LocalQueryEngine(
@@ -223,23 +243,192 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
         )
         chunks = list(engine.ask_stream("alpha?"))
 
-        assert chunks == ["chunk ", "two"]
-        assert calls["kwargs"]["stream"] is True
-        assert calls["kwargs"]["options"]["temperature"] == 0.9
-        assert calls["kwargs"]["options"]["top_k"] == 40
-        assert calls["kwargs"]["options"]["num_ctx"] == 8192
-        assert calls["kwargs"]["options"]["num_predict"] == 4096
+        assert chunks == ["chunk ", "two [S1]"]
+        assert calls[-1]["stream"] is True
+        assert calls[-1]["options"]["temperature"] == 0.9
+        assert calls[-1]["options"]["top_k"] == 40
+        assert calls[-1]["options"]["num_ctx"] == 8192
+        assert calls[-1]["options"]["num_predict"] == 4096
 
         events = list(engine.ask_stream_events("alpha?"))
-        assert events == [
-            {"type": "notice", "text": "Embedding query and retrieving context..."},
-            {"type": "notice", "text": "Retrieved 1 context chunk(s). Requesting answer from gemma4..."},
-            {"type": "thinking", "text": "considering "},
-            {"type": "answer", "text": "chunk "},
-            {"type": "answer", "text": "two"},
-        ]
+        assert events[0] == {"type": "notice", "text": "Planning retrieval tool calls..."}
+        assert {"type": "tool_call", "tool": "search_local_context", "text": "Running search_local_context..."} in events
+        assert any(event.get("type") == "sources" and event["sources"][0]["label"] == "[S1]" for event in events)
+        assert {"type": "thinking", "text": "considering "} in events
+        assert {"type": "answer", "text": "chunk "} in events
+        assert {"type": "answer", "text": "two [S1]"} in events
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_retrieval_uses_relevance_cutoff_without_fixed_chunk_limit(monkeypatch):
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+            return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+    class FakeStore:
+        def exists(self):
+            return True
+
+        def count(self):
+            return 3
+
+        def search(self, vector, *, top_k):
+            assert top_k == 80
+            return [
+                {"id": "a", "node_type": "chunk", "content": "alpha", "score": 1.0},
+                {"id": "b", "node_type": "chunk", "content": "beta", "score": 0.75},
+                {"id": "c", "node_type": "chunk", "content": "gamma", "score": 0.71},
+            ]
+
+        def child_chunks(self, parent, *, limit):
+            return []
+
+    monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    try:
+        engine = local_rag.LocalQueryEngine(working_dir=str(tmp_path), progress_enabled=False)
+        engine.store = FakeStore()
+        engine.record_count = 3
+
+        matches = engine._retrieve("alpha?")
+
+        assert [match["id"] for match in matches] == ["a", "b"]
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_retrieval_stops_at_context_token_budget_after_first_match(monkeypatch):
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+            return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+    class FakeStore:
+        def exists(self):
+            return True
+
+        def count(self):
+            return 2
+
+        def search(self, vector, *, top_k):
+            return [
+                {"id": "a", "node_type": "chunk", "content": "alpha " * 220, "score": 1.0},
+                {"id": "b", "node_type": "chunk", "content": "beta " * 220, "score": 0.9},
+            ]
+
+        def child_chunks(self, parent, *, limit):
+            return []
+
+    monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    try:
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            context_window=1024,
+            context_token_fraction=0.25,
+            progress_enabled=False,
+        )
+        engine.store = FakeStore()
+        engine.record_count = 2
+
+        matches = engine._retrieve("alpha?")
+
+        assert [match["id"] for match in matches] == ["a"]
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_repeated_local_tool_call_excludes_already_returned_chunks(monkeypatch):
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+            return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+    class FakeStore:
+        def exists(self):
+            return True
+
+        def count(self):
+            return 2
+
+        def search(self, vector, *, top_k):
+            return [
+                {"id": "a", "node_type": "chunk", "content": "alpha", "score": 1.0},
+                {"id": "b", "node_type": "chunk", "content": "beta", "score": 0.9},
+            ]
+
+        def child_chunks(self, parent, *, limit):
+            return []
+
+    monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    try:
+        engine = local_rag.LocalQueryEngine(working_dir=str(tmp_path), progress_enabled=False)
+        engine.store = FakeStore()
+        engine.record_count = 2
+        citations = local_rag.CitationRegistry()
+
+        first = engine._execute_tool_call(
+            _tool_call(arguments={"query": "alpha?"}),
+            question="alpha?",
+            citations=citations,
+        )[1]
+        second = engine._execute_tool_call(
+            _tool_call(arguments={"query": "alpha?"}),
+            question="alpha?",
+            citations=citations,
+        )[1]
+
+        assert [result["chunk_id"] for result in first["results"]] == ["a", "b"]
+        assert second["results"] == []
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_web_search_duckduckgo_lite_parses_results(monkeypatch):
+    import requests
+
+    class FakeResponse:
+        text = """
+        <a class="result-link" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpaper">Paper</a>
+        <td class="result-snippet">Useful snippet</td>
+        """
+
+        def raise_for_status(self):
+            pass
+
+    calls = {}
+
+    def fake_get(url, timeout, headers):
+        calls["url"] = url
+        calls["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    result = local_rag.web_search_duckduckgo_lite("query", max_results=3, timeout=4.0)
+
+    assert calls["timeout"] == 4.0
+    assert "q=query" in calls["url"]
+    assert result["results"] == [
+        {
+            "title": "Paper",
+            "url": "https://example.com/paper",
+            "snippet": "Useful snippet",
+            "provider": "duckduckgo_lite",
+        }
+    ]
 
 
 def test_local_query_engine_reports_thinking_only_cutoff(monkeypatch):
@@ -267,15 +456,19 @@ def test_local_query_engine_reports_thinking_only_cutoff(monkeypatch):
             def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
                 return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
 
-        def fake_chat(**kwargs):
-            return iter(
-                [
+        calls = []
+
+        monkeypatch.setattr(
+            local_rag,
+            "_ollama_chat",
+            _fake_local_tool_chat(
+                calls,
+                final_events=[
                     {"message": {"content": "<think>still thinking"}},
                     {"done": True, "done_reason": "length", "message": {"content": ""}},
-                ]
-            )
-
-        monkeypatch.setattr(local_rag, "_ollama_chat", fake_chat)
+                ],
+            ),
+        )
         monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
 
         engine = local_rag.LocalQueryEngine(
@@ -285,9 +478,8 @@ def test_local_query_engine_reports_thinking_only_cutoff(monkeypatch):
         )
         events = list(engine.ask_stream_events("alpha?"))
 
-        assert events[0] == {"type": "notice", "text": "Embedding query and retrieving context..."}
-        assert events[1] == {"type": "notice", "text": "Retrieved 1 context chunk(s). Requesting answer from gemma4..."}
-        assert events[2] == {"type": "thinking", "text": "still thinking"}
+        assert events[0] == {"type": "notice", "text": "Planning retrieval tool calls..."}
+        assert {"type": "thinking", "text": "still thinking"} in events
         assert events[-1]["type"] == "notice"
         assert "token limit" in events[-1]["text"]
     finally:
@@ -346,26 +538,21 @@ def test_local_query_engine_expands_lancedb_summary_hits(monkeypatch):
             def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
                 return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
 
-        calls = {}
+        calls = []
 
-        def fake_chat(**kwargs):
-            calls["kwargs"] = kwargs
-            return {"message": {"content": "answer"}}
-
-        monkeypatch.setattr(local_rag, "_ollama_chat", fake_chat)
+        monkeypatch.setattr(local_rag, "_ollama_chat", _fake_local_tool_chat(calls))
         monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
 
         engine = local_rag.LocalQueryEngine(
             working_dir=str(tmp_path),
             progress_enabled=False,
             model="gemma4",
-            top_k=1,
         )
 
-        assert engine.ask("alpha?") == "answer"
-        user_prompt = calls["kwargs"]["messages"][1]["content"]
-        assert "alpha leaf context" in user_prompt
-        assert "document summary only" not in user_prompt
+        assert engine.ask("alpha?") == "answer [S1]"
+        tool_messages = [message for message in calls[-1]["messages"] if message.get("role") == "tool"]
+        assert "alpha leaf context" in tool_messages[0]["content"]
+        assert "document summary only" not in tool_messages[0]["content"]
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 

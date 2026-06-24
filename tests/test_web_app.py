@@ -449,6 +449,74 @@ def test_upload_endpoint_allows_forced_duplicate(monkeypatch, workspace_tmp):
     assert captured["force_duplicate_hashes"] == [captured["uploads"][0]["hash"]]
 
 
+def test_pdf_documents_list_and_download_endpoint(monkeypatch, workspace_tmp):
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    pdf_path = web_app.DATA_DIR / "ST231.pdf"
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=processed_dir / "doc.md",
+        source_hash="hash-download",
+        source_pdf_name=pdf_path.name,
+        source_pdf_path=pdf_path,
+    )
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+
+    client = TestClient(web_app.app)
+    listing = client.get("/api/pdfs")
+
+    assert listing.status_code == 200
+    pdfs = listing.json()["pdfs"]
+    assert pdfs[0]["hash"] == "hash-download"
+    assert pdfs[0]["can_download"] is True
+    assert pdfs[0]["download_url"] == "/api/pdfs/hash-download/download"
+
+    download = client.get("/api/pdfs/hash-download/download")
+    assert download.status_code == 200
+    assert download.content.startswith(b"%PDF")
+
+
+def test_pdf_download_reports_missing_hash_and_missing_file(monkeypatch, workspace_tmp):
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    missing_pdf = web_app.DATA_DIR / f"missing-{uuid.uuid4().hex}.pdf"
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=processed_dir / "doc.md",
+        source_hash="hash-missing-file",
+        source_pdf_name="missing.pdf",
+        source_pdf_path=missing_pdf,
+    )
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+
+    client = TestClient(web_app.app)
+
+    assert client.get("/api/pdfs/no-such-hash/download").status_code == 404
+    assert client.get("/api/pdfs/hash-missing-file/download").status_code == 404
+
+
+def test_pdf_download_rejects_paths_outside_data_dir(monkeypatch, workspace_tmp):
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    outside_pdf = workspace_tmp / "outside.pdf"
+    outside_pdf.write_bytes(b"%PDF-1.4 outside")
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=processed_dir / "doc.md",
+        source_hash="hash-unsafe",
+        source_pdf_name="outside.pdf",
+        source_pdf_path=outside_pdf,
+    )
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+
+    client = TestClient(web_app.app)
+
+    assert client.get("/api/pdfs/hash-unsafe/download").status_code == 403
+
+
 def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
     events = []
 
@@ -466,6 +534,7 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
         def ask_stream_events(self, question):
             assert question == "alpha?"
             yield {"type": "thinking", "text": "checking "}
+            yield {"type": "sources", "sources": [{"id": "S1", "label": "[S1]", "kind": "local"}]}
             yield {"type": "answer", "text": "chunk "}
             yield {"type": "answer", "text": "two"}
 
@@ -481,12 +550,14 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
             "max_k": 25,
             "context_window": 4096,
             "llm_num_predict": 512,
+            "web_search_enabled": False,
         },
     )
 
     assert response.status_code == 200
     assert [json.loads(line) for line in response.text.splitlines()] == [
         {"type": "thinking", "text": "checking "},
+        {"type": "sources", "sources": [{"id": "S1", "label": "[S1]", "kind": "local"}]},
         {"type": "answer", "text": "chunk "},
         {"type": "answer", "text": "two"},
     ]
@@ -496,6 +567,11 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
     assert events[1][1]["context_window"] == 4096
     assert events[1][1]["llm_num_predict"] == 512
     assert events[1][1]["llm_timeout"] == 120.0
+    assert events[1][1]["web_search_enabled"] is False
+    assert events[1][1]["retrieval_candidate_k"] == 80
+    assert events[1][1]["retrieval_min_score"] == 0.36
+    assert events[1][1]["retrieval_relative_cutoff"] == 0.72
+    assert events[1][1]["context_token_fraction"] == 0.60
     assert events[-1] == "finish"
 
 

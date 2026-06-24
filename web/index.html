@@ -27,6 +27,16 @@
           <button id="reindexButton" type="button">Reindex</button>
         </div>
         <div id="uploadStatus" class="status"></div>
+        <table class="data-table pdf-table">
+          <thead>
+            <tr>
+              <th>PDF</th>
+              <th>Status</th>
+              <th>Download</th>
+            </tr>
+          </thead>
+          <tbody id="pdfsBody"></tbody>
+        </table>
         <table class="data-table">
           <thead>
             <tr>
@@ -94,6 +104,10 @@
                 <label>
                   Max Output
                   <input id="maxOutputInput" type="number" min="64" max="32768" step="64" value="4096" />
+                </label>
+                <label class="checkbox-label">
+                  Web search
+                  <input id="webSearchInput" type="checkbox" checked />
                 </label>
               </div>
               <textarea id="questionInput" rows="3" placeholder="Ask a question"></textarea>

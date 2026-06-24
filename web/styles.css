@@ -141,6 +141,10 @@ input[type="file"] {
   border: 1px solid var(--line);
 }
 
+.pdf-table {
+  margin-bottom: 14px;
+}
+
 .data-table th,
 .data-table td {
   border-bottom: 1px solid var(--line);
@@ -344,6 +348,54 @@ input[type="file"] {
   font-size: 13px;
 }
 
+.sources-block {
+  margin: 0 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfcfd;
+}
+
+.sources-block[hidden] {
+  display: none;
+}
+
+.sources-block summary {
+  cursor: pointer;
+  padding: 7px 10px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.sources-body {
+  display: grid;
+  gap: 8px;
+  padding: 0 10px 10px;
+  font-size: 13px;
+}
+
+.source-item {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  color: var(--muted);
+}
+
+.source-item strong {
+  color: var(--text);
+}
+
+.source-links {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.source-links a,
+.download-link {
+  color: var(--accent-strong);
+}
+
 .chat-form {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -366,6 +418,11 @@ input[type="file"] {
   font-weight: 650;
 }
 
+.sampler-settings .checkbox-label {
+  grid-template-columns: 1fr auto;
+  align-items: end;
+}
+
 .sampler-settings input {
   width: 100%;
   min-height: 34px;
@@ -374,6 +431,12 @@ input[type="file"] {
   border-radius: 6px;
   background: #ffffff;
   color: var(--text);
+}
+
+.sampler-settings input[type="checkbox"] {
+  width: 22px;
+  min-height: 22px;
+  align-self: center;
 }
 
 #questionInput {

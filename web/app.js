@@ -23,6 +23,7 @@ const els = {
   uploadButton: document.getElementById("uploadButton"),
   reindexButton: document.getElementById("reindexButton"),
   uploadStatus: document.getElementById("uploadStatus"),
+  pdfsBody: document.getElementById("pdfsBody"),
   jobsBody: document.getElementById("jobsBody"),
   searchInput: document.getElementById("searchInput"),
   searchButton: document.getElementById("searchButton"),
@@ -37,6 +38,7 @@ const els = {
   maxKInput: document.getElementById("maxKInput"),
   contextWindowInput: document.getElementById("contextWindowInput"),
   maxOutputInput: document.getElementById("maxOutputInput"),
+  webSearchInput: document.getElementById("webSearchInput"),
   sendButton: document.getElementById("sendButton"),
   chatLayout: document.getElementById("chatLayout"),
   chatSidebar: document.getElementById("chatSidebar"),
@@ -416,6 +418,7 @@ function addAssistantMessageToChat(chat, parts) {
     thinking: parts.rawThinking,
     answerHtml: parts.body.innerHTML,
     thinkingHtml: parts.rawThinking ? parts.thinkingBody.innerHTML : "",
+    sources: parts.sources,
     notice: parts.notice.textContent || "",
     createdAt: nowIso(),
   });
@@ -493,6 +496,30 @@ async function refreshJobs() {
   }
 }
 
+async function refreshPdfs() {
+  try {
+    const data = await requestJson("/api/pdfs");
+    els.pdfsBody.innerHTML = "";
+    for (const item of data.pdfs || []) {
+      const row = document.createElement("tr");
+      const download = item.download_url
+        ? `<a class="download-link" href="${escapeHtml(item.download_url)}">Download</a>`
+        : escapeHtml(item.path_error || "");
+      row.innerHTML = `
+        <td>
+          <strong>${escapeHtml(item.filename || item.hash)}</strong><br />
+          ${escapeHtml(item.hash || "")}
+        </td>
+        <td>${escapeHtml(item.status || "")}</td>
+        <td>${download}</td>
+      `;
+      els.pdfsBody.appendChild(row);
+    }
+  } catch (error) {
+    setStatus(els.uploadStatus, error.message, true);
+  }
+}
+
 function scheduleHealthPolling() {
   if (state.healthTimer) {
     clearInterval(state.healthTimer);
@@ -543,6 +570,7 @@ async function uploadFiles(forceDuplicates = false) {
     els.fileInput.value = "";
     setStatus(els.uploadStatus, `Queued job ${job.id.slice(0, 8)}.`);
     await refreshJobs();
+    await refreshPdfs();
   } catch (error) {
     if (
       !forceDuplicates &&
@@ -575,6 +603,7 @@ async function enqueueReindex() {
     const job = await requestJson("/api/reindex", { method: "POST" });
     setStatus(els.uploadStatus, `Queued reindex job ${job.id.slice(0, 8)}.`);
     await refreshJobs();
+    await refreshPdfs();
   } catch (error) {
     setStatus(els.uploadStatus, error.message, true);
   } finally {
@@ -610,11 +639,15 @@ function renderIndexRows(rows) {
   for (const item of rows) {
     const row = document.createElement("tr");
     row.dataset.recordId = item.id;
+    const download = item.source_hash
+      ? `<br /><a class="download-link" href="/api/pdfs/${encodeURIComponent(item.source_hash)}/download">Download PDF</a>`
+      : "";
     row.innerHTML = `
       <td class="source-cell">
         <strong>${escapeHtml(item.id)}</strong><br />
         ${escapeHtml(item.file_path)}<br />
         chunk ${escapeHtml(item.chunk_index)}
+        ${download}
       </td>
       <td>
         <textarea class="content-edit" spellcheck="false"></textarea>
@@ -703,6 +736,17 @@ function addAssistantMessage() {
   thinkingBody.className = "thinking-body rendered";
   thinking.append(summary, thinkingBody);
 
+  const sources = document.createElement("details");
+  sources.className = "sources-block";
+  sources.hidden = true;
+
+  const sourcesSummary = document.createElement("summary");
+  sourcesSummary.textContent = "Sources";
+
+  const sourcesBody = document.createElement("div");
+  sourcesBody.className = "sources-body";
+  sources.append(sourcesSummary, sourcesBody);
+
   const notice = document.createElement("div");
   notice.className = "stream-notice";
   notice.hidden = true;
@@ -710,16 +754,25 @@ function addAssistantMessage() {
   const body = document.createElement("div");
   body.className = "body rendered";
 
-  message.append(roleLabel, thinking, notice, body);
+  message.append(roleLabel, thinking, sources, notice, body);
   els.chatMessages.appendChild(message);
   els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
   return {
     body,
     thinking,
     thinkingBody,
+    sourcesPanel: sources,
+    sourcesBody,
     notice,
     rawAnswer: "",
     rawThinking: "",
+    sourcesData: [],
+    get sources() {
+      return this.sourcesData;
+    },
+    set sources(value) {
+      this.sourcesData = Array.isArray(value) ? value : [];
+    },
     transientNotices: [],
     persistentNotices: [],
     gemmaResponseStarted: false,
@@ -736,16 +789,60 @@ function addAssistantMessage() {
   };
 }
 
+function sourceTitle(source) {
+  if (source.kind === "web") {
+    return source.title || source.url || source.label;
+  }
+  return source.source_pdf_name || source.file_path || source.chunk_id || source.label;
+}
+
+function sourceLocation(source) {
+  if (source.kind === "web") {
+    return source.provider || "";
+  }
+  return [source.section_path, source.page_label].filter(Boolean).join(" | ");
+}
+
+function renderSourcePanel(parts) {
+  const sources = Array.isArray(parts.sources) ? parts.sources : [];
+  parts.sourcesPanel.hidden = sources.length === 0;
+  parts.sourcesPanel.open = sources.length > 0;
+  parts.sourcesBody.innerHTML = "";
+  for (const source of sources) {
+    const item = document.createElement("div");
+    item.className = "source-item";
+    const links = [];
+    if (source.kind === "web" && source.url) {
+      links.push(`<a href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">Open</a>`);
+    }
+    if (source.kind === "local" && source.download_url) {
+      links.push(`<a href="${escapeHtml(source.download_url)}">Download PDF</a>`);
+    }
+    const score = source.kind === "local" && Number.isFinite(Number(source.score))
+      ? `score ${Number(source.score).toFixed(3)}`
+      : "";
+    item.innerHTML = `
+      <strong>${escapeHtml(source.label || source.id || "")} ${escapeHtml(sourceTitle(source))}</strong>
+      <span>${escapeHtml([sourceLocation(source), score].filter(Boolean).join(" | "))}</span>
+      <span>${escapeHtml(source.snippet || "")}</span>
+      <span class="source-links">${links.join("")}</span>
+    `;
+    parts.sourcesBody.appendChild(item);
+  }
+}
+
 function addSavedAssistantMessage(saved) {
   const parts = addAssistantMessage();
   parts.finalized = true;
   parts.rawAnswer = saved.text || "";
   parts.rawThinking = saved.thinking || "";
+  parts.sources = saved.sources || [];
   if (parts.rawThinking) {
     parts.thinking.hidden = false;
     parts.thinking.open = false;
     parts.thinkingBody.innerHTML = saved.thinkingHtml || escapeHtml(parts.rawThinking);
   }
+  renderSourcePanel(parts);
   if (saved.notice) {
     parts.notice.textContent = saved.notice;
     parts.notice.hidden = false;
@@ -761,6 +858,9 @@ function addSavedAssistantMessage(saved) {
 function isTransientNotice(text) {
   return (
     text === "Embedding query and retrieving context..." ||
+    text === "Planning retrieval tool calls..." ||
+    /^Running .+\.\.\.$/.test(text) ||
+    /^Retrieved \d+ .+\(s\)\.?$/.test(text) ||
     /^Retrieved \d+ context chunk\(s\)\. Requesting answer from .+\.\.\.$/.test(text)
   );
 }
@@ -800,6 +900,22 @@ function appendStreamEvent(parts, event) {
 
   if (type === "error") {
     addPersistentNotice(parts, `[Error] ${text}`);
+    return;
+  }
+
+  if (type === "sources") {
+    parts.sources = Array.isArray(event.sources) ? event.sources : [];
+    renderSourcePanel(parts);
+    return;
+  }
+
+  if (type === "tool_call" || type === "tool_result") {
+    if (isTransientNotice(text)) {
+      parts.transientNotices.push(text);
+    } else {
+      parts.persistentNotices.push(text);
+    }
+    updateNotice(parts);
     return;
   }
 
@@ -876,6 +992,7 @@ async function sendQuestion(event) {
         max_k: Math.trunc(numericSetting(els.maxKInput, 40, 1)),
         context_window: Math.trunc(numericSetting(els.contextWindowInput, 8192, 1)),
         llm_num_predict: Math.trunc(numericSetting(els.maxOutputInput, 4096, 1)),
+        web_search_enabled: Boolean(els.webSearchInput.checked),
       }),
     });
     if (!response.ok || !response.body) {
@@ -976,5 +1093,6 @@ renderActiveChat();
 persistChatState();
 refreshHealth();
 refreshJobs();
+refreshPdfs();
 scheduleHealthPolling();
 scheduleJobsPolling();

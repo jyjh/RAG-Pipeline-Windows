@@ -113,6 +113,13 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
             temperature,
             sampler_top_k,
             context_window,
+            retrieval_candidate_k,
+            retrieval_min_score,
+            retrieval_relative_cutoff,
+            context_token_fraction,
+            web_search_enabled,
+            web_search_timeout,
+            web_search_max_results,
             progress_enabled,
         ):
             calls["working_dir"] = working_dir
@@ -125,6 +132,13 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
             calls["temperature"] = temperature
             calls["sampler_top_k"] = sampler_top_k
             calls["context_window"] = context_window
+            calls["retrieval_candidate_k"] = retrieval_candidate_k
+            calls["retrieval_min_score"] = retrieval_min_score
+            calls["retrieval_relative_cutoff"] = retrieval_relative_cutoff
+            calls["context_token_fraction"] = context_token_fraction
+            calls["web_search_enabled"] = web_search_enabled
+            calls["web_search_timeout"] = web_search_timeout
+            calls["web_search_max_results"] = web_search_max_results
             calls["progress_enabled"] = progress_enabled
 
         def ask(self, question):
@@ -158,6 +172,13 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
         "temperature": 0.9,
         "sampler_top_k": 40,
         "context_window": 8192,
+        "retrieval_candidate_k": 80,
+        "retrieval_min_score": 0.36,
+        "retrieval_relative_cutoff": 0.72,
+        "context_token_fraction": 0.6,
+        "web_search_enabled": True,
+        "web_search_timeout": 8.0,
+        "web_search_max_results": 5,
         "progress_enabled": True,
         "question": "What is regularization?",
     }

@@ -160,7 +160,7 @@ health_poll_interval_ms = 60000
 jobs_poll_interval_ms = 60000
 ```
 
-Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/indexing work in the background, lets users inspect/edit/delete index records, and streams chat answers as Ollama produces them. The chat panel saves conversations in the browser's `localStorage` and includes a collapsible saved-chat sidebar with rename/delete controls. Uploads are tracked by PDF SHA-256 hash across queued and ingested files; duplicate uploads are rejected unless the browser confirmation prompt is accepted for a forced re-upload. Forced re-upload cleanup waits until the job reaches ingestion, then removes existing indexed records for that parent PDF before fresh ingestion/indexing. The chat panel exposes sampler controls for temperature, top-k (`Max K`), context window, and maximum output tokens. When Ollama returns model thinking, the chat UI shows it in a collapsible block above the answer and reports clearly if the model stops before producing final answer text. Chat output is rendered as Markdown with local LaTeX-to-MathML formatting. Queued ingestion/indexing waits before expensive phases while chat queries are active; a phase already running is not forcibly interrupted. Query generation defaults to temperature `0.9`, top-k `40`, context window `8192`, and max output `4096`.
+Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/indexing work in the background, lets users inspect/edit/delete index records, and streams chat answers as Ollama produces them. Uploaded and indexed PDFs are listed with download links for source verification. The chat panel saves conversations in the browser's `localStorage` and includes a collapsible saved-chat sidebar with rename/delete controls. Uploads are tracked by PDF SHA-256 hash across queued and ingested files; duplicate uploads are rejected unless the browser confirmation prompt is accepted for a forced re-upload. Forced re-upload cleanup waits until the job reaches ingestion, then removes existing indexed records for that parent PDF before fresh ingestion/indexing. The chat panel exposes sampler controls for temperature, top-k (`Max K`), context window, maximum output tokens, and web-search enablement. When Ollama returns model thinking, the chat UI shows it in a collapsible block above the answer and reports clearly if the model stops before producing final answer text. Chat output is rendered as Markdown with local LaTeX-to-MathML formatting and includes a Sources panel populated from retrieved chunks and web results. Queued ingestion/indexing waits before expensive phases while chat queries are active; a phase already running is not forcibly interrupted. Query generation defaults to temperature `0.9`, top-k `40`, context window `8192`, and max output `4096`.
 
 ## Architecture
 
@@ -185,7 +185,9 @@ Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/
 4. **Querying**
    - Questions are embedded locally through Ollama.
    - Summary hits are expanded to child chunks, while direct chunk hits are used as answer context.
-   - `gemma4` synthesizes an answer from retrieved context and cites source numbers with section/page metadata.
+   - Context selection uses a relevance cutoff plus a context-token budget instead of a fixed chunk count.
+   - Ollama native tool calls let the model pull additional local context and optional keyless web-search results before final answer streaming.
+   - `gemma4` synthesizes an answer from tool-returned sources and cites `[S#]` local chunks or `[W#]` web results shown in the Sources panel.
 
 ## Hardware And Runtime Notes
 

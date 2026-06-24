@@ -36,6 +36,16 @@ vector_top_k = 24
 bm25_top_k = 24
 rrf_k = 60
 rerank_top_k = 12
+min_relevance_score = 0.36
+relative_relevance_cutoff = 0.72
+candidate_top_k = 80
+context_token_fraction = 0.60
+
+[web_search]
+enabled = true
+provider = "duckduckgo_lite"
+timeout_seconds = 8.0
+max_results = 5
 
 [server]
 host = "127.0.0.1"

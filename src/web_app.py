@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from src.defaults import DEFAULT_LLM_MODEL
-from src.pdf_registry import PdfRegistry, remove_source_entries_by_hash
+from src.pdf_registry import PdfRegistry, load_source_map, remove_source_entries_by_hash
 from src.vector_store import default_store, lancedb_path
 
 
@@ -41,6 +41,13 @@ DEFAULT_MAX_K = 40
 DEFAULT_CONTEXT_WINDOW = 8192
 DEFAULT_LLM_NUM_PREDICT = 4096
 DEFAULT_LLM_TIMEOUT = 120.0
+DEFAULT_RETRIEVAL_CANDIDATE_K = 80
+DEFAULT_RETRIEVAL_MIN_SCORE = 0.36
+DEFAULT_RETRIEVAL_RELATIVE_CUTOFF = 0.72
+DEFAULT_CONTEXT_TOKEN_FRACTION = 0.60
+DEFAULT_WEB_SEARCH_ENABLED = True
+DEFAULT_WEB_SEARCH_TIMEOUT = 8.0
+DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 DEFAULT_INDEX_BACKEND = "lancedb"
 DEFAULT_SUMMARY_MODE = "hybrid"
 DEFAULT_CHUNK_TARGET_TOKENS = 900
@@ -162,6 +169,138 @@ def delete_index_records(*, record_ids: list[str], db_dir: Path | None = None) -
 
     with INDEX_LOCK:
         return _index_store(db_dir).delete_records(record_ids=list(ids))
+
+
+def _resolve_pdf_path(raw_path: str, *, root_dir: Path = ROOT_DIR, data_dir: Path = DATA_DIR) -> Path:
+    if not raw_path:
+        raise FileNotFoundError("PDF path is missing.")
+    path = Path(raw_path)
+    candidate = path if path.is_absolute() else root_dir / path
+    resolved = candidate.resolve()
+    data_root = data_dir.resolve()
+    try:
+        resolved.relative_to(data_root)
+    except ValueError as exc:
+        raise PermissionError(f"PDF path is outside the data directory: {resolved}") from exc
+    if resolved.suffix.lower() != ".pdf":
+        raise PermissionError(f"Download path is not a PDF: {resolved}")
+    return resolved
+
+
+def _pdf_download_url(source_hash: str) -> str:
+    return f"/api/pdfs/{source_hash}/download" if source_hash else ""
+
+
+def _pdf_entry_for_response(
+    *,
+    source_hash: str,
+    filename: str,
+    status: str = "",
+    upload_path: str = "",
+    source_pdf_path: str = "",
+    processed_markdown_path: str = "",
+    updated_at: str = "",
+    root_dir: Path = ROOT_DIR,
+    data_dir: Path = DATA_DIR,
+) -> dict[str, Any]:
+    raw_path = upload_path or source_pdf_path
+    can_download = False
+    path_error = ""
+    if raw_path:
+        try:
+            can_download = _resolve_pdf_path(raw_path, root_dir=root_dir, data_dir=data_dir).exists()
+        except FileNotFoundError:
+            path_error = "missing_path"
+        except PermissionError:
+            path_error = "unsafe_path"
+        except OSError:
+            path_error = "invalid_path"
+    return {
+        "hash": source_hash,
+        "filename": filename or Path(raw_path).name,
+        "status": status,
+        "upload_path": upload_path,
+        "source_pdf_path": source_pdf_path,
+        "processed_markdown_path": processed_markdown_path,
+        "updated_at": updated_at,
+        "can_download": can_download,
+        "download_url": _pdf_download_url(source_hash) if can_download else "",
+        "path_error": path_error,
+    }
+
+
+def list_pdf_documents(
+    *,
+    registry_path: Path | None = None,
+    processed_dir: Path | None = None,
+    root_dir: Path = ROOT_DIR,
+    data_dir: Path = DATA_DIR,
+) -> dict[str, Any]:
+    registry_path = registry_path or PDF_REGISTRY_PATH
+    processed_dir = processed_dir or PROCESSED_DIR
+    entries: dict[str, dict[str, Any]] = {}
+
+    payload = PdfRegistry(registry_path).load()
+    for source_hash, entry in payload.get("pdfs", {}).items():
+        if not isinstance(entry, dict):
+            continue
+        entries[str(source_hash)] = _pdf_entry_for_response(
+            source_hash=str(source_hash),
+            filename=str(entry.get("filename", "")),
+            status=str(entry.get("status", "")),
+            upload_path=str(entry.get("upload_path", "")),
+            processed_markdown_path=str(entry.get("processed_markdown_path", "")),
+            updated_at=str(entry.get("updated_at", "")),
+            root_dir=root_dir,
+            data_dir=data_dir,
+        )
+
+    source_map = load_source_map(processed_dir)
+    for entry in source_map.get("documents", {}).values():
+        if not isinstance(entry, dict):
+            continue
+        source_hash = str(entry.get("source_hash", ""))
+        if not source_hash:
+            continue
+        current = entries.get(source_hash, {})
+        entries[source_hash] = _pdf_entry_for_response(
+            source_hash=source_hash,
+            filename=str(current.get("filename") or entry.get("source_pdf_name", "")),
+            status=str(current.get("status") or "indexed"),
+            upload_path=str(current.get("upload_path") or ""),
+            source_pdf_path=str(entry.get("source_pdf_path", "")),
+            processed_markdown_path=str(entry.get("processed_markdown_path", "")),
+            updated_at=str(entry.get("updated_at", current.get("updated_at", ""))),
+            root_dir=root_dir,
+            data_dir=data_dir,
+        )
+
+    rows = sorted(entries.values(), key=lambda item: (item.get("filename", ""), item.get("hash", "")))
+    return {"pdfs": rows, "total": len(rows)}
+
+
+def resolve_pdf_download_path(
+    source_hash: str,
+    *,
+    registry_path: Path | None = None,
+    processed_dir: Path | None = None,
+    root_dir: Path = ROOT_DIR,
+    data_dir: Path = DATA_DIR,
+) -> tuple[Path, str]:
+    documents = list_pdf_documents(
+        registry_path=registry_path,
+        processed_dir=processed_dir,
+        root_dir=root_dir,
+        data_dir=data_dir,
+    )["pdfs"]
+    match = next((item for item in documents if item.get("hash") == source_hash), None)
+    if match is None:
+        raise FileNotFoundError(f"PDF not found for source hash: {source_hash}")
+    raw_path = str(match.get("upload_path") or match.get("source_pdf_path") or "")
+    path = _resolve_pdf_path(raw_path, root_dir=root_dir, data_dir=data_dir)
+    if not path.exists():
+        raise FileNotFoundError(f"PDF file is missing for source hash: {source_hash}")
+    return path, str(match.get("filename") or path.name)
 
 
 @dataclass
@@ -498,6 +637,13 @@ class ChatRequest(BaseModel):
     context_window: int | None = DEFAULT_CONTEXT_WINDOW
     llm_num_predict: int | None = DEFAULT_LLM_NUM_PREDICT
     llm_timeout: float | None = DEFAULT_LLM_TIMEOUT
+    web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED
+    retrieval_candidate_k: int | None = DEFAULT_RETRIEVAL_CANDIDATE_K
+    retrieval_min_score: float | None = DEFAULT_RETRIEVAL_MIN_SCORE
+    retrieval_relative_cutoff: float | None = DEFAULT_RETRIEVAL_RELATIVE_CUTOFF
+    context_token_fraction: float | None = DEFAULT_CONTEXT_TOKEN_FRACTION
+    web_search_timeout: float | None = DEFAULT_WEB_SEARCH_TIMEOUT
+    web_search_max_results: int | None = DEFAULT_WEB_SEARCH_MAX_RESULTS
 
 
 class IndexUpdateRequest(BaseModel):
@@ -755,6 +901,22 @@ def get_job(job_id: str):
     return job
 
 
+@app.get("/api/pdfs")
+def pdf_documents():
+    return list_pdf_documents()
+
+
+@app.get("/api/pdfs/{source_hash}/download")
+def download_pdf(source_hash: str):
+    try:
+        path, filename = resolve_pdf_download_path(source_hash)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(path, media_type="application/pdf", filename=filename)
+
+
 @app.get("/api/index")
 def index_rows(offset: int = 0, limit: int = 50, search: str = ""):
     try:
@@ -803,8 +965,10 @@ def chat_stream(payload: ChatRequest):
     job_queue.begin_query()
 
     def generate():
-        def encode_event(event_type: str, text: str) -> str:
-            return json.dumps({"type": event_type, "text": text}, ensure_ascii=False) + "\n"
+        def encode_event(event: dict[str, Any]) -> str:
+            payload = dict(event)
+            payload["type"] = str(payload.get("type") or "answer")
+            return json.dumps(payload, ensure_ascii=False) + "\n"
 
         try:
             from src.query import QueryEngine
@@ -820,20 +984,25 @@ def chat_stream(payload: ChatRequest):
                 temperature=payload.temperature,
                 sampler_top_k=payload.max_k,
                 context_window=payload.context_window,
+                retrieval_candidate_k=payload.retrieval_candidate_k,
+                retrieval_min_score=payload.retrieval_min_score,
+                retrieval_relative_cutoff=payload.retrieval_relative_cutoff,
+                context_token_fraction=payload.context_token_fraction,
+                web_search_enabled=payload.web_search_enabled,
+                web_search_timeout=payload.web_search_timeout,
+                web_search_max_results=payload.web_search_max_results,
                 progress_enabled=False,
             )
             if hasattr(engine, "ask_stream_events"):
                 for event in engine.ask_stream_events(question):
-                    event_type = str(event.get("type", "answer"))
-                    text = str(event.get("text", ""))
-                    if text:
-                        yield encode_event(event_type, text)
+                    if event.get("text") or event.get("sources"):
+                        yield encode_event(event)
             else:
                 for chunk in engine.ask_stream(question):
                     if chunk:
-                        yield encode_event("answer", chunk)
+                        yield encode_event({"type": "answer", "text": chunk})
         except Exception as exc:
-            yield encode_event("error", str(exc))
+            yield encode_event({"type": "error", "text": str(exc)})
         finally:
             job_queue.finish_query()
 

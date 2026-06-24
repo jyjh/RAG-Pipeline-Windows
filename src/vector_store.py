@@ -135,6 +135,8 @@ class LanceDBVectorStore:
         self.db_path = lancedb_path(self.working_dir)
 
     def exists(self) -> bool:
+        if not self.db_path.exists():
+            return False
         try:
             if TABLE_NAME in self._table_names():
                 return self.is_compatible()

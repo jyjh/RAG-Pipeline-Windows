@@ -17,6 +17,13 @@ class QueryEngine:
         temperature: float | None = None,
         sampler_top_k: int | None = None,
         context_window: int | None = None,
+        retrieval_candidate_k: int | None = None,
+        retrieval_min_score: float | None = None,
+        retrieval_relative_cutoff: float | None = None,
+        context_token_fraction: float | None = None,
+        web_search_enabled: bool = True,
+        web_search_timeout: float | None = None,
+        web_search_max_results: int | None = None,
         progress_enabled: bool = True,
     ):
         from src.local_rag import LocalQueryEngine
@@ -32,6 +39,13 @@ class QueryEngine:
             temperature=temperature,
             sampler_top_k=sampler_top_k,
             context_window=context_window,
+            retrieval_candidate_k=retrieval_candidate_k,
+            retrieval_min_score=retrieval_min_score,
+            retrieval_relative_cutoff=retrieval_relative_cutoff,
+            context_token_fraction=context_token_fraction,
+            web_search_enabled=web_search_enabled,
+            web_search_timeout=web_search_timeout,
+            web_search_max_results=web_search_max_results,
             progress_enabled=progress_enabled,
         )
 

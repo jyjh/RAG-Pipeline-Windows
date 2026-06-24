@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
 import socket
 import sys
+import urllib.parse
 import urllib.error
 import urllib.request
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +26,15 @@ DEFAULT_NUM_PREDICT = 4096
 DEFAULT_SAMPLER_TOP_K = 40
 DEFAULT_CONTEXT_WINDOW = 8192
 DEFAULT_LLM_TIMEOUT = 120.0
+DEFAULT_RETRIEVAL_CANDIDATE_K = 80
+DEFAULT_RETRIEVAL_MIN_SCORE = 0.36
+DEFAULT_RETRIEVAL_RELATIVE_CUTOFF = 0.72
+DEFAULT_CONTEXT_TOKEN_FRACTION = 0.60
+DEFAULT_TOOL_MAX_ROUNDS = 4
+DEFAULT_TOOL_MAX_CALLS = 8
+DEFAULT_WEB_SEARCH_TIMEOUT = 8.0
+DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
+CONTEXT_METADATA_TOKEN_OVERHEAD = 64
 
 
 def _status(message: str, *, enabled: bool = True) -> None:
@@ -84,10 +96,11 @@ def _ollama_host() -> str:
 def _ollama_chat(
     *,
     model: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     options: dict[str, int | float],
     stream: bool,
     timeout: float,
+    tools: list[dict[str, Any]] | None = None,
 ):
     payload = {
         "model": model,
@@ -95,6 +108,8 @@ def _ollama_chat(
         "options": options,
         "stream": stream,
     }
+    if tools:
+        payload["tools"] = tools
     if stream:
         return _ollama_chat_stream(payload, timeout=timeout)
     return _ollama_chat_once(payload, timeout=timeout)
@@ -214,6 +229,20 @@ def _ollama_done_reason(response: Any) -> str:
     return str(getattr(response, "done_reason", "") or "")
 
 
+def _ollama_response_message(response: Any) -> dict[str, Any]:
+    if isinstance(response, dict):
+        message = response.get("message") or {}
+        return dict(message) if isinstance(message, dict) else {}
+    message = getattr(response, "message", None)
+    return dict(message) if isinstance(message, dict) else {}
+
+
+def _ollama_tool_calls(response: Any) -> list[dict[str, Any]]:
+    message = _ollama_response_message(response)
+    calls = message.get("tool_calls") or []
+    return [dict(call) for call in calls if isinstance(call, dict)]
+
+
 def _split_think_tag_events(content: str, *, in_thinking: bool) -> tuple[list[dict[str, str]], bool]:
     events: list[dict[str, str]] = []
     text = content
@@ -275,6 +304,193 @@ def chunk_markdown(text: str, *, max_chars: int = 3000, overlap: int = 400) -> l
 
     flush_current()
     return chunks
+
+
+def estimate_context_tokens(text: str) -> int:
+    return math.ceil(len(text or "") / 4) + CONTEXT_METADATA_TOKEN_OVERHEAD
+
+
+def _source_pdf_name(record: dict[str, Any]) -> str:
+    name = str(record.get("source_pdf_name") or "").strip()
+    if name:
+        return name
+    source_path = str(record.get("source_pdf_path") or "").strip()
+    if source_path:
+        return Path(source_path).name
+    file_path = str(record.get("file_path") or "").strip()
+    return Path(file_path).name if file_path else "source"
+
+
+def _page_label(record: dict[str, Any]) -> str:
+    page_start = int(record.get("page_start") or 0)
+    page_end = int(record.get("page_end") or 0)
+    if page_start and page_end and page_start != page_end:
+        return f"pages {page_start}-{page_end}"
+    if page_start:
+        return f"page {page_start}"
+    return ""
+
+
+def _short_snippet(text: str, *, limit: int = 360) -> str:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(0, limit - 1)].rstrip() + "..."
+
+
+class CitationRegistry:
+    def __init__(self):
+        self._local_by_record_id: dict[str, dict[str, Any]] = {}
+        self._web_by_url: dict[str, dict[str, Any]] = {}
+        self._local_sources: list[dict[str, Any]] = []
+        self._web_sources: list[dict[str, Any]] = []
+
+    def add_local(self, record: dict[str, Any]) -> dict[str, Any]:
+        record_id = str(record.get("id") or "")
+        if record_id in self._local_by_record_id:
+            return self._local_by_record_id[record_id]
+        source_hash = str(record.get("source_hash") or "")
+        source = {
+            "id": f"S{len(self._local_sources) + 1}",
+            "kind": "local",
+            "label": f"[S{len(self._local_sources) + 1}]",
+            "chunk_id": record_id,
+            "doc_id": str(record.get("doc_id") or ""),
+            "source_hash": source_hash,
+            "source_pdf_name": _source_pdf_name(record),
+            "source_pdf_path": str(record.get("source_pdf_path") or ""),
+            "file_path": str(record.get("file_path") or ""),
+            "section_path": str(record.get("section_path") or ""),
+            "page_start": int(record.get("page_start") or 0),
+            "page_end": int(record.get("page_end") or 0),
+            "page_label": _page_label(record),
+            "score": round(float(record.get("score") or 0.0), 4),
+            "snippet": _short_snippet(str(record.get("content") or "")),
+            "download_url": f"/api/pdfs/{source_hash}/download" if source_hash else "",
+        }
+        self._local_by_record_id[record_id] = source
+        self._local_sources.append(source)
+        return source
+
+    def add_web(self, result: dict[str, Any]) -> dict[str, Any]:
+        url = str(result.get("url") or "")
+        if url in self._web_by_url:
+            return self._web_by_url[url]
+        source = {
+            "id": f"W{len(self._web_sources) + 1}",
+            "kind": "web",
+            "label": f"[W{len(self._web_sources) + 1}]",
+            "title": str(result.get("title") or url),
+            "url": url,
+            "snippet": _short_snippet(str(result.get("snippet") or ""), limit=300),
+            "provider": str(result.get("provider") or "duckduckgo_lite"),
+        }
+        self._web_by_url[url] = source
+        self._web_sources.append(source)
+        return source
+
+    def local_record_ids(self) -> set[str]:
+        return set(self._local_by_record_id)
+
+    def all_sources(self) -> list[dict[str, Any]]:
+        return [*self._local_sources, *self._web_sources]
+
+    def valid_labels(self) -> set[str]:
+        return {source["label"] for source in self.all_sources()}
+
+
+class DuckDuckGoLiteParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.results: list[dict[str, str]] = []
+        self._link: dict[str, Any] | None = None
+        self._snippet: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr = {key.lower(): value or "" for key, value in attrs}
+        classes = set(attr.get("class", "").split())
+        if tag == "a" and attr.get("href") and (
+            "result-link" in classes
+            or "result__a" in classes
+            or "result-title-a" in classes
+            or "uddg=" in attr.get("href", "")
+        ):
+            self._link = {"href": attr["href"], "text": []}
+            return
+        if "result-snippet" in classes or "result__snippet" in classes:
+            self._snippet = []
+
+    def handle_data(self, data: str) -> None:
+        if self._link is not None:
+            self._link["text"].append(data)
+        if self._snippet is not None:
+            self._snippet.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._link is not None:
+            title = " ".join("".join(self._link["text"]).split())
+            url = normalize_search_url(str(self._link["href"]))
+            if title and url and not any(item["url"] == url for item in self.results):
+                self.results.append({"title": title, "url": url, "snippet": ""})
+            self._link = None
+            return
+        if self._snippet is not None:
+            snippet = " ".join("".join(self._snippet).split())
+            if snippet and self.results and not self.results[-1].get("snippet"):
+                self.results[-1]["snippet"] = snippet
+            self._snippet = None
+
+
+def normalize_search_url(url: str) -> str:
+    raw = url.strip()
+    if not raw:
+        return ""
+    if raw.startswith("//"):
+        raw = "https:" + raw
+    parsed = urllib.parse.urlparse(raw)
+    query = urllib.parse.parse_qs(parsed.query)
+    if "uddg" in query and query["uddg"]:
+        return urllib.parse.unquote(query["uddg"][0])
+    return raw
+
+
+def web_search_duckduckgo_lite(
+    query: str,
+    *,
+    max_results: int = DEFAULT_WEB_SEARCH_MAX_RESULTS,
+    timeout: float = DEFAULT_WEB_SEARCH_TIMEOUT,
+) -> dict[str, Any]:
+    import requests
+
+    params = urllib.parse.urlencode({"q": query})
+    url = f"https://lite.duckduckgo.com/lite/?{params}"
+    try:
+        response = requests.get(
+            url,
+            timeout=timeout,
+            headers={"User-Agent": "local-rag-pipeline/1.0"},
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        return {"results": [], "error": f"Web search failed: {exc}", "provider": "duckduckgo_lite"}
+
+    parser = DuckDuckGoLiteParser()
+    parser.feed(response.text)
+    results = []
+    for result in parser.results:
+        if not result.get("url"):
+            continue
+        results.append(
+            {
+                "title": result.get("title", ""),
+                "url": result.get("url", ""),
+                "snippet": result.get("snippet", ""),
+                "provider": "duckduckgo_lite",
+            }
+        )
+        if len(results) >= max(1, max_results):
+            break
+    return {"results": results, "error": "", "provider": "duckduckgo_lite"}
 
 
 class LocalVectorIndexer:
@@ -426,19 +642,28 @@ class LocalQueryEngine:
         embedding_batch_size: int | None = None,
         embedding_timeout: float | None = None,
         progress_enabled: bool = True,
-        top_k: int = 5,
+        top_k: int | None = None,
         num_predict: int | None = None,
         llm_timeout: float | None = None,
         temperature: float | None = None,
         sampler_top_k: int | None = None,
         context_window: int | None = None,
+        retrieval_candidate_k: int | None = None,
+        retrieval_min_score: float | None = None,
+        retrieval_relative_cutoff: float | None = None,
+        context_token_fraction: float | None = None,
+        web_search_enabled: bool = True,
+        web_search_timeout: float | None = None,
+        web_search_max_results: int | None = None,
+        tool_max_rounds: int = DEFAULT_TOOL_MAX_ROUNDS,
+        tool_max_calls: int = DEFAULT_TOOL_MAX_CALLS,
     ):
         from src.embeddings import EmbeddingEngine
 
         self.working_dir = working_dir
         self.model = model
         self.progress_enabled = progress_enabled
-        self.top_k = top_k
+        self.top_k = _positive_int(top_k, 5) if top_k is not None else 5
         self.num_predict = _positive_int(
             num_predict or os.environ.get("LOCAL_RAG_NUM_PREDICT"),
             DEFAULT_NUM_PREDICT,
@@ -459,6 +684,41 @@ class LocalQueryEngine:
             llm_timeout if llm_timeout is not None else os.environ.get("LOCAL_RAG_LLM_TIMEOUT"),
             DEFAULT_LLM_TIMEOUT,
         )
+        self.retrieval_candidate_k = _positive_int(
+            retrieval_candidate_k or os.environ.get("LOCAL_RAG_RETRIEVAL_CANDIDATE_K"),
+            DEFAULT_RETRIEVAL_CANDIDATE_K,
+        )
+        self.retrieval_min_score = _positive_float(
+            retrieval_min_score
+            if retrieval_min_score is not None
+            else os.environ.get("LOCAL_RAG_RETRIEVAL_MIN_SCORE"),
+            DEFAULT_RETRIEVAL_MIN_SCORE,
+        )
+        self.retrieval_relative_cutoff = _positive_float(
+            retrieval_relative_cutoff
+            if retrieval_relative_cutoff is not None
+            else os.environ.get("LOCAL_RAG_RETRIEVAL_RELATIVE_CUTOFF"),
+            DEFAULT_RETRIEVAL_RELATIVE_CUTOFF,
+        )
+        self.context_token_fraction = _positive_float(
+            context_token_fraction
+            if context_token_fraction is not None
+            else os.environ.get("LOCAL_RAG_CONTEXT_TOKEN_FRACTION"),
+            DEFAULT_CONTEXT_TOKEN_FRACTION,
+        )
+        self.web_search_enabled = bool(web_search_enabled)
+        self.web_search_timeout = _positive_float(
+            web_search_timeout
+            if web_search_timeout is not None
+            else os.environ.get("LOCAL_RAG_WEB_SEARCH_TIMEOUT"),
+            DEFAULT_WEB_SEARCH_TIMEOUT,
+        )
+        self.web_search_max_results = _positive_int(
+            web_search_max_results or os.environ.get("LOCAL_RAG_WEB_SEARCH_MAX_RESULTS"),
+            DEFAULT_WEB_SEARCH_MAX_RESULTS,
+        )
+        self.tool_max_rounds = _positive_int(tool_max_rounds, DEFAULT_TOOL_MAX_ROUNDS)
+        self.tool_max_calls = _positive_int(tool_max_calls, DEFAULT_TOOL_MAX_CALLS)
         self.engine = EmbeddingEngine(
             model_name=embedding_model,
             ollama_batch_size=embedding_batch_size,
@@ -475,40 +735,84 @@ class LocalQueryEngine:
             "num_predict": self.num_predict,
         }
 
-    def _chat_messages(self, question: str, matches: list[dict[str, Any]]) -> list[dict[str, str]]:
-        context_blocks = []
-        for i, match in enumerate(matches, start=1):
-            section_path = match.get("section_path") or f"chunk-{match.get('chunk_index')}"
-            page_start = int(match.get("page_start") or 0)
-            page_end = int(match.get("page_end") or 0)
-            page_label = ""
-            if page_start and page_end and page_start != page_end:
-                page_label = f" pages {page_start}-{page_end}"
-            elif page_start:
-                page_label = f" page {page_start}"
-            context_blocks.append(
-                f"[{i}] {match.get('file_path', '')} :: {section_path}{page_label}\n"
-                f"{match.get('content', '')}"
-            )
-        prompt = (
-            "Answer the question using only the context below. "
-            "Cite source numbers like [1] when relevant. "
-            "If the context is insufficient, say what is missing.\n\n"
-            f"Question: {question}\n\n"
-            "Context:\n"
-            + "\n\n".join(context_blocks)
+    def _tool_messages(self, question: str) -> list[dict[str, Any]]:
+        web_instruction = (
+            "Use web_search only when local context is insufficient or the user asks for current/external facts."
+            if self.web_search_enabled
+            else "Do not use web_search; it is disabled for this request."
         )
         return [
             {
                 "role": "system",
                 "content": (
-                    "You answer from the supplied local context only. "
-                    "Keep any thinking concise, then write a complete final answer "
-                    "in plain text and cite source numbers."
+                    "You are a retrieval-augmented assistant. Before answering, you must call "
+                    "search_local_context at least once. You may call search_local_context again "
+                    "with a narrower query when more evidence is needed. "
+                    f"{web_instruction} "
+                    "Use only information returned by tools. In the final answer, cite every "
+                    "factual claim with source IDs exactly as provided, such as [S1] or [W1]. "
+                    "If the available sources are insufficient, say what is missing."
                 ),
             },
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": question},
         ]
+
+    def _tool_definitions(self) -> list[dict[str, Any]]:
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_local_context",
+                    "description": (
+                        "Search the local vectorized PDF index for source chunks relevant to the question. "
+                        "Call this before answering and again if additional local evidence is needed."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The focused retrieval query.",
+                            },
+                            "exclude_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Optional local chunk IDs that should not be returned again.",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                },
+            }
+        ]
+        if self.web_search_enabled:
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": (
+                            "Search the public web for current or external facts that are not available "
+                            "in local PDF context."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "The web search query.",
+                                },
+                                "max_results": {
+                                    "type": "integer",
+                                    "description": "Maximum result count to return.",
+                                },
+                            },
+                            "required": ["query"],
+                        },
+                    },
+                }
+            )
+        return tools
 
     def _load_record_count(self) -> int:
         if not self.store.exists():
@@ -521,9 +825,13 @@ class LocalQueryEngine:
         _status(f"Local query: loaded {count} structured record(s).", enabled=self.progress_enabled)
         return count
 
-    def _retrieve(self, question: str) -> list[dict[str, Any]]:
+    def _context_token_budget(self) -> int:
+        return max(256, int(math.floor(self.context_window * min(self.context_token_fraction, 0.95))))
+
+    def _retrieve(self, question: str, *, exclude_ids: set[str] | None = None) -> list[dict[str, Any]]:
         if not self.record_count:
             return []
+        exclude_ids = exclude_ids or set()
 
         query_vector = self.engine.get_mrl_embeddings(
             [question],
@@ -532,60 +840,305 @@ class LocalQueryEngine:
         )[0]
         candidates = self.store.search(
             query_vector.tolist(),
-            top_k=max(self.top_k * 4, self.top_k + 8),
+            top_k=self.retrieval_candidate_k,
         )
-        results: list[dict[str, Any]] = []
+        if not candidates:
+            return []
+
+        best_score = max(float(candidate.get("score") or 0.0) for candidate in candidates)
+        score_cutoff = max(self.retrieval_min_score, best_score * self.retrieval_relative_cutoff)
+        token_budget = self._context_token_budget()
+        used_tokens = 0
         seen: set[str] = set()
+        results: list[dict[str, Any]] = []
+
+        def maybe_add(record: dict[str, Any], *, inherited_score: float | None = None) -> bool:
+            nonlocal used_tokens
+            record_id = str(record.get("id") or "")
+            if not record_id or record_id in seen or record_id in exclude_ids:
+                return False
+            score = float(record.get("score") or inherited_score or 0.0)
+            if score < score_cutoff:
+                return False
+            tokens = estimate_context_tokens(str(record.get("content") or ""))
+            if results and used_tokens + tokens > token_budget:
+                return False
+            item = dict(record)
+            item["score"] = score
+            item["estimated_tokens"] = tokens
+            seen.add(record_id)
+            results.append(item)
+            used_tokens += tokens
+            return True
+
         for candidate in candidates:
+            score = float(candidate.get("score") or 0.0)
+            if score < score_cutoff:
+                continue
             node_type = str(candidate.get("node_type", "chunk"))
             if node_type == "chunk":
-                if candidate.get("id") not in seen:
-                    seen.add(str(candidate.get("id")))
-                    results.append(candidate)
+                maybe_add(candidate)
             else:
-                for child in self.store.child_chunks(candidate, limit=self.top_k):
-                    if child.get("id") in seen:
-                        continue
-                    seen.add(str(child.get("id")))
-                    results.append(child)
-                    if len(results) >= self.top_k:
-                        break
-            if len(results) >= self.top_k:
+                for child in self.store.child_chunks(candidate, limit=self.retrieval_candidate_k):
+                    if not maybe_add(child, inherited_score=score) and results:
+                        if used_tokens >= token_budget:
+                            break
+            if used_tokens >= token_budget:
                 break
         return results
 
-    def ask(self, question: str) -> str:
-        matches = self._retrieve(question)
-        if not matches:
-            return "No local index records were found. Run index mode first."
-
-        try:
-            _status(
-                f"Local query: requesting answer from Ollama model {self.model} "
-                f"(timeout={self.llm_timeout:g}s)",
-                enabled=self.progress_enabled,
+    def _local_tool_result(
+        self,
+        *,
+        query: str,
+        exclude_ids: set[str],
+        citations: CitationRegistry,
+    ) -> dict[str, Any]:
+        matches = self._retrieve(query, exclude_ids=exclude_ids)
+        context_blocks = []
+        for match in matches:
+            source = citations.add_local(match)
+            location = " :: ".join(
+                part
+                for part in [
+                    source.get("source_pdf_name", ""),
+                    source.get("section_path", ""),
+                    source.get("page_label", ""),
+                ]
+                if part
             )
+            context_blocks.append(
+                {
+                    "source_id": source["id"],
+                    "citation": source["label"],
+                    "chunk_id": source["chunk_id"],
+                    "score": source["score"],
+                    "location": location,
+                    "content": str(match.get("content") or ""),
+                }
+            )
+        return {
+            "tool": "search_local_context",
+            "query": query,
+            "result_count": len(context_blocks),
+            "context_token_budget": self._context_token_budget(),
+            "results": context_blocks,
+            "instructions": (
+                "Use these source IDs for citations. Do not cite local context that is not listed here."
+            ),
+        }
+
+    def _web_tool_result(
+        self,
+        *,
+        query: str,
+        max_results: int | None,
+        citations: CitationRegistry,
+    ) -> dict[str, Any]:
+        if not self.web_search_enabled:
+            return {"tool": "web_search", "query": query, "result_count": 0, "error": "Web search is disabled."}
+        response = web_search_duckduckgo_lite(
+            query,
+            max_results=_positive_int(max_results, self.web_search_max_results),
+            timeout=self.web_search_timeout,
+        )
+        results = []
+        for result in response.get("results", []):
+            source = citations.add_web(result)
+            results.append(
+                {
+                    "source_id": source["id"],
+                    "citation": source["label"],
+                    "title": source["title"],
+                    "url": source["url"],
+                    "snippet": source["snippet"],
+                    "provider": source["provider"],
+                }
+            )
+        return {
+            "tool": "web_search",
+            "query": query,
+            "result_count": len(results),
+            "provider": response.get("provider", "duckduckgo_lite"),
+            "error": response.get("error", ""),
+            "results": results,
+            "instructions": "Use these web source IDs for citations. Do not cite URLs that are not listed here.",
+        }
+
+    def _execute_tool_call(
+        self,
+        call: dict[str, Any],
+        *,
+        question: str,
+        citations: CitationRegistry,
+    ) -> tuple[str, dict[str, Any], str]:
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name = str(function.get("name") or "")
+        arguments = function.get("arguments") or {}
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        if name == "search_local_context":
+            query = str(arguments.get("query") or question).strip() or question
+            raw_excludes = arguments.get("exclude_ids", [])
+            requested_excludes = {str(value) for value in raw_excludes} if isinstance(raw_excludes, list) else set()
+            exclude_ids = citations.local_record_ids() | requested_excludes
+            result = self._local_tool_result(query=query, exclude_ids=exclude_ids, citations=citations)
+            text = f"Retrieved {result['result_count']} local source chunk(s)."
+            return name, result, text
+
+        if name == "web_search":
+            query = str(arguments.get("query") or question).strip() or question
+            result = self._web_tool_result(
+                query=query,
+                max_results=arguments.get("max_results"),
+                citations=citations,
+            )
+            text = f"Retrieved {result['result_count']} web result(s)."
+            if result.get("error"):
+                text = str(result["error"])
+            return name, result, text
+
+        return name or "unknown", {"error": f"Unknown tool: {name or 'unknown'}"}, "Unknown tool call."
+
+    def _append_tool_result(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tool_name: str,
+        result: dict[str, Any],
+    ) -> None:
+        messages.append(
+            {
+                "role": "tool",
+                "tool_name": tool_name,
+                "content": json.dumps(result, ensure_ascii=False),
+            }
+        )
+
+    def _forced_local_tool_call(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        question: str,
+        citations: CitationRegistry,
+    ) -> tuple[dict[str, Any], str]:
+        call = {
+            "function": {
+                "name": "search_local_context",
+                "arguments": {"query": question, "exclude_ids": []},
+            }
+        }
+        messages.append({"role": "assistant", "content": "", "tool_calls": [call]})
+        tool_name, result, text = self._execute_tool_call(call, question=question, citations=citations)
+        self._append_tool_result(messages, tool_name=tool_name, result=result)
+        return result, text
+
+    def _run_tool_rounds(self, question: str):
+        citations = CitationRegistry()
+        messages = self._tool_messages(question)
+        tools = self._tool_definitions()
+        local_search_used = False
+        tool_calls_used = 0
+
+        for _ in range(self.tool_max_rounds):
             response = _ollama_chat(
                 model=self.model,
-                messages=self._chat_messages(question, matches),
+                messages=messages,
                 options=self._ollama_options(),
                 stream=False,
                 timeout=self.llm_timeout,
+                tools=tools,
             )
-        except Exception as exc:
-            raise RuntimeError(
-                f"Local Ollama query failed for model '{self.model}'. "
-                f"Run `{_ollama_pull_command(self.model)}` and ensure Ollama is running. "
-                f"Original error: {exc}"
-            ) from exc
+            thinking = _ollama_response_thinking(response)
+            if thinking:
+                yield {"type": "thinking", "text": thinking}
 
-        content = _ollama_response_content(response).strip()
-        if not content:
-            raise RuntimeError(
-                f"Ollama returned an empty answer for model '{self.model}'. "
-                "Check the model response in Ollama logs or retry with a different --llm_model."
+            tool_calls = _ollama_tool_calls(response)
+            if not tool_calls:
+                if not local_search_used:
+                    yield {
+                        "type": "notice",
+                        "text": "The model did not call the required local search tool, so local context was retrieved before answering.",
+                    }
+                    result, text = self._forced_local_tool_call(
+                        messages,
+                        question=question,
+                        citations=citations,
+                    )
+                    local_search_used = True
+                    tool_calls_used += 1
+                    yield {"type": "tool_result", "tool": "search_local_context", "text": text}
+                    yield {"type": "sources", "sources": citations.all_sources()}
+                    if not result.get("results"):
+                        break
+                    continue
+                break
+
+            message = _ollama_response_message(response)
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": str(message.get("content") or ""),
+                    "tool_calls": tool_calls,
+                }
             )
-        return content
+            for call in tool_calls:
+                if tool_calls_used >= self.tool_max_calls:
+                    yield {
+                        "type": "notice",
+                        "text": "Tool-call limit reached; answering from the context already retrieved.",
+                    }
+                    break
+                function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                tool_name = str(function.get("name") or "unknown")
+                yield {"type": "tool_call", "tool": tool_name, "text": f"Running {tool_name}..."}
+                tool_name, result, text = self._execute_tool_call(
+                    call,
+                    question=question,
+                    citations=citations,
+                )
+                tool_calls_used += 1
+                if tool_name == "search_local_context":
+                    local_search_used = True
+                self._append_tool_result(messages, tool_name=tool_name, result=result)
+                yield {"type": "tool_result", "tool": tool_name, "text": text}
+                yield {"type": "sources", "sources": citations.all_sources()}
+            if tool_calls_used >= self.tool_max_calls:
+                break
+
+        if not local_search_used:
+            result, text = self._forced_local_tool_call(
+                messages,
+                question=question,
+                citations=citations,
+            )
+            yield {"type": "tool_result", "tool": "search_local_context", "text": text}
+            yield {"type": "sources", "sources": citations.all_sources()}
+
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Write the final answer now using only the tool results above. "
+                    "Cite every factual claim with the source IDs in square brackets. "
+                    "If the sources are insufficient, say what information is missing."
+                ),
+            }
+        )
+        yield {
+            "type": "_tool_state",
+            "messages": messages,
+            "citations": citations,
+        }
+
+    def ask(self, question: str) -> str:
+        return "".join(self.ask_stream(question)).strip()
 
     def ask_stream(self, question: str):
         for event in self.ask_stream_events(question):
@@ -593,21 +1146,20 @@ class LocalQueryEngine:
                 yield event["text"]
 
     def ask_stream_events(self, question: str):
-        yield {"type": "notice", "text": "Embedding query and retrieving context..."}
-        matches = self._retrieve(question)
-        if not matches:
-            yield {"type": "answer", "text": "No local index records were found. Run index mode first."}
-            return
-
-        yield {
-            "type": "notice",
-            "text": (
-                f"Retrieved {len(matches)} context chunk(s). "
-                f"Requesting answer from {self.model}..."
-            ),
-        }
-
+        yield {"type": "notice", "text": "Planning retrieval tool calls..."}
         try:
+            tool_state: dict[str, Any] | None = None
+            for event in self._run_tool_rounds(question):
+                if event.get("type") == "_tool_state":
+                    tool_state = event
+                    continue
+                yield event
+            if tool_state is None:
+                yield {"type": "answer", "text": "No local context could be retrieved. Run index mode first."}
+                return
+
+            messages = tool_state["messages"]
+            citations: CitationRegistry = tool_state["citations"]
             _status(
                 f"Local query: streaming answer from Ollama model {self.model} "
                 f"(timeout={self.llm_timeout:g}s)",
@@ -615,7 +1167,7 @@ class LocalQueryEngine:
             )
             stream = _ollama_chat(
                 model=self.model,
-                messages=self._chat_messages(question, matches),
+                messages=messages,
                 options=self._ollama_options(),
                 stream=True,
                 timeout=self.llm_timeout,
@@ -625,6 +1177,7 @@ class LocalQueryEngine:
             thinking_emitted = False
             in_thinking = False
             done_reason = ""
+            answer_text = ""
             for chunk in stream:
                 done_reason = _ollama_done_reason(chunk) or done_reason
                 thinking = _ollama_response_thinking(chunk)
@@ -645,6 +1198,7 @@ class LocalQueryEngine:
                             thinking_emitted = True
                         if event["type"] == "answer":
                             answer_emitted = True
+                            answer_text += event["text"]
                         yield event
         except Exception as exc:
             raise RuntimeError(
@@ -677,4 +1231,10 @@ class LocalQueryEngine:
             yield {
                 "type": "notice",
                 "text": "The model reached its token limit, so the answer may be incomplete.",
+            }
+        invalid = sorted(set(re.findall(r"\[[SW]\d+\]", answer_text)) - citations.valid_labels())
+        if invalid:
+            yield {
+                "type": "notice",
+                "text": f"The answer cited unknown source ID(s): {', '.join(invalid)}.",
             }

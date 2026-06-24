@@ -128,6 +128,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ollama num_ctx context window in query mode.",
     )
     parser.add_argument(
+        "--retrieval_candidate_k",
+        type=int,
+        default=80,
+        help="Candidate pool size for local vector retrieval before relevance cutoffs.",
+    )
+    parser.add_argument(
+        "--retrieval_min_score",
+        type=float,
+        default=0.36,
+        help="Minimum normalized relevance score for local context chunks.",
+    )
+    parser.add_argument(
+        "--retrieval_relative_cutoff",
+        type=float,
+        default=0.72,
+        help="Keep chunks with score at least this fraction of the best hit.",
+    )
+    parser.add_argument(
+        "--context_token_fraction",
+        type=float,
+        default=0.60,
+        help="Fraction of the model context window allowed for retrieved context.",
+    )
+    parser.add_argument(
+        "--no_web_search",
+        action="store_true",
+        help="Disable the web_search tool in query mode.",
+    )
+    parser.add_argument(
+        "--web_search_timeout",
+        type=float,
+        default=8.0,
+        help="Seconds before a keyless web-search request fails.",
+    )
+    parser.add_argument(
+        "--web_search_max_results",
+        type=int,
+        default=5,
+        help="Maximum web-search results returned to the model per call.",
+    )
+    parser.add_argument(
         "--parser_mode",
         choices=["hybrid", "manual", "docling"],
         default="hybrid",
@@ -205,6 +246,13 @@ def main(argv: list[str] | None = None) -> int:
                 temperature=args.temperature,
                 sampler_top_k=args.max_k,
                 context_window=args.context_window,
+                retrieval_candidate_k=args.retrieval_candidate_k,
+                retrieval_min_score=args.retrieval_min_score,
+                retrieval_relative_cutoff=args.retrieval_relative_cutoff,
+                context_token_fraction=args.context_token_fraction,
+                web_search_enabled=not args.no_web_search,
+                web_search_timeout=args.web_search_timeout,
+                web_search_max_results=args.web_search_max_results,
                 progress_enabled=not args.no_progress,
             ).ask(args.question)
             print(answer)
