@@ -476,6 +476,82 @@ input[type="file"] {
   color: var(--accent-strong);
 }
 
+.tool-results-block {
+  margin: 10px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfcfd;
+}
+
+.tool-results-block[hidden] {
+  display: none;
+}
+
+.tool-results-block summary {
+  cursor: pointer;
+  padding: 7px 10px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.tool-results-body {
+  display: grid;
+  gap: 10px;
+  padding: 0 10px 10px;
+  font-size: 13px;
+}
+
+.tool-result-item,
+.tool-result-list,
+.tool-result-row {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tool-result-item {
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.tool-result-item:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.tool-result-heading,
+.tool-result-row-heading {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.tool-result-heading span,
+.tool-result-row-heading span,
+.tool-result-status {
+  color: var(--muted);
+}
+
+.tool-result-row pre,
+.tool-result-json pre {
+  max-height: 260px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #ffffff;
+  padding: 8px;
+  color: var(--text);
+  font: 12px/1.45 Consolas, "Liberation Mono", monospace;
+}
+
+.tool-result-json summary {
+  padding: 4px 0;
+}
+
 .chat-form {
   display: grid;
   grid-template-columns: 1fr auto;

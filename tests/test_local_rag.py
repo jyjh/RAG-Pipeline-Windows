@@ -288,6 +288,12 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
         events = list(engine.ask_stream_events("alpha?"))
         assert events[0] == {"type": "notice", "text": "Planning retrieval tool calls..."}
         assert {"type": "tool_call", "tool": "search_local_context", "text": "Running search_local_context..."} in events
+        tool_results = [event for event in events if event.get("type") == "tool_result"]
+        assert tool_results
+        assert tool_results[0]["tool"] == "search_local_context"
+        assert tool_results[0]["result"]["tool"] == "search_local_context"
+        assert tool_results[0]["result"]["results"][0]["citation"] == "[S1]"
+        assert json.loads(tool_results[0]["content"]) == tool_results[0]["result"]
         assert any(event.get("type") == "sources" and event["sources"][0]["label"] == "[S1]" for event in events)
         assert {"type": "thinking", "text": "considering "} in events
         assert {"type": "answer", "text": "chunk "} in events

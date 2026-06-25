@@ -1395,6 +1395,16 @@ class LocalQueryEngine:
             }
         )
 
+    @staticmethod
+    def _tool_result_event(tool_name: str, result: dict[str, Any], text: str) -> dict[str, Any]:
+        return {
+            "type": "tool_result",
+            "tool": tool_name,
+            "text": text,
+            "result": result,
+            "content": json.dumps(result, ensure_ascii=False),
+        }
+
     def _forced_local_tool_call(
         self,
         messages: list[dict[str, Any]],
@@ -1454,7 +1464,7 @@ class LocalQueryEngine:
                     )
                     local_search_used = True
                     tool_calls_used += 1
-                    yield {"type": "tool_result", "tool": "search_local_context", "text": text}
+                    yield self._tool_result_event("search_local_context", result, text)
                     yield {"type": "sources", "sources": citations.all_sources()}
                     if not result.get("results"):
                         break
@@ -1489,7 +1499,7 @@ class LocalQueryEngine:
                 if tool_name == "search_local_context":
                     local_search_used = True
                 self._append_tool_result(messages, tool_name=tool_name, result=result)
-                yield {"type": "tool_result", "tool": tool_name, "text": text}
+                yield self._tool_result_event(tool_name, result, text)
                 yield {"type": "sources", "sources": citations.all_sources()}
             if tool_calls_used >= self.tool_max_calls:
                 break
@@ -1500,7 +1510,7 @@ class LocalQueryEngine:
                 question=question,
                 citations=citations,
             )
-            yield {"type": "tool_result", "tool": "search_local_context", "text": text}
+            yield self._tool_result_event("search_local_context", result, text)
             yield {"type": "sources", "sources": citations.all_sources()}
 
         messages.append(

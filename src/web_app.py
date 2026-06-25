@@ -1380,7 +1380,7 @@ def chat_stream(payload: ChatRequest):
             )
             if hasattr(engine, "ask_stream_events"):
                 for event in engine.ask_stream_events(question):
-                    if event.get("text") or event.get("sources"):
+                    if event.get("text") or event.get("sources") or event.get("result") or event.get("content"):
                         yield encode_event(event)
             else:
                 for chunk in engine.ask_stream(question):

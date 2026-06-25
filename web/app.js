@@ -597,6 +597,7 @@ function addAssistantMessageToChat(chat, parts) {
     answerHtml: parts.answerStable.innerHTML,
     thinkingHtml: parts.rawThinking ? parts.thinkingStable.innerHTML : "",
     sources: parts.sources,
+    toolResults: parts.toolResults,
     notice: parts.notice.textContent || "",
     createdAt: nowIso(),
   });
@@ -1089,7 +1090,18 @@ function addAssistantMessage() {
   answerTail.className = "stream-tail raw-tail";
   body.append(answerStable, answerTail);
 
-  message.append(roleLabel, thinking, sources, notice, body);
+  const toolResultsPanel = document.createElement("details");
+  toolResultsPanel.className = "tool-results-block";
+  toolResultsPanel.hidden = true;
+
+  const toolResultsSummary = document.createElement("summary");
+  toolResultsSummary.textContent = "Tool results";
+
+  const toolResultsBody = document.createElement("div");
+  toolResultsBody.className = "tool-results-body";
+  toolResultsPanel.append(toolResultsSummary, toolResultsBody);
+
+  message.append(roleLabel, thinking, sources, notice, body, toolResultsPanel);
   els.chatMessages.appendChild(message);
   els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
   return {
@@ -1102,12 +1114,15 @@ function addAssistantMessage() {
     thinkingTail,
     sourcesPanel: sources,
     sourcesBody,
+    toolResultsPanel,
+    toolResultsBody,
     notice,
     rawAnswer: "",
     rawThinking: "",
     answerCommittedLength: 0,
     thinkingCommittedLength: 0,
     sourcesData: [],
+    toolResults: [],
     get sources() {
       return this.sourcesData;
     },
@@ -1172,12 +1187,180 @@ function renderSourcePanel(parts) {
   }
 }
 
+function normalizeToolResultEvent(event) {
+  const result = event.result && typeof event.result === "object" ? event.result : null;
+  return {
+    tool: String(event.tool || result?.tool || "tool"),
+    text: String(event.text || ""),
+    result,
+    content: String(event.content || (result ? JSON.stringify(result) : "")),
+  };
+}
+
+function toolResultJson(entry) {
+  if (entry.result && typeof entry.result === "object") {
+    return JSON.stringify(entry.result, null, 2);
+  }
+  if (entry.content) {
+    try {
+      return JSON.stringify(JSON.parse(entry.content), null, 2);
+    } catch (_) {
+      return entry.content;
+    }
+  }
+  return "";
+}
+
+function toolResultItemTitle(item) {
+  return item.location || item.title || item.url || item.chunk_id || item.source_id || "";
+}
+
+function toolResultItemText(item) {
+  return item.content || item.snippet || item.error || "";
+}
+
+function sourceAsToolResultItem(source) {
+  if (source.kind === "web") {
+    return {
+      source_id: source.id || "",
+      citation: source.label || source.id || "",
+      title: source.title || source.url || "",
+      url: source.url || "",
+      snippet: source.snippet || "",
+      provider: source.provider || "",
+    };
+  }
+  return {
+    source_id: source.id || "",
+    citation: source.label || source.id || "",
+    chunk_id: source.chunk_id || "",
+    score: source.score,
+    location: [source.source_pdf_name, source.section_path, source.page_label].filter(Boolean).join(" :: "),
+    snippet: source.snippet || "",
+  };
+}
+
+function fallbackToolResultEntries(parts) {
+  if (Array.isArray(parts.toolResults) && parts.toolResults.length) {
+    return parts.toolResults;
+  }
+
+  const sources = Array.isArray(parts.sources) ? parts.sources : [];
+  const localSources = sources.filter((source) => source.kind !== "web");
+  const webSources = sources.filter((source) => source.kind === "web");
+  const entries = [];
+
+  if (localSources.length) {
+    const result = {
+      tool: "search_local_context",
+      result_count: localSources.length,
+      results: localSources.map(sourceAsToolResultItem),
+    };
+    entries.push({
+      tool: result.tool,
+      text: `Retrieved ${localSources.length} local source chunk(s).`,
+      result,
+      content: JSON.stringify(result),
+      fromSources: true,
+    });
+  }
+
+  if (webSources.length) {
+    const result = {
+      tool: "web_search",
+      result_count: webSources.length,
+      results: webSources.map(sourceAsToolResultItem),
+    };
+    entries.push({
+      tool: result.tool,
+      text: `Retrieved ${webSources.length} web result(s).`,
+      result,
+      content: JSON.stringify(result),
+      fromSources: true,
+    });
+  }
+
+  return entries;
+}
+
+function renderToolResultsPanel(parts) {
+  const entries = fallbackToolResultEntries(parts);
+  parts.toolResultsPanel.hidden = entries.length === 0;
+  parts.toolResultsPanel.open = entries.length > 0;
+  parts.toolResultsBody.innerHTML = "";
+
+  for (const [index, entry] of entries.entries()) {
+    const result = entry.result && typeof entry.result === "object" ? entry.result : {};
+    const toolName = entry.tool || result.tool || `tool_${index + 1}`;
+    const query = result.query ? ` query: ${result.query}` : "";
+    const item = document.createElement("div");
+    item.className = "tool-result-item";
+
+    const heading = document.createElement("div");
+    heading.className = "tool-result-heading";
+    const resultCount = Number.isFinite(Number(result.result_count))
+      ? `${Number(result.result_count)} result(s)`
+      : "";
+    heading.innerHTML = `
+      <strong>${escapeHtml(toolName)}</strong>
+      <span>${escapeHtml([query, resultCount, result.provider || ""].filter(Boolean).join(" | "))}</span>
+    `;
+    item.appendChild(heading);
+
+    if (entry.text || result.error) {
+      const status = document.createElement("div");
+      status.className = "tool-result-status";
+      status.textContent = result.error || entry.text;
+      item.appendChild(status);
+    }
+
+    const rows = Array.isArray(result.results) ? result.results : [];
+    if (rows.length) {
+      const list = document.createElement("div");
+      list.className = "tool-result-list";
+      for (const row of rows) {
+        const rowItem = document.createElement("div");
+        rowItem.className = "tool-result-row";
+
+        const rowHeading = document.createElement("div");
+        rowHeading.className = "tool-result-row-heading";
+        const citation = row.citation || row.source_id || "";
+        rowHeading.innerHTML = `
+          <strong>${escapeHtml(citation)}</strong>
+          <span>${escapeHtml(toolResultItemTitle(row))}</span>
+        `;
+
+        const rowText = document.createElement("pre");
+        rowText.textContent = toolResultItemText(row);
+        rowItem.append(rowHeading, rowText);
+        list.appendChild(rowItem);
+      }
+      item.appendChild(list);
+    }
+
+    const rawJson = toolResultJson(entry);
+    if (rawJson) {
+      const raw = document.createElement("details");
+      raw.className = "tool-result-json";
+      const summary = document.createElement("summary");
+      summary.textContent = entry.fromSources ? "Source details" : "JSON sent to model";
+      const pre = document.createElement("pre");
+      pre.textContent = rawJson;
+      raw.append(summary, pre);
+      item.appendChild(raw);
+    }
+
+    parts.toolResultsBody.appendChild(item);
+  }
+}
+
 function addSavedAssistantMessage(saved) {
   const parts = addAssistantMessage();
   parts.finalized = true;
   parts.rawAnswer = saved.text || "";
   parts.rawThinking = saved.thinking || "";
   parts.sources = saved.sources || [];
+  parts.toolResults = Array.isArray(saved.toolResults) ? saved.toolResults : [];
   if (parts.rawThinking) {
     parts.thinking.hidden = false;
     parts.thinking.open = false;
@@ -1201,6 +1384,7 @@ function addSavedAssistantMessage(saved) {
     parts.answerStable.textContent = parts.rawAnswer;
     parts.answerCommittedLength = parts.rawAnswer.length;
   }
+  renderToolResultsPanel(parts);
   return parts;
 }
 
@@ -1233,11 +1417,11 @@ function markGemmaResponseStarted(parts) {
 function appendStreamEvent(parts, event) {
   const type = event.type || "answer";
   const text = event.text || "";
-  if (!text) {
-    return;
-  }
 
   if (type === "thinking") {
+    if (!text) {
+      return;
+    }
     markGemmaResponseStarted(parts);
     parts.thinking.hidden = false;
     parts.thinking.open = true;
@@ -1248,6 +1432,9 @@ function appendStreamEvent(parts, event) {
   }
 
   if (type === "error") {
+    if (!text) {
+      return;
+    }
     addPersistentNotice(parts, `[Error] ${text}`);
     return;
   }
@@ -1258,7 +1445,26 @@ function appendStreamEvent(parts, event) {
     return;
   }
 
-  if (type === "tool_call" || type === "tool_result") {
+  if (type === "tool_result") {
+    if (event.result || event.content) {
+      parts.toolResults.push(normalizeToolResultEvent(event));
+    }
+    if (!text) {
+      return;
+    }
+    if (isTransientNotice(text)) {
+      parts.transientNotices.push(text);
+    } else {
+      parts.persistentNotices.push(text);
+    }
+    updateNotice(parts);
+    return;
+  }
+
+  if (type === "tool_call") {
+    if (!text) {
+      return;
+    }
     if (isTransientNotice(text)) {
       parts.transientNotices.push(text);
     } else {
@@ -1269,6 +1475,9 @@ function appendStreamEvent(parts, event) {
   }
 
   if (type === "notice") {
+    if (!text) {
+      return;
+    }
     if (isTransientNotice(text)) {
       parts.transientNotices.push(text);
     } else {
@@ -1278,6 +1487,9 @@ function appendStreamEvent(parts, event) {
     return;
   }
 
+  if (!text) {
+    return;
+  }
   markGemmaResponseStarted(parts);
   parts.rawAnswer += text;
   updateStreamTailRaw(parts, "answer");
@@ -1308,6 +1520,8 @@ async function formatAssistantMessage(parts) {
     }
   } catch (error) {
     addFormattingNotice(parts, error);
+  } finally {
+    renderToolResultsPanel(parts);
   }
 }
 

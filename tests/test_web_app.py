@@ -860,6 +860,21 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
         def ask_stream_events(self, question):
             assert question == "alpha?"
             yield {"type": "thinking", "text": "checking "}
+            yield {
+                "type": "tool_result",
+                "tool": "search_local_context",
+                "text": "Retrieved 1 local source chunk(s).",
+                "result": {
+                    "tool": "search_local_context",
+                    "query": "alpha?",
+                    "result_count": 1,
+                    "results": [{"citation": "[S1]", "content": "alpha context"}],
+                },
+                "content": (
+                    '{"tool":"search_local_context","query":"alpha?",'
+                    '"result_count":1,"results":[{"citation":"[S1]","content":"alpha context"}]}'
+                ),
+            }
             yield {"type": "sources", "sources": [{"id": "S1", "label": "[S1]", "kind": "local"}]}
             yield {"type": "answer", "text": "chunk "}
             yield {"type": "answer", "text": "two"}
@@ -884,6 +899,21 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
     assert response.status_code == 200
     assert [json.loads(line) for line in response.text.splitlines()] == [
         {"type": "thinking", "text": "checking "},
+        {
+            "type": "tool_result",
+            "tool": "search_local_context",
+            "text": "Retrieved 1 local source chunk(s).",
+            "result": {
+                "tool": "search_local_context",
+                "query": "alpha?",
+                "result_count": 1,
+                "results": [{"citation": "[S1]", "content": "alpha context"}],
+            },
+            "content": (
+                '{"tool":"search_local_context","query":"alpha?",'
+                '"result_count":1,"results":[{"citation":"[S1]","content":"alpha context"}]}'
+            ),
+        },
         {"type": "sources", "sources": [{"id": "S1", "label": "[S1]", "kind": "local"}]},
         {"type": "answer", "text": "chunk "},
         {"type": "answer", "text": "two"},
