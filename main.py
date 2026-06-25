@@ -232,7 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.9,
+        default=0.3,
         help="Ollama sampling temperature in query mode.",
     )
     parser.add_argument(

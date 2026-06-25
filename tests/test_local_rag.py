@@ -69,6 +69,75 @@ def test_chunk_markdown_splits_long_text_without_empty_chunks():
     assert len(chunks) > 2
 
 
+def test_write_index_manifest_summarizes_source_quality_counts():
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_manifest_{uuid.uuid4().hex}"
+    try:
+        records = [
+            {
+                "id": "doc",
+                "node_type": "document_summary",
+                "content": "summary",
+                "source_hash": "hash-a",
+                "source_pdf_name": "doc.pdf",
+                "source_pdf_path": "data/doc.pdf",
+                "page_start": 1,
+                "page_end": 3,
+            },
+            {
+                "id": "chunk",
+                "node_type": "chunk",
+                "content": "alpha context",
+                "source_hash": "hash-a",
+                "source_pdf_name": "doc.pdf",
+                "source_pdf_path": "data/doc.pdf",
+                "page_start": 2,
+                "page_end": 2,
+            },
+        ]
+
+        manifest = local_rag.write_index_manifest(
+            tmp_path,
+            records,
+            embedding_model="fake-embed",
+            embedding_dim=3,
+        )
+
+        assert tmp_path.joinpath(local_rag.INDEX_MANIFEST_FILENAME).exists()
+        assert manifest["total_records"] == 2
+        assert manifest["documents"]["hash-a"]["record_count"] == 2
+        assert manifest["documents"]["hash-a"]["chunk_count"] == 1
+        assert manifest["documents"]["hash-a"]["summary_count"] == 1
+        assert manifest["documents"]["hash-a"]["page_start"] == 1
+        assert manifest["documents"]["hash-a"]["page_end"] == 3
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_citation_support_warnings_flag_weak_cited_claims():
+    messages = [
+        {
+            "role": "tool",
+            "content": (
+                '{"results":[{"citation":"[S1]",'
+                '"content":"The suspension report discusses spring stiffness and damping ratios."}]}'
+            ),
+        }
+    ]
+
+    supported = local_rag.citation_support_warnings(
+        "The report discusses spring stiffness and damping ratios [S1].",
+        messages,
+    )
+    weak = local_rag.citation_support_warnings(
+        "Aerodynamic vortices define accumulator voltage limits [S1].",
+        messages,
+    )
+
+    assert supported == []
+    assert weak
+    assert "[S1]" in weak[0]
+
+
 def test_ollama_chat_posts_directly_to_api_chat(monkeypatch):
     calls = []
 
@@ -218,7 +287,7 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
         assert calls[0]["model"] == "gemma4"
         assert calls[0]["tools"][0]["function"]["name"] == "search_local_context"
         assert calls[-1]["stream"] is True
-        assert calls[-1]["options"]["temperature"] == 0.9
+        assert calls[-1]["options"]["temperature"] == 0.3
         assert calls[-1]["options"]["top_k"] == 40
         assert calls[-1]["options"]["num_ctx"] == 8192
         assert calls[-1]["options"]["num_predict"] == 4096
@@ -280,7 +349,7 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
 
         assert chunks == ["chunk ", "two [S1]"]
         assert calls[-1]["stream"] is True
-        assert calls[-1]["options"]["temperature"] == 0.9
+        assert calls[-1]["options"]["temperature"] == 0.3
         assert calls[-1]["options"]["top_k"] == 40
         assert calls[-1]["options"]["num_ctx"] == 8192
         assert calls[-1]["options"]["num_predict"] == 4096

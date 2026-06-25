@@ -34,6 +34,23 @@ def test_parse_toc_entries_handles_dot_leaders():
     assert entries == [("7.2", "Changes at test time", 206)]
 
 
+def test_markdown_hash_headings_create_sections():
+    root = Path.cwd() / f".tmp_test_sectioning_{uuid.uuid4().hex}"
+    try:
+        markdown_path = root / "notes.md"
+        root.mkdir(parents=True)
+        markdown_path.write_text("# Overview\n\nalpha\n\n## Details\n\nbeta", encoding="utf-8")
+
+        records = build_section_records(markdown_path, source_root=root)
+
+        paths = {record["section_path"] for record in records}
+        assert "Overview" in paths
+        assert "Overview > Details" in paths
+        assert any(record["node_type"] == "chunk" and "beta" in record["content"] for record in records)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_outline_extraction_builds_nested_page_ranges():
     overview = FakeDestination("Overview")
     review = FakeDestination("Review")

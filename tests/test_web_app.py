@@ -1402,6 +1402,62 @@ def test_pdf_documents_endpoint_paginates(monkeypatch, workspace_tmp):
     assert [pdf["filename"] for pdf in payload["pdfs"]] == ["doc-10.pdf", "doc-11.pdf"]
 
 
+def test_pdf_documents_include_quality_payload(monkeypatch, workspace_tmp):
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    markdown_path = processed_dir / "quality.md"
+    markdown_path.write_text("# Overview\n\n" + ("alpha context " * 80), encoding="utf-8")
+    source_hash = "hash-quality"
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=markdown_path,
+        source_hash=source_hash,
+        source_pdf_name="quality.pdf",
+        source_pdf_path=web_app.DATA_DIR / "quality.pdf",
+    )
+    db_dir = workspace_tmp / "db"
+    local_rag.write_index_manifest(
+        db_dir,
+        [
+            {
+                "id": "summary",
+                "node_type": "document_summary",
+                "content": "summary",
+                "source_hash": source_hash,
+                "source_pdf_name": "quality.pdf",
+                "source_pdf_path": str(web_app.DATA_DIR / "quality.pdf"),
+                "page_start": 1,
+                "page_end": 2,
+            },
+            {
+                "id": "chunk",
+                "node_type": "chunk",
+                "content": "alpha context",
+                "source_hash": source_hash,
+                "source_pdf_name": "quality.pdf",
+                "source_pdf_path": str(web_app.DATA_DIR / "quality.pdf"),
+                "page_start": 1,
+                "page_end": 1,
+            },
+        ],
+        embedding_model="fake-embed",
+        embedding_dim=3,
+    )
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+
+    client = TestClient(web_app.app)
+    response = client.get("/api/pdfs")
+
+    assert response.status_code == 200
+    quality = response.json()["pdfs"][0]["quality"]
+    assert quality["label"] == "ready"
+    assert quality["chunk_count"] == 1
+    assert quality["record_count"] == 2
+    assert quality["markdown_exists"] is True
+
+
 def test_pdf_documents_list_and_download_endpoint(monkeypatch, workspace_tmp):
     processed_dir = workspace_tmp / "processed"
     processed_dir.mkdir()

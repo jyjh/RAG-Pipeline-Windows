@@ -11,6 +11,7 @@ import time
 import urllib.parse
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,8 @@ from src.sectioning import (
 )
 from src.vector_store import LanceDBVectorStore, default_store
 
-QUERY_TEMPERATURE = 0.9
+QUERY_TEMPERATURE = 0.3
+INDEX_MANIFEST_FILENAME = "index_manifest.json"
 DEFAULT_NUM_PREDICT = 4096
 DEFAULT_SAMPLER_TOP_K = 40
 DEFAULT_CONTEXT_WINDOW = 8192
@@ -600,6 +602,185 @@ class CitationRegistry:
         return {source["label"] for source in self.all_sources()}
 
 
+SUPPORT_STOPWORDS = {
+    "about",
+    "above",
+    "after",
+    "also",
+    "because",
+    "before",
+    "being",
+    "between",
+    "could",
+    "every",
+    "from",
+    "have",
+    "into",
+    "more",
+    "only",
+    "same",
+    "should",
+    "source",
+    "sources",
+    "than",
+    "that",
+    "their",
+    "there",
+    "these",
+    "this",
+    "through",
+    "using",
+    "when",
+    "where",
+    "which",
+    "with",
+    "would",
+}
+
+
+def _citation_labels(text: str) -> list[str]:
+    return re.findall(r"\[[SW]\d+\]", text or "")
+
+
+def _claim_keywords(text: str) -> set[str]:
+    cleaned = re.sub(r"\[[SW]\d+\]", " ", text or "")
+    words = {
+        word.lower()
+        for word in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", cleaned)
+        if word.lower() not in SUPPORT_STOPWORDS
+    }
+    return words
+
+
+def _claim_fragments(answer_text: str) -> list[str]:
+    fragments = []
+    for line in re.split(r"\n+", answer_text or ""):
+        line = line.strip()
+        if not line:
+            continue
+        fragments.extend(part.strip() for part in re.split(r"(?<=[.!?])\s+", line) if part.strip())
+    return fragments
+
+
+def _tool_source_texts(messages: list[dict[str, Any]]) -> dict[str, str]:
+    texts: dict[str, list[str]] = {}
+    for message in messages:
+        if message.get("role") != "tool":
+            continue
+        try:
+            payload = json.loads(str(message.get("content") or "{}"))
+        except json.JSONDecodeError:
+            continue
+        for item in payload.get("results") or []:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("citation") or item.get("source_id") or "").strip()
+            if label and not label.startswith("["):
+                label = f"[{label}]"
+            if not label:
+                continue
+            text = str(item.get("content") or item.get("snippet") or "")
+            if text:
+                texts.setdefault(label, []).append(text)
+    return {label: "\n".join(parts) for label, parts in texts.items()}
+
+
+def citation_support_warnings(answer_text: str, messages: list[dict[str, Any]]) -> list[str]:
+    source_texts = _tool_source_texts(messages)
+    weak_claim_labels: set[str] = set()
+    for fragment in _claim_fragments(answer_text):
+        labels = _citation_labels(fragment)
+        if not labels:
+            continue
+        keywords = _claim_keywords(fragment)
+        if len(keywords) < 4:
+            continue
+        supported = False
+        for label in labels:
+            source_text = source_texts.get(label, "").lower()
+            if not source_text:
+                continue
+            overlap = sum(1 for keyword in keywords if keyword in source_text)
+            if overlap / max(len(keywords), 1) >= 0.25:
+                supported = True
+                break
+        if not supported:
+            weak_claim_labels.update(labels)
+    if not weak_claim_labels:
+        return []
+    labels = ", ".join(sorted(weak_claim_labels))
+    return [
+        "Citation support check found weak lexical support for cited claim(s) "
+        f"using {labels}. Review the Sources panel before relying on those claim(s)."
+    ]
+
+
+def _manifest_source_key(record: dict[str, Any]) -> str:
+    source_hash = str(record.get("source_hash") or "").strip()
+    if source_hash:
+        return source_hash
+    source_path = str(record.get("source_pdf_path") or record.get("file_path") or "").strip()
+    return source_path or str(record.get("doc_id") or "unknown")
+
+
+def _build_index_manifest(records: list[dict[str, Any]], *, embedding_model: str, embedding_dim: int) -> dict[str, Any]:
+    documents: dict[str, dict[str, Any]] = {}
+    for record in records:
+        key = _manifest_source_key(record)
+        document = documents.setdefault(
+            key,
+            {
+                "source_hash": str(record.get("source_hash") or ""),
+                "source_pdf_name": str(record.get("source_pdf_name") or ""),
+                "source_pdf_path": str(record.get("source_pdf_path") or ""),
+                "file_path": str(record.get("file_path") or ""),
+                "record_count": 0,
+                "chunk_count": 0,
+                "summary_count": 0,
+                "content_char_count": 0,
+                "page_start": 0,
+                "page_end": 0,
+            },
+        )
+        node_type = str(record.get("node_type") or "")
+        content = str(record.get("content") or "")
+        document["record_count"] += 1
+        document["content_char_count"] += len(content)
+        if node_type == "chunk":
+            document["chunk_count"] += 1
+        elif node_type.endswith("summary"):
+            document["summary_count"] += 1
+        page_start = int(record.get("page_start") or 0)
+        page_end = int(record.get("page_end") or 0)
+        if page_start:
+            current = int(document.get("page_start") or 0)
+            document["page_start"] = page_start if not current else min(current, page_start)
+        if page_end:
+            document["page_end"] = max(int(document.get("page_end") or 0), page_end)
+    return {
+        "version": 1,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "embedding_model": embedding_model,
+        "embedding_dim": int(embedding_dim),
+        "total_records": len(records),
+        "documents": documents,
+    }
+
+
+def write_index_manifest(
+    working_dir: str | Path,
+    records: list[dict[str, Any]],
+    *,
+    embedding_model: str,
+    embedding_dim: int,
+) -> dict[str, Any]:
+    manifest = _build_index_manifest(records, embedding_model=embedding_model, embedding_dim=embedding_dim)
+    path = Path(working_dir) / INDEX_MANIFEST_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    return manifest
+
+
 class DuckDuckGoLiteParser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -823,6 +1004,12 @@ class LocalVectorIndexer:
         store = LanceDBVectorStore(self.working_dir)
         output_target = store.db_path / "chunks"
         store.write_records(
+            records,
+            embedding_model=self.embedding_model,
+            embedding_dim=768,
+        )
+        write_index_manifest(
+            self.working_dir,
             records,
             embedding_model=self.embedding_model,
             embedding_dim=768,
@@ -1652,3 +1839,5 @@ class LocalQueryEngine:
                 "type": "notice",
                 "text": f"The answer cited unknown source ID(s): {', '.join(invalid)}.",
             }
+        for warning in citation_support_warnings(answer_text, messages):
+            yield {"type": "notice", "text": warning}

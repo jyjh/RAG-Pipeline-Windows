@@ -225,7 +225,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
         "embedding_timeout": 30.0,
         "llm_num_predict": 4096,
         "llm_timeout": 120.0,
-        "temperature": 0.9,
+        "temperature": 0.3,
         "sampler_top_k": 40,
         "context_window": 8192,
         "retrieval_candidate_k": 80,

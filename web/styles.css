@@ -251,6 +251,31 @@ input[type="file"] {
   color: var(--danger);
 }
 
+.advanced-settings {
+  margin-bottom: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+
+.advanced-settings summary {
+  cursor: pointer;
+  padding: 9px 12px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.advanced-settings .toolbar,
+.advanced-settings .sampler-settings {
+  padding: 0 12px 12px;
+}
+
+.chat-advanced-settings {
+  grid-column: 1 / -1;
+  margin-bottom: 0;
+}
+
 .duplicate-prompt {
   display: flex;
   align-items: center;
@@ -602,6 +627,47 @@ input[type="file"] {
 .source-links a,
 .download-link {
   color: var(--accent-strong);
+}
+
+.quality-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.quality-ready {
+  border: 1px solid #a9d6b8;
+  background: #eaf7ee;
+  color: var(--good);
+}
+
+.quality-review {
+  border: 1px solid #d9b456;
+  background: #fff4cb;
+  color: #6e4a0d;
+}
+
+.quality-not_ready {
+  border: 1px solid #e0baba;
+  background: #fff0f0;
+  color: var(--danger);
+}
+
+.quality-detail,
+.quality-warning {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.quality-warning {
+  color: var(--warn);
 }
 
 .tool-results-block {

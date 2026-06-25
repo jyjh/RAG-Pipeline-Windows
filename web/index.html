@@ -14,9 +14,9 @@
       </div>
       <div class="app-header-actions">
         <nav class="tabs" aria-label="Views">
-          <button class="tab active" data-tab-target="upload">Upload</button>
-          <button class="tab" data-tab-target="index">Index</button>
-          <button class="tab" data-tab-target="chat">Chat</button>
+          <button class="tab active" data-tab-target="upload">Documents</button>
+          <button class="tab" data-tab-target="index">Review</button>
+          <button class="tab" data-tab-target="chat">Ask</button>
         </nav>
         <button id="updateButton" class="update-button update-checking" type="button" title="Checking for updates">
           Checking
@@ -54,6 +54,7 @@
             <tr>
               <th>PDF</th>
               <th>Status</th>
+              <th>Quality</th>
               <th>Download</th>
             </tr>
           </thead>
@@ -81,10 +82,10 @@
 
       <section id="index" class="panel">
         <div class="toolbar">
-          <input id="searchInput" type="search" placeholder="Standard text search" />
-          <button id="searchButton" type="button">Standard search</button>
+          <input id="searchInput" type="search" placeholder="Search indexed content" />
+          <button id="searchButton" type="button">Search</button>
           <label class="inline-select-label">
-            Summary rows
+            Rows
             <select id="indexPageSizeSelect">
               <option value="20" selected>20</option>
               <option value="50">50</option>
@@ -96,14 +97,17 @@
           <span id="pageLabel"></span>
           <button id="nextPageButton" type="button">Next</button>
         </div>
-        <div class="toolbar vector-search-toolbar">
-          <input id="vectorSearchInput" type="search" placeholder="Vector search (slower)" />
-          <label class="inline-select-label">
-            Relevance floor
-            <input id="vectorRelevanceFloorInput" type="number" min="0" max="1" step="0.05" value="0.7" />
-          </label>
-          <button id="vectorSearchButton" type="button">Vector search</button>
-        </div>
+        <details class="advanced-settings">
+          <summary>Advanced retrieval search</summary>
+          <div class="toolbar vector-search-toolbar">
+            <input id="vectorSearchInput" type="search" placeholder="Vector search query" />
+            <label class="inline-select-label">
+              Relevance floor
+              <input id="vectorRelevanceFloorInput" type="number" min="0" max="1" step="0.05" value="0.7" />
+            </label>
+            <button id="vectorSearchButton" type="button">Vector search</button>
+          </div>
+        </details>
         <div id="indexStatus" class="status"></div>
         <table class="data-table index-table">
           <thead>
@@ -133,32 +137,35 @@
             </div>
             <div id="chatMessages" class="chat-messages" aria-live="polite"></div>
             <form id="chatForm" class="chat-form">
-              <div class="sampler-settings" aria-label="Sampler settings">
-                <label>
-                  Temperature
-                  <input id="temperatureInput" type="number" min="0" max="2" step="0.05" value="0.9" />
-                </label>
-                <label>
-                  Max K
-                  <input id="maxKInput" type="number" min="1" max="200" step="1" value="40" />
-                </label>
-                <label>
-                  Context
-                  <input id="contextWindowInput" type="number" min="1024" max="131072" step="1024" value="8192" />
-                </label>
-                <label>
-                  Max Output
-                  <input id="maxOutputInput" type="number" min="64" max="32768" step="64" value="4096" />
-                </label>
-                <label>
-                  Relevance Floor
-                  <input id="relevanceFloorInput" type="number" min="0" max="1" step="0.01" value="0.5" />
-                </label>
-                <label class="checkbox-label">
-                  Web search
-                  <input id="webSearchInput" type="checkbox" checked />
-                </label>
-              </div>
+              <details class="advanced-settings chat-advanced-settings">
+                <summary>Advanced answer settings</summary>
+                <div class="sampler-settings" aria-label="Sampler settings">
+                  <label>
+                    Temperature
+                    <input id="temperatureInput" type="number" min="0" max="2" step="0.05" value="0.3" />
+                  </label>
+                  <label>
+                    Max K
+                    <input id="maxKInput" type="number" min="1" max="200" step="1" value="40" />
+                  </label>
+                  <label>
+                    Context
+                    <input id="contextWindowInput" type="number" min="1024" max="131072" step="1024" value="8192" />
+                  </label>
+                  <label>
+                    Max Output
+                    <input id="maxOutputInput" type="number" min="64" max="32768" step="64" value="4096" />
+                  </label>
+                  <label>
+                    Relevance Floor
+                    <input id="relevanceFloorInput" type="number" min="0" max="1" step="0.01" value="0.5" />
+                  </label>
+                  <label class="checkbox-label">
+                    Web search
+                    <input id="webSearchInput" type="checkbox" checked />
+                  </label>
+                </div>
+              </details>
               <textarea id="questionInput" rows="3" placeholder="Ask a question"></textarea>
               <button id="sendButton" type="submit">Send</button>
             </form>

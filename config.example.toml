@@ -27,7 +27,7 @@ formula_enrichment = false
 table_structure = true
 accelerator = "auto"
 num_threads = 8
-asset_triggers = "none"
+asset_triggers = "images"
 progress_enabled = true
 
 [chunking]

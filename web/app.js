@@ -868,6 +868,43 @@ function updatePageControls({ total, offset, limit, label, prevButton, nextButto
   nextButton.disabled = offset + limit >= total;
 }
 
+function qualityTitle(value) {
+  if (value === "ready") {
+    return "Ready";
+  }
+  if (value === "not_ready") {
+    return "Not ready";
+  }
+  return "Needs review";
+}
+
+function qualityWarnings(warnings) {
+  const labels = {
+    low_extracted_text: "low text",
+    missing_index_manifest: "index details missing",
+    missing_markdown: "missing Markdown",
+    no_chunks: "no chunks",
+    not_indexed: "not indexed",
+  };
+  return (Array.isArray(warnings) ? warnings : []).map((warning) => labels[warning] || warning);
+}
+
+function renderQualityCell(quality) {
+  const data = quality && typeof quality === "object" ? quality : {};
+  const label = data.label || "review";
+  const warningText = qualityWarnings(data.warnings).join(", ");
+  const metrics = [
+    Number(data.chunk_count || 0) ? `${Number(data.chunk_count)} chunks` : "",
+    Number(data.markdown_char_count || 0) ? `${Number(data.markdown_char_count)} chars` : "",
+    Number(data.enrichment_markers || 0) ? `${Number(data.enrichment_markers)} enriched` : "",
+  ].filter(Boolean);
+  return `
+    <span class="quality-badge quality-${escapeHtml(label)}">${escapeHtml(qualityTitle(label))}</span>
+    <span class="quality-detail">${escapeHtml(metrics.join(" | "))}</span>
+    <span class="quality-warning">${escapeHtml(warningText)}</span>
+  `;
+}
+
 async function refreshJobs() {
   try {
     const params = new URLSearchParams({
@@ -930,6 +967,7 @@ async function refreshPdfs() {
           ${escapeHtml(item.hash || "")}
         </td>
         <td>${escapeHtml(item.status || "")}</td>
+        <td>${renderQualityCell(item.quality)}</td>
         <td>${download}</td>
       `;
       els.pdfsBody.appendChild(row);
@@ -2162,7 +2200,7 @@ async function sendQuestion(event) {
       signal: abortController.signal,
       body: JSON.stringify({
         question,
-        temperature: numericSetting(els.temperatureInput, 0.9, 0),
+        temperature: numericSetting(els.temperatureInput, 0.3, 0),
         max_k: Math.trunc(numericSetting(els.maxKInput, 40, 1)),
         context_window: Math.trunc(numericSetting(els.contextWindowInput, 8192, 1)),
         llm_num_predict: Math.trunc(numericSetting(els.maxOutputInput, 4096, 1)),

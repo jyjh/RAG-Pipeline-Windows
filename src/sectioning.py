@@ -489,17 +489,28 @@ def sections_from_markdown(doc_title: str, content: str) -> tuple[list[SectionNo
 
 def markdown_headings(content: str) -> list[tuple[int, int, str]]:
     headings: list[tuple[int, int, str]] = []
-    pattern = re.compile(
-        r"(?m)^(?:#{1,6}\s+)?(?P<title>(?P<num>\d+(?:\.\d+)*|[A-Z](?:\.\d+)*)\s+[^\n]{3,120})$"
+    hash_pattern = re.compile(r"(?m)^(?P<hashes>#{1,6})\s+(?P<title>[^\n#][^\n]{2,160})\s*$")
+    numbered_pattern = re.compile(
+        r"(?m)^(?P<title>(?P<num>\d+(?:\.\d+)*|[A-Z](?:\.\d+)*)\s+[^\n]{3,120})$"
     )
-    for match in pattern.finditer(content):
+    seen_offsets: set[int] = set()
+    for match in hash_pattern.finditer(content):
+        title = clean_title(match.group("title"))
+        if is_noise_line(title):
+            continue
+        level = len(match.group("hashes")) - 1
+        headings.append((match.start(), level, title))
+        seen_offsets.add(match.start())
+    for match in numbered_pattern.finditer(content):
+        if match.start() in seen_offsets:
+            continue
         title = clean_title(match.group("title"))
         if is_noise_line(title):
             continue
         number = match.group("num")
         level = number.count(".")
         headings.append((match.start(), level, title))
-    return headings
+    return sorted(headings, key=lambda item: item[0])
 
 
 def strip_front_matter(content: str) -> str:

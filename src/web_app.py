@@ -46,6 +46,8 @@ from src.local_rag import (
     DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL,
     DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
     DEFAULT_QUERY_SYSTEM_PROMPT,
+    INDEX_MANIFEST_FILENAME,
+    write_index_manifest,
 )
 from src.pdf_registry import PdfRegistry, load_source_map, remove_source_entries_by_hash, sha256_file
 from src.vector_store import default_store, lancedb_path, record_matches, record_row
@@ -63,7 +65,7 @@ WEB_DIR = ROOT_DIR / "web"
 DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
 DEFAULT_EMBEDDING_BATCH_SIZE = 8
 DEFAULT_EMBEDDING_TIMEOUT = 30.0
-DEFAULT_TEMPERATURE = 0.9
+DEFAULT_TEMPERATURE = 0.3
 DEFAULT_MAX_K = 40
 DEFAULT_CONTEXT_WINDOW = 8192
 DEFAULT_LLM_NUM_PREDICT = 4096
@@ -997,6 +999,119 @@ def _pdf_download_url(source_hash: str) -> str:
     return f"/api/pdfs/{source_hash}/download" if source_hash else ""
 
 
+def _resolve_workspace_path(raw_path: str, *, root_dir: Path = ROOT_DIR) -> Path | None:
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+    try:
+        path = Path(text)
+        return path if path.is_absolute() else root_dir / path
+    except (OSError, ValueError):
+        return None
+
+
+def _load_index_manifest(db_dir: Path | None = None) -> dict[str, Any]:
+    resolved_db_dir = Path(db_dir or DB_DIR)
+    path = resolved_db_dir / INDEX_MANIFEST_FILENAME
+    if not path.exists():
+        return _derive_index_manifest(resolved_db_dir)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _derive_index_manifest(resolved_db_dir)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _derive_index_manifest(db_dir: Path) -> dict[str, Any]:
+    try:
+        store = _index_store(db_dir)
+        if not store.exists():
+            return {}
+        model, dim = store.metadata()
+        records: list[dict[str, Any]] = []
+        for batch in store.iter_record_batches(batch_size=INDEX_STREAM_DEFAULT_BATCH_SIZE):
+            records.extend(batch)
+        return write_index_manifest(db_dir, records, embedding_model=model, embedding_dim=dim)
+    except Exception:
+        return {}
+
+
+def _index_manifest_stats(
+    entry: dict[str, Any],
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    documents = manifest.get("documents", {}) if isinstance(manifest.get("documents"), dict) else {}
+    keys = [
+        str(entry.get("hash") or ""),
+        str(entry.get("source_pdf_path") or ""),
+        str(entry.get("upload_path") or ""),
+    ]
+    for key in keys:
+        stats = documents.get(key)
+        if isinstance(stats, dict):
+            return dict(stats)
+    return {}
+
+
+def _markdown_quality(processed_markdown_path: str, *, root_dir: Path = ROOT_DIR) -> dict[str, Any]:
+    path = _resolve_workspace_path(processed_markdown_path, root_dir=root_dir)
+    if path is None:
+        return {"markdown_exists": False, "markdown_char_count": 0, "page_markers": 0, "enrichment_markers": 0}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {"markdown_exists": False, "markdown_char_count": 0, "page_markers": 0, "enrichment_markers": 0}
+    return {
+        "markdown_exists": True,
+        "markdown_char_count": len(text.strip()),
+        "page_markers": len(re.findall(r"(?m)^##\s+Page\s+\d+", text)),
+        "enrichment_markers": text.count("[Vision Analysis]") + text.count("[Page Image Analysis]"),
+        "table_markers": text.count("|"),
+        "equation_markers": len(re.findall(r"(?<!\\)\$[^$\n]{1,160}(?<!\\)\$", text)),
+    }
+
+
+def _document_quality(
+    entry: dict[str, Any],
+    *,
+    manifest: dict[str, Any],
+    root_dir: Path = ROOT_DIR,
+) -> dict[str, Any]:
+    stats = _index_manifest_stats(entry, manifest)
+    markdown = _markdown_quality(str(entry.get("processed_markdown_path") or ""), root_dir=root_dir)
+    status = str(entry.get("status") or "")
+    warnings: list[str] = []
+    if not markdown["markdown_exists"]:
+        warnings.append("missing_markdown")
+    elif int(markdown["markdown_char_count"]) < 500:
+        warnings.append("low_extracted_text")
+    if status != "indexed":
+        warnings.append("not_indexed")
+    if not stats:
+        warnings.append("missing_index_manifest")
+    elif int(stats.get("chunk_count") or 0) <= 0:
+        warnings.append("no_chunks")
+
+    if not warnings:
+        label = "ready"
+    elif "not_indexed" in warnings or "no_chunks" in warnings:
+        label = "not_ready"
+    else:
+        label = "review"
+
+    return {
+        "label": label,
+        "warnings": warnings,
+        "record_count": int(stats.get("record_count") or 0),
+        "chunk_count": int(stats.get("chunk_count") or 0),
+        "summary_count": int(stats.get("summary_count") or 0),
+        "content_char_count": int(stats.get("content_char_count") or 0),
+        "page_start": int(stats.get("page_start") or 0),
+        "page_end": int(stats.get("page_end") or 0),
+        **markdown,
+    }
+
+
 def _pdf_entry_for_response(
     *,
     source_hash: str,
@@ -1048,6 +1163,7 @@ def list_pdf_documents(
     registry_path = registry_path or PDF_REGISTRY_PATH
     processed_dir = processed_dir or PROCESSED_DIR
     entries: dict[str, dict[str, Any]] = {}
+    manifest = _load_index_manifest(DB_DIR)
 
     payload = PdfRegistry(registry_path).load()
     for source_hash, entry in payload.get("pdfs", {}).items():
@@ -1085,6 +1201,8 @@ def list_pdf_documents(
         )
 
     rows = sorted(entries.values(), key=lambda item: (item.get("filename", ""), item.get("hash", "")))
+    for item in rows:
+        item["quality"] = _document_quality(item, manifest=manifest, root_dir=root_dir)
     query = search.strip().lower()
     if query:
         rows = [
