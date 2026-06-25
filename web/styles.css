@@ -94,6 +94,18 @@ button:disabled {
   color: #ffffff;
 }
 
+#sendButton.stop-button {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: #ffffff;
+}
+
+#sendButton.stop-button:hover {
+  border-color: #7f2828;
+  background: #7f2828;
+  color: #ffffff;
+}
+
 .update-button {
   min-width: 104px;
   white-space: nowrap;

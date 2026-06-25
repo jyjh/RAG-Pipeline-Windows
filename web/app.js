@@ -8,6 +8,7 @@ const state = {
   chats: [],
   activeChatId: null,
   streamingChatId: null,
+  chatAbortController: null,
   chatSidebarCollapsed: false,
   healthPollIntervalMs: 60000,
   jobsPollIntervalMs: 60000,
@@ -1414,6 +1415,21 @@ function markGemmaResponseStarted(parts) {
   }
 }
 
+function setSendButtonStreaming(streaming) {
+  els.sendButton.disabled = false;
+  els.sendButton.textContent = streaming ? "Stop" : "Send";
+  els.sendButton.classList.toggle("stop-button", streaming);
+  els.sendButton.title = streaming ? "Stop generation" : "";
+  els.sendButton.setAttribute("aria-label", streaming ? "Stop generation" : "Send");
+}
+
+function stopGeneration() {
+  if (!state.streamingChatId || !state.chatAbortController) {
+    return;
+  }
+  state.chatAbortController.abort();
+}
+
 function appendStreamEvent(parts, event) {
   const type = event.type || "answer";
   const text = event.text || "";
@@ -1538,17 +1554,20 @@ async function sendQuestion(event) {
   const chat = activeChat() || createChat({ activate: true });
   state.activeChatId = chat.id;
   state.streamingChatId = chat.id;
+  const abortController = new AbortController();
+  state.chatAbortController = abortController;
   addUserMessageToChat(chat, question);
   addMessage("You", question);
   const assistantParts = addAssistantMessage();
   els.questionInput.value = "";
-  els.sendButton.disabled = true;
+  setSendButtonStreaming(true);
   renderSavedChats();
 
   try {
     const response = await fetch("/api/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: abortController.signal,
       body: JSON.stringify({
         question,
         temperature: numericSetting(els.temperatureInput, 0.9, 0),
@@ -1594,12 +1613,19 @@ async function sendQuestion(event) {
     buffer += decoder.decode();
     processLine(buffer);
   } catch (error) {
-    appendStreamEvent(assistantParts, { type: "error", text: error.message });
+    if (error.name === "AbortError") {
+      appendStreamEvent(assistantParts, { type: "notice", text: "Generation stopped." });
+    } else {
+      appendStreamEvent(assistantParts, { type: "error", text: error.message });
+    }
   } finally {
     await formatAssistantMessage(assistantParts);
     addAssistantMessageToChat(chat, assistantParts);
     state.streamingChatId = null;
-    els.sendButton.disabled = false;
+    if (state.chatAbortController === abortController) {
+      state.chatAbortController = null;
+    }
+    setSendButtonStreaming(false);
     renderSavedChats();
     await refreshHealth();
   }
@@ -1663,6 +1689,13 @@ els.nextPageButton.addEventListener("click", () => {
 });
 els.indexBody.addEventListener("click", handleIndexAction);
 els.chatForm.addEventListener("submit", sendQuestion);
+els.sendButton.addEventListener("click", (event) => {
+  if (!state.streamingChatId) {
+    return;
+  }
+  event.preventDefault();
+  stopGeneration();
+});
 els.newChatButton.addEventListener("click", () => {
   if (state.streamingChatId) {
     return;
