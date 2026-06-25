@@ -3,6 +3,26 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from pathlib import Path
+from typing import Any
+
+from src.defaults import (
+    DEFAULT_ASSET_TRIGGERS,
+    DEFAULT_DOCLING_ACCELERATOR,
+    DEFAULT_OCR_BACKEND,
+    DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
+    DEFAULT_OCR_FORCE_FULL_PAGE,
+    DEFAULT_OCR_LANGS,
+    DEFAULT_PDF_PARSER_MODE,
+    DEFAULT_RAPIDOCR_BACKEND,
+    DEFAULT_TESSERACT_CMD,
+    DEFAULT_TESSERACT_DATA_PATH,
+    DEFAULT_TESSERACT_PSM,
+    DEFAULT_VISION_ENABLED,
+    DEFAULT_VISION_MODEL,
+    SUPPORTED_OCR_BACKENDS,
+    SUPPORTED_RAPIDOCR_BACKENDS,
+)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -46,6 +66,106 @@ def _configure_console() -> None:
                 stream.reconfigure(encoding="utf-8")
             except Exception:
                 pass
+
+
+def _load_toml_config(config_path: Path | None = None) -> dict[str, Any]:
+    config_path = config_path or Path("config.toml")
+    if not config_path.exists():
+        return {}
+    try:
+        import tomllib
+
+        with config_path.open("rb") as handle:
+            payload = tomllib.load(handle)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_optional_int(value: Any, default: int | None) -> int | None:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_langs(value: Any, default: tuple[str, ...]) -> list[str]:
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+        return parts or list(default)
+    if isinstance(value, (list, tuple)):
+        parts = [str(part).strip() for part in value if str(part).strip()]
+        return parts or list(default)
+    return list(default)
+
+
+def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
+    payload = _load_toml_config(config_path)
+    ingestion = payload.get("ingestion", {}) if isinstance(payload.get("ingestion"), dict) else {}
+    models = payload.get("models", {}) if isinstance(payload.get("models"), dict) else {}
+    return {
+        "parser_mode": str(ingestion.get("parser_mode") or DEFAULT_PDF_PARSER_MODE),
+        "accelerator": str(ingestion.get("accelerator") or DEFAULT_DOCLING_ACCELERATOR),
+        "asset_triggers": str(ingestion.get("asset_triggers") or DEFAULT_ASSET_TRIGGERS),
+        "vision_model": str(models.get("vision_model") or DEFAULT_VISION_MODEL),
+        "vision_enabled": _as_bool(ingestion.get("vision_enabled"), DEFAULT_VISION_ENABLED),
+        "ocr_backend": str(ingestion.get("ocr_backend") or DEFAULT_OCR_BACKEND),
+        "ocr_langs": _as_langs(ingestion.get("ocr_langs"), DEFAULT_OCR_LANGS),
+        "ocr_force_full_page": _as_bool(ingestion.get("ocr_force_full_page"), DEFAULT_OCR_FORCE_FULL_PAGE),
+        "ocr_bitmap_area_threshold": _as_float(
+            ingestion.get("ocr_bitmap_area_threshold"),
+            DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
+        ),
+        "rapidocr_backend": str(ingestion.get("rapidocr_backend") or DEFAULT_RAPIDOCR_BACKEND),
+        "tesseract_cmd": str(ingestion.get("tesseract_cmd") or DEFAULT_TESSERACT_CMD),
+        "tesseract_data_path": str(ingestion.get("tesseract_data_path") or DEFAULT_TESSERACT_DATA_PATH),
+        "tesseract_psm": _as_optional_int(ingestion.get("tesseract_psm"), DEFAULT_TESSERACT_PSM),
+    }
+
+
+def _ingestion_args(args: argparse.Namespace) -> dict[str, Any]:
+    config = _load_ingestion_config()
+    return {
+        "parser_mode": args.parser_mode or config["parser_mode"],
+        "accelerator": args.accelerator or config["accelerator"],
+        "asset_triggers": args.asset_triggers or config["asset_triggers"],
+        "vision_model": args.vision_model or config["vision_model"],
+        "vision_enabled": _as_bool(args.vision_enabled, config["vision_enabled"]),
+        "ocr_backend": args.ocr_backend or config["ocr_backend"],
+        "ocr_langs": _as_langs(args.ocr_langs, tuple(config["ocr_langs"])),
+        "ocr_force_full_page": _as_bool(args.ocr_force_full_page, config["ocr_force_full_page"]),
+        "ocr_bitmap_area_threshold": (
+            args.ocr_bitmap_area_threshold
+            if args.ocr_bitmap_area_threshold is not None
+            else config["ocr_bitmap_area_threshold"]
+        ),
+        "rapidocr_backend": args.rapidocr_backend or config["rapidocr_backend"],
+        "tesseract_cmd": args.tesseract_cmd or config["tesseract_cmd"],
+        "tesseract_data_path": args.tesseract_data_path or config["tesseract_data_path"],
+        "tesseract_psm": args.tesseract_psm if args.tesseract_psm is not None else config["tesseract_psm"],
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -188,24 +308,59 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--parser_mode",
         choices=["hybrid", "manual", "docling"],
-        default="hybrid",
+        default=None,
         help="PDF parser selection for ingest mode",
     )
     parser.add_argument(
         "--accelerator",
         choices=["auto", "cpu", "cuda", "mps", "xpu"],
-        default="auto",
+        default=None,
         help="Docling accelerator selection",
     )
     parser.add_argument(
         "--asset_triggers",
         choices=["none", "images", "all"],
-        default="none",
+        default=None,
         help=(
             "When hybrid/manual ingest should run Docling asset enrichment after pypdf text succeeds. "
             "Use 'all' to include table/equation heuristics."
         ),
     )
+    parser.add_argument("--vision_model", default=None, help="Ollama vision model for figure/page analysis.")
+    parser.add_argument(
+        "--vision_enabled",
+        choices=["true", "false", "1", "0", "yes", "no", "on", "off"],
+        default=None,
+        help="Enable local vision analysis for figures and scanned-page fallback.",
+    )
+    parser.add_argument(
+        "--ocr_backend",
+        choices=list(SUPPORTED_OCR_BACKENDS),
+        default=None,
+        help="Docling OCR backend for scanned/image-only PDFs.",
+    )
+    parser.add_argument("--ocr_langs", default=None, help="Comma-separated OCR languages.")
+    parser.add_argument(
+        "--ocr_force_full_page",
+        choices=["true", "false", "1", "0", "yes", "no", "on", "off"],
+        default=None,
+        help="Force full-page OCR for scanned PDFs.",
+    )
+    parser.add_argument(
+        "--ocr_bitmap_area_threshold",
+        type=float,
+        default=None,
+        help="Docling OCR bitmap area threshold.",
+    )
+    parser.add_argument(
+        "--rapidocr_backend",
+        choices=list(SUPPORTED_RAPIDOCR_BACKENDS),
+        default=None,
+        help="RapidOCR inference backend.",
+    )
+    parser.add_argument("--tesseract_cmd", default=None, help="Tesseract executable path or command.")
+    parser.add_argument("--tesseract_data_path", default=None, help="Tesseract language data directory.")
+    parser.add_argument("--tesseract_psm", type=int, default=None, help="Tesseract page segmentation mode.")
     parser.add_argument(
         "--no_progress",
         action="store_true",
@@ -223,12 +378,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.mode == "ingest":
             print("Starting ingestion mode...", file=sys.stderr, flush=True)
+            ingestion_options = _ingestion_args(args)
             run_ingestion(
                 args.data_dir,
                 args.md_dir,
-                parser_mode=args.parser_mode,
-                accelerator=args.accelerator,
-                asset_triggers=args.asset_triggers,
+                **ingestion_options,
                 progress_enabled=not args.no_progress,
             )
             return 0

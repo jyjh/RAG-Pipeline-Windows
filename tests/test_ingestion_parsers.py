@@ -1,17 +1,26 @@
 from types import SimpleNamespace
 
+import pytest
+
 from src.ingestion import (
     DisabledVisionDescriber,
     DoclingPdfParser,
     HybridPdfParser,
     ManualTextPdfParser,
+    OllamaVisionDescriber,
+    ScannedPageImageParser,
+    VISION_ANALYSIS_NUM_CTX,
+    _build_docling_converter,
+    _build_ocr_options,
+    run_ingestion,
 )
 
 
 class FakePage:
-    def __init__(self, text, resources=None):
+    def __init__(self, text, resources=None, images=None):
         self.text = text
         self.resources = resources or {}
+        self.images = images or []
 
     def extract_text(self, **kwargs):
         return self.text
@@ -23,10 +32,15 @@ class FakePage:
 
 
 class FakeReader:
-    def __init__(self, page_texts, resources_by_page=None):
+    def __init__(self, page_texts, resources_by_page=None, images_by_page=None):
         resources_by_page = resources_by_page or {}
+        images_by_page = images_by_page or {}
         self.pages = [
-            FakePage(text, resources_by_page.get(index + 1))
+            FakePage(
+                text,
+                resources_by_page.get(index + 1),
+                images_by_page.get(index + 1),
+            )
             for index, text in enumerate(page_texts)
         ]
 
@@ -64,8 +78,8 @@ class FailingConverter:
         raise RuntimeError("docling unavailable")
 
 
-def reader_factory(page_texts, resources_by_page=None):
-    return lambda file_path: FakeReader(page_texts, resources_by_page)
+def reader_factory(page_texts, resources_by_page=None, images_by_page=None):
+    return lambda file_path: FakeReader(page_texts, resources_by_page, images_by_page)
 
 
 def docling_parser_for(items):
@@ -73,6 +87,84 @@ def docling_parser_for(items):
         vision_describer=DisabledVisionDescriber(),
         converter=FakeConverter(FakeDoc(items)),
     )
+
+
+class FakeImage:
+    is_displayed = True
+
+    def __init__(self):
+        self.image = self
+
+    def save(self, handle, format):
+        handle.write(b"fake-png")
+
+
+class RecordingVisionDescriber:
+    def __init__(self, response="described scanned vibration diagram"):
+        self.response = response
+        self.calls = []
+
+    def describe(self, image_data, *, prompt=None):
+        self.calls.append({"image_data": image_data, "prompt": prompt})
+        return self.response
+
+
+def test_docling_converter_defaults_to_rapidocr_onnx_full_page():
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import RapidOcrOptions
+
+    converter = _build_docling_converter()
+    options = converter.format_to_options[InputFormat.PDF].pipeline_options
+    ocr_options = options.ocr_options
+
+    assert isinstance(ocr_options, RapidOcrOptions)
+    assert ocr_options.backend == "onnxruntime"
+    assert ocr_options.lang == ["english"]
+    assert ocr_options.force_full_page_ocr is True
+
+
+def test_docling_ocr_options_support_tesseract_and_easyocr():
+    from docling.datamodel.pipeline_options import EasyOcrOptions, TesseractCliOcrOptions
+
+    tesseract = _build_ocr_options(
+        ocr_backend="tesseract_cli",
+        ocr_langs=["eng"],
+        tesseract_cmd="C:/Tools/tesseract.exe",
+        tesseract_data_path="C:/Tools/tessdata",
+        tesseract_psm=6,
+    )
+    easyocr = _build_ocr_options(ocr_backend="easyocr", ocr_langs=["en"])
+
+    assert isinstance(tesseract, TesseractCliOcrOptions)
+    assert tesseract.tesseract_cmd == "C:/Tools/tesseract.exe"
+    assert tesseract.path == "C:/Tools/tessdata"
+    assert tesseract.psm == 6
+    assert isinstance(easyocr, EasyOcrOptions)
+    assert easyocr.lang == ["en"]
+
+
+def test_unsupported_ocr_backend_is_rejected():
+    with pytest.raises(ValueError, match="Unsupported OCR backend"):
+        _build_ocr_options(ocr_backend="unknown")
+
+
+def test_ollama_vision_describer_uses_prompt_and_larger_context(monkeypatch):
+    calls = []
+
+    def fake_generate(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(response="vision text")
+
+    monkeypatch.setattr("src.ingestion._ollama_generate", fake_generate)
+
+    describer = OllamaVisionDescriber(vision_model="vision-test")
+    result = describer.describe(b"image", prompt="custom prompt")
+
+    assert result == "vision text"
+    assert calls[0]["prompt"] == "Hello"
+    assert calls[1]["model"] == "vision-test"
+    assert calls[1]["prompt"] == "custom prompt"
+    assert calls[1]["options"] == {"num_ctx": VISION_ANALYSIS_NUM_CTX}
 
 
 def test_docling_parser_builds_converter_lazily(monkeypatch):
@@ -279,3 +371,108 @@ def test_hybrid_parser_routes_to_docling_when_text_is_garbage():
     parser = HybridPdfParser(manual_parser=Manual(), docling_parser=Docling())
 
     assert parser.parse("fake.pdf") == "docling"
+
+
+def test_hybrid_parser_falls_back_to_page_image_analysis_when_docling_fails():
+    vision = RecordingVisionDescriber()
+    fallback = ScannedPageImageParser(
+        vision_describer=vision,
+        vision_enabled=True,
+        reader_factory=reader_factory([""], images_by_page={1: [FakeImage()]}),
+    )
+
+    class Manual:
+        def extract_page_texts(self, file_path):
+            return [""]
+
+        def is_text_usable(self, page_texts):
+            return False
+
+    class Docling:
+        def parse(self, file_path):
+            raise RuntimeError("ocr failed")
+
+    parser = HybridPdfParser(
+        manual_parser=Manual(),
+        docling_parser=Docling(),
+        scanned_page_parser=fallback,
+    )
+
+    output = parser.parse("fake.pdf")
+
+    assert "## Page 1" in output
+    assert "[Page Image Analysis]" in output
+    assert "described scanned vibration diagram" in output
+    assert vision.calls
+    assert "scanned STEM textbook page" in vision.calls[0]["prompt"]
+
+
+def test_hybrid_parser_falls_back_to_page_image_analysis_when_docling_is_empty():
+    vision = RecordingVisionDescriber("visible equation and mechanism diagram")
+    fallback = ScannedPageImageParser(
+        vision_describer=vision,
+        vision_enabled=True,
+        reader_factory=reader_factory([""], images_by_page={1: [FakeImage()]}),
+    )
+
+    class Manual:
+        def extract_page_texts(self, file_path):
+            return [""]
+
+        def is_text_usable(self, page_texts):
+            return False
+
+    class Docling:
+        def parse(self, file_path):
+            return "   "
+
+    parser = HybridPdfParser(
+        manual_parser=Manual(),
+        docling_parser=Docling(),
+        scanned_page_parser=fallback,
+    )
+
+    assert "visible equation and mechanism diagram" in parser.parse("fake.pdf")
+
+
+def test_scanned_page_fallback_requires_vision_enabled():
+    fallback = ScannedPageImageParser(
+        vision_describer=DisabledVisionDescriber(),
+        vision_enabled=False,
+        reader_factory=reader_factory([""], images_by_page={1: [FakeImage()]}),
+    )
+
+    with pytest.raises(RuntimeError, match="vision is disabled"):
+        fallback.parse("fake.pdf")
+
+
+def test_scanned_page_fallback_rejects_failed_vision_descriptions():
+    fallback = ScannedPageImageParser(
+        vision_describer=RecordingVisionDescriber("[Image description failed]"),
+        vision_enabled=True,
+        reader_factory=reader_factory([""], images_by_page={1: [FakeImage()]}),
+    )
+
+    with pytest.raises(RuntimeError, match="No usable page-image analysis"):
+        fallback.parse("fake.pdf")
+
+
+def test_run_ingestion_refuses_empty_markdown(monkeypatch, tmp_path):
+    input_pdf = tmp_path / "scan.pdf"
+    input_pdf.write_bytes(b"%PDF-1.4")
+    output_dir = tmp_path / "processed"
+
+    class EmptyProcessor:
+        def __init__(self, **kwargs):
+            pass
+
+        def process_pdf(self, file_path):
+            return ""
+
+    monkeypatch.setattr("src.ingestion.DocumentProcessor", EmptyProcessor)
+
+    with pytest.raises(RuntimeError, match="empty Markdown"):
+        run_ingestion(str(input_pdf), str(output_dir), progress_enabled=False)
+
+    assert not (output_dir / "scan.md").exists()
+    assert not (output_dir / ".source_map.json").exists()

@@ -12,7 +12,14 @@ reranker_model = ""
 embedding_dim = 768
 
 [ingestion]
-ocr_backend = "tesseract_cli"
+ocr_backend = "rapidocr"
+ocr_langs = ["english"]
+ocr_force_full_page = true
+ocr_bitmap_area_threshold = 0.05
+rapidocr_backend = "onnxruntime"
+tesseract_cmd = "tesseract"
+tesseract_data_path = ""
+tesseract_psm = 3
 ocr_strategy = "auto"
 vision_enabled = true
 figure_crop_enabled = true

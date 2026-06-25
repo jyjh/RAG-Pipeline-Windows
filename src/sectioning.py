@@ -10,6 +10,7 @@ from typing import Any
 DEFAULT_CHUNK_TARGET_TOKENS = 900
 DEFAULT_CHUNK_OVERLAP_TOKENS = 120
 CHARS_PER_TOKEN = 4
+ENRICHED_MARKDOWN_MARKERS = ("[Vision Analysis]", "[Page Image Analysis]")
 
 
 @dataclass
@@ -70,6 +71,10 @@ class SectionChunk:
         }
 
 
+def has_enriched_markdown(content: str) -> bool:
+    return any(marker in content for marker in ENRICHED_MARKDOWN_MARKERS)
+
+
 def build_section_records(
     markdown_path: Path,
     *,
@@ -81,6 +86,7 @@ def build_section_records(
     source_root = source_root or Path.cwd()
     from src.pdf_registry import source_entry_for_markdown
 
+    markdown_content = markdown_path.read_text(encoding="utf-8")
     source_entry = source_entry_for_markdown(markdown_path)
     mapped_pdf_value = str(source_entry.get("source_pdf_path", ""))
     mapped_pdf_path = Path(mapped_pdf_value) if mapped_pdf_value else None
@@ -89,13 +95,15 @@ def build_section_records(
         pdf_path = find_source_pdf(markdown_path, source_root=source_root)
     max_chars = max(800, chunk_target_tokens * CHARS_PER_TOKEN)
     overlap_chars = max(0, chunk_overlap_tokens * CHARS_PER_TOKEN)
+    use_markdown_content = has_enriched_markdown(markdown_content)
     if pdf_path is not None:
         sections, pages = sections_from_pdf(pdf_path)
         source_path = str(pdf_path)
         doc_title = pdf_path.stem
+        if use_markdown_content or not any(page.text.strip() for page in pages):
+            sections, pages = sections_from_markdown(doc_title, markdown_content)
     else:
-        content = markdown_path.read_text(encoding="utf-8")
-        sections, pages = sections_from_markdown(markdown_path.stem, content)
+        sections, pages = sections_from_markdown(markdown_path.stem, markdown_content)
         source_path = str(markdown_path)
         doc_title = markdown_path.stem
 
@@ -104,8 +112,7 @@ def build_section_records(
     source_pdf_path = str(source_entry.get("source_pdf_path", pdf_path if pdf_path else ""))
 
     if not sections:
-        content = markdown_path.read_text(encoding="utf-8")
-        sections, pages = sections_from_markdown(markdown_path.stem, content)
+        sections, pages = sections_from_markdown(markdown_path.stem, markdown_content)
         source_path = str(markdown_path)
         doc_title = markdown_path.stem
 

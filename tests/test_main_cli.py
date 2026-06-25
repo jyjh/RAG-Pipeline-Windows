@@ -11,6 +11,16 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         parser_mode,
         accelerator,
         asset_triggers,
+        vision_model,
+        vision_enabled,
+        ocr_backend,
+        ocr_langs,
+        ocr_force_full_page,
+        ocr_bitmap_area_threshold,
+        rapidocr_backend,
+        tesseract_cmd,
+        tesseract_data_path,
+        tesseract_psm,
         progress_enabled,
     ):
         calls["data_dir"] = data_dir
@@ -18,6 +28,16 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         calls["parser_mode"] = parser_mode
         calls["accelerator"] = accelerator
         calls["asset_triggers"] = asset_triggers
+        calls["vision_model"] = vision_model
+        calls["vision_enabled"] = vision_enabled
+        calls["ocr_backend"] = ocr_backend
+        calls["ocr_langs"] = ocr_langs
+        calls["ocr_force_full_page"] = ocr_force_full_page
+        calls["ocr_bitmap_area_threshold"] = ocr_bitmap_area_threshold
+        calls["rapidocr_backend"] = rapidocr_backend
+        calls["tesseract_cmd"] = tesseract_cmd
+        calls["tesseract_data_path"] = tesseract_data_path
+        calls["tesseract_psm"] = tesseract_psm
         calls["progress_enabled"] = progress_enabled
 
     monkeypatch.setattr(main, "run_ingestion", fake_run_ingestion)
@@ -36,6 +56,26 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
             "cpu",
             "--asset_triggers",
             "none",
+            "--vision_model",
+            "vision-test",
+            "--vision_enabled",
+            "false",
+            "--ocr_backend",
+            "tesseract_cli",
+            "--ocr_langs",
+            "eng",
+            "--ocr_force_full_page",
+            "false",
+            "--ocr_bitmap_area_threshold",
+            "0.2",
+            "--rapidocr_backend",
+            "torch",
+            "--tesseract_cmd",
+            "C:/Tools/tesseract.exe",
+            "--tesseract_data_path",
+            "C:/Tools/tessdata",
+            "--tesseract_psm",
+            "6",
             "--no_progress",
         ]
     )
@@ -47,6 +87,16 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         "parser_mode": "docling",
         "accelerator": "cpu",
         "asset_triggers": "none",
+        "vision_model": "vision-test",
+        "vision_enabled": False,
+        "ocr_backend": "tesseract_cli",
+        "ocr_langs": ["eng"],
+        "ocr_force_full_page": False,
+        "ocr_bitmap_area_threshold": 0.2,
+        "rapidocr_backend": "torch",
+        "tesseract_cmd": "C:/Tools/tesseract.exe",
+        "tesseract_data_path": "C:/Tools/tessdata",
+        "tesseract_psm": 6,
         "progress_enabled": False,
     }
 

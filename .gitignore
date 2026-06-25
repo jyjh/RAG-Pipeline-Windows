@@ -37,14 +37,12 @@ site/
 *.egg-info/
 .eggs/
 pip-wheel-metadata/
-src/__pycache__
+src/__pycache__/
 
 # RAG pipeline runtime/build outputs
 db/
 processed_docs/
-data/.pdf_upload_registry.json
-data/uploads/
-data/.upload_queue/
+data/
 .tmp_smoke/
 .tmp_test_*/
 logs/

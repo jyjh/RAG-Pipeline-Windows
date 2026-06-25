@@ -4,6 +4,7 @@ from pathlib import Path
 
 from src.sectioning import (
     PageText,
+    SectionNode,
     build_section_records,
     content_for_section,
     outline_sections,
@@ -125,5 +126,52 @@ def test_section_records_include_parent_pdf_source_metadata():
         assert records
         assert {record["source_hash"] for record in records} == {"hash-a"}
         assert {record["source_pdf_name"] for record in records} == {"doc.pdf"}
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_section_records_index_enriched_markdown_when_source_pdf_has_no_text(monkeypatch):
+    root = Path.cwd() / f".tmp_test_sectioning_{uuid.uuid4().hex}"
+    try:
+        pdf_path = root / "uploads" / "scan.pdf"
+        pdf_path.parent.mkdir(parents=True)
+        pdf_path.write_bytes(b"%PDF-1.4")
+        markdown_path = root / "processed" / "scan.md"
+        markdown_path.parent.mkdir(parents=True)
+        markdown_path.write_text(
+            "## Page 1\n\n> [Page Image Analysis]: viscous damping diagram and $mx'' + cx' + kx = 0$",
+            encoding="utf-8",
+        )
+        write_source_entry(
+            processed_dir=markdown_path.parent,
+            markdown_path=markdown_path,
+            source_hash="hash-scan",
+            source_pdf_name="scan.pdf",
+            source_pdf_path=pdf_path,
+        )
+
+        def fake_sections_from_pdf(path):
+            return (
+                [
+                    SectionNode(
+                        node_id="pdf-section",
+                        parent_id="",
+                        title="PDF Outline",
+                        level=0,
+                        page_start=1,
+                        page_end=1,
+                    )
+                ],
+                [PageText(1, "")],
+            )
+
+        monkeypatch.setattr("src.sectioning.sections_from_pdf", fake_sections_from_pdf)
+
+        records = build_section_records(markdown_path, source_root=root)
+
+        chunks = [record for record in records if record["node_type"] == "chunk"]
+        assert chunks
+        assert any("viscous damping diagram" in record["content"] for record in chunks)
+        assert {record["source_pdf_path"] for record in records} == {str(pdf_path)}
     finally:
         shutil.rmtree(root, ignore_errors=True)

@@ -587,6 +587,49 @@ def test_queue_pauses_new_work_while_query_is_active(workspace_tmp):
     assert (workspace_tmp / "uploads" / job.id / "doc.pdf").exists()
 
 
+def test_queue_passes_ingestion_options_to_worker(workspace_tmp):
+    captured = {}
+
+    def fake_ingest(input_dir, output_dir, **kwargs):
+        captured.update(kwargs)
+
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=workspace_tmp / "db",
+        run_ingestion_func=fake_ingest,
+        run_indexing_func=lambda *args, **kwargs: None,
+    )
+
+    queue._run_ingestion(
+        "input",
+        "output",
+        {
+            "vision_model": "vision-test",
+            "vision_enabled": False,
+            "ocr_backend": "tesseract_cli",
+            "ocr_langs": ["eng"],
+            "ocr_force_full_page": False,
+            "ocr_bitmap_area_threshold": 0.2,
+            "rapidocr_backend": "torch",
+            "tesseract_cmd": "C:/Tools/tesseract.exe",
+            "tesseract_data_path": "C:/Tools/tessdata",
+            "tesseract_psm": 6,
+        },
+    )
+
+    assert captured["vision_model"] == "vision-test"
+    assert captured["vision_enabled"] is False
+    assert captured["ocr_backend"] == "tesseract_cli"
+    assert captured["ocr_langs"] == ["eng"]
+    assert captured["ocr_force_full_page"] is False
+    assert captured["ocr_bitmap_area_threshold"] == 0.2
+    assert captured["rapidocr_backend"] == "torch"
+    assert captured["tesseract_cmd"] == "C:/Tools/tesseract.exe"
+    assert captured["tesseract_data_path"] == "C:/Tools/tessdata"
+    assert captured["tesseract_psm"] == 6
+
+
 def test_force_duplicate_cleanup_waits_until_ingestion_phase(workspace_tmp, lancedb_tmp):
     calls = []
     processed_dir = workspace_tmp / "processed"
@@ -696,6 +739,11 @@ def test_upload_endpoint_enqueues_pdf_batch(monkeypatch, workspace_tmp):
     assert captured["filenames"] == ["notes.pdf"]
     assert captured["uploads"][0]["filename"] == "notes.pdf"
     assert len(captured["uploads"][0]["hash"]) == 64
+    assert captured["options"]["ocr_backend"] == "rapidocr"
+    assert captured["options"]["rapidocr_backend"] == "onnxruntime"
+    assert captured["options"]["ocr_force_full_page"] is True
+    assert captured["options"]["ocr_langs"] == ["english"]
+    assert captured["options"]["vision_enabled"] is True
     assert Path(captured["staging_dir"]).joinpath("notes.pdf").exists()
 
 

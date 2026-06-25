@@ -9,6 +9,7 @@
 # PDF/document parsing and OCR
 docling
 pypdf
+onnxruntime
 
 # Local LLM/VLM serving
 ollama

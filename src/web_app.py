@@ -22,7 +22,22 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from src.defaults import DEFAULT_LLM_MODEL
+from src.defaults import (
+    DEFAULT_ASSET_TRIGGERS,
+    DEFAULT_DOCLING_ACCELERATOR,
+    DEFAULT_LLM_MODEL,
+    DEFAULT_OCR_BACKEND,
+    DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
+    DEFAULT_OCR_FORCE_FULL_PAGE,
+    DEFAULT_OCR_LANGS,
+    DEFAULT_PDF_PARSER_MODE,
+    DEFAULT_RAPIDOCR_BACKEND,
+    DEFAULT_TESSERACT_CMD,
+    DEFAULT_TESSERACT_DATA_PATH,
+    DEFAULT_TESSERACT_PSM,
+    DEFAULT_VISION_ENABLED,
+    DEFAULT_VISION_MODEL,
+)
 from src.local_rag import (
     DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL,
     DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
@@ -106,6 +121,38 @@ def _nonempty_str(value: Any, default: str) -> str:
     return text or default
 
 
+def _bool_value(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _optional_int(value: Any, default: int | None) -> int | None:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _string_list(value: Any, default: tuple[str, ...]) -> list[str]:
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+        return parts or list(default)
+    if isinstance(value, (list, tuple)):
+        parts = [str(part).strip() for part in value if str(part).strip()]
+        return parts or list(default)
+    return list(default)
+
+
 def _load_toml_config(config_path: Path) -> dict[str, Any]:
     if not config_path.exists():
         return {}
@@ -172,8 +219,35 @@ def _load_chat_config(config_path: Path | None = None) -> dict[str, Any]:
     }
 
 
+def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
+    config_path = config_path or (ROOT_DIR / "config.toml")
+    payload = _load_toml_config(config_path)
+    ingestion = payload.get("ingestion", {}) if isinstance(payload.get("ingestion"), dict) else {}
+    models = payload.get("models", {}) if isinstance(payload.get("models"), dict) else {}
+
+    return {
+        "parser_mode": _nonempty_str(ingestion.get("parser_mode"), DEFAULT_PDF_PARSER_MODE),
+        "accelerator": _nonempty_str(ingestion.get("accelerator"), DEFAULT_DOCLING_ACCELERATOR),
+        "asset_triggers": _nonempty_str(ingestion.get("asset_triggers"), DEFAULT_ASSET_TRIGGERS),
+        "vision_model": _nonempty_str(models.get("vision_model"), DEFAULT_VISION_MODEL),
+        "vision_enabled": _bool_value(ingestion.get("vision_enabled"), DEFAULT_VISION_ENABLED),
+        "ocr_backend": _nonempty_str(ingestion.get("ocr_backend"), DEFAULT_OCR_BACKEND),
+        "ocr_langs": _string_list(ingestion.get("ocr_langs"), DEFAULT_OCR_LANGS),
+        "ocr_force_full_page": _bool_value(ingestion.get("ocr_force_full_page"), DEFAULT_OCR_FORCE_FULL_PAGE),
+        "ocr_bitmap_area_threshold": _positive_float(
+            ingestion.get("ocr_bitmap_area_threshold"),
+            DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
+        ),
+        "rapidocr_backend": _nonempty_str(ingestion.get("rapidocr_backend"), DEFAULT_RAPIDOCR_BACKEND),
+        "tesseract_cmd": _nonempty_str(ingestion.get("tesseract_cmd"), DEFAULT_TESSERACT_CMD),
+        "tesseract_data_path": str(ingestion.get("tesseract_data_path") or DEFAULT_TESSERACT_DATA_PATH),
+        "tesseract_psm": _optional_int(ingestion.get("tesseract_psm"), DEFAULT_TESSERACT_PSM),
+    }
+
+
 SERVER_CONFIG = _load_server_config()
 CHAT_CONFIG = _load_chat_config()
+INGESTION_CONFIG = _load_ingestion_config()
 
 
 def _index_store(db_dir: Path | None = None):
@@ -939,9 +1013,22 @@ class RagJobQueue:
         run_ingestion_func(
             input_dir,
             output_dir,
-            parser_mode=options.get("parser_mode", "hybrid"),
-            accelerator=options.get("accelerator", "auto"),
-            asset_triggers=options.get("asset_triggers", "none"),
+            parser_mode=options.get("parser_mode", INGESTION_CONFIG["parser_mode"]),
+            accelerator=options.get("accelerator", INGESTION_CONFIG["accelerator"]),
+            asset_triggers=options.get("asset_triggers", INGESTION_CONFIG["asset_triggers"]),
+            vision_model=options.get("vision_model", INGESTION_CONFIG["vision_model"]),
+            vision_enabled=options.get("vision_enabled", INGESTION_CONFIG["vision_enabled"]),
+            ocr_backend=options.get("ocr_backend", INGESTION_CONFIG["ocr_backend"]),
+            ocr_langs=options.get("ocr_langs", INGESTION_CONFIG["ocr_langs"]),
+            ocr_force_full_page=options.get("ocr_force_full_page", INGESTION_CONFIG["ocr_force_full_page"]),
+            ocr_bitmap_area_threshold=options.get(
+                "ocr_bitmap_area_threshold",
+                INGESTION_CONFIG["ocr_bitmap_area_threshold"],
+            ),
+            rapidocr_backend=options.get("rapidocr_backend", INGESTION_CONFIG["rapidocr_backend"]),
+            tesseract_cmd=options.get("tesseract_cmd", INGESTION_CONFIG["tesseract_cmd"]),
+            tesseract_data_path=options.get("tesseract_data_path", INGESTION_CONFIG["tesseract_data_path"]),
+            tesseract_psm=options.get("tesseract_psm", INGESTION_CONFIG["tesseract_psm"]),
             progress_enabled=options.get("progress_enabled", False),
         )
 
@@ -1222,9 +1309,26 @@ async def upload_files(request: Request):
             force_duplicate_hashes=sorted(forced_hashes),
             job_id=job_id,
             options={
-                "parser_mode": str(form.get("parser_mode") or "hybrid"),
-                "accelerator": str(form.get("accelerator") or "auto"),
-                "asset_triggers": str(form.get("asset_triggers") or "none"),
+                "parser_mode": str(form.get("parser_mode") or INGESTION_CONFIG["parser_mode"]),
+                "accelerator": str(form.get("accelerator") or INGESTION_CONFIG["accelerator"]),
+                "asset_triggers": str(form.get("asset_triggers") or INGESTION_CONFIG["asset_triggers"]),
+                "vision_model": str(form.get("vision_model") or INGESTION_CONFIG["vision_model"]),
+                "vision_enabled": _bool_value(form.get("vision_enabled"), INGESTION_CONFIG["vision_enabled"]),
+                "ocr_backend": str(form.get("ocr_backend") or INGESTION_CONFIG["ocr_backend"]),
+                "ocr_langs": _string_list(form.get("ocr_langs"), tuple(INGESTION_CONFIG["ocr_langs"])),
+                "ocr_force_full_page": _bool_value(
+                    form.get("ocr_force_full_page"),
+                    INGESTION_CONFIG["ocr_force_full_page"],
+                ),
+                "ocr_bitmap_area_threshold": float(
+                    form.get("ocr_bitmap_area_threshold") or INGESTION_CONFIG["ocr_bitmap_area_threshold"]
+                ),
+                "rapidocr_backend": str(form.get("rapidocr_backend") or INGESTION_CONFIG["rapidocr_backend"]),
+                "tesseract_cmd": str(form.get("tesseract_cmd") or INGESTION_CONFIG["tesseract_cmd"]),
+                "tesseract_data_path": str(
+                    form.get("tesseract_data_path") or INGESTION_CONFIG["tesseract_data_path"]
+                ),
+                "tesseract_psm": _optional_int(form.get("tesseract_psm"), INGESTION_CONFIG["tesseract_psm"]),
                 "embedding_model": str(form.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
                 "embedding_batch_size": int(form.get("embedding_batch_size") or DEFAULT_EMBEDDING_BATCH_SIZE),
                 "embedding_timeout": float(form.get("embedding_timeout") or DEFAULT_EMBEDDING_TIMEOUT),

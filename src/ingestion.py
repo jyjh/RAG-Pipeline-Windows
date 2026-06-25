@@ -11,6 +11,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from src.defaults import (
+    DEFAULT_ASSET_TRIGGERS,
+    DEFAULT_DOCLING_ACCELERATOR,
+    DEFAULT_OCR_BACKEND,
+    DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
+    DEFAULT_OCR_FORCE_FULL_PAGE,
+    DEFAULT_OCR_LANGS,
+    DEFAULT_PDF_PARSER_MODE,
+    DEFAULT_RAPIDOCR_BACKEND,
+    DEFAULT_TESSERACT_CMD,
+    DEFAULT_TESSERACT_DATA_PATH,
+    DEFAULT_TESSERACT_PSM,
+    DEFAULT_VISION_ENABLED,
+    DEFAULT_VISION_MODEL,
+    SUPPORTED_OCR_BACKENDS,
+    SUPPORTED_RAPIDOCR_BACKENDS,
+)
+
 logger = logging.getLogger(__name__)
 
 STEM_VISION_PROMPT = """You are analyzing a STEM document image. Provide a precise technical description:
@@ -19,6 +37,20 @@ STEM_VISION_PROMPT = """You are analyzing a STEM document image. Provide a preci
 - Diagrams and schematics: label all components, describe connections, signal/data flow directions
 - Tables: transcribe the structure, headers, and representative values
 Be machine-readable and exact. Avoid subjective language."""
+
+SCANNED_PAGE_VISION_PROMPT = """You are analyzing a scanned STEM textbook page. Extract searchable technical context:
+- Transcribe visible headings, body text, captions, labels, and equations as accurately as possible.
+- For diagrams, identify components, arrows, dimensions, symbols, and relationships between labeled parts.
+- Preserve page order and technical terminology.
+- Use LaTeX for equations when possible.
+Be concise but complete enough for retrieval."""
+
+VISION_ANALYSIS_NUM_CTX = 8192
+FAILED_VISION_DESCRIPTIONS = {
+    "[Image description failed]",
+    "[Image description empty]",
+    "[Vision analysis disabled]",
+}
 
 
 class _LegacyDocumentProcessor:
@@ -147,7 +179,7 @@ class PdfParser(Protocol):
 
 
 class VisionDescriber(Protocol):
-    def describe(self, image_data: bytes) -> str:
+    def describe(self, image_data: bytes, *, prompt: str | None = None) -> str:
         """Return a technical description for an image."""
 
 
@@ -171,14 +203,15 @@ class OllamaVisionDescriber:
             logger.warning("Could not pre-warm vision model: %s", exc)
         self._loaded = True
 
-    def describe(self, image_data: bytes) -> str:
+    def describe(self, image_data: bytes, *, prompt: str | None = None) -> str:
         self._ensure_loaded()
         try:
             encoded_image = base64.b64encode(image_data).decode("utf-8")
             response = _ollama_generate(
                 model=self.vision_model,
-                prompt=STEM_VISION_PROMPT,
+                prompt=prompt or STEM_VISION_PROMPT,
                 images=[encoded_image],
+                options={"num_ctx": VISION_ANALYSIS_NUM_CTX},
             )
             return response.response or "[Image description empty]"
         except Exception as exc:
@@ -187,7 +220,7 @@ class OllamaVisionDescriber:
 
 
 class DisabledVisionDescriber:
-    def describe(self, image_data: bytes) -> str:
+    def describe(self, image_data: bytes, *, prompt: str | None = None) -> str:
         return "[Vision analysis disabled]"
 
 
@@ -229,6 +262,105 @@ def _docling_components():
     from docling.document_converter import DocumentConverter, PdfFormatOption
 
     return InputFormat, AcceleratorDevice, AcceleratorOptions, PdfPipelineOptions, DocumentConverter, PdfFormatOption
+
+
+def _normalize_bool(value: bool | str | int | None, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _normalize_optional_int(value: int | str | None) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_ocr_langs(value: str | list[str] | tuple[str, ...] | None, *, backend: str) -> list[str]:
+    if isinstance(value, str):
+        langs = [part.strip() for part in value.split(",") if part.strip()]
+    elif value is None:
+        langs = []
+    else:
+        langs = [str(part).strip() for part in value if str(part).strip()]
+    if langs:
+        return langs
+    if backend == "rapidocr":
+        return list(DEFAULT_OCR_LANGS)
+    if backend in {"tesseract", "tesseract_cli"}:
+        return ["eng"]
+    if backend == "easyocr":
+        return ["en"]
+    return []
+
+
+def _build_ocr_options(
+    *,
+    ocr_backend: str = DEFAULT_OCR_BACKEND,
+    ocr_langs: str | list[str] | tuple[str, ...] | None = None,
+    ocr_force_full_page: bool = DEFAULT_OCR_FORCE_FULL_PAGE,
+    ocr_bitmap_area_threshold: float = DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
+    rapidocr_backend: str = DEFAULT_RAPIDOCR_BACKEND,
+    tesseract_cmd: str = DEFAULT_TESSERACT_CMD,
+    tesseract_data_path: str | None = DEFAULT_TESSERACT_DATA_PATH,
+    tesseract_psm: int | str | None = DEFAULT_TESSERACT_PSM,
+) -> Any:
+    from docling.datamodel.pipeline_options import (
+        EasyOcrOptions,
+        OcrAutoOptions,
+        RapidOcrOptions,
+        TesseractCliOcrOptions,
+        TesseractOcrOptions,
+    )
+
+    backend = str(ocr_backend or DEFAULT_OCR_BACKEND).lower()
+    if backend not in SUPPORTED_OCR_BACKENDS:
+        choices = ", ".join(SUPPORTED_OCR_BACKENDS)
+        raise ValueError(f"Unsupported OCR backend '{ocr_backend}'. Use one of: {choices}")
+
+    force_full_page = _normalize_bool(ocr_force_full_page, DEFAULT_OCR_FORCE_FULL_PAGE)
+    bitmap_area_threshold = float(ocr_bitmap_area_threshold or DEFAULT_OCR_BITMAP_AREA_THRESHOLD)
+    langs = _normalize_ocr_langs(ocr_langs, backend=backend)
+
+    common = {
+        "lang": langs,
+        "force_full_page_ocr": force_full_page,
+        "bitmap_area_threshold": bitmap_area_threshold,
+    }
+    if backend == "auto":
+        return OcrAutoOptions(**common)
+    if backend == "rapidocr":
+        rapid_backend = str(rapidocr_backend or DEFAULT_RAPIDOCR_BACKEND).lower()
+        if rapid_backend not in SUPPORTED_RAPIDOCR_BACKENDS:
+            choices = ", ".join(SUPPORTED_RAPIDOCR_BACKENDS)
+            raise ValueError(f"Unsupported RapidOCR backend '{rapidocr_backend}'. Use one of: {choices}")
+        return RapidOcrOptions(**common, backend=rapid_backend)
+    if backend == "tesseract_cli":
+        path = str(tesseract_data_path or "").strip() or None
+        return TesseractCliOcrOptions(
+            **common,
+            tesseract_cmd=str(tesseract_cmd or DEFAULT_TESSERACT_CMD),
+            path=path,
+            psm=_normalize_optional_int(tesseract_psm),
+        )
+    if backend == "tesseract":
+        path = str(tesseract_data_path or "").strip() or None
+        return TesseractOcrOptions(
+            **common,
+            path=path,
+            psm=_normalize_optional_int(tesseract_psm),
+        )
+    return EasyOcrOptions(**common)
 
 
 def _coerce_accelerator(accelerator: str | Any) -> Any:
@@ -280,12 +412,20 @@ def _progress_status(message: str, *, enabled: bool = True) -> None:
 
 def _build_docling_converter(
     *,
-    accelerator: str | Any = "auto",
+    accelerator: str | Any = DEFAULT_DOCLING_ACCELERATOR,
     num_threads: int = 8,
     generate_picture_images: bool = True,
     table_structure: bool = True,
     formula_enrichment: bool = False,
     ocr_enabled: bool = True,
+    ocr_backend: str = DEFAULT_OCR_BACKEND,
+    ocr_langs: str | list[str] | tuple[str, ...] | None = None,
+    ocr_force_full_page: bool = DEFAULT_OCR_FORCE_FULL_PAGE,
+    ocr_bitmap_area_threshold: float = DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
+    rapidocr_backend: str = DEFAULT_RAPIDOCR_BACKEND,
+    tesseract_cmd: str = DEFAULT_TESSERACT_CMD,
+    tesseract_data_path: str | None = DEFAULT_TESSERACT_DATA_PATH,
+    tesseract_psm: int | str | None = DEFAULT_TESSERACT_PSM,
 ) -> Any:
     InputFormat, _, AcceleratorOptions, PdfPipelineOptions, DocumentConverter, PdfFormatOption = _docling_components()
     device = _coerce_accelerator(accelerator)
@@ -293,6 +433,17 @@ def _build_docling_converter(
     pipeline_options = PdfPipelineOptions(generate_picture_images=generate_picture_images)
     pipeline_options.accelerator_options = accelerator_options
     pipeline_options.do_ocr = ocr_enabled
+    if ocr_enabled:
+        pipeline_options.ocr_options = _build_ocr_options(
+            ocr_backend=ocr_backend,
+            ocr_langs=ocr_langs,
+            ocr_force_full_page=ocr_force_full_page,
+            ocr_bitmap_area_threshold=ocr_bitmap_area_threshold,
+            rapidocr_backend=rapidocr_backend,
+            tesseract_cmd=tesseract_cmd,
+            tesseract_data_path=tesseract_data_path,
+            tesseract_psm=tesseract_psm,
+        )
     pipeline_options.do_table_structure = table_structure
     pipeline_options.do_formula_enrichment = formula_enrichment
 
@@ -414,11 +565,19 @@ class DoclingMarkdownRenderer:
 @dataclass
 class DoclingPdfParser:
     vision_describer: VisionDescriber
-    accelerator: str | Any = "auto"
+    accelerator: str | Any = DEFAULT_DOCLING_ACCELERATOR
     num_threads: int = 8
     table_structure: bool = True
     formula_enrichment: bool = False
     ocr_enabled: bool = True
+    ocr_backend: str = DEFAULT_OCR_BACKEND
+    ocr_langs: str | list[str] | tuple[str, ...] | None = None
+    ocr_force_full_page: bool = DEFAULT_OCR_FORCE_FULL_PAGE
+    ocr_bitmap_area_threshold: float = DEFAULT_OCR_BITMAP_AREA_THRESHOLD
+    rapidocr_backend: str = DEFAULT_RAPIDOCR_BACKEND
+    tesseract_cmd: str = DEFAULT_TESSERACT_CMD
+    tesseract_data_path: str | None = DEFAULT_TESSERACT_DATA_PATH
+    tesseract_psm: int | str | None = DEFAULT_TESSERACT_PSM
     progress_enabled: bool = False
     reader_factory: Callable[[str], Any] = _default_pdf_reader
     converter: Any | None = None
@@ -496,6 +655,14 @@ class DoclingPdfParser:
                 table_structure=self.table_structure,
                 formula_enrichment=self.formula_enrichment,
                 ocr_enabled=self.ocr_enabled,
+                ocr_backend=self.ocr_backend,
+                ocr_langs=self.ocr_langs,
+                ocr_force_full_page=self.ocr_force_full_page,
+                ocr_bitmap_area_threshold=self.ocr_bitmap_area_threshold,
+                rapidocr_backend=self.rapidocr_backend,
+                tesseract_cmd=self.tesseract_cmd,
+                tesseract_data_path=self.tesseract_data_path,
+                tesseract_psm=self.tesseract_psm,
             )
             return self.converter.convert(file_path)
 
@@ -514,6 +681,14 @@ class DoclingPdfParser:
             table_structure=self.table_structure,
             formula_enrichment=self.formula_enrichment,
             ocr_enabled=self.ocr_enabled,
+            ocr_backend=self.ocr_backend,
+            ocr_langs=self.ocr_langs,
+            ocr_force_full_page=self.ocr_force_full_page,
+            ocr_bitmap_area_threshold=self.ocr_bitmap_area_threshold,
+            rapidocr_backend=self.rapidocr_backend,
+            tesseract_cmd=self.tesseract_cmd,
+            tesseract_data_path=self.tesseract_data_path,
+            tesseract_psm=self.tesseract_psm,
         )
 
 
@@ -812,10 +987,105 @@ class ManualTextPdfParser:
         return "\n".join(normalized).strip()
 
 
+class ScannedPageImageParser:
+    def __init__(
+        self,
+        *,
+        vision_describer: VisionDescriber,
+        vision_enabled: bool,
+        reader_factory: Callable[[str], Any] = _default_pdf_reader,
+        progress_enabled: bool = False,
+    ):
+        self.vision_describer = vision_describer
+        self.vision_enabled = vision_enabled
+        self.reader_factory = reader_factory
+        self.progress_enabled = progress_enabled
+
+    def parse(self, file_path: str) -> str:
+        if not self.vision_enabled:
+            raise RuntimeError(
+                f"Scanned PDF fallback requires vision analysis, but vision is disabled: {Path(file_path).name}"
+            )
+
+        try:
+            reader = self.reader_factory(file_path)
+        except Exception as exc:
+            raise RuntimeError(f"Could not open scanned PDF for page-image fallback: {file_path}") from exc
+
+        pages = getattr(reader, "pages", [])
+        page_iter = _iter_with_progress(
+            enumerate(pages, start=1),
+            enabled=self.progress_enabled,
+            total=len(pages),
+            desc=f"Analyze page images: {Path(file_path).name}",
+            unit="page",
+        )
+        parts: list[str] = []
+        for page_no, page in page_iter:
+            image_bytes = self._page_image_bytes(page)
+            if not image_bytes:
+                continue
+            page_parts = [f"## Page {page_no}"]
+            for image_data in image_bytes:
+                description = self.vision_describer.describe(
+                    image_data,
+                    prompt=SCANNED_PAGE_VISION_PROMPT,
+                )
+                if self._is_usable_description(description):
+                    page_parts.append(f"> [Page Image Analysis]: {description.strip()}")
+            if len(page_parts) > 1:
+                parts.append("\n\n".join(page_parts))
+
+        if not parts:
+            raise RuntimeError(
+                f"No usable page-image analysis was produced for scanned PDF fallback: {Path(file_path).name}"
+            )
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _is_usable_description(description: str) -> bool:
+        text = (description or "").strip()
+        return bool(text) and text not in FAILED_VISION_DESCRIPTIONS
+
+    def _page_image_bytes(self, page) -> list[bytes]:
+        images = list(getattr(page, "images", []) or [])
+        output: list[bytes] = []
+        for image in images:
+            if getattr(image, "is_displayed", True) is False:
+                continue
+            try:
+                output.append(self._image_to_png_bytes(image))
+            except Exception as exc:
+                logger.warning("Could not extract page image for fallback: %s", exc)
+        return output
+
+    @staticmethod
+    def _image_to_png_bytes(image) -> bytes:
+        source_image = getattr(image, "image", None)
+        if source_image is None:
+            data = getattr(image, "data", None)
+            if not data:
+                raise ValueError("PDF image has no pixel data")
+            from PIL import Image
+
+            source_image = Image.open(io.BytesIO(data))
+
+        buffered = io.BytesIO()
+        source_image.save(buffered, format="PNG")
+        return buffered.getvalue()
+
+
 class HybridPdfParser:
-    def __init__(self, *, manual_parser: ManualTextPdfParser, docling_parser: DoclingPdfParser):
+    def __init__(
+        self,
+        *,
+        manual_parser: ManualTextPdfParser,
+        docling_parser: DoclingPdfParser,
+        scanned_page_parser: ScannedPageImageParser | None = None,
+    ):
         self.manual_parser = manual_parser
         self.docling_parser = docling_parser
+        self.scanned_page_parser = scanned_page_parser
 
     def parse(self, file_path: str) -> str:
         page_texts = self.manual_parser.extract_page_texts(file_path)
@@ -829,22 +1099,47 @@ class HybridPdfParser:
             )
 
         logger.info("Extracted PDF text is missing or low quality; using full Docling parsing: %s", file_path)
-        return self.docling_parser.parse(file_path)
+        try:
+            content = self.docling_parser.parse(file_path)
+        except Exception as exc:
+            logger.warning("Docling parsing failed for scanned PDF; using page-image fallback: %s", exc)
+            return self._parse_scanned_pages(file_path)
+
+        if content.strip():
+            return content
+
+        logger.warning("Docling parsing returned empty content for scanned PDF; using page-image fallback: %s", file_path)
+        return self._parse_scanned_pages(file_path)
+
+    def _parse_scanned_pages(self, file_path: str) -> str:
+        if self.scanned_page_parser is None:
+            raise RuntimeError(f"Scanned PDF parsing failed and no page-image fallback is configured: {file_path}")
+        return self.scanned_page_parser.parse(file_path)
+
 
 
 class DocumentProcessor:
     def __init__(
         self,
-        vision_model: str = "qwen2.5vl:7b",
-        parser_mode: str = "hybrid",
-        accelerator: str | Any = "auto",
+        vision_model: str = DEFAULT_VISION_MODEL,
+        parser_mode: str = DEFAULT_PDF_PARSER_MODE,
+        accelerator: str | Any = DEFAULT_DOCLING_ACCELERATOR,
         num_threads: int = 8,
-        vision_enabled: bool = True,
+        vision_enabled: bool = DEFAULT_VISION_ENABLED,
         min_text_chars: int = 20,
-        asset_triggers: str = ManualTextPdfParser.ASSET_TRIGGER_NONE,
+        asset_triggers: str = DEFAULT_ASSET_TRIGGERS,
+        ocr_backend: str = DEFAULT_OCR_BACKEND,
+        ocr_langs: str | list[str] | tuple[str, ...] | None = None,
+        ocr_force_full_page: bool = DEFAULT_OCR_FORCE_FULL_PAGE,
+        ocr_bitmap_area_threshold: float = DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
+        rapidocr_backend: str = DEFAULT_RAPIDOCR_BACKEND,
+        tesseract_cmd: str = DEFAULT_TESSERACT_CMD,
+        tesseract_data_path: str | None = DEFAULT_TESSERACT_DATA_PATH,
+        tesseract_psm: int | str | None = DEFAULT_TESSERACT_PSM,
         progress_enabled: bool = True,
     ):
         self.vision_model = vision_model
+        vision_enabled = _normalize_bool(vision_enabled, DEFAULT_VISION_ENABLED)
         if vision_enabled:
             self.vision_describer: VisionDescriber = OllamaVisionDescriber(vision_model=vision_model)
         else:
@@ -855,6 +1150,14 @@ class DocumentProcessor:
             accelerator=accelerator,
             num_threads=num_threads,
             ocr_enabled=True,
+            ocr_backend=ocr_backend,
+            ocr_langs=ocr_langs,
+            ocr_force_full_page=ocr_force_full_page,
+            ocr_bitmap_area_threshold=ocr_bitmap_area_threshold,
+            rapidocr_backend=rapidocr_backend,
+            tesseract_cmd=tesseract_cmd,
+            tesseract_data_path=tesseract_data_path,
+            tesseract_psm=tesseract_psm,
             progress_enabled=progress_enabled,
         )
         self.asset_docling_parser = DoclingPdfParser(
@@ -862,12 +1165,25 @@ class DocumentProcessor:
             accelerator=accelerator,
             num_threads=num_threads,
             ocr_enabled=False,
+            ocr_backend=ocr_backend,
+            ocr_langs=ocr_langs,
+            ocr_force_full_page=ocr_force_full_page,
+            ocr_bitmap_area_threshold=ocr_bitmap_area_threshold,
+            rapidocr_backend=rapidocr_backend,
+            tesseract_cmd=tesseract_cmd,
+            tesseract_data_path=tesseract_data_path,
+            tesseract_psm=tesseract_psm,
             progress_enabled=progress_enabled,
         )
         self.manual_parser = ManualTextPdfParser(
             docling_parser=self.asset_docling_parser,
             min_text_chars=min_text_chars,
             asset_triggers=asset_triggers,
+            progress_enabled=progress_enabled,
+        )
+        self.scanned_page_parser = ScannedPageImageParser(
+            vision_describer=self.vision_describer,
+            vision_enabled=vision_enabled,
             progress_enabled=progress_enabled,
         )
         self.parser = self._select_parser(parser_mode)
@@ -878,6 +1194,7 @@ class DocumentProcessor:
             return HybridPdfParser(
                 manual_parser=self.manual_parser,
                 docling_parser=self.docling_parser,
+                scanned_page_parser=self.scanned_page_parser,
             )
         if mode == "manual":
             return self.manual_parser
@@ -906,9 +1223,19 @@ def run_ingestion(
     input_dir: str,
     output_dir: str,
     *,
-    parser_mode: str = "hybrid",
-    accelerator: str | Any = "auto",
-    asset_triggers: str = ManualTextPdfParser.ASSET_TRIGGER_NONE,
+    parser_mode: str = DEFAULT_PDF_PARSER_MODE,
+    accelerator: str | Any = DEFAULT_DOCLING_ACCELERATOR,
+    asset_triggers: str = DEFAULT_ASSET_TRIGGERS,
+    vision_model: str = DEFAULT_VISION_MODEL,
+    vision_enabled: bool = DEFAULT_VISION_ENABLED,
+    ocr_backend: str = DEFAULT_OCR_BACKEND,
+    ocr_langs: str | list[str] | tuple[str, ...] | None = None,
+    ocr_force_full_page: bool = DEFAULT_OCR_FORCE_FULL_PAGE,
+    ocr_bitmap_area_threshold: float = DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
+    rapidocr_backend: str = DEFAULT_RAPIDOCR_BACKEND,
+    tesseract_cmd: str = DEFAULT_TESSERACT_CMD,
+    tesseract_data_path: str | None = DEFAULT_TESSERACT_DATA_PATH,
+    tesseract_psm: int | str | None = DEFAULT_TESSERACT_PSM,
     progress_enabled: bool = True,
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -929,13 +1256,28 @@ def run_ingestion(
         if processor is None:
             _progress_status("Preparing PDF parser...", enabled=progress_enabled)
             processor = DocumentProcessor(
+                vision_model=vision_model,
                 parser_mode=parser_mode,
                 accelerator=accelerator,
+                vision_enabled=vision_enabled,
                 asset_triggers=asset_triggers,
+                ocr_backend=ocr_backend,
+                ocr_langs=ocr_langs,
+                ocr_force_full_page=ocr_force_full_page,
+                ocr_bitmap_area_threshold=ocr_bitmap_area_threshold,
+                rapidocr_backend=rapidocr_backend,
+                tesseract_cmd=tesseract_cmd,
+                tesseract_data_path=tesseract_data_path,
+                tesseract_psm=tesseract_psm,
                 progress_enabled=progress_enabled,
             )
 
         md_content = processor.process_pdf(str(input_path))
+        if not md_content.strip():
+            raise RuntimeError(
+                f"Ingestion produced empty Markdown for {input_path.name}. "
+                "Check OCR dependencies or enable vision-based scanned-page fallback."
+            )
 
         output_path = Path(output_dir) / f"{input_path.stem}.md"
         with output_path.open("w", encoding="utf-8") as handle:

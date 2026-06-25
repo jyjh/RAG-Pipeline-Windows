@@ -23,6 +23,7 @@ Local retrieval-augmented generation pipeline for NUS FSAE knowledge transfer. T
 Implemented behavior:
 
 - Born-digital PDF text extraction with pypdf.
+- Scanned/image-only PDF OCR through Docling with RapidOCR ONNX by default.
 - Docling PDF layout parsing with CUDA acceleration where available.
 - Lazy `qwen2.5vl:7b` vision enrichment for figures/charts/diagrams.
 - Inline vision-description injection so figures remain near surrounding explanatory text.
@@ -134,7 +135,18 @@ python main.py --mode index --md_dir processed_docs --db_dir db
 python main.py --mode query --db_dir db --question "Explain the bias-variance tradeoff"
 ```
 
-For born-digital PDFs, ingest defaults to pypdf text extraction and does not run Docling asset enrichment unless requested. Use `--asset_triggers images` to enrich pages with embedded images, or `--asset_triggers all` to also enrich table/equation heuristic pages. Ingestion shows per-document and per-page progress bars by default; pass `--no_progress` to disable them.
+For born-digital PDFs, ingest defaults to pypdf text extraction and does not run Docling asset enrichment unless requested. Use `--asset_triggers images` to enrich pages with embedded images, or `--asset_triggers all` to also enrich table/equation heuristic pages. Scanned/image-only PDFs fall back to Docling OCR with RapidOCR/ONNX Runtime by default. If OCR fails or returns no content, ingestion analyzes page images with the configured vision model and writes searchable `[Page Image Analysis]` Markdown instead of silently producing an empty file. Ingestion shows per-document and per-page progress bars by default; pass `--no_progress` to disable them.
+
+OCR defaults live under `[ingestion]` in `config.toml`:
+
+```toml
+ocr_backend = "rapidocr"
+ocr_langs = ["english"]
+ocr_force_full_page = true
+rapidocr_backend = "onnxruntime"
+```
+
+Optional backends are `auto`, `tesseract_cli`, `tesseract`, and `easyocr`. Tesseract backends require a system Tesseract install and language data; set `tesseract_cmd`, `tesseract_data_path`, and `tesseract_psm` when using them. Diagram support is currently search-oriented: diagrams are represented as inline vision descriptions embedded with nearby OCR/page text, not as retrieved image thumbnails.
 
 Indexing and query use Ollama embeddings only. Use `--embedding_model` to select a different Ollama embedding model, `--embedding_batch_size 1` if Ollama struggles with larger embedding batches, and `--embedding_timeout 30` to fail clearly instead of waiting indefinitely. Indexing writes chunks to LanceDB, with `--summary_mode hybrid`, `--chunk_target_tokens 900`, and `--chunk_overlap_tokens 120` by default; the overlap is only used when a detected section is too large. Query mode defaults for `context_window`, `llm_num_predict`, and `min_relevance_score` are set in `config.toml`. Ollama chat generation does not use a request timeout; after a connection loss it cancels only after `--ollama_max_lost_health_checks` failed health checks spaced by `--ollama_health_check_interval`.
 
@@ -170,7 +182,8 @@ Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/
 
 1. **Ingestion**
    - Born-digital PDF text is extracted with pypdf by default.
-   - Docling is used for scanned/image-only PDFs or targeted asset enrichment.
+   - Docling OCR is used for scanned/image-only PDFs or targeted asset enrichment.
+   - If Docling cannot parse a scan, page images are described by the local vision model so retrieval still has searchable context.
    - Tables and structured items are exported as Markdown where supported.
    - Figures/charts can be sent to local Qwen2.5-VL through Ollama.
 
