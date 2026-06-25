@@ -15,7 +15,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
@@ -45,7 +45,7 @@ from src.local_rag import (
     DEFAULT_QUERY_SYSTEM_PROMPT,
 )
 from src.pdf_registry import PdfRegistry, load_source_map, remove_source_entries_by_hash
-from src.vector_store import default_store, lancedb_path
+from src.vector_store import default_store, lancedb_path, record_matches, record_row
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -87,6 +87,13 @@ DEFAULT_UPDATE_REMOTE = "origin"
 DEFAULT_UPDATE_BRANCH = "main"
 GIT_TIMEOUT_SECONDS = 30.0
 GIT_PULL_TIMEOUT_SECONDS = 300.0
+INDEX_STREAM_DEFAULT_BATCH_SIZE = 250
+INDEX_STREAM_MAX_BATCH_SIZE = 1_000
+INDEX_STREAM_WORKERS = min(8, max(2, os.cpu_count() or 2))
+INDEX_SUMMARY_NODE_TYPES = {"document_summary", "section_summary"}
+INDEX_CHILD_DEFAULT_LIMIT = 100
+INDEX_CHILD_MAX_LIMIT = 500
+DEFAULT_INDEX_VECTOR_RELEVANCE_FLOOR = 0.70
 
 INDEX_LOCK = threading.RLock()
 
@@ -142,6 +149,23 @@ def _optional_int(value: Any, default: int | None) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _page_slice(rows: list[dict[str, Any]], *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
+    total = len(rows)
+    offset = max(0, int(offset))
+    if limit is None:
+        page = rows[offset:]
+        resolved_limit = len(page)
+    else:
+        resolved_limit = min(max(1, int(limit)), 100)
+        page = rows[offset : offset + resolved_limit]
+    return {
+        "rows": page,
+        "total": total,
+        "offset": offset,
+        "limit": resolved_limit,
+    }
 
 
 def _string_list(value: Any, default: tuple[str, ...]) -> list[str]:
@@ -578,6 +602,258 @@ def list_index_rows(
         return _index_store(db_dir).list_records(offset=offset, limit=limit, search=search)
 
 
+def _index_records_snapshot(db_dir: Path | None = None) -> tuple[list[dict[str, Any]], str, int]:
+    store = _index_store(db_dir)
+    if not store.exists():
+        raise FileNotFoundError(f"LanceDB table not found at {lancedb_path(db_dir or DB_DIR) / 'chunks'}")
+    count = store.count()
+    if count <= 0:
+        model, dim = store.metadata()
+        return [], model, dim
+    payload = store.list_records(offset=0, limit=count, search="")
+    return (
+        list(payload.get("rows") or []),
+        str(payload.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
+        int(payload.get("embedding_dim") or 768),
+    )
+
+
+def _is_index_summary(row: dict[str, Any]) -> bool:
+    return str(row.get("node_type") or "chunk") in INDEX_SUMMARY_NODE_TYPES
+
+
+def _index_top_summary_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    doc_summaries = [row for row in rows if str(row.get("node_type") or "") == "document_summary"]
+    if doc_summaries:
+        return doc_summaries
+
+    summary_ids = {str(row.get("id") or "") for row in rows if _is_index_summary(row)}
+    root_summaries = [
+        row
+        for row in rows
+        if _is_index_summary(row) and str(row.get("parent_id") or "") not in summary_ids
+    ]
+    if root_summaries:
+        return root_summaries
+
+    root_chunks = [row for row in rows if not str(row.get("parent_id") or "")]
+    return root_chunks or rows
+
+
+def _index_descends_from(row: dict[str, Any], parent_id: str, by_id: dict[str, dict[str, Any]]) -> bool:
+    current_id = str(row.get("parent_id") or "")
+    seen: set[str] = set()
+    while current_id and current_id not in seen:
+        if current_id == parent_id:
+            return True
+        seen.add(current_id)
+        current_id = str(by_id.get(current_id, {}).get("parent_id") or "")
+    return False
+
+
+def _index_child_candidates(
+    parent: dict[str, Any],
+    rows: list[dict[str, Any]],
+    by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    parent_id = str(parent.get("id") or "")
+    if not parent_id:
+        return []
+
+    if str(parent.get("node_type") or "") == "document_summary":
+        doc_id = str(parent.get("doc_id") or "")
+        return [
+            row
+            for row in rows
+            if str(row.get("id") or "") != parent_id
+            and str(row.get("doc_id") or "") == doc_id
+        ]
+
+    return [
+        row
+        for row in rows
+        if str(row.get("id") or "") != parent_id
+        and _index_descends_from(row, parent_id, by_id)
+    ]
+
+
+def _index_section_depth(row: dict[str, Any], parent: dict[str, Any]) -> int:
+    parent_parts = [part.strip() for part in str(parent.get("section_path") or "").split(">") if part.strip()]
+    row_parts = [part.strip() for part in str(row.get("section_path") or "").split(">") if part.strip()]
+    if parent_parts and row_parts[: len(parent_parts)] == parent_parts:
+        return max(1, len(row_parts) - len(parent_parts))
+    return 1
+
+
+def _index_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    node_type = str(row.get("node_type") or "chunk")
+    node_order = {"document_summary": 0, "section_summary": 1, "chunk": 2}.get(node_type, 3)
+    chunk_index = row.get("chunk_index")
+    try:
+        chunk_number = int(chunk_index)
+    except (TypeError, ValueError):
+        chunk_number = -1
+    return (
+        str(row.get("source_pdf_name") or row.get("file_path") or ""),
+        str(row.get("section_path") or ""),
+        node_order,
+        chunk_number,
+        str(row.get("id") or ""),
+    )
+
+
+def _with_index_hierarchy_metadata(
+    row: dict[str, Any],
+    *,
+    children: list[dict[str, Any]],
+    parent: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    item = dict(row)
+    item["child_count"] = len(children)
+    item["summary_count"] = sum(1 for child in children if _is_index_summary(child))
+    item["detail_count"] = sum(1 for child in children if str(child.get("node_type") or "") == "chunk")
+    item["node_level"] = 0 if parent is None else min(_index_section_depth(row, parent), 6)
+    return item
+
+
+def list_index_summary_rows(
+    *,
+    offset: int = 0,
+    limit: int = 20,
+    search: str = "",
+    db_dir: Path | None = None,
+) -> dict[str, Any]:
+    offset = max(0, int(offset))
+    resolved_limit = None if int(limit) <= 0 else min(max(1, int(limit)), 200)
+    query = str(search or "").strip()
+
+    with INDEX_LOCK:
+        rows, embedding_model, embedding_dim = _index_records_snapshot(db_dir)
+
+    by_id = {str(row.get("id") or ""): row for row in rows if row.get("id")}
+    top_rows = _index_top_summary_rows(rows)
+    if query:
+        top_rows = [
+            row
+            for row in top_rows
+            if record_matches(row, query)
+            or any(record_matches(child, query) for child in _index_child_candidates(row, rows, by_id))
+        ]
+    top_rows = sorted(top_rows, key=_index_sort_key)
+    page = _page_slice(top_rows, offset=offset, limit=resolved_limit)
+    page_rows = [
+        _with_index_hierarchy_metadata(
+            row,
+            children=[
+                child
+                for child in _index_child_candidates(row, rows, by_id)
+                if not query or record_matches(child, query)
+            ],
+        )
+        for row in page["rows"]
+    ]
+    return {
+        "offset": page["offset"],
+        "limit": page["limit"],
+        "total": page["total"],
+        "rows": page_rows,
+        "embedding_model": embedding_model,
+        "embedding_dim": embedding_dim,
+        "view": "hierarchy",
+    }
+
+
+def list_index_child_rows(
+    *,
+    parent_id: str,
+    offset: int = 0,
+    limit: int = INDEX_CHILD_DEFAULT_LIMIT,
+    search: str = "",
+    db_dir: Path | None = None,
+) -> dict[str, Any]:
+    parent_id = str(parent_id or "").strip()
+    if not parent_id:
+        raise KeyError(parent_id)
+    offset = max(0, int(offset))
+    resolved_limit = min(max(1, int(limit)), INDEX_CHILD_MAX_LIMIT)
+    query = str(search or "").strip()
+
+    with INDEX_LOCK:
+        rows, embedding_model, embedding_dim = _index_records_snapshot(db_dir)
+
+    by_id = {str(row.get("id") or ""): row for row in rows if row.get("id")}
+    parent = by_id.get(parent_id)
+    if parent is None:
+        raise KeyError(parent_id)
+
+    children = _index_child_candidates(parent, rows, by_id)
+    if query:
+        children = [row for row in children if record_matches(row, query)]
+    children = sorted(children, key=_index_sort_key)
+    page = _page_slice(children, offset=offset, limit=resolved_limit)
+    return {
+        "parent_id": parent_id,
+        "offset": page["offset"],
+        "limit": page["limit"],
+        "total": page["total"],
+        "rows": [
+            _with_index_hierarchy_metadata(row, children=[], parent=parent)
+            for row in page["rows"]
+        ],
+        "embedding_model": embedding_model,
+        "embedding_dim": embedding_dim,
+        "view": "hierarchy_children",
+    }
+
+
+def _index_stream_batch_size(value: int) -> int:
+    return min(max(1, int(value)), INDEX_STREAM_MAX_BATCH_SIZE)
+
+
+def iter_index_row_events(
+    *,
+    batch_size: int = INDEX_STREAM_DEFAULT_BATCH_SIZE,
+    search: str = "",
+    db_dir: Path | None = None,
+) -> Iterator[dict[str, Any]]:
+    batch_size = _index_stream_batch_size(batch_size)
+    search = str(search or "")
+    store = _index_store(db_dir)
+    if not store.exists():
+        raise FileNotFoundError(f"LanceDB table not found at {lancedb_path(db_dir or DB_DIR) / 'chunks'}")
+
+    total = None if search else store.count()
+    embedding_model, embedding_dim = store.metadata()
+    yield {
+        "type": "metadata",
+        "batch_size": batch_size,
+        "total": total,
+        "embedding_model": embedding_model,
+        "embedding_dim": embedding_dim,
+    }
+
+    received = 0
+    for rows in store.iter_record_batches(
+        batch_size=batch_size,
+        search=search,
+        workers=INDEX_STREAM_WORKERS,
+    ):
+        received += len(rows)
+        yield {
+            "type": "rows",
+            "rows": rows,
+            "received": received,
+        }
+
+    yield {
+        "type": "done",
+        "received": received,
+        "total": received if search else total,
+        "embedding_model": embedding_model,
+        "embedding_dim": embedding_dim,
+    }
+
+
 def update_index_record(
     *,
     record_id: str,
@@ -625,6 +901,68 @@ def delete_index_records(*, record_ids: list[str], db_dir: Path | None = None) -
 
     with INDEX_LOCK:
         return _index_store(db_dir).delete_records(record_ids=list(ids))
+
+
+def vector_search_index_rows(
+    *,
+    query: str,
+    relevance_floor: float = DEFAULT_INDEX_VECTOR_RELEVANCE_FLOOR,
+    embedding_model: str | None = None,
+    embedding_batch_size: int | None = None,
+    embedding_timeout: float | None = None,
+    db_dir: Path | None = None,
+) -> dict[str, Any]:
+    query = str(query or "").strip()
+    if not query:
+        raise ValueError("Vector search query cannot be empty.")
+    relevance_floor = min(max(0.0, float(relevance_floor)), 1.0)
+
+    from src.local_rag import LocalQueryEngine
+
+    engine = LocalQueryEngine(
+        working_dir=str(db_dir or DB_DIR),
+        embedding_model=embedding_model or DEFAULT_EMBEDDING_MODEL,
+        embedding_batch_size=embedding_batch_size,
+        embedding_timeout=embedding_timeout,
+        retrieval_candidate_k=DEFAULT_RETRIEVAL_CANDIDATE_K,
+        retrieval_min_score=relevance_floor,
+        retrieval_relative_cutoff=DEFAULT_RETRIEVAL_RELATIVE_CUTOFF,
+        context_token_fraction=DEFAULT_CONTEXT_TOKEN_FRACTION,
+        web_search_enabled=False,
+        progress_enabled=False,
+    )
+    result = engine.search_local_context(query=query, relevance_floor=relevance_floor)
+    rows: list[dict[str, Any]] = []
+    for item in result.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        record_id = str(item.get("chunk_id") or "")
+        if not record_id:
+            continue
+        try:
+            row = record_row(engine.store.get_record(record_id))
+        except Exception:
+            row = {
+                "id": record_id,
+                "content": str(item.get("content") or ""),
+                "node_type": "chunk",
+                "file_path": str(item.get("location") or ""),
+                "chunk_index": "",
+            }
+        row["score"] = float(item.get("score") or 0.0)
+        row["citation"] = str(item.get("citation") or "")
+        row["source_id"] = str(item.get("source_id") or "")
+        row["location"] = str(item.get("location") or "")
+        row["vector_query"] = query
+        rows.append(row)
+
+    return {
+        "query": query,
+        "relevance_floor": relevance_floor,
+        "rows": rows,
+        "total": len(rows),
+        "tool_result": result,
+    }
 
 
 def _resolve_pdf_path(raw_path: str, *, root_dir: Path = ROOT_DIR, data_dir: Path = DATA_DIR) -> Path:
@@ -688,6 +1026,8 @@ def _pdf_entry_for_response(
 def list_pdf_documents(
     *,
     search: str = "",
+    offset: int = 0,
+    limit: int | None = None,
     registry_path: Path | None = None,
     processed_dir: Path | None = None,
     root_dir: Path = ROOT_DIR,
@@ -741,7 +1081,23 @@ def list_pdf_documents(
             if query in str(item.get("filename", "")).lower()
             or query in str(item.get("hash", "")).lower()
         ]
-    return {"pdfs": rows, "total": len(rows)}
+    page = _page_slice(rows, offset=offset, limit=limit)
+    return {
+        "pdfs": page["rows"],
+        "total": page["total"],
+        "offset": page["offset"],
+        "limit": page["limit"],
+    }
+
+
+def list_job_rows(*, offset: int = 0, limit: int | None = 10) -> dict[str, Any]:
+    page = _page_slice(job_queue.list_jobs(), offset=offset, limit=limit)
+    return {
+        "jobs": page["rows"],
+        "total": page["total"],
+        "offset": page["offset"],
+        "limit": page["limit"],
+    }
 
 
 def resolve_pdf_download_path(
@@ -1140,6 +1496,14 @@ class IndexDeleteRequest(BaseModel):
     record_ids: list[str]
 
 
+class IndexVectorSearchRequest(BaseModel):
+    query: str
+    relevance_floor: float = DEFAULT_INDEX_VECTOR_RELEVANCE_FLOOR
+    embedding_model: str | None = DEFAULT_EMBEDDING_MODEL
+    embedding_batch_size: int | None = DEFAULT_EMBEDDING_BATCH_SIZE
+    embedding_timeout: float | None = DEFAULT_EMBEDDING_TIMEOUT
+
+
 class ReindexRequest(BaseModel):
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_batch_size: int | None = DEFAULT_EMBEDDING_BATCH_SIZE
@@ -1243,16 +1607,45 @@ def render_markdown(payload: RenderRequest):
     return {"html": render_markdown_text(payload.text)}
 
 
+def _upload_options_from_form(form: Any) -> dict[str, Any]:
+    return {
+        "parser_mode": str(form.get("parser_mode") or INGESTION_CONFIG["parser_mode"]),
+        "accelerator": str(form.get("accelerator") or INGESTION_CONFIG["accelerator"]),
+        "asset_triggers": str(form.get("asset_triggers") or INGESTION_CONFIG["asset_triggers"]),
+        "vision_model": str(form.get("vision_model") or INGESTION_CONFIG["vision_model"]),
+        "vision_enabled": _bool_value(form.get("vision_enabled"), INGESTION_CONFIG["vision_enabled"]),
+        "ocr_backend": str(form.get("ocr_backend") or INGESTION_CONFIG["ocr_backend"]),
+        "ocr_langs": _string_list(form.get("ocr_langs"), tuple(INGESTION_CONFIG["ocr_langs"])),
+        "ocr_force_full_page": _bool_value(
+            form.get("ocr_force_full_page"),
+            INGESTION_CONFIG["ocr_force_full_page"],
+        ),
+        "ocr_bitmap_area_threshold": float(
+            form.get("ocr_bitmap_area_threshold") or INGESTION_CONFIG["ocr_bitmap_area_threshold"]
+        ),
+        "rapidocr_backend": str(form.get("rapidocr_backend") or INGESTION_CONFIG["rapidocr_backend"]),
+        "tesseract_cmd": str(form.get("tesseract_cmd") or INGESTION_CONFIG["tesseract_cmd"]),
+        "tesseract_data_path": str(form.get("tesseract_data_path") or INGESTION_CONFIG["tesseract_data_path"]),
+        "tesseract_psm": _optional_int(form.get("tesseract_psm"), INGESTION_CONFIG["tesseract_psm"]),
+        "embedding_model": str(form.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
+        "embedding_batch_size": int(form.get("embedding_batch_size") or DEFAULT_EMBEDDING_BATCH_SIZE),
+        "embedding_timeout": float(form.get("embedding_timeout") or DEFAULT_EMBEDDING_TIMEOUT),
+        "index_backend": str(form.get("index_backend") or DEFAULT_INDEX_BACKEND),
+        "summary_mode": str(form.get("summary_mode") or DEFAULT_SUMMARY_MODE),
+        "chunk_target_tokens": int(form.get("chunk_target_tokens") or DEFAULT_CHUNK_TARGET_TOKENS),
+        "chunk_overlap_tokens": int(form.get("chunk_overlap_tokens") or DEFAULT_CHUNK_OVERLAP_TOKENS),
+        "progress_enabled": False,
+    }
+
+
 @app.post("/api/uploads")
 async def upload_files(request: Request):
-    job_id = uuid.uuid4().hex
-    staging_dir = STAGING_DIR / job_id
-    staging_dir.mkdir(parents=True, exist_ok=True)
     filenames: list[str] = []
     uploads: list[dict[str, Any]] = []
     used_names: set[str] = set()
-    queued = False
-    registered = False
+    staging_dirs: dict[str, Path] = {}
+    registered_jobs: list[tuple[str, list[dict[str, Any]]]] = []
+    queued_job_ids: set[str] = set()
 
     try:
         form = await request.form()
@@ -1273,6 +1666,10 @@ async def upload_files(request: Request):
                 counter += 1
             used_names.add(filename.lower())
 
+            job_id = uuid.uuid4().hex
+            staging_dir = STAGING_DIR / job_id
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            staging_dirs[job_id] = staging_dir
             destination = staging_dir / filename
             digest = hashlib.sha256()
             with destination.open("wb") as handle:
@@ -1289,6 +1686,8 @@ async def upload_files(request: Request):
                     "filename": filename,
                     "hash": digest.hexdigest(),
                     "staging_path": str(destination),
+                    "staging_dir": str(staging_dir),
+                    "job_id": job_id,
                 }
             )
 
@@ -1331,57 +1730,51 @@ async def upload_files(request: Request):
             )
 
         forced_hashes = {entry["hash"] for entry in duplicate_entries} if force_duplicates else set()
-        registry.register_queued(job_id=job_id, files=uploads, forced_hashes=forced_hashes)
-        registered = True
-        job = job_queue.enqueue_upload(
-            staging_dir=staging_dir,
-            filenames=filenames,
-            uploads=uploads,
-            force_duplicate_hashes=sorted(forced_hashes),
-            job_id=job_id,
-            options={
-                "parser_mode": str(form.get("parser_mode") or INGESTION_CONFIG["parser_mode"]),
-                "accelerator": str(form.get("accelerator") or INGESTION_CONFIG["accelerator"]),
-                "asset_triggers": str(form.get("asset_triggers") or INGESTION_CONFIG["asset_triggers"]),
-                "vision_model": str(form.get("vision_model") or INGESTION_CONFIG["vision_model"]),
-                "vision_enabled": _bool_value(form.get("vision_enabled"), INGESTION_CONFIG["vision_enabled"]),
-                "ocr_backend": str(form.get("ocr_backend") or INGESTION_CONFIG["ocr_backend"]),
-                "ocr_langs": _string_list(form.get("ocr_langs"), tuple(INGESTION_CONFIG["ocr_langs"])),
-                "ocr_force_full_page": _bool_value(
-                    form.get("ocr_force_full_page"),
-                    INGESTION_CONFIG["ocr_force_full_page"],
-                ),
-                "ocr_bitmap_area_threshold": float(
-                    form.get("ocr_bitmap_area_threshold") or INGESTION_CONFIG["ocr_bitmap_area_threshold"]
-                ),
-                "rapidocr_backend": str(form.get("rapidocr_backend") or INGESTION_CONFIG["rapidocr_backend"]),
-                "tesseract_cmd": str(form.get("tesseract_cmd") or INGESTION_CONFIG["tesseract_cmd"]),
-                "tesseract_data_path": str(
-                    form.get("tesseract_data_path") or INGESTION_CONFIG["tesseract_data_path"]
-                ),
-                "tesseract_psm": _optional_int(form.get("tesseract_psm"), INGESTION_CONFIG["tesseract_psm"]),
-                "embedding_model": str(form.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
-                "embedding_batch_size": int(form.get("embedding_batch_size") or DEFAULT_EMBEDDING_BATCH_SIZE),
-                "embedding_timeout": float(form.get("embedding_timeout") or DEFAULT_EMBEDDING_TIMEOUT),
-                "index_backend": str(form.get("index_backend") or DEFAULT_INDEX_BACKEND),
-                "summary_mode": str(form.get("summary_mode") or DEFAULT_SUMMARY_MODE),
-                "chunk_target_tokens": int(form.get("chunk_target_tokens") or DEFAULT_CHUNK_TARGET_TOKENS),
-                "chunk_overlap_tokens": int(form.get("chunk_overlap_tokens") or DEFAULT_CHUNK_OVERLAP_TOKENS),
-                "progress_enabled": False,
-            },
-        )
-        queued = True
-        return job.to_dict()
+        options = _upload_options_from_form(form)
+        jobs: list[QueueJob] = []
+        for upload in uploads:
+            job_id = str(upload["job_id"])
+            file_upload = {
+                "filename": str(upload["filename"]),
+                "hash": str(upload["hash"]),
+                "staging_path": str(upload["staging_path"]),
+            }
+            file_forced_hashes = {file_upload["hash"]} if file_upload["hash"] in forced_hashes else set()
+            registry.register_queued(
+                job_id=job_id,
+                files=[file_upload],
+                forced_hashes=file_forced_hashes,
+            )
+            registered_jobs.append((job_id, [file_upload]))
+            job = job_queue.enqueue_upload(
+                staging_dir=Path(str(upload["staging_dir"])),
+                filenames=[file_upload["filename"]],
+                uploads=[file_upload],
+                force_duplicate_hashes=sorted(file_forced_hashes),
+                job_id=job_id,
+                options=options,
+            )
+            queued_job_ids.add(job_id)
+            jobs.append(job)
+
+        job_payloads = [job.to_dict() for job in jobs]
+        response = dict(job_payloads[0]) if job_payloads else {}
+        response["jobs"] = job_payloads
+        response["job_count"] = len(job_payloads)
+        response["filenames"] = filenames
+        return response
     except Exception:
-        if not queued:
-            if registered:
+        for registered_job_id, files in registered_jobs:
+            if registered_job_id not in queued_job_ids:
                 PdfRegistry(PDF_REGISTRY_PATH).mark_job_status(
-                    job_id=job_id,
-                    files=uploads,
+                    job_id=registered_job_id,
+                    files=files,
                     status="failed",
                     error="Upload was not queued.",
                 )
-            shutil.rmtree(staging_dir, ignore_errors=True)
+        for staging_job_id, staging_dir in staging_dirs.items():
+            if staging_job_id not in queued_job_ids:
+                shutil.rmtree(staging_dir, ignore_errors=True)
         raise
 
 
@@ -1406,8 +1799,8 @@ async def reindex(request: Request):
 
 
 @app.get("/api/jobs")
-def list_jobs():
-    return {"jobs": job_queue.list_jobs()}
+def list_jobs(offset: int = 0, limit: int = 10):
+    return list_job_rows(offset=offset, limit=limit)
 
 
 @app.get("/api/jobs/{job_id}")
@@ -1419,8 +1812,8 @@ def get_job(job_id: str):
 
 
 @app.get("/api/pdfs")
-def pdf_documents(search: str = ""):
-    return list_pdf_documents(search=search)
+def pdf_documents(search: str = "", offset: int = 0, limit: int = 10):
+    return list_pdf_documents(search=search, offset=offset, limit=limit)
 
 
 @app.get("/api/pdfs/{source_hash}/download")
@@ -1440,6 +1833,67 @@ def index_rows(offset: int = 0, limit: int = 50, search: str = ""):
         return list_index_rows(offset=offset, limit=limit, search=search)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/index/summaries")
+def index_summary_rows(offset: int = 0, limit: int = 20, search: str = ""):
+    try:
+        return list_index_summary_rows(offset=offset, limit=limit, search=search)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/index/children")
+def index_child_rows(
+    parent_id: str,
+    offset: int = 0,
+    limit: int = INDEX_CHILD_DEFAULT_LIMIT,
+    search: str = "",
+):
+    try:
+        return list_index_child_rows(
+            parent_id=parent_id,
+            offset=offset,
+            limit=limit,
+            search=search,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Record not found: {exc}") from exc
+
+
+@app.get("/api/index/stream")
+def index_rows_stream(
+    batch_size: int = INDEX_STREAM_DEFAULT_BATCH_SIZE,
+    search: str = "",
+):
+    try:
+        events = iter_index_row_events(batch_size=batch_size, search=search)
+        first_event = next(events)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except StopIteration:
+        first_event = {
+            "type": "done",
+            "received": 0,
+            "total": 0,
+            "embedding_model": DEFAULT_EMBEDDING_MODEL,
+            "embedding_dim": 768,
+        }
+
+    def generate():
+        def encode_event(event: dict[str, Any]) -> str:
+            return json.dumps(event, ensure_ascii=False) + "\n"
+
+        yield encode_event(first_event)
+        try:
+            for event in events:
+                yield encode_event(event)
+        except Exception as exc:
+            yield encode_event({"type": "error", "message": str(exc)})
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson; charset=utf-8")
 
 
 @app.post("/api/index/update")
@@ -1469,6 +1923,22 @@ def delete_index(payload: IndexDeleteRequest):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Record not found: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/index/vector-search")
+def vector_search_index(payload: IndexVectorSearchRequest):
+    try:
+        return vector_search_index_rows(
+            query=payload.query,
+            relevance_floor=payload.relevance_floor,
+            embedding_model=payload.embedding_model,
+            embedding_batch_size=payload.embedding_batch_size,
+            embedding_timeout=payload.embedding_timeout,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

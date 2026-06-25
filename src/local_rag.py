@@ -1235,6 +1235,29 @@ class LocalQueryEngine:
             result["error"] = "Retrieved local context did not fit within the prompt token budget."
         return result
 
+    def search_local_context(
+        self,
+        *,
+        query: str,
+        relevance_floor: float | None = None,
+        token_budget: int | None = None,
+    ) -> dict[str, Any]:
+        previous_min_score = self.retrieval_min_score
+        if relevance_floor is not None:
+            try:
+                self.retrieval_min_score = max(0.0, float(relevance_floor))
+            except (TypeError, ValueError):
+                self.retrieval_min_score = previous_min_score
+        try:
+            return self._local_tool_result(
+                query=query,
+                exclude_ids=set(),
+                citations=CitationRegistry(),
+                token_budget=token_budget,
+            )
+        finally:
+            self.retrieval_min_score = previous_min_score
+
     def _web_tool_result(
         self,
         *,

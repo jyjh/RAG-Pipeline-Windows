@@ -164,6 +164,15 @@ main {
   margin-bottom: 14px;
 }
 
+.table-pager {
+  margin-top: 18px;
+  margin-bottom: 8px;
+}
+
+.table-pager strong {
+  min-width: 52px;
+}
+
 input[type="search"],
 select,
 textarea {
@@ -179,9 +188,22 @@ input[type="search"] {
   padding: 7px 10px;
 }
 
+input[type="number"] {
+  min-height: 36px;
+  padding: 7px 10px;
+}
+
 select {
   min-height: 36px;
   padding: 7px 10px;
+}
+
+.vector-search-toolbar {
+  align-items: center;
+}
+
+#vectorRelevanceFloorInput {
+  width: 84px;
 }
 
 .inline-select-label {
@@ -241,6 +263,56 @@ input[type="file"] {
   width: 260px;
   color: var(--muted);
   word-break: break-word;
+}
+
+.index-source-node {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 8px;
+  padding-left: calc(var(--index-level, 0) * 18px);
+}
+
+.tree-toggle {
+  width: 26px;
+  min-height: 26px;
+  padding: 0;
+  align-self: start;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.tree-spacer {
+  width: 26px;
+}
+
+.index-summary-row {
+  background: #fbfcfd;
+}
+
+.index-summary-row .content-edit {
+  min-height: 96px;
+}
+
+.index-detail-row .index-source-node {
+  border-left: 2px solid #cbd5df;
+  margin-left: 13px;
+}
+
+.index-vector-result-row {
+  background: #fffdf5;
+}
+
+.index-node-meta,
+.index-record-id {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.index-load-more-row td,
+.index-empty-child-row td {
+  color: var(--muted);
+  padding-left: 42px;
+  background: #fbfcfd;
 }
 
 .content-edit {

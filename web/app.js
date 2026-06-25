@@ -4,7 +4,16 @@ const state = {
   indexPageSize: "20",
   total: 0,
   search: "",
+  indexMode: "standard",
+  vectorSearch: "",
+  vectorRelevanceFloor: 0.7,
   pdfSearch: "",
+  pdfOffset: 0,
+  pdfLimit: 10,
+  pdfTotal: 0,
+  jobsOffset: 0,
+  jobsLimit: 10,
+  jobsTotal: 0,
   chats: [],
   activeChatId: null,
   streamingChatId: null,
@@ -16,6 +25,8 @@ const state = {
   jobsTimer: null,
   updateTimer: null,
   updateApplying: false,
+  indexAbortController: null,
+  indexLoadToken: 0,
 };
 
 const LIVE_RENDER_INTERVAL_MS = 200;
@@ -24,6 +35,8 @@ const STREAM_TAIL_MAX_CHARS = 2200;
 const UPDATE_POLL_INTERVAL_MS = 5 * 60 * 1000;
 const RESTART_POLL_INTERVAL_MS = 1000;
 const RESTART_POLL_TIMEOUT_MS = 120000;
+const INDEX_STREAM_BATCH_SIZE = 250;
+const INDEX_CHILD_BATCH_SIZE = 100;
 const CHAT_STORAGE_KEY = "rag.chatHistory.v1";
 const CHAT_UI_STORAGE_KEY = "rag.chatUi.v1";
 
@@ -36,10 +49,19 @@ const els = {
   uploadStatus: document.getElementById("uploadStatus"),
   pdfSearchInput: document.getElementById("pdfSearchInput"),
   pdfSearchButton: document.getElementById("pdfSearchButton"),
+  prevPdfPageButton: document.getElementById("prevPdfPageButton"),
+  pdfPageLabel: document.getElementById("pdfPageLabel"),
+  nextPdfPageButton: document.getElementById("nextPdfPageButton"),
   pdfsBody: document.getElementById("pdfsBody"),
+  prevJobsPageButton: document.getElementById("prevJobsPageButton"),
+  jobsPageLabel: document.getElementById("jobsPageLabel"),
+  nextJobsPageButton: document.getElementById("nextJobsPageButton"),
   jobsBody: document.getElementById("jobsBody"),
   searchInput: document.getElementById("searchInput"),
   searchButton: document.getElementById("searchButton"),
+  vectorSearchInput: document.getElementById("vectorSearchInput"),
+  vectorRelevanceFloorInput: document.getElementById("vectorRelevanceFloorInput"),
+  vectorSearchButton: document.getElementById("vectorSearchButton"),
   indexPageSizeSelect: document.getElementById("indexPageSizeSelect"),
   prevPageButton: document.getElementById("prevPageButton"),
   nextPageButton: document.getElementById("nextPageButton"),
@@ -77,26 +99,104 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+async function errorFromResponse(response) {
+  let detail = await response.text();
+  try {
+    const parsed = JSON.parse(detail);
+    detail = parsed.detail || detail;
+  } catch (_) {
+    // Keep the raw response text.
+  }
+  const message =
+    typeof detail === "string"
+      ? detail
+      : detail.message || `${response.status} ${response.statusText}`;
+  const error = new Error(message);
+  error.status = response.status;
+  error.detail = detail;
+  return error;
+}
+
 async function requestJson(path, options = {}) {
   const response = await fetch(path, options);
   if (!response.ok) {
-    let detail = await response.text();
-    try {
-      const parsed = JSON.parse(detail);
-      detail = parsed.detail || detail;
-    } catch (_) {
-      // Keep the raw response text.
-    }
-    const message =
-      typeof detail === "string"
-        ? detail
-        : detail.message || `${response.status} ${response.statusText}`;
-    const error = new Error(message);
-    error.status = response.status;
-    error.detail = detail;
-    throw error;
+    throw await errorFromResponse(response);
   }
   return response.json();
+}
+
+function isAbortError(error) {
+  return error && error.name === "AbortError";
+}
+
+function startIndexLoad() {
+  if (state.indexAbortController) {
+    state.indexAbortController.abort();
+  }
+  const abortController = new AbortController();
+  state.indexAbortController = abortController;
+  state.indexLoadToken += 1;
+  return { abortController, token: state.indexLoadToken };
+}
+
+function isActiveIndexLoad(load) {
+  return (
+    state.indexLoadToken === load.token &&
+    state.indexAbortController === load.abortController &&
+    !load.abortController.signal.aborted
+  );
+}
+
+function finishIndexLoad(load) {
+  if (state.indexAbortController === load.abortController) {
+    state.indexAbortController = null;
+  }
+}
+
+function abortIndexLoad() {
+  if (state.indexAbortController) {
+    state.indexAbortController.abort();
+    state.indexAbortController = null;
+  }
+}
+
+async function readNdjson(response, onEvent) {
+  if (!response.body) {
+    for (const line of (await response.text()).split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed) {
+        await onEvent(JSON.parse(trimmed));
+      }
+    }
+    return;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    let newlineIndex = buffer.indexOf("\n");
+    while (newlineIndex !== -1) {
+      const line = buffer.slice(0, newlineIndex).trim();
+      buffer = buffer.slice(newlineIndex + 1);
+      if (line) {
+        await onEvent(JSON.parse(line));
+      }
+      newlineIndex = buffer.indexOf("\n");
+    }
+  }
+
+  buffer += decoder.decode();
+  const trimmed = buffer.trim();
+  if (trimmed) {
+    await onEvent(JSON.parse(trimmed));
+  }
 }
 
 function sleep(ms) {
@@ -753,9 +853,26 @@ async function applyUpdate() {
   }
 }
 
+function updatePageControls({ total, offset, limit, label, prevButton, nextButton }) {
+  const start = total ? offset + 1 : 0;
+  const end = Math.min(offset + limit, total);
+  label.textContent = `${start}-${end} of ${total}`;
+  prevButton.disabled = offset <= 0;
+  nextButton.disabled = offset + limit >= total;
+}
+
 async function refreshJobs() {
   try {
-    const data = await requestJson("/api/jobs");
+    const params = new URLSearchParams({
+      offset: String(state.jobsOffset),
+      limit: String(state.jobsLimit),
+    });
+    const data = await requestJson(`/api/jobs?${params}`);
+    state.jobsTotal = data.total || 0;
+    if (state.jobsOffset >= state.jobsTotal && state.jobsOffset > 0) {
+      state.jobsOffset = Math.max(0, Math.floor((state.jobsTotal - 1) / state.jobsLimit) * state.jobsLimit);
+      return refreshJobs();
+    }
     els.jobsBody.innerHTML = "";
     for (const job of data.jobs || []) {
       const row = document.createElement("tr");
@@ -768,6 +885,14 @@ async function refreshJobs() {
       `;
       els.jobsBody.appendChild(row);
     }
+    updatePageControls({
+      total: state.jobsTotal,
+      offset: state.jobsOffset,
+      limit: state.jobsLimit,
+      label: els.jobsPageLabel,
+      prevButton: els.prevJobsPageButton,
+      nextButton: els.nextJobsPageButton,
+    });
   } catch (error) {
     setStatus(els.uploadStatus, error.message, true);
   }
@@ -775,8 +900,17 @@ async function refreshJobs() {
 
 async function refreshPdfs() {
   try {
-    const params = new URLSearchParams({ search: state.pdfSearch });
+    const params = new URLSearchParams({
+      offset: String(state.pdfOffset),
+      limit: String(state.pdfLimit),
+      search: state.pdfSearch,
+    });
     const data = await requestJson(`/api/pdfs?${params}`);
+    state.pdfTotal = data.total || 0;
+    if (state.pdfOffset >= state.pdfTotal && state.pdfOffset > 0) {
+      state.pdfOffset = Math.max(0, Math.floor((state.pdfTotal - 1) / state.pdfLimit) * state.pdfLimit);
+      return refreshPdfs();
+    }
     els.pdfsBody.innerHTML = "";
     for (const item of data.pdfs || []) {
       const row = document.createElement("tr");
@@ -793,6 +927,14 @@ async function refreshPdfs() {
       `;
       els.pdfsBody.appendChild(row);
     }
+    updatePageControls({
+      total: state.pdfTotal,
+      offset: state.pdfOffset,
+      limit: state.pdfLimit,
+      label: els.pdfPageLabel,
+      prevButton: els.prevPdfPageButton,
+      nextButton: els.nextPdfPageButton,
+    });
   } catch (error) {
     setStatus(els.uploadStatus, error.message, true);
   }
@@ -851,9 +993,16 @@ async function uploadFiles(forceDuplicates = false) {
   els.uploadButton.disabled = true;
   setStatus(els.uploadStatus, forceDuplicates ? "Queueing forced upload..." : "Queueing upload...");
   try {
-    const job = await requestJson("/api/uploads", { method: "POST", body });
+    const result = await requestJson("/api/uploads", { method: "POST", body });
+    const jobs = Array.isArray(result.jobs) && result.jobs.length ? result.jobs : [result];
     els.fileInput.value = "";
-    setStatus(els.uploadStatus, `Queued job ${job.id.slice(0, 8)}.`);
+    state.jobsOffset = 0;
+    state.pdfOffset = 0;
+    if (jobs.length === 1) {
+      setStatus(els.uploadStatus, `Queued job ${jobs[0].id.slice(0, 8)}.`);
+    } else {
+      setStatus(els.uploadStatus, `Queued ${jobs.length} jobs.`);
+    }
     await refreshJobs();
     await refreshPdfs();
   } catch (error) {
@@ -887,6 +1036,7 @@ async function enqueueReindex() {
   try {
     const job = await requestJson("/api/reindex", { method: "POST" });
     setStatus(els.uploadStatus, `Queued reindex job ${job.id.slice(0, 8)}.`);
+    state.jobsOffset = 0;
     await refreshJobs();
     await refreshPdfs();
   } catch (error) {
@@ -897,8 +1047,10 @@ async function enqueueReindex() {
 }
 
 async function loadIndex() {
+  const load = startIndexLoad();
+  state.indexMode = "standard";
   if (state.indexPageSize === "all") {
-    return loadAllIndexRows();
+    return loadAllIndexSummaries(load);
   }
   state.limit = Number(state.indexPageSize) || 20;
   const params = new URLSearchParams({
@@ -907,74 +1059,159 @@ async function loadIndex() {
     search: state.search,
   });
   try {
-    const data = await requestJson(`/api/index?${params}`);
+    const data = await requestJson(`/api/index/summaries?${params}`, {
+      signal: load.abortController.signal,
+    });
+    if (!isActiveIndexLoad(load)) {
+      return;
+    }
     state.total = data.total || 0;
     renderIndexRows(data.rows || []);
     const start = state.total ? state.offset + 1 : 0;
     const end = Math.min(state.offset + state.limit, state.total);
-    els.pageLabel.textContent = `${start}-${end} of ${state.total}`;
+    els.pageLabel.textContent = `${start}-${end} of ${state.total} summaries`;
     els.prevPageButton.disabled = state.offset <= 0;
     els.nextPageButton.disabled = state.offset + state.limit >= state.total;
     setStatus(els.indexStatus, `Embedding model: ${data.embedding_model || "unknown"}`);
   } catch (error) {
+    if (isAbortError(error) || !isActiveIndexLoad(load)) {
+      return;
+    }
     els.indexBody.innerHTML = "";
     els.pageLabel.textContent = "";
     setStatus(els.indexStatus, error.message, true);
+  } finally {
+    finishIndexLoad(load);
   }
 }
 
-async function loadAllIndexRows() {
-  const batchSize = 100;
-  const rows = [];
-  let offset = 0;
-  let total = 0;
-  let embeddingModel = "unknown";
+async function loadAllIndexSummaries(load) {
+  const params = new URLSearchParams({
+    offset: "0",
+    limit: "0",
+    search: state.search,
+  });
+
+  els.indexBody.innerHTML = "";
+  els.pageLabel.textContent = "Loading summaries...";
+  els.prevPageButton.disabled = true;
+  els.nextPageButton.disabled = true;
+  setStatus(els.indexStatus, "Loading summary chunks...");
+
   try {
-    while (true) {
-      const params = new URLSearchParams({
-        offset: String(offset),
-        limit: String(batchSize),
-        search: state.search,
-      });
-      const data = await requestJson(`/api/index?${params}`);
-      const batch = data.rows || [];
-      if (offset === 0) {
-        total = data.total || 0;
-        embeddingModel = data.embedding_model || "unknown";
-      }
-      rows.push(...batch);
-      offset += batch.length;
-      if (!batch.length || rows.length >= total) {
-        break;
-      }
+    const data = await requestJson(`/api/index/summaries?${params}`, {
+      signal: load.abortController.signal,
+    });
+    if (!isActiveIndexLoad(load)) {
+      return;
     }
-    state.total = total;
+    const rows = data.rows || [];
+    state.total = data.total || rows.length;
     renderIndexRows(rows);
-    els.pageLabel.textContent = `All ${rows.length} of ${total}`;
+    els.pageLabel.textContent = `All ${rows.length} of ${state.total} summaries`;
     els.prevPageButton.disabled = true;
     els.nextPageButton.disabled = true;
-    setStatus(els.indexStatus, `Embedding model: ${embeddingModel}`);
+    setStatus(els.indexStatus, `Embedding model: ${data.embedding_model || "unknown"}`);
   } catch (error) {
+    if (isAbortError(error) || !isActiveIndexLoad(load)) {
+      return;
+    }
     els.indexBody.innerHTML = "";
     els.pageLabel.textContent = "";
     setStatus(els.indexStatus, error.message, true);
+  } finally {
+    finishIndexLoad(load);
   }
 }
 
-function renderIndexRows(rows) {
-  els.indexBody.innerHTML = "";
-  for (const item of rows) {
-    const row = document.createElement("tr");
-    row.dataset.recordId = item.id;
-    const download = item.source_hash
-      ? `<br /><a class="download-link" href="/api/pdfs/${encodeURIComponent(item.source_hash)}/download">Download PDF</a>`
-      : "";
-    row.innerHTML = `
+function indexNodeLabel(item) {
+  const nodeType = item.node_type || "chunk";
+  if (nodeType === "document_summary") {
+    return "Document summary";
+  }
+  if (nodeType === "section_summary") {
+    return "Section summary";
+  }
+  return `Detail chunk ${item.chunk_index}`;
+}
+
+function indexPageRange(item) {
+  const start = Number(item.page_start || 0);
+  const end = Number(item.page_end || 0);
+  if (!start && !end) {
+    return "";
+  }
+  if (start && end && start !== end) {
+    return `pages ${start}-${end}`;
+  }
+  return `page ${start || end}`;
+}
+
+function indexChildCountLabel(item) {
+  const detailCount = Number(item.detail_count || 0);
+  const summaryCount = Number(item.summary_count || 0);
+  if (!detailCount && !summaryCount) {
+    return "";
+  }
+  const parts = [];
+  if (summaryCount) {
+    parts.push(`${summaryCount} summaries`);
+  }
+  if (detailCount) {
+    parts.push(`${detailCount} details`);
+  }
+  return parts.join(", ");
+}
+
+function indexScoreLabel(item) {
+  const score = Number(item.score || 0);
+  if (!score) {
+    return "";
+  }
+  return `score ${score.toFixed(3)}`;
+}
+
+function createIndexRow(item, options = {}) {
+  const row = document.createElement("tr");
+  row.dataset.recordId = item.id;
+  row.dataset.nodeType = item.node_type || "chunk";
+  row.classList.add("index-node-row");
+  const level = Number(options.level ?? item.node_level ?? 0);
+  row.style.setProperty("--index-level", String(Math.max(0, level)));
+  if ((item.node_type || "") === "document_summary" || (item.node_type || "") === "section_summary") {
+    row.classList.add("index-summary-row");
+  } else {
+    row.classList.add("index-detail-row");
+  }
+  if (options.parentId) {
+    row.dataset.parentId = options.parentId;
+  }
+
+  const download = item.source_hash
+    ? `<br /><a class="download-link" href="/api/pdfs/${encodeURIComponent(item.source_hash)}/download">Download PDF</a>`
+    : "";
+  const hasChildren = Number(item.child_count || 0) > 0;
+  const toggle = hasChildren && options.allowToggle
+    ? `<button type="button" class="tree-toggle" data-action="toggle-children" aria-expanded="false" title="Show details" aria-label="Show details">+</button>`
+    : `<span class="tree-spacer"></span>`;
+  const sourceName = item.source_pdf_name || item.file_path || item.title || item.id;
+  const pageRange = indexPageRange(item);
+  const childCount = indexChildCountLabel(item);
+  const meta = [indexNodeLabel(item), indexScoreLabel(item), pageRange, childCount]
+    .filter(Boolean)
+    .join(" | ");
+  row.innerHTML = `
       <td class="source-cell">
-        <strong>${escapeHtml(item.id)}</strong><br />
-        ${escapeHtml(item.file_path)}<br />
-        chunk ${escapeHtml(item.chunk_index)}
-        ${download}
+        <div class="index-source-node">
+          ${toggle}
+          <div>
+            <strong>${escapeHtml(item.title || item.id)}</strong><br />
+            <span class="index-node-meta">${escapeHtml(meta)}</span><br />
+            ${escapeHtml(sourceName)}<br />
+            <span class="index-record-id">${escapeHtml(item.id)}</span>
+            ${download}
+          </div>
+        </div>
       </td>
       <td>
         <textarea class="content-edit" spellcheck="false"></textarea>
@@ -986,8 +1223,227 @@ function renderIndexRows(rows) {
         </div>
       </td>
     `;
-    row.querySelector("textarea").value = item.content || "";
-    els.indexBody.appendChild(row);
+  row.querySelector("textarea").value = item.content || "";
+  return row;
+}
+
+function createIndexLoadMoreRow(parentId, nextOffset, total) {
+  const row = document.createElement("tr");
+  row.className = "index-load-more-row";
+  row.dataset.parentId = parentId;
+  const remaining = Math.max(0, total - nextOffset);
+  row.innerHTML = `
+    <td colspan="3">
+      <button type="button" data-action="load-more-children" data-next-offset="${nextOffset}">
+        Load ${Math.min(INDEX_CHILD_BATCH_SIZE, remaining)} more detail rows
+      </button>
+    </td>
+  `;
+  return row;
+}
+
+function createIndexEmptyChildRow(parentId) {
+  const row = document.createElement("tr");
+  row.className = "index-empty-child-row";
+  row.dataset.parentId = parentId;
+  row.innerHTML = `<td colspan="3">No matching detail rows.</td>`;
+  return row;
+}
+
+function appendIndexRows(rows) {
+  const fragment = document.createDocumentFragment();
+  for (const item of rows) {
+    fragment.appendChild(createIndexRow(item, { allowToggle: true }));
+  }
+  els.indexBody.appendChild(fragment);
+}
+
+function renderIndexRows(rows) {
+  els.indexBody.innerHTML = "";
+  appendIndexRows(rows);
+}
+
+function renderVectorIndexRows(rows) {
+  els.indexBody.innerHTML = "";
+  const fragment = document.createDocumentFragment();
+  for (const item of rows) {
+    const row = createIndexRow(item, { allowToggle: false });
+    row.classList.add("index-vector-result-row");
+    fragment.appendChild(row);
+  }
+  els.indexBody.appendChild(fragment);
+}
+
+async function runIndexVectorSearch() {
+  const query = els.vectorSearchInput.value.trim();
+  if (!query) {
+    setStatus(els.indexStatus, "Enter a vector search query.", true);
+    return;
+  }
+
+  const relevanceFloor = numericSetting(els.vectorRelevanceFloorInput, 0.7, 0);
+  state.indexMode = "vector";
+  state.vectorSearch = query;
+  state.vectorRelevanceFloor = relevanceFloor;
+  const load = startIndexLoad();
+  els.vectorSearchButton.disabled = true;
+  els.prevPageButton.disabled = true;
+  els.nextPageButton.disabled = true;
+  els.pageLabel.textContent = "Vector search running...";
+  setStatus(els.indexStatus, "Vector search is querying embeddings and may take longer.");
+
+  try {
+    const data = await requestJson("/api/index/vector-search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: load.abortController.signal,
+      body: JSON.stringify({
+        query,
+        relevance_floor: relevanceFloor,
+      }),
+    });
+    if (!isActiveIndexLoad(load)) {
+      return;
+    }
+    const rows = data.rows || [];
+    renderVectorIndexRows(rows);
+    state.total = data.total || rows.length;
+    els.pageLabel.textContent = `${rows.length} vector result${rows.length === 1 ? "" : "s"}`;
+    setStatus(
+      els.indexStatus,
+      `Vector search complete. Relevance floor: ${Number(data.relevance_floor || relevanceFloor).toFixed(2)}`
+    );
+  } catch (error) {
+    if (isAbortError(error) || !isActiveIndexLoad(load)) {
+      return;
+    }
+    els.indexBody.innerHTML = "";
+    els.pageLabel.textContent = "";
+    setStatus(els.indexStatus, error.message, true);
+  } finally {
+    els.vectorSearchButton.disabled = false;
+    finishIndexLoad(load);
+  }
+}
+
+function indexRowsForParent(parentId) {
+  return Array.from(els.indexBody.querySelectorAll("tr")).filter(
+    (row) => row.dataset.parentId === parentId
+  );
+}
+
+function indexParentRow(parentId) {
+  return Array.from(els.indexBody.querySelectorAll("tr")).find(
+    (row) => row.dataset.recordId === parentId && !row.dataset.parentId
+  );
+}
+
+function removeIndexLoadMoreRows(parentId) {
+  for (const row of indexRowsForParent(parentId)) {
+    if (row.classList.contains("index-load-more-row")) {
+      row.remove();
+    }
+  }
+}
+
+function setIndexChildrenVisible(parentId, visible) {
+  for (const row of indexRowsForParent(parentId)) {
+    row.hidden = !visible;
+  }
+}
+
+function setIndexToggle(button, expanded) {
+  button.textContent = expanded ? "-" : "+";
+  button.setAttribute("aria-expanded", expanded ? "true" : "false");
+  button.title = expanded ? "Hide details" : "Show details";
+  button.setAttribute("aria-label", button.title);
+}
+
+function insertIndexRowsAfter(anchor, rows) {
+  const fragment = document.createDocumentFragment();
+  for (const row of rows) {
+    fragment.appendChild(row);
+  }
+  anchor.after(fragment);
+}
+
+async function loadIndexChildren(parentRow, offset = 0, toggleButton = null) {
+  const parentId = parentRow.dataset.recordId;
+  const params = new URLSearchParams({
+    parent_id: parentId,
+    offset: String(offset),
+    limit: String(INDEX_CHILD_BATCH_SIZE),
+    search: state.search,
+  });
+  const existingRows = indexRowsForParent(parentId).filter(
+    (row) => !row.classList.contains("index-load-more-row")
+  );
+  const anchor = existingRows.length ? existingRows[existingRows.length - 1] : parentRow;
+  removeIndexLoadMoreRows(parentId);
+
+  const data = await requestJson(`/api/index/children?${params}`);
+  const rows = data.rows || [];
+  const nodes = rows.map((item) =>
+    createIndexRow(item, {
+      level: item.node_level || 1,
+      parentId,
+      allowToggle: false,
+    })
+  );
+  if (!rows.length && offset === 0) {
+    nodes.push(createIndexEmptyChildRow(parentId));
+  }
+
+  const nextOffset = Number(data.offset || 0) + rows.length;
+  if (nextOffset < Number(data.total || 0)) {
+    nodes.push(createIndexLoadMoreRow(parentId, nextOffset, Number(data.total || 0)));
+  }
+  insertIndexRowsAfter(anchor, nodes);
+  if (toggleButton) {
+    setIndexToggle(toggleButton, true);
+  }
+}
+
+async function toggleIndexChildren(parentRow, button) {
+  const parentId = parentRow.dataset.recordId;
+  const expanded = button.getAttribute("aria-expanded") === "true";
+  if (expanded) {
+    setIndexChildrenVisible(parentId, false);
+    setIndexToggle(button, false);
+    return;
+  }
+
+  const existingRows = indexRowsForParent(parentId);
+  if (existingRows.length) {
+    setIndexChildrenVisible(parentId, true);
+    setIndexToggle(button, true);
+    return;
+  }
+
+  button.disabled = true;
+  try {
+    await loadIndexChildren(parentRow, 0, button);
+  } catch (error) {
+    setStatus(els.indexStatus, error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function loadMoreIndexChildren(button) {
+  const row = button.closest("tr");
+  const parentId = row.dataset.parentId;
+  const parentRow = indexParentRow(parentId);
+  if (!parentRow) {
+    return;
+  }
+  button.disabled = true;
+  try {
+    await loadIndexChildren(parentRow, Number(button.dataset.nextOffset || 0));
+  } catch (error) {
+    setStatus(els.indexStatus, error.message, true);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -998,8 +1454,17 @@ async function handleIndexAction(event) {
   }
 
   const row = button.closest("tr");
-  const recordId = row.dataset.recordId;
   const action = button.dataset.action;
+  if (action === "toggle-children") {
+    await toggleIndexChildren(row, button);
+    return;
+  }
+  if (action === "load-more-children") {
+    await loadMoreIndexChildren(button);
+    return;
+  }
+
+  const recordId = row.dataset.recordId;
   const textarea = row.querySelector("textarea");
   button.disabled = true;
 
@@ -1020,7 +1485,11 @@ async function handleIndexAction(event) {
         body: JSON.stringify({ record_ids: [recordId] }),
       });
       setStatus(els.indexStatus, `Deleted ${recordId}.`);
-      await loadIndex();
+      if (state.indexMode === "vector") {
+        await runIndexVectorSearch();
+      } else {
+        await loadIndex();
+      }
     }
   } catch (error) {
     setStatus(els.indexStatus, error.message, true);
@@ -1639,6 +2108,8 @@ document.querySelectorAll("[data-tab-target]").forEach((button) => {
     document.getElementById(button.dataset.tabTarget).classList.add("active");
     if (button.dataset.tabTarget === "index") {
       loadIndex();
+    } else {
+      abortIndexLoad();
     }
   });
 });
@@ -1648,13 +2119,31 @@ els.uploadButton.addEventListener("click", uploadFiles);
 els.reindexButton.addEventListener("click", enqueueReindex);
 els.pdfSearchButton.addEventListener("click", () => {
   state.pdfSearch = els.pdfSearchInput.value.trim();
+  state.pdfOffset = 0;
   refreshPdfs();
 });
 els.pdfSearchInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     state.pdfSearch = els.pdfSearchInput.value.trim();
+    state.pdfOffset = 0;
     refreshPdfs();
   }
+});
+els.prevPdfPageButton.addEventListener("click", () => {
+  state.pdfOffset = Math.max(0, state.pdfOffset - state.pdfLimit);
+  refreshPdfs();
+});
+els.nextPdfPageButton.addEventListener("click", () => {
+  state.pdfOffset += state.pdfLimit;
+  refreshPdfs();
+});
+els.prevJobsPageButton.addEventListener("click", () => {
+  state.jobsOffset = Math.max(0, state.jobsOffset - state.jobsLimit);
+  refreshJobs();
+});
+els.nextJobsPageButton.addEventListener("click", () => {
+  state.jobsOffset += state.jobsLimit;
+  refreshJobs();
 });
 els.searchButton.addEventListener("click", () => {
   state.offset = 0;
@@ -1666,6 +2155,12 @@ els.searchInput.addEventListener("keydown", (event) => {
     state.offset = 0;
     state.search = els.searchInput.value.trim();
     loadIndex();
+  }
+});
+els.vectorSearchButton.addEventListener("click", runIndexVectorSearch);
+els.vectorSearchInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    runIndexVectorSearch();
   }
 });
 els.indexPageSizeSelect.addEventListener("change", () => {

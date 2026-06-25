@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+import src.local_rag as local_rag
 import src.query as query
 import src.web_app as web_app
 from src.pdf_registry import load_source_map, write_source_entry
@@ -141,6 +142,95 @@ def _write_index(db_dir: Path):
     )
 
 
+def _write_hierarchical_index(db_dir: Path):
+    LanceDBVectorStore(db_dir).write_records(
+        [
+            {
+                "id": "doc-summary",
+                "doc_id": "doc",
+                "parent_id": "",
+                "node_type": "document_summary",
+                "file_path": "processed_docs/doc.md",
+                "chunk_index": -1,
+                "content": "document summary alpha",
+                "title": "Doc",
+                "section_path": "Doc",
+                "page_start": 1,
+                "page_end": 4,
+                "summary": "document summary alpha",
+                "tags": ["alpha"],
+                "vector": [1.0, 0.0, 0.0],
+            },
+            {
+                "id": "top-summary",
+                "doc_id": "doc",
+                "parent_id": "doc-summary",
+                "node_type": "section_summary",
+                "file_path": "processed_docs/doc.md",
+                "chunk_index": -1,
+                "content": "top section summary beta",
+                "title": "Top",
+                "section_path": "Doc > Top",
+                "page_start": 2,
+                "page_end": 4,
+                "summary": "top summary",
+                "tags": ["beta"],
+                "vector": [1.0, 0.0, 0.0],
+            },
+            {
+                "id": "leaf-summary",
+                "doc_id": "doc",
+                "parent_id": "top-summary",
+                "node_type": "section_summary",
+                "file_path": "processed_docs/doc.md",
+                "chunk_index": -1,
+                "content": "leaf summary gamma",
+                "title": "Leaf",
+                "section_path": "Doc > Top > Leaf",
+                "page_start": 3,
+                "page_end": 4,
+                "summary": "leaf summary",
+                "tags": ["gamma"],
+                "vector": [1.0, 0.0, 0.0],
+            },
+            {
+                "id": "chunk-1",
+                "doc_id": "doc",
+                "parent_id": "leaf-summary",
+                "node_type": "chunk",
+                "file_path": "processed_docs/doc.md",
+                "chunk_index": 0,
+                "content": "detailed gamma chunk",
+                "title": "Leaf",
+                "section_path": "Doc > Top > Leaf",
+                "page_start": 3,
+                "page_end": 3,
+                "summary": "leaf summary",
+                "tags": ["gamma"],
+                "vector": [1.0, 0.0, 0.0],
+            },
+            {
+                "id": "chunk-2",
+                "doc_id": "doc",
+                "parent_id": "leaf-summary",
+                "node_type": "chunk",
+                "file_path": "processed_docs/doc.md",
+                "chunk_index": 1,
+                "content": "detailed delta chunk",
+                "title": "Leaf",
+                "section_path": "Doc > Top > Leaf",
+                "page_start": 4,
+                "page_end": 4,
+                "summary": "leaf summary",
+                "tags": ["delta"],
+                "vector": [0.0, 1.0, 0.0],
+            },
+        ],
+        embedding_model="nomic-embed-text",
+        embedding_dim=3,
+    )
+
+
 def _wait_for(predicate, timeout=3.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -159,6 +249,158 @@ def test_index_rows_hide_vectors_and_support_search(lancedb_tmp):
     assert result["total"] == 1
     assert result["rows"][0]["id"] == "doc.md:1"
     assert "vector" not in result["rows"][0]
+
+
+def test_iter_index_row_events_streams_batches(lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    _write_index(db_dir)
+
+    events = list(web_app.iter_index_row_events(batch_size=1, db_dir=db_dir))
+
+    assert [event["type"] for event in events] == ["metadata", "rows", "rows", "done"]
+    assert events[0]["total"] == 2
+    assert events[0]["embedding_model"] == "nomic-embed-text"
+    assert events[1]["rows"][0]["id"] == "doc.md:0"
+    assert events[2]["rows"][0]["id"] == "doc.md:1"
+    assert events[-1]["received"] == 2
+    assert events[-1]["total"] == 2
+    assert "vector" not in events[1]["rows"][0]
+
+
+def test_index_stream_endpoint_filters_and_streams(monkeypatch, lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    _write_index(db_dir)
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+
+    client = TestClient(web_app.app)
+    response = client.get("/api/index/stream?batch_size=1&search=beta")
+
+    assert response.status_code == 200
+    events = [json.loads(line) for line in response.text.splitlines()]
+    assert [event["type"] for event in events] == ["metadata", "rows", "done"]
+    assert events[0]["total"] is None
+    assert events[1]["rows"][0]["id"] == "doc.md:1"
+    assert events[-1]["received"] == 1
+    assert events[-1]["total"] == 1
+
+
+def test_index_summary_endpoint_returns_document_level_rows(monkeypatch, lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    _write_hierarchical_index(db_dir)
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+
+    client = TestClient(web_app.app)
+    response = client.get("/api/index/summaries")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["view"] == "hierarchy"
+    assert payload["total"] == 1
+    assert payload["rows"][0]["id"] == "doc-summary"
+    assert payload["rows"][0]["node_type"] == "document_summary"
+    assert payload["rows"][0]["summary_count"] == 2
+    assert payload["rows"][0]["detail_count"] == 2
+    assert payload["rows"][0]["child_count"] == 4
+
+
+def test_index_children_endpoint_pages_descendants(monkeypatch, lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    _write_hierarchical_index(db_dir)
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+
+    client = TestClient(web_app.app)
+    response = client.get(
+        "/api/index/children",
+        params={"parent_id": "doc-summary", "offset": 1, "limit": 2},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["view"] == "hierarchy_children"
+    assert payload["total"] == 4
+    assert payload["offset"] == 1
+    assert [row["id"] for row in payload["rows"]] == ["leaf-summary", "chunk-1"]
+    assert payload["rows"][0]["node_level"] == 2
+    assert payload["rows"][1]["node_level"] == 2
+
+
+def test_index_summary_search_matches_child_rows(monkeypatch, lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    _write_hierarchical_index(db_dir)
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+
+    client = TestClient(web_app.app)
+    summaries = client.get("/api/index/summaries", params={"search": "delta"})
+    children = client.get(
+        "/api/index/children",
+        params={"parent_id": "doc-summary", "search": "delta"},
+    )
+
+    assert summaries.status_code == 200
+    assert summaries.json()["total"] == 1
+    assert summaries.json()["rows"][0]["detail_count"] == 1
+    assert children.status_code == 200
+    assert [row["id"] for row in children.json()["rows"]] == ["chunk-2"]
+
+
+def test_index_vector_search_endpoint_uses_local_tool(monkeypatch, lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    _write_hierarchical_index(db_dir)
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+    calls = {}
+
+    class FakeLocalQueryEngine:
+        def __init__(self, **kwargs):
+            calls["init"] = kwargs
+            self.store = LanceDBVectorStore(db_dir)
+
+        def search_local_context(self, **kwargs):
+            calls["search"] = kwargs
+            return {
+                "tool": "search_local_context",
+                "query": kwargs["query"],
+                "result_count": 1,
+                "results": [
+                    {
+                        "source_id": "S1",
+                        "citation": "[S1]",
+                        "chunk_id": "chunk-2",
+                        "score": 0.82,
+                        "location": "Doc :: Top :: page 4",
+                        "content": "detailed delta chunk",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(local_rag, "LocalQueryEngine", FakeLocalQueryEngine)
+
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/index/vector-search",
+        json={"query": "delta dynamics", "relevance_floor": 0.72},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert calls["init"]["working_dir"] == str(db_dir)
+    assert calls["init"]["retrieval_min_score"] == 0.72
+    assert calls["init"]["web_search_enabled"] is False
+    assert calls["search"] == {"query": "delta dynamics", "relevance_floor": 0.72}
+    assert payload["query"] == "delta dynamics"
+    assert payload["relevance_floor"] == 0.72
+    assert payload["total"] == 1
+    assert payload["rows"][0]["id"] == "chunk-2"
+    assert payload["rows"][0]["score"] == 0.82
+    assert payload["rows"][0]["citation"] == "[S1]"
+    assert payload["tool_result"]["tool"] == "search_local_context"
+
+
+def test_index_vector_search_rejects_empty_query():
+    client = TestClient(web_app.app)
+    response = client.post("/api/index/vector-search", json={"query": " "})
+
+    assert response.status_code == 400
+    assert "cannot be empty" in response.json()["detail"]
 
 
 def test_update_index_record_reembeds_and_saves(monkeypatch, lancedb_tmp):
@@ -767,6 +1009,45 @@ def test_upload_endpoint_enqueues_pdf_batch(monkeypatch, workspace_tmp):
     assert Path(captured["staging_dir"]).joinpath("notes.pdf").exists()
 
 
+def test_upload_endpoint_splits_multiple_pdfs_into_jobs(monkeypatch, workspace_tmp):
+    captured = []
+
+    class FakeQueue:
+        def enqueue_upload(self, **kwargs):
+            captured.append(kwargs)
+            return web_app.QueueJob(
+                id=kwargs["job_id"],
+                kind="upload",
+                filenames=kwargs["filenames"],
+                uploads=kwargs["uploads"],
+                staging_dir=str(kwargs["staging_dir"]),
+            )
+
+    monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/uploads",
+        files=[
+            ("files", ("one.pdf", b"%PDF-1.4 one", "application/pdf")),
+            ("files", ("two.pdf", b"%PDF-1.4 two", "application/pdf")),
+        ],
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job_count"] == 2
+    assert payload["filenames"] == ["one.pdf", "two.pdf"]
+    assert [job["filenames"] for job in payload["jobs"]] == [["one.pdf"], ["two.pdf"]]
+    assert [item["filenames"] for item in captured] == [["one.pdf"], ["two.pdf"]]
+    assert captured[0]["job_id"] != captured[1]["job_id"]
+    assert captured[0]["staging_dir"] != captured[1]["staging_dir"]
+    assert Path(captured[0]["staging_dir"]).joinpath("one.pdf").exists()
+    assert Path(captured[1]["staging_dir"]).joinpath("two.pdf").exists()
+
+
 def test_upload_endpoint_rejects_duplicate_pdf_without_force(monkeypatch, workspace_tmp):
     class FakeQueue:
         def enqueue_upload(self, **kwargs):
@@ -833,6 +1114,53 @@ def test_upload_endpoint_allows_forced_duplicate(monkeypatch, workspace_tmp):
     assert response.status_code == 200
     assert response.json()["force_duplicate_hashes"] == captured["force_duplicate_hashes"]
     assert captured["force_duplicate_hashes"] == [captured["uploads"][0]["hash"]]
+
+
+def test_jobs_endpoint_paginates(monkeypatch):
+    class FakeQueue:
+        def list_jobs(self):
+            return [{"id": f"job-{index:02}", "filenames": [f"{index}.pdf"]} for index in range(12)]
+
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    client = TestClient(web_app.app)
+    response = client.get("/api/jobs", params={"offset": 10, "limit": 10})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 12
+    assert payload["offset"] == 10
+    assert payload["limit"] == 10
+    assert [job["id"] for job in payload["jobs"]] == ["job-10", "job-11"]
+
+
+def test_pdf_documents_endpoint_paginates(monkeypatch, workspace_tmp):
+    registry_path = workspace_tmp / "registry.json"
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    web_app.PdfRegistry(registry_path).register_queued(
+        job_id="job",
+        files=[
+            {
+                "filename": f"doc-{index:02}.pdf",
+                "hash": f"hash-{index:02}",
+                "staging_path": "",
+            }
+            for index in range(12)
+        ],
+    )
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", registry_path)
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+
+    client = TestClient(web_app.app)
+    response = client.get("/api/pdfs", params={"offset": 10, "limit": 10})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 12
+    assert payload["offset"] == 10
+    assert payload["limit"] == 10
+    assert [pdf["filename"] for pdf in payload["pdfs"]] == ["doc-10.pdf", "doc-11.pdf"]
 
 
 def test_pdf_documents_list_and_download_endpoint(monkeypatch, workspace_tmp):

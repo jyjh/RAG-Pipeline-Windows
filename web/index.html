@@ -36,6 +36,12 @@
           <input id="pdfSearchInput" type="search" placeholder="Search PDFs by title or hash" />
           <button id="pdfSearchButton" type="button">Search PDFs</button>
         </div>
+        <div class="toolbar table-pager">
+          <strong>PDFs</strong>
+          <button id="prevPdfPageButton" type="button">Prev</button>
+          <span id="pdfPageLabel"></span>
+          <button id="nextPdfPageButton" type="button">Next</button>
+        </div>
         <table class="data-table pdf-table">
           <thead>
             <tr>
@@ -46,6 +52,12 @@
           </thead>
           <tbody id="pdfsBody"></tbody>
         </table>
+        <div class="toolbar table-pager">
+          <strong>Jobs</strong>
+          <button id="prevJobsPageButton" type="button">Prev</button>
+          <span id="jobsPageLabel"></span>
+          <button id="nextJobsPageButton" type="button">Next</button>
+        </div>
         <table class="data-table">
           <thead>
             <tr>
@@ -62,10 +74,10 @@
 
       <section id="index" class="panel">
         <div class="toolbar">
-          <input id="searchInput" type="search" placeholder="Search index" />
-          <button id="searchButton" type="button">Search</button>
+          <input id="searchInput" type="search" placeholder="Standard text search" />
+          <button id="searchButton" type="button">Standard search</button>
           <label class="inline-select-label">
-            Rows
+            Summary rows
             <select id="indexPageSizeSelect">
               <option value="20" selected>20</option>
               <option value="50">50</option>
@@ -77,11 +89,19 @@
           <span id="pageLabel"></span>
           <button id="nextPageButton" type="button">Next</button>
         </div>
+        <div class="toolbar vector-search-toolbar">
+          <input id="vectorSearchInput" type="search" placeholder="Vector search (slower)" />
+          <label class="inline-select-label">
+            Relevance floor
+            <input id="vectorRelevanceFloorInput" type="number" min="0" max="1" step="0.05" value="0.7" />
+          </label>
+          <button id="vectorSearchButton" type="button">Vector search</button>
+        </div>
         <div id="indexStatus" class="status"></div>
         <table class="data-table index-table">
           <thead>
             <tr>
-              <th>Source</th>
+              <th>Structure</th>
               <th>Content</th>
               <th>Actions</th>
             </tr>

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
 
 LANCEDB_DIRNAME = "lancedb"
@@ -27,6 +30,26 @@ REQUIRED_LANCEDB_COLUMNS = {
     "embedding_dim",
     "vector",
 }
+LIST_RECORD_COLUMNS = [
+    "id",
+    "doc_id",
+    "parent_id",
+    "node_type",
+    "file_path",
+    "chunk_index",
+    "content",
+    "title",
+    "section_path",
+    "page_start",
+    "page_end",
+    "summary",
+    "tags",
+    "source_hash",
+    "source_pdf_name",
+    "source_pdf_path",
+    "embedding_model",
+    "embedding_dim",
+]
 
 
 class VectorStore(Protocol):
@@ -49,6 +72,16 @@ class VectorStore(Protocol):
         limit: int = 50,
         search: str = "",
     ) -> dict[str, Any]: ...
+
+    def iter_record_batches(
+        self,
+        *,
+        batch_size: int = 250,
+        search: str = "",
+        workers: int | None = None,
+    ) -> Iterator[list[dict[str, Any]]]: ...
+
+    def metadata(self) -> tuple[str, int]: ...
 
     def get_record(self, record_id: str) -> dict[str, Any]: ...
 
@@ -129,6 +162,10 @@ def record_matches(record: dict[str, Any], search: str) -> bool:
     return search.lower() in haystack
 
 
+def _record_batch_rows(raw_rows: list[dict[str, Any]], search: str) -> list[dict[str, Any]]:
+    return [record_row(row) for row in raw_rows if record_matches(row, search)]
+
+
 class LanceDBVectorStore:
     def __init__(self, working_dir: str | Path):
         self.working_dir = Path(working_dir)
@@ -185,11 +222,18 @@ class LanceDBVectorStore:
     ) -> dict[str, Any]:
         if not self.exists():
             raise FileNotFoundError(f"LanceDB table not found at {self.db_path / TABLE_NAME}")
-        rows = self._scan_rows()
-        rows = [row for row in rows if record_matches(row, search)]
-        total = len(rows)
-        page = rows[offset : offset + limit]
-        model, dim = self._metadata(rows)
+        if search:
+            rows = [row for row in self._scan_rows(columns=LIST_RECORD_COLUMNS) if record_matches(row, search)]
+            total = len(rows)
+            page = rows[offset : offset + limit]
+        else:
+            total = self.count()
+            page = self._scan_rows(
+                offset=offset,
+                limit=limit,
+                columns=LIST_RECORD_COLUMNS,
+            )
+        model, dim = self.metadata()
         return {
             "offset": offset,
             "limit": limit,
@@ -198,6 +242,50 @@ class LanceDBVectorStore:
             "embedding_model": model,
             "embedding_dim": dim,
         }
+
+    def iter_record_batches(
+        self,
+        *,
+        batch_size: int = 250,
+        search: str = "",
+        workers: int | None = None,
+    ) -> Iterator[list[dict[str, Any]]]:
+        if not self.exists():
+            raise FileNotFoundError(f"LanceDB table not found at {self.db_path / TABLE_NAME}")
+        batch_size = max(1, int(batch_size))
+        worker_count = max(1, int(workers or min(8, max(2, os.cpu_count() or 2))))
+        pending: deque[Future[list[dict[str, Any]]]] = deque()
+        executor = ThreadPoolExecutor(max_workers=worker_count)
+
+        try:
+            raw_batches = self._raw_record_batches(batch_size=batch_size)
+
+            def submit_next() -> bool:
+                try:
+                    raw_rows = next(raw_batches)
+                except StopIteration:
+                    return False
+                pending.append(executor.submit(_record_batch_rows, raw_rows, search))
+                return True
+
+            for _ in range(worker_count * 2):
+                if not submit_next():
+                    break
+
+            while pending:
+                future = pending.popleft()
+                rows = future.result()
+                submit_next()
+                if rows:
+                    yield rows
+        finally:
+            for future in pending:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def metadata(self) -> tuple[str, int]:
+        rows = self._scan_rows(limit=1, columns=["embedding_model", "embedding_dim"])
+        return self._metadata(rows)
 
     def get_record(self, record_id: str) -> dict[str, Any]:
         matches = self._where(f"id = {sql_string(record_id)}", limit=1)
@@ -324,11 +412,44 @@ class LanceDBVectorStore:
             query = query.limit(limit)
         return query.to_list()
 
-    def _scan_rows(self) -> list[dict[str, Any]]:
+    def _scan_rows(
+        self,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+        columns: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         count = self.count()
         if count <= 0:
             return []
-        return self._table().search().limit(count).to_list()
+        offset = max(0, int(offset))
+        if offset >= count:
+            return []
+        row_limit = count - offset if limit is None else max(0, min(int(limit), count - offset))
+        if row_limit <= 0:
+            return []
+        query = self._table().search()
+        if columns:
+            query = query.select(columns)
+        if offset:
+            query = query.offset(offset)
+        return query.limit(row_limit).to_list()
+
+    def _raw_record_batches(self, *, batch_size: int) -> Iterator[list[dict[str, Any]]]:
+        count = self.count()
+        if count <= 0:
+            return
+        reader = (
+            self._table()
+            .search()
+            .select(LIST_RECORD_COLUMNS)
+            .limit(count)
+            .to_batches(batch_size=max(1, int(batch_size)))
+        )
+        for batch in reader:
+            rows = batch.to_pylist()
+            if rows:
+                yield rows
 
     def _normalize_result(self, row: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(row)
