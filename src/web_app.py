@@ -14,6 +14,7 @@ import sys
 import threading
 import uuid
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,6 +99,13 @@ INDEX_CHILD_MAX_LIMIT = 500
 DEFAULT_INDEX_VECTOR_RELEVANCE_FLOOR = 0.70
 FORCE_UPLOAD_TOKEN_TTL_SECONDS = 15 * 60
 UPLOAD_FORCE_TOKEN_SECRET = os.urandom(32)
+RECOVERABLE_UPLOAD_STATUSES = {"queued", "saving_uploads", "ingesting", "ingested"}
+UPLOAD_RESUME_STATUS_ORDER = {
+    "queued": 0,
+    "saving_uploads": 1,
+    "ingesting": 2,
+    "ingested": 3,
+}
 
 INDEX_LOCK = threading.RLock()
 
@@ -1140,6 +1148,8 @@ class QueueJob:
     force_duplicate_hashes: list[str] = field(default_factory=list)
     staging_dir: str | None = None
     upload_dir: str | None = None
+    resume_status: str | None = None
+    recovered: bool = False
     options: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     created_at: str = field(default_factory=_utcnow)
@@ -1157,6 +1167,8 @@ class QueueJob:
             "force_duplicate_hashes": list(self.force_duplicate_hashes),
             "staging_dir": self.staging_dir,
             "upload_dir": self.upload_dir,
+            "resume_status": self.resume_status,
+            "recovered": self.recovered,
             "options": dict(self.options),
             "error": self.error,
             "created_at": self.created_at,
@@ -1207,6 +1219,9 @@ class RagJobQueue:
         force_duplicate_hashes: list[str] | None = None,
         job_id: str | None = None,
         options: dict[str, Any] | None = None,
+        resume_status: str | None = None,
+        recovered: bool = False,
+        created_at: str | None = None,
         auto_start: bool = True,
     ) -> QueueJob:
         job = QueueJob(
@@ -1216,7 +1231,10 @@ class RagJobQueue:
             uploads=uploads or [],
             force_duplicate_hashes=force_duplicate_hashes or [],
             staging_dir=str(staging_dir),
+            resume_status=resume_status,
+            recovered=recovered,
             options=options or {},
+            created_at=created_at or _utcnow(),
         )
         return self._enqueue(job, auto_start=auto_start)
 
@@ -1285,16 +1303,7 @@ class RagJobQueue:
 
     def _run_job(self, job: QueueJob) -> None:
         if job.kind == "upload":
-            upload_dir = self._save_staged_uploads(job)
-            self._wait_for_no_queries(job, "ingesting")
-            self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="ingesting")
-            self._prepare_for_forced_duplicates(job)
-            self._run_ingestion(str(upload_dir), str(self.processed_dir), job.options)
-            self._mark_processed_paths(job)
-            self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="ingested")
-            self._wait_for_no_queries(job, "indexing")
-            self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options)
-            self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="indexed")
+            self._run_upload_job(job)
             return
 
         if job.kind == "reindex":
@@ -1303,6 +1312,25 @@ class RagJobQueue:
             return
 
         raise ValueError(f"Unknown job kind: {job.kind}")
+
+    def _run_upload_job(self, job: QueueJob) -> None:
+        resume_status = job.resume_status or "queued"
+        if resume_status == "ingested" and self._job_processed_paths_exist(job):
+            self._wait_for_no_queries(job, "indexing")
+            self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options)
+            self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="indexed")
+            return
+
+        upload_dir = self._ensure_upload_dir(job)
+        self._wait_for_no_queries(job, "ingesting")
+        self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="ingesting")
+        self._prepare_for_forced_duplicates(job)
+        self._run_ingestion(str(upload_dir), str(self.processed_dir), job.options)
+        self._mark_processed_paths(job)
+        self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="ingested")
+        self._wait_for_no_queries(job, "indexing")
+        self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options)
+        self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="indexed")
 
     def _wait_for_no_queries(self, job: QueueJob, phase: str) -> None:
         with self._condition:
@@ -1320,28 +1348,90 @@ class RagJobQueue:
             raise ValueError("Upload job has no staging directory.")
 
         staging_dir = Path(job.staging_dir)
-        if not staging_dir.exists():
-            raise FileNotFoundError(f"Upload staging directory not found: {staging_dir}")
-
         upload_dir = self.upload_root / job.id
         upload_dir.mkdir(parents=True, exist_ok=True)
+        if not staging_dir.exists():
+            self._populate_existing_upload_paths(job, upload_dir)
+            self._require_upload_files(job, upload_dir)
+            job.upload_dir = str(upload_dir)
+            return upload_dir
+
         for filename in job.filenames:
             source = staging_dir / filename
-            if not source.exists():
-                continue
             destination = upload_dir / source.name
-            destination.write_bytes(source.read_bytes())
+            if source.exists():
+                try:
+                    same_file = source.resolve() == destination.resolve()
+                except OSError:
+                    same_file = False
+                if not same_file:
+                    shutil.copy2(source, destination)
+            elif not destination.exists():
+                continue
             for item in job.uploads:
                 if item.get("filename") == filename:
                     item["upload_path"] = str(destination)
-            try:
-                source.unlink()
-            except PermissionError:
-                pass
+            if source.exists():
+                try:
+                    source.unlink()
+                except PermissionError:
+                    pass
         shutil.rmtree(staging_dir, ignore_errors=True)
         job.upload_dir = str(upload_dir)
+        self._require_upload_files(job, upload_dir)
         self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="saving_uploads")
         return upload_dir
+
+    def _ensure_upload_dir(self, job: QueueJob) -> Path:
+        upload_dir = Path(job.upload_dir) if job.upload_dir else self.upload_root / job.id
+        staging_dir = Path(job.staging_dir) if job.staging_dir else None
+        if staging_dir and staging_dir.exists():
+            return self._save_staged_uploads(job)
+
+        self._populate_existing_upload_paths(job, upload_dir)
+        self._require_upload_files(job, upload_dir)
+        job.upload_dir = str(upload_dir)
+        return upload_dir
+
+    def _populate_existing_upload_paths(self, job: QueueJob, upload_dir: Path) -> None:
+        for item in job.uploads:
+            raw_upload_path = str(item.get("upload_path") or "")
+            upload_path = Path(raw_upload_path) if raw_upload_path else None
+            if upload_path is not None and upload_path.exists():
+                continue
+            filename = str(item.get("filename") or "")
+            candidate = upload_dir / filename if filename else None
+            if candidate is not None and candidate.exists():
+                item["upload_path"] = str(candidate)
+
+    def _require_upload_files(self, job: QueueJob, upload_dir: Path) -> None:
+        missing: list[str] = []
+        for item in job.uploads:
+            filename = str(item.get("filename") or "")
+            raw_upload_path = str(item.get("upload_path") or "")
+            candidates = [Path(raw_upload_path)] if raw_upload_path else []
+            if filename:
+                candidates.append(upload_dir / filename)
+            existing = next((path for path in candidates if path.exists() and path.suffix.lower() == ".pdf"), None)
+            if existing is None:
+                missing.append(filename or str(item.get("hash") or "unknown PDF"))
+            else:
+                item["upload_path"] = str(existing)
+        if missing:
+            raise FileNotFoundError(f"Uploaded PDF file(s) missing for job {job.id}: {', '.join(missing)}")
+
+    def _processed_path_for_upload(self, item: dict[str, Any]) -> Path:
+        raw_path = str(item.get("processed_markdown_path") or "")
+        if raw_path:
+            path = Path(raw_path)
+            return path if path.is_absolute() else self.processed_dir / path.name
+        filename = str(item.get("filename") or "")
+        return self.processed_dir / f"{Path(filename).stem}.md"
+
+    def _job_processed_paths_exist(self, job: QueueJob) -> bool:
+        if not job.uploads:
+            return False
+        return all(self._processed_path_for_upload(item).exists() for item in job.uploads)
 
     def _prepare_for_forced_duplicates(self, job: QueueJob) -> None:
         hashes = {value for value in job.force_duplicate_hashes if value}
@@ -1450,6 +1540,97 @@ class RagJobQueue:
         with self._condition:
             return [job.to_dict() for job in reversed(list(self._jobs.values()))]
 
+    def recover_pending_uploads(self, *, auto_start: bool = True) -> dict[str, Any]:
+        jobs = self._recovery_jobs_from_registry()
+        recovered: list[QueueJob] = []
+        with self._condition:
+            for job in jobs:
+                if job.id in self._jobs:
+                    continue
+                self._jobs[job.id] = job
+                self._queue.append(job.id)
+                recovered.append(job)
+            if auto_start and recovered:
+                self._ensure_worker_locked()
+            if recovered:
+                self._condition.notify_all()
+        return {
+            "recovered": len(recovered),
+            "jobs": [job.to_dict() for job in recovered],
+        }
+
+    def _recovery_jobs_from_registry(self) -> list[QueueJob]:
+        payload = self.registry.load()
+        groups: dict[str, dict[str, Any]] = {}
+        for source_hash, entry in payload.get("pdfs", {}).items():
+            if not isinstance(entry, dict):
+                continue
+            status = str(entry.get("status") or "")
+            if status not in RECOVERABLE_UPLOAD_STATUSES:
+                continue
+            job_id = str(entry.get("job_id") or f"recovered-{source_hash}")
+            group = groups.setdefault(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "entries": [],
+                    "resume_status": status,
+                    "created_at": str(entry.get("created_at") or _utcnow()),
+                    "options": dict(entry.get("options") or {}) if isinstance(entry.get("options"), dict) else {},
+                },
+            )
+            group["entries"].append((str(source_hash), entry))
+            if UPLOAD_RESUME_STATUS_ORDER[status] < UPLOAD_RESUME_STATUS_ORDER[str(group["resume_status"])]:
+                group["resume_status"] = status
+            if not group["options"] and isinstance(entry.get("options"), dict):
+                group["options"] = dict(entry["options"])
+
+        jobs: list[QueueJob] = []
+        for group in sorted(groups.values(), key=lambda item: str(item.get("created_at") or "")):
+            uploads: list[dict[str, Any]] = []
+            filenames: list[str] = []
+            staging_dirs: list[Path] = []
+            force_duplicate_hashes: list[str] = []
+            upload_dir = ""
+            for source_hash, entry in group["entries"]:
+                filename = str(entry.get("filename") or Path(str(entry.get("upload_path") or "")).name)
+                staging_path = str(entry.get("staging_path") or "")
+                if staging_path:
+                    staging_dirs.append(Path(staging_path).parent)
+                upload_path = str(entry.get("upload_path") or "")
+                if upload_path:
+                    upload_dir = upload_dir or str(Path(upload_path).parent)
+                if isinstance(entry.get("previous_entry"), dict):
+                    force_duplicate_hashes.append(source_hash)
+                filenames.append(filename)
+                uploads.append(
+                    {
+                        "filename": filename,
+                        "hash": source_hash,
+                        "staging_path": staging_path,
+                        "upload_path": upload_path,
+                        "processed_markdown_path": str(entry.get("processed_markdown_path") or ""),
+                    }
+                )
+            staging_dir = staging_dirs[0] if staging_dirs else None
+            jobs.append(
+                QueueJob(
+                    id=str(group["job_id"]),
+                    kind="upload",
+                    phase="recovered",
+                    filenames=filenames,
+                    uploads=uploads,
+                    force_duplicate_hashes=sorted(set(force_duplicate_hashes)),
+                    staging_dir=str(staging_dir) if staging_dir is not None else None,
+                    upload_dir=upload_dir or None,
+                    resume_status=str(group["resume_status"]),
+                    recovered=True,
+                    options=dict(group["options"]),
+                    created_at=str(group["created_at"]),
+                )
+            )
+        return jobs
+
     def summary(self) -> dict[str, Any]:
         with self._condition:
             running = [
@@ -1551,7 +1732,19 @@ def render_markdown_text(text: str) -> str:
 
 
 job_queue = RagJobQueue()
-app = FastAPI(title="Local FSAE RAG Pipeline")
+
+
+def recover_pending_upload_jobs_on_startup() -> dict[str, Any]:
+    return job_queue.recover_pending_uploads()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    recover_pending_upload_jobs_on_startup()
+    yield
+
+
+app = FastAPI(title="Local FSAE RAG Pipeline", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 
@@ -2012,6 +2205,7 @@ async def upload_files(request: Request):
                 job_id=job_id,
                 files=[file_upload],
                 forced_hashes=file_forced_hashes,
+                options=options,
             )
             registered_jobs.append((job_id, [file_upload]))
             job = job_queue.enqueue_upload(

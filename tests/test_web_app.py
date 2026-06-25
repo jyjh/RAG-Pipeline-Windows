@@ -974,6 +974,110 @@ def test_force_duplicate_cleanup_waits_until_ingestion_phase(workspace_tmp, lanc
     assert load_source_map(processed_dir)["documents"] == {}
 
 
+def test_startup_recovery_resumes_saved_upload(workspace_tmp):
+    calls = []
+    registry_path = workspace_tmp / "registry.json"
+    upload_root = workspace_tmp / "uploads"
+    processed_dir = workspace_tmp / "processed"
+    db_dir = workspace_tmp / "db"
+    upload_dir = upload_root / "job-saved"
+    upload_dir.mkdir(parents=True)
+    upload_path = upload_dir / "saved.pdf"
+    upload_path.write_bytes(b"%PDF-1.4 saved")
+    file_upload = {
+        "filename": "saved.pdf",
+        "hash": "hash-saved",
+        "staging_path": "",
+        "upload_path": str(upload_path),
+    }
+    registry = web_app.PdfRegistry(registry_path)
+    registry.register_queued(
+        job_id="job-saved",
+        files=[file_upload],
+        options={"ocr_backend": "tesseract_cli", "embedding_model": "persisted-embed"},
+    )
+    registry.mark_job_status(job_id="job-saved", files=[file_upload], status="saving_uploads")
+
+    def fake_ingest(input_dir, output_dir, **kwargs):
+        calls.append(("ingest", Path(input_dir), kwargs["ocr_backend"]))
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        Path(output_dir, "saved.md").write_text("saved markdown", encoding="utf-8")
+
+    def fake_index(md_dir, db_dir_arg, **kwargs):
+        calls.append(("index", Path(md_dir), kwargs["embedding_model"]))
+
+    queue = web_app.RagJobQueue(
+        upload_root=upload_root,
+        processed_dir=processed_dir,
+        db_dir=db_dir,
+        registry_path=registry_path,
+        run_ingestion_func=fake_ingest,
+        run_indexing_func=fake_index,
+    )
+
+    recovered = queue.recover_pending_uploads()
+    _wait_for(lambda: queue.get_job("job-saved")["status"] == "done")
+
+    entry = web_app.PdfRegistry(registry_path).load()["pdfs"]["hash-saved"]
+    assert recovered["recovered"] == 1
+    assert recovered["jobs"][0]["resume_status"] == "saving_uploads"
+    assert calls == [
+        ("ingest", upload_dir, "tesseract_cli"),
+        ("index", processed_dir, "persisted-embed"),
+    ]
+    assert entry["status"] == "indexed"
+    assert entry["upload_path"] == str(upload_path)
+
+
+def test_startup_recovery_resumes_ingested_upload_at_indexing(workspace_tmp):
+    calls = []
+    registry_path = workspace_tmp / "registry.json"
+    upload_root = workspace_tmp / "uploads"
+    processed_dir = workspace_tmp / "processed"
+    db_dir = workspace_tmp / "db"
+    processed_dir.mkdir()
+    processed_path = processed_dir / "ingested.md"
+    processed_path.write_text("ingested markdown", encoding="utf-8")
+    file_upload = {
+        "filename": "ingested.pdf",
+        "hash": "hash-ingested",
+        "staging_path": "",
+        "upload_path": "",
+        "processed_markdown_path": str(processed_path),
+    }
+    registry = web_app.PdfRegistry(registry_path)
+    registry.register_queued(
+        job_id="job-ingested",
+        files=[file_upload],
+        options={"embedding_model": "persisted-embed"},
+    )
+    registry.mark_job_status(job_id="job-ingested", files=[file_upload], status="ingested")
+
+    def fake_ingest(*args, **kwargs):
+        raise AssertionError("ingested recovery should not re-run ingestion")
+
+    def fake_index(md_dir, db_dir_arg, **kwargs):
+        calls.append(("index", Path(md_dir), Path(db_dir_arg), kwargs["embedding_model"]))
+
+    queue = web_app.RagJobQueue(
+        upload_root=upload_root,
+        processed_dir=processed_dir,
+        db_dir=db_dir,
+        registry_path=registry_path,
+        run_ingestion_func=fake_ingest,
+        run_indexing_func=fake_index,
+    )
+
+    recovered = queue.recover_pending_uploads()
+    _wait_for(lambda: queue.get_job("job-ingested")["status"] == "done")
+
+    entry = web_app.PdfRegistry(registry_path).load()["pdfs"]["hash-ingested"]
+    assert recovered["recovered"] == 1
+    assert recovered["jobs"][0]["resume_status"] == "ingested"
+    assert calls == [("index", processed_dir, db_dir, "persisted-embed")]
+    assert entry["status"] == "indexed"
+
+
 def test_upload_endpoint_enqueues_pdf_batch(monkeypatch, workspace_tmp):
     captured = {}
 

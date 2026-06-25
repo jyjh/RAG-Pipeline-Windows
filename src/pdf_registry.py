@@ -83,8 +83,10 @@ class PdfRegistry:
         job_id: str,
         files: list[dict[str, Any]],
         forced_hashes: set[str] | None = None,
+        options: dict[str, Any] | None = None,
     ) -> None:
         forced_hashes = forced_hashes or set()
+        options = dict(options or {})
         with _LOCK:
             payload = self.load()
             pdfs = payload.setdefault("pdfs", {})
@@ -103,6 +105,8 @@ class PdfRegistry:
                     "created_at": now,
                     "updated_at": now,
                 }
+                if options:
+                    entry["options"] = dict(options)
                 if isinstance(existing, dict) and file_hash in forced_hashes:
                     entry["previous_entry"] = existing
                 pdfs[file_hash] = entry
