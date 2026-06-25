@@ -18,6 +18,8 @@ const state = {
 };
 
 const LIVE_RENDER_INTERVAL_MS = 200;
+const STREAM_TAIL_HOLD_CHARS = 700;
+const STREAM_TAIL_MAX_CHARS = 2200;
 const UPDATE_POLL_INTERVAL_MS = 5 * 60 * 1000;
 const RESTART_POLL_INTERVAL_MS = 1000;
 const RESTART_POLL_TIMEOUT_MS = 120000;
@@ -115,8 +117,10 @@ async function renderMarkdown(text) {
 function renderKeys(kind) {
   if (kind === "thinking") {
     return {
-      element: "thinkingBody",
+      stableElement: "thinkingStable",
+      tailElement: "thinkingTail",
       raw: "rawThinking",
+      committedLength: "thinkingCommittedLength",
       version: "thinkingRenderVersion",
       timer: "thinkingRenderTimer",
       inFlight: "thinkingRenderInFlight",
@@ -124,13 +128,147 @@ function renderKeys(kind) {
     };
   }
   return {
-    element: "body",
+    stableElement: "answerStable",
+    tailElement: "answerTail",
     raw: "rawAnswer",
+    committedLength: "answerCommittedLength",
     version: "answerRenderVersion",
     timer: "answerRenderTimer",
     inFlight: "answerRenderInFlight",
     lastAt: "answerLastRenderAt",
   };
+}
+
+function setStreamTailRaw(parts, keys, text) {
+  const tail = parts[keys.tailElement];
+  tail.className = "stream-tail raw-tail";
+  tail.textContent = text;
+}
+
+function setStreamTailHtml(parts, keys, html) {
+  const tail = parts[keys.tailElement];
+  tail.className = "stream-tail rendered";
+  tail.innerHTML = html || "";
+}
+
+function appendStreamStableHtml(parts, keys, html) {
+  if (html) {
+    parts[keys.stableElement].insertAdjacentHTML("beforeend", html);
+  }
+}
+
+function replaceStreamHtml(parts, kind, html) {
+  const keys = renderKeys(kind);
+  parts[keys.stableElement].innerHTML = html || "";
+  setStreamTailRaw(parts, keys, "");
+  parts[keys.committedLength] = parts[keys.raw].length;
+}
+
+function updateStreamTailRaw(parts, kind) {
+  const keys = renderKeys(kind);
+  setStreamTailRaw(parts, keys, parts[keys.raw].slice(parts[keys.committedLength]));
+}
+
+function countUnescapedMarker(text, marker) {
+  let count = 0;
+  let index = 0;
+  while ((index = text.indexOf(marker, index)) !== -1) {
+    let slashCount = 0;
+    for (let i = index - 1; i >= 0 && text[i] === "\\"; i -= 1) {
+      slashCount += 1;
+    }
+    if (slashCount % 2 === 0) {
+      count += 1;
+    }
+    index += marker.length;
+  }
+  return count;
+}
+
+function hasOpenFencedCodeBlock(text) {
+  const fencePattern = /^[ \t]*(`{3,}|~{3,})/gm;
+  let openFence = null;
+  let match = fencePattern.exec(text);
+  while (match) {
+    const fence = match[1];
+    if (!openFence) {
+      openFence = fence;
+    } else if (fence[0] === openFence[0] && fence.length >= openFence.length) {
+      openFence = null;
+    }
+    match = fencePattern.exec(text);
+  }
+  return Boolean(openFence);
+}
+
+function isSafeMarkdownCommit(text) {
+  return (
+    !hasOpenFencedCodeBlock(text) &&
+    countUnescapedMarker(text, "$$") % 2 === 0 &&
+    countUnescapedMarker(text, "\\[") === countUnescapedMarker(text, "\\]") &&
+    countUnescapedMarker(text, "\\(") === countUnescapedMarker(text, "\\)")
+  );
+}
+
+function blockBoundariesBefore(text, limit) {
+  const boundaries = [];
+  const boundaryPattern = /\n[ \t]*\n/g;
+  let match = boundaryPattern.exec(text);
+  while (match) {
+    if (boundaryPattern.lastIndex > limit) {
+      break;
+    }
+    boundaries.push(boundaryPattern.lastIndex);
+    match = boundaryPattern.exec(text);
+  }
+  return boundaries;
+}
+
+function softBoundariesBefore(text, limit) {
+  const boundaries = [];
+  const newline = text.lastIndexOf("\n", limit);
+  if (newline > 0) {
+    boundaries.push(newline + 1);
+  }
+
+  const sentencePattern = /[.!?][)"'\]]?\s+/g;
+  let match = sentencePattern.exec(text);
+  while (match) {
+    if (sentencePattern.lastIndex > limit) {
+      break;
+    }
+    boundaries.push(sentencePattern.lastIndex);
+    match = sentencePattern.exec(text);
+  }
+
+  const space = text.lastIndexOf(" ", limit);
+  if (space > 0) {
+    boundaries.push(space + 1);
+  }
+  return boundaries;
+}
+
+function streamingStableCutoff(text, committedLength) {
+  const target = text.length - STREAM_TAIL_HOLD_CHARS;
+  if (target <= committedLength) {
+    return committedLength;
+  }
+
+  let candidates = blockBoundariesBefore(text, target);
+  if (text.length - committedLength > STREAM_TAIL_MAX_CHARS) {
+    candidates = candidates.concat(softBoundariesBefore(text, target));
+  }
+
+  const uniqueCandidates = [...new Set(candidates)]
+    .filter((candidate) => candidate > committedLength && candidate <= target)
+    .sort((left, right) => right - left);
+
+  for (const candidate of uniqueCandidates) {
+    if (isSafeMarkdownCommit(text.slice(0, candidate))) {
+      return candidate;
+    }
+  }
+  return committedLength;
 }
 
 function renderDelay(parts, keys) {
@@ -189,11 +327,35 @@ async function runMarkdownRender(parts, kind) {
     return;
   }
 
+  const committedLength = parts[keys.committedLength];
+  const cutoff = streamingStableCutoff(text, committedLength);
+  const stableDelta = text.slice(committedLength, cutoff);
+  const tailText = text.slice(cutoff);
+
   parts[keys.inFlight] = true;
   try {
-    const html = await renderMarkdown(text);
-    if (!parts.finalized && parts[keys.version] === version) {
-      parts[keys.element].innerHTML = html;
+    const [stableHtml, tailHtml] = await Promise.all([
+      stableDelta ? renderMarkdown(stableDelta) : "",
+      tailText ? renderMarkdown(tailText) : "",
+    ]);
+    if (parts.finalized) {
+      return;
+    }
+
+    const rawStillStartsWithRenderedText = parts[keys.raw].startsWith(text);
+    if (
+      stableDelta &&
+      parts[keys.committedLength] === committedLength &&
+      rawStillStartsWithRenderedText
+    ) {
+      appendStreamStableHtml(parts, keys, stableHtml);
+      parts[keys.committedLength] = cutoff;
+    }
+
+    if (parts[keys.version] === version && parts[keys.raw] === text) {
+      setStreamTailHtml(parts, keys, tailHtml);
+    } else {
+      updateStreamTailRaw(parts, kind);
     }
   } catch (error) {
     addFormattingNotice(parts, error);
@@ -432,8 +594,8 @@ function addAssistantMessageToChat(chat, parts) {
     role: "assistant",
     text: parts.rawAnswer,
     thinking: parts.rawThinking,
-    answerHtml: parts.body.innerHTML,
-    thinkingHtml: parts.rawThinking ? parts.thinkingBody.innerHTML : "",
+    answerHtml: parts.answerStable.innerHTML,
+    thinkingHtml: parts.rawThinking ? parts.thinkingStable.innerHTML : "",
     sources: parts.sources,
     notice: parts.notice.textContent || "",
     createdAt: nowIso(),
@@ -896,7 +1058,12 @@ function addAssistantMessage() {
   summary.textContent = "Model thinking";
 
   const thinkingBody = document.createElement("div");
-  thinkingBody.className = "thinking-body rendered";
+  thinkingBody.className = "thinking-body stream-body";
+  const thinkingStable = document.createElement("div");
+  thinkingStable.className = "stream-stable rendered";
+  const thinkingTail = document.createElement("div");
+  thinkingTail.className = "stream-tail raw-tail";
+  thinkingBody.append(thinkingStable, thinkingTail);
   thinking.append(summary, thinkingBody);
 
   const sources = document.createElement("details");
@@ -915,20 +1082,31 @@ function addAssistantMessage() {
   notice.hidden = true;
 
   const body = document.createElement("div");
-  body.className = "body rendered";
+  body.className = "body stream-body";
+  const answerStable = document.createElement("div");
+  answerStable.className = "stream-stable rendered";
+  const answerTail = document.createElement("div");
+  answerTail.className = "stream-tail raw-tail";
+  body.append(answerStable, answerTail);
 
   message.append(roleLabel, thinking, sources, notice, body);
   els.chatMessages.appendChild(message);
   els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
   return {
     body,
+    answerStable,
+    answerTail,
     thinking,
     thinkingBody,
+    thinkingStable,
+    thinkingTail,
     sourcesPanel: sources,
     sourcesBody,
     notice,
     rawAnswer: "",
     rawThinking: "",
+    answerCommittedLength: 0,
+    thinkingCommittedLength: 0,
     sourcesData: [],
     get sources() {
       return this.sourcesData;
@@ -1003,7 +1181,13 @@ function addSavedAssistantMessage(saved) {
   if (parts.rawThinking) {
     parts.thinking.hidden = false;
     parts.thinking.open = false;
-    parts.thinkingBody.innerHTML = saved.thinkingHtml || escapeHtml(parts.rawThinking);
+    if (saved.thinkingHtml) {
+      replaceStreamHtml(parts, "thinking", saved.thinkingHtml);
+    } else {
+      parts.thinkingStable.className = "stream-stable raw-tail";
+      parts.thinkingStable.textContent = parts.rawThinking;
+      parts.thinkingCommittedLength = parts.rawThinking.length;
+    }
   }
   renderSourcePanel(parts);
   if (saved.notice) {
@@ -1011,9 +1195,11 @@ function addSavedAssistantMessage(saved) {
     parts.notice.hidden = false;
   }
   if (saved.answerHtml) {
-    parts.body.innerHTML = saved.answerHtml;
+    replaceStreamHtml(parts, "answer", saved.answerHtml);
   } else {
-    parts.body.textContent = parts.rawAnswer;
+    parts.answerStable.className = "stream-stable raw-tail";
+    parts.answerStable.textContent = parts.rawAnswer;
+    parts.answerCommittedLength = parts.rawAnswer.length;
   }
   return parts;
 }
@@ -1056,7 +1242,7 @@ function appendStreamEvent(parts, event) {
     parts.thinking.hidden = false;
     parts.thinking.open = true;
     parts.rawThinking += text;
-    parts.thinkingBody.textContent = parts.rawThinking;
+    updateStreamTailRaw(parts, "thinking");
     queueMarkdownRender(parts, "thinking");
     return;
   }
@@ -1094,7 +1280,7 @@ function appendStreamEvent(parts, event) {
 
   markGemmaResponseStarted(parts);
   parts.rawAnswer += text;
-  parts.body.textContent = parts.rawAnswer;
+  updateStreamTailRaw(parts, "answer");
   queueMarkdownRender(parts, "answer");
 }
 
@@ -1115,10 +1301,10 @@ async function formatAssistantMessage(parts) {
       parts.rawAnswer ? renderMarkdown(parts.rawAnswer) : "",
     ]);
     if (parts.rawThinking) {
-      parts.thinkingBody.innerHTML = thinkingHtml;
+      replaceStreamHtml(parts, "thinking", thinkingHtml);
     }
     if (parts.rawAnswer) {
-      parts.body.innerHTML = answerHtml;
+      replaceStreamHtml(parts, "answer", answerHtml);
     }
   } catch (error) {
     addFormattingNotice(parts, error);

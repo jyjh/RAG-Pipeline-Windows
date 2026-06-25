@@ -356,6 +356,25 @@ input[type="file"] {
   white-space: normal;
 }
 
+.stream-body {
+  min-width: 0;
+}
+
+.stream-stable:empty,
+.stream-tail:empty {
+  display: none;
+}
+
+.stream-stable.raw-tail,
+.stream-tail.raw-tail {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.stream-tail {
+  overflow-wrap: anywhere;
+}
+
 .rendered p {
   margin: 0 0 10px;
   color: var(--text);
