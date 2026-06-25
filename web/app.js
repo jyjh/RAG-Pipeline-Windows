@@ -28,6 +28,7 @@ const state = {
   indexAbortController: null,
   indexLoadToken: 0,
   uploadDragDepth: 0,
+  pendingForceUploadToken: "",
 };
 
 const LIVE_RENDER_INTERVAL_MS = 200;
@@ -50,6 +51,9 @@ const els = {
   uploadButton: document.getElementById("uploadButton"),
   reindexButton: document.getElementById("reindexButton"),
   uploadStatus: document.getElementById("uploadStatus"),
+  duplicatePrompt: document.getElementById("duplicatePrompt"),
+  duplicatePromptText: document.getElementById("duplicatePromptText"),
+  forceUploadButton: document.getElementById("forceUploadButton"),
   pdfSearchInput: document.getElementById("pdfSearchInput"),
   pdfSearchButton: document.getElementById("pdfSearchButton"),
   prevPdfPageButton: document.getElementById("prevPdfPageButton"),
@@ -978,6 +982,24 @@ function duplicateUploadMessage(detail) {
   return `${detail.message || "Duplicate PDF upload detected."}\n\n${names}`;
 }
 
+function clearDuplicatePrompt() {
+  state.pendingForceUploadToken = "";
+  els.duplicatePrompt.hidden = true;
+  els.duplicatePromptText.textContent = "";
+  els.forceUploadButton.disabled = true;
+}
+
+function showDuplicatePrompt(detail) {
+  const forceToken = detail?.force_token || "";
+  state.pendingForceUploadToken = forceToken;
+  const actionText = forceToken
+    ? "Use Force upload to queue the duplicate file(s) anyway."
+    : "The server did not issue a force token for this upload.";
+  els.duplicatePromptText.textContent = `${duplicateUploadMessage(detail)}\n\n${actionText}`;
+  els.duplicatePrompt.hidden = false;
+  els.forceUploadButton.disabled = !forceToken;
+}
+
 function pdfFilesFromList(files) {
   const accepted = [];
   const rejected = [];
@@ -1006,6 +1028,7 @@ function updateSelectedFilesLabel() {
 }
 
 function setSelectedUploadFiles(files) {
+  clearDuplicatePrompt();
   const { accepted, rejected } = pdfFilesFromList(files);
   if (!accepted.length) {
     setStatus(els.uploadStatus, "Drop one or more PDF files.", true);
@@ -1062,28 +1085,37 @@ function handleUploadDrop(event) {
   setSelectedUploadFiles(event.dataTransfer?.files || []);
 }
 
-async function uploadFiles(forceDuplicates = false) {
+async function uploadFiles(forceDuplicates = false, forceToken = "") {
+  const isForced = forceDuplicates === true;
   const files = Array.from(els.fileInput.files || []);
   if (!files.length) {
     setStatus(els.uploadStatus, "Choose one or more PDF files.", true);
     return;
+  }
+  if (!isForced) {
+    clearDuplicatePrompt();
   }
 
   const body = new FormData();
   for (const file of files) {
     body.append("files", file);
   }
-  if (forceDuplicates) {
+  if (isForced) {
     body.append("force_duplicates", "true");
+    if (forceToken) {
+      body.append("force_token", forceToken);
+    }
   }
 
   els.uploadButton.disabled = true;
-  setStatus(els.uploadStatus, forceDuplicates ? "Queueing forced upload..." : "Queueing upload...");
+  els.forceUploadButton.disabled = true;
+  setStatus(els.uploadStatus, isForced ? "Queueing forced upload..." : "Queueing upload...");
   try {
     const result = await requestJson("/api/uploads", { method: "POST", body });
     const jobs = Array.isArray(result.jobs) && result.jobs.length ? result.jobs : [result];
     els.fileInput.value = "";
     updateSelectedFilesLabel();
+    clearDuplicatePrompt();
     state.jobsOffset = 0;
     state.pdfOffset = 0;
     if (jobs.length === 1) {
@@ -1095,26 +1127,29 @@ async function uploadFiles(forceDuplicates = false) {
     await refreshPdfs();
   } catch (error) {
     if (
-      !forceDuplicates &&
       error.status === 409 &&
       error.detail &&
-      error.detail.can_force !== false
+      error.detail.can_force !== false &&
+      error.detail.force_token
     ) {
-      const confirmed = window.confirm(`${duplicateUploadMessage(error.detail)}\n\nForce re-upload?`);
-      if (confirmed) {
-        await uploadFiles(true);
-        return;
-      }
-      setStatus(els.uploadStatus, "Duplicate upload cancelled.", true);
+      showDuplicatePrompt(error.detail);
+      setStatus(
+        els.uploadStatus,
+        isForced ? "Forced upload was blocked. Review the warning below and retry." : "Duplicate upload blocked.",
+        true,
+      );
       return;
     }
     if (error.status === 409 && error.detail) {
+      clearDuplicatePrompt();
       setStatus(els.uploadStatus, duplicateUploadMessage(error.detail), true);
       return;
     }
+    clearDuplicatePrompt();
     setStatus(els.uploadStatus, error.message, true);
   } finally {
     els.uploadButton.disabled = false;
+    els.forceUploadButton.disabled = !state.pendingForceUploadToken;
   }
 }
 
@@ -2203,12 +2238,21 @@ document.querySelectorAll("[data-tab-target]").forEach((button) => {
 });
 
 els.updateButton.addEventListener("click", applyUpdate);
-els.fileInput.addEventListener("change", updateSelectedFilesLabel);
+els.fileInput.addEventListener("change", () => {
+  clearDuplicatePrompt();
+  updateSelectedFilesLabel();
+});
 els.uploadDropZone.addEventListener("dragenter", handleUploadDrag);
 els.uploadDropZone.addEventListener("dragover", handleUploadDrag);
 els.uploadDropZone.addEventListener("dragleave", clearUploadDrag);
 els.uploadDropZone.addEventListener("drop", handleUploadDrop);
-els.uploadButton.addEventListener("click", uploadFiles);
+els.uploadButton.addEventListener("click", () => uploadFiles());
+els.forceUploadButton.addEventListener("click", () => {
+  if (!state.pendingForceUploadToken) {
+    return;
+  }
+  uploadFiles(true, state.pendingForceUploadToken);
+});
 els.reindexButton.addEventListener("click", enqueueReindex);
 els.pdfSearchButton.addEventListener("click", () => {
   state.pdfSearch = els.pdfSearchInput.value.trim();

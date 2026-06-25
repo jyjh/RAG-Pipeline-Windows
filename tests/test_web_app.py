@@ -1,3 +1,4 @@
+import hashlib
 import json
 import shutil
 import subprocess
@@ -1077,8 +1078,128 @@ def test_upload_endpoint_rejects_duplicate_pdf_without_force(monkeypatch, worksp
     assert second.status_code == 409
     detail = second.json()["detail"]
     assert detail["can_force"] is True
+    assert detail["force_token"]
     assert detail["duplicates"][0]["filename"] == "copy.pdf"
     assert detail["duplicates"][0]["existing_filename"] == "notes.pdf"
+
+
+def test_upload_endpoint_rejects_duplicate_from_index_source_map(monkeypatch, workspace_tmp):
+    class FakeQueue:
+        def enqueue_upload(self, **kwargs):
+            raise AssertionError("duplicate upload should not be queued")
+
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    content = b"%PDF-1.4 already indexed"
+    source_hash = hashlib.sha256(content).hexdigest()
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=processed_dir / "notes.md",
+        source_hash=source_hash,
+        source_pdf_name="notes.pdf",
+        source_pdf_path=web_app.DATA_DIR / "notes.pdf",
+    )
+    monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/uploads",
+        files=[("files", ("copy.pdf", content, "application/pdf"))],
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["can_force"] is True
+    assert detail["force_token"]
+    assert detail["duplicates"][0]["filename"] == "copy.pdf"
+    assert detail["duplicates"][0]["existing_filename"] == "notes.pdf"
+    assert detail["duplicates"][0]["status"] == "indexed"
+
+
+def test_upload_endpoint_rejects_duplicate_from_vector_store(monkeypatch, workspace_tmp, lancedb_tmp):
+    class FakeQueue:
+        def enqueue_upload(self, **kwargs):
+            raise AssertionError("duplicate upload should not be queued")
+
+    content = b"%PDF-1.4 indexed in vector store"
+    source_hash = hashlib.sha256(content).hexdigest()
+    db_dir = lancedb_tmp / "db"
+    LanceDBVectorStore(db_dir).write_records(
+        [
+            {
+                "id": "chunk-duplicate",
+                "doc_id": "doc",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": "processed_docs/notes.md",
+                "chunk_index": 0,
+                "content": "duplicate content",
+                "title": "Notes",
+                "section_path": "Notes",
+                "page_start": 1,
+                "page_end": 1,
+                "summary": "summary",
+                "tags": [],
+                "source_hash": source_hash,
+                "source_pdf_name": "notes.pdf",
+                "source_pdf_path": str(web_app.DATA_DIR / "notes.pdf"),
+                "vector": [1.0, 0.0, 0.0],
+            }
+        ],
+        embedding_model="nomic-embed-text",
+        embedding_dim=3,
+    )
+    monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", workspace_tmp / "processed")
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/uploads",
+        files=[("files", ("copy.pdf", content, "application/pdf"))],
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["force_token"]
+    assert detail["duplicates"][0]["existing_filename"] == "notes.pdf"
+    assert detail["duplicates"][0]["record_id"] == "chunk-duplicate"
+
+
+def test_upload_endpoint_rejects_duplicate_from_existing_data_pdf(monkeypatch, workspace_tmp):
+    class FakeQueue:
+        def enqueue_upload(self, **kwargs):
+            raise AssertionError("duplicate upload should not be queued")
+
+    data_dir = workspace_tmp / "data"
+    uploads_dir = data_dir / "uploads" / "existing-job"
+    uploads_dir.mkdir(parents=True)
+    content = b"%PDF-1.4 existing uploaded pdf"
+    uploads_dir.joinpath("notes.pdf").write_bytes(content)
+
+    monkeypatch.setattr(web_app, "DATA_DIR", data_dir)
+    monkeypatch.setattr(web_app, "STAGING_DIR", data_dir / ".upload_queue")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", data_dir / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", workspace_tmp / "processed")
+    monkeypatch.setattr(web_app, "DB_DIR", workspace_tmp / "db")
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/uploads",
+        files=[("files", ("copy.pdf", content, "application/pdf"))],
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["force_token"]
+    assert detail["duplicates"][0]["existing_filename"] == "notes.pdf"
+    assert detail["duplicates"][0]["status"] == "uploaded"
 
 
 def test_upload_endpoint_allows_forced_duplicate(monkeypatch, workspace_tmp):
@@ -1105,12 +1226,26 @@ def test_upload_endpoint_allows_forced_duplicate(monkeypatch, workspace_tmp):
         "/api/uploads",
         files=[("files", ("notes.pdf", b"%PDF-1.4 same", "application/pdf"))],
     )
-    response = client.post(
+    duplicate = client.post(
+        "/api/uploads",
+        files=[("files", ("copy.pdf", b"%PDF-1.4 same", "application/pdf"))],
+    )
+    direct_force = client.post(
         "/api/uploads",
         data={"force_duplicates": "true"},
         files=[("files", ("copy.pdf", b"%PDF-1.4 same", "application/pdf"))],
     )
+    response = client.post(
+        "/api/uploads",
+        data={
+            "force_duplicates": "true",
+            "force_token": duplicate.json()["detail"]["force_token"],
+        },
+        files=[("files", ("copy.pdf", b"%PDF-1.4 same", "application/pdf"))],
+    )
 
+    assert duplicate.status_code == 409
+    assert direct_force.status_code == 409
     assert response.status_code == 200
     assert response.json()["force_duplicate_hashes"] == captured["force_duplicate_hashes"]
     assert captured["force_duplicate_hashes"] == [captured["uploads"][0]["hash"]]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hmac
 import html
 import hashlib
 import ipaddress
@@ -44,7 +46,7 @@ from src.local_rag import (
     DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
     DEFAULT_QUERY_SYSTEM_PROMPT,
 )
-from src.pdf_registry import PdfRegistry, load_source_map, remove_source_entries_by_hash
+from src.pdf_registry import PdfRegistry, load_source_map, remove_source_entries_by_hash, sha256_file
 from src.vector_store import default_store, lancedb_path, record_matches, record_row
 
 
@@ -94,6 +96,8 @@ INDEX_SUMMARY_NODE_TYPES = {"document_summary", "section_summary"}
 INDEX_CHILD_DEFAULT_LIMIT = 100
 INDEX_CHILD_MAX_LIMIT = 500
 DEFAULT_INDEX_VECTOR_RELEVANCE_FLOOR = 0.70
+FORCE_UPLOAD_TOKEN_TTL_SECONDS = 15 * 60
+UPLOAD_FORCE_TOKEN_SECRET = os.urandom(32)
 
 INDEX_LOCK = threading.RLock()
 
@@ -1638,6 +1642,260 @@ def _upload_options_from_form(form: Any) -> dict[str, Any]:
     }
 
 
+def _upload_hashes(files: list[dict[str, Any]]) -> list[str]:
+    return sorted({str(item.get("hash", "")) for item in files if item.get("hash")})
+
+
+def _duplicate_hashes(duplicates: list[dict[str, Any]]) -> list[str]:
+    return sorted({str(item.get("hash", "")) for item in duplicates if item.get("hash")})
+
+
+def _force_upload_token(
+    *,
+    upload_hashes: list[str],
+    duplicate_hashes: list[str],
+    now: datetime | None = None,
+) -> str:
+    issued_at = int((now or datetime.now(timezone.utc)).timestamp())
+    payload = {
+        "upload_hashes": sorted(upload_hashes),
+        "duplicate_hashes": sorted(duplicate_hashes),
+        "expires_at": issued_at + FORCE_UPLOAD_TOKEN_TTL_SECONDS,
+    }
+    payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    signature = hmac.new(UPLOAD_FORCE_TOKEN_SECRET, payload_bytes, hashlib.sha256).digest()
+    return ".".join(
+        [
+            base64.urlsafe_b64encode(payload_bytes).decode("ascii").rstrip("="),
+            base64.urlsafe_b64encode(signature).decode("ascii").rstrip("="),
+        ]
+    )
+
+
+def _decode_force_token_part(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+
+
+def _force_upload_token_valid(
+    token: str,
+    *,
+    upload_hashes: list[str],
+    duplicate_hashes: list[str],
+    now: datetime | None = None,
+) -> bool:
+    try:
+        encoded_payload, encoded_signature = str(token or "").split(".", 1)
+        payload_bytes = _decode_force_token_part(encoded_payload)
+        signature = _decode_force_token_part(encoded_signature)
+        expected_signature = hmac.new(UPLOAD_FORCE_TOKEN_SECRET, payload_bytes, hashlib.sha256).digest()
+        if not hmac.compare_digest(signature, expected_signature):
+            return False
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except Exception:
+        return False
+
+    if sorted(payload.get("upload_hashes") or []) != sorted(upload_hashes):
+        return False
+    if sorted(payload.get("duplicate_hashes") or []) != sorted(duplicate_hashes):
+        return False
+    expires_at = int(payload.get("expires_at") or 0)
+    current_time = int((now or datetime.now(timezone.utc)).timestamp())
+    return expires_at >= current_time
+
+
+def _duplicate_response_detail(
+    *,
+    message: str,
+    duplicates: list[dict[str, Any]],
+    files: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "message": message,
+        "can_force": True,
+        "force_token": _force_upload_token(
+            upload_hashes=_upload_hashes(files),
+            duplicate_hashes=_duplicate_hashes(duplicates),
+        ),
+        "force_token_expires_seconds": FORCE_UPLOAD_TOKEN_TTL_SECONDS,
+        "duplicates": duplicates,
+    }
+
+
+def _indexed_source_duplicate_entries(
+    files: list[dict[str, Any]],
+    *,
+    known_hashes: set[str],
+    processed_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    processed_dir = processed_dir or PROCESSED_DIR
+    source_documents = load_source_map(processed_dir).get("documents", {})
+    indexed_by_hash: dict[str, dict[str, Any]] = {}
+    for entry in source_documents.values():
+        if not isinstance(entry, dict):
+            continue
+        source_hash = str(entry.get("source_hash", ""))
+        if source_hash and source_hash not in indexed_by_hash:
+            indexed_by_hash[source_hash] = entry
+
+    duplicates: list[dict[str, Any]] = []
+    for item in files:
+        file_hash = str(item.get("hash", ""))
+        if not file_hash or file_hash in known_hashes:
+            continue
+        existing = indexed_by_hash.get(file_hash)
+        if not existing:
+            continue
+        duplicates.append(
+            {
+                "filename": str(item.get("filename", "")),
+                "hash": file_hash,
+                "existing_filename": str(existing.get("source_pdf_name", "")),
+                "status": "indexed",
+                "job_id": "",
+            }
+        )
+    return duplicates
+
+
+def _vector_store_duplicate_entries(
+    files: list[dict[str, Any]],
+    *,
+    known_hashes: set[str],
+    db_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    store = _index_store(db_dir)
+    if not store.exists():
+        return []
+    file_hashes = {str(item.get("hash", "")) for item in files if item.get("hash")}
+    target_hashes = file_hashes - known_hashes
+    if not target_hashes:
+        return []
+
+    try:
+        rows = store.list_records(offset=0, limit=store.count(), search="").get("rows") or []
+    except Exception:
+        return []
+
+    indexed_by_hash: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        source_hash = str(row.get("source_hash", ""))
+        if source_hash in target_hashes and source_hash not in indexed_by_hash:
+            indexed_by_hash[source_hash] = row
+
+    duplicates: list[dict[str, Any]] = []
+    for item in files:
+        file_hash = str(item.get("hash", ""))
+        if not file_hash or file_hash in known_hashes:
+            continue
+        existing = indexed_by_hash.get(file_hash)
+        if not existing:
+            continue
+        existing_filename = (
+            str(existing.get("source_pdf_name", ""))
+            or Path(str(existing.get("source_pdf_path") or existing.get("file_path") or "")).name
+        )
+        duplicates.append(
+            {
+                "filename": str(item.get("filename", "")),
+                "hash": file_hash,
+                "existing_filename": existing_filename,
+                "status": "indexed",
+                "job_id": "",
+                "record_id": str(existing.get("id", "")),
+            }
+        )
+    return duplicates
+
+
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _data_pdf_duplicate_entries(
+    files: list[dict[str, Any]],
+    *,
+    known_hashes: set[str],
+    data_dir: Path | None = None,
+    staging_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    data_dir = data_dir or DATA_DIR
+    staging_dir = staging_dir or STAGING_DIR
+    file_hashes = {str(item.get("hash", "")) for item in files if item.get("hash")}
+    target_hashes = file_hashes - known_hashes
+    if not target_hashes or not data_dir.exists():
+        return []
+
+    current_paths: set[Path] = set()
+    for item in files:
+        raw_path = str(item.get("staging_path", ""))
+        if raw_path:
+            try:
+                current_paths.add(Path(raw_path).resolve())
+            except OSError:
+                pass
+
+    existing_by_hash: dict[str, Path] = {}
+    for candidate in data_dir.rglob("*.pdf"):
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in current_paths:
+            continue
+        if staging_dir.exists() and _path_is_relative_to(resolved, staging_dir):
+            continue
+        try:
+            digest = sha256_file(resolved)
+        except OSError:
+            continue
+        if digest in target_hashes and digest not in existing_by_hash:
+            existing_by_hash[digest] = resolved
+
+    duplicates: list[dict[str, Any]] = []
+    for item in files:
+        file_hash = str(item.get("hash", ""))
+        if not file_hash or file_hash in known_hashes:
+            continue
+        existing = existing_by_hash.get(file_hash)
+        if not existing:
+            continue
+        duplicates.append(
+            {
+                "filename": str(item.get("filename", "")),
+                "hash": file_hash,
+                "existing_filename": existing.name,
+                "status": "uploaded",
+                "job_id": "",
+            }
+        )
+    return duplicates
+
+
+def _blocking_duplicate_entries(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    registry = PdfRegistry(PDF_REGISTRY_PATH)
+    duplicates = registry.blocking_duplicates(files)
+    known_hashes = {str(entry.get("hash", "")) for entry in duplicates}
+
+    source_duplicates = _indexed_source_duplicate_entries(files, known_hashes=known_hashes)
+    duplicates.extend(source_duplicates)
+    known_hashes.update(str(entry.get("hash", "")) for entry in source_duplicates)
+
+    vector_duplicates = _vector_store_duplicate_entries(files, known_hashes=known_hashes)
+    duplicates.extend(vector_duplicates)
+    known_hashes.update(str(entry.get("hash", "")) for entry in vector_duplicates)
+
+    data_duplicates = _data_pdf_duplicate_entries(files, known_hashes=known_hashes)
+    duplicates.extend(data_duplicates)
+    return duplicates
+
+
 @app.post("/api/uploads")
 async def upload_files(request: Request):
     filenames: list[str] = []
@@ -1718,18 +1976,28 @@ async def upload_files(request: Request):
             )
 
         registry = PdfRegistry(PDF_REGISTRY_PATH)
-        duplicate_entries = registry.blocking_duplicates(uploads)
-        if duplicate_entries and not force_duplicates:
+        duplicate_entries = _blocking_duplicate_entries(uploads)
+        force_token = str(form.get("force_token") or "")
+        force_token_valid = (
+            force_duplicates
+            and bool(duplicate_entries)
+            and _force_upload_token_valid(
+                force_token,
+                upload_hashes=_upload_hashes(uploads),
+                duplicate_hashes=_duplicate_hashes(duplicate_entries),
+            )
+        )
+        if duplicate_entries and not force_token_valid:
             raise HTTPException(
                 status_code=409,
-                detail={
-                    "message": "One or more PDFs have already been uploaded or queued.",
-                    "can_force": True,
-                    "duplicates": duplicate_entries,
-                },
+                detail=_duplicate_response_detail(
+                    message="One or more PDFs have already been uploaded or queued.",
+                    duplicates=duplicate_entries,
+                    files=uploads,
+                ),
             )
 
-        forced_hashes = {entry["hash"] for entry in duplicate_entries} if force_duplicates else set()
+        forced_hashes = {entry["hash"] for entry in duplicate_entries} if force_token_valid else set()
         options = _upload_options_from_form(form)
         jobs: list[QueueJob] = []
         for upload in uploads:

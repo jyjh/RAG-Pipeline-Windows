@@ -251,6 +251,28 @@ input[type="file"] {
   color: var(--danger);
 }
 
+.duplicate-prompt {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid #e0baba;
+  border-radius: 8px;
+  background: #fff8f0;
+  color: var(--danger);
+}
+
+.duplicate-prompt[hidden] {
+  display: none;
+}
+
+.duplicate-prompt div {
+  flex: 1 1 320px;
+  white-space: pre-line;
+}
+
 .data-table {
   width: 100%;
   border-collapse: collapse;
