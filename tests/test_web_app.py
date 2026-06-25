@@ -490,7 +490,7 @@ def test_update_apply_endpoint_pulls_spawns_restart_and_schedules_exit(monkeypat
     git_calls = []
     spawned = []
     scheduled = []
-    monkeypatch.setattr(web_app, "_require_loopback_request", lambda request: None)
+    monkeypatch.setattr(web_app, "_require_local_update_request", lambda request: None)
     monkeypatch.setattr(
         web_app,
         "get_update_status",
@@ -547,11 +547,31 @@ def test_update_apply_rejects_active_query(monkeypatch):
     assert "active chat query" in exc_info.value.detail["message"]
 
 
-def test_update_apply_requires_loopback_request():
+def test_update_apply_requires_local_request(monkeypatch):
+    _set_update_config(monkeypatch)
+
     assert web_app._is_loopback_host("127.0.0.1") is True
     assert web_app._is_loopback_host("127.10.1.2") is True
     assert web_app._is_loopback_host("::1") is True
+    assert web_app._is_loopback_host("0:0:0:0:0:0:0:1") is True
     assert web_app._is_loopback_host("192.168.1.20") is False
+    assert web_app._is_local_update_host("127.0.0.1") is True
+    assert web_app._is_local_update_host("192.168.1.20") is False
+
+
+def test_update_apply_accepts_configured_bind_address(monkeypatch):
+    _set_update_config(monkeypatch)
+    monkeypatch.setitem(web_app.SERVER_CONFIG, "host", "100.87.142.5")
+
+    assert web_app._is_local_update_host("100.87.142.5") is True
+    assert web_app._is_local_update_host("100.87.142.6") is False
+
+
+def test_update_apply_does_not_accept_wildcard_bind_address(monkeypatch):
+    _set_update_config(monkeypatch)
+    monkeypatch.setitem(web_app.SERVER_CONFIG, "host", "0.0.0.0")
+
+    assert web_app._is_local_update_host("192.168.1.20") is False
 
 
 def test_queue_pauses_new_work_while_query_is_active(workspace_tmp):

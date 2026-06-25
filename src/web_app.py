@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -445,14 +446,44 @@ def _is_loopback_host(host: str | None) -> bool:
     value = str(host or "").strip().lower()
     if value == "localhost":
         return True
-    if value.startswith("127."):
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_unspecified_host(host: str | None) -> bool:
+    value = str(host or "").strip().lower()
+    if value in {"", "*"}:
         return True
-    return value in {"::1", "0:0:0:0:0:0:0:1"}
+    try:
+        return ipaddress.ip_address(value).is_unspecified
+    except ValueError:
+        return False
 
 
-def _require_loopback_request(request: Request) -> None:
+def _is_configured_bind_host(host: str | None) -> bool:
+    bind_host = str(SERVER_CONFIG.get("host") or "").strip().lower()
+    if _is_unspecified_host(bind_host):
+        return False
+
+    value = str(host or "").strip().lower()
+    if value == bind_host:
+        return True
+
+    try:
+        return ipaddress.ip_address(value) == ipaddress.ip_address(bind_host)
+    except ValueError:
+        return False
+
+
+def _is_local_update_host(host: str | None) -> bool:
+    return _is_loopback_host(host) or _is_configured_bind_host(host)
+
+
+def _require_local_update_request(request: Request) -> None:
     client_host = request.client.host if request.client else ""
-    if not _is_loopback_host(client_host):
+    if not _is_local_update_host(client_host):
         raise HTTPException(status_code=403, detail="Updates can only be started from the local machine.")
 
 
@@ -1201,7 +1232,7 @@ def update_status():
 
 @app.post("/api/update/apply")
 def update_apply(request: Request, background_tasks: BackgroundTasks):
-    _require_loopback_request(request)
+    _require_local_update_request(request)
     response = apply_available_update()
     background_tasks.add_task(_schedule_process_exit)
     return response
