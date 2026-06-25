@@ -37,6 +37,7 @@ site/
 *.egg-info/
 .eggs/
 pip-wheel-metadata/
+src/__pycache__
 
 # RAG pipeline runtime/build outputs
 db/
