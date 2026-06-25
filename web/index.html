@@ -26,10 +26,13 @@
 
     <main>
       <section id="upload" class="panel active">
-        <div class="toolbar">
-          <input id="fileInput" type="file" accept="application/pdf,.pdf" multiple />
-          <button id="uploadButton" type="button">Upload + index</button>
-          <button id="reindexButton" type="button">Reindex</button>
+        <div id="uploadDropZone" class="upload-drop-zone">
+          <div class="toolbar">
+            <input id="fileInput" type="file" accept="application/pdf,.pdf" multiple />
+            <button id="uploadButton" type="button">Upload + index</button>
+            <button id="reindexButton" type="button">Reindex</button>
+          </div>
+          <div id="selectedFilesLabel" class="selected-files-label">Drop PDFs</div>
         </div>
         <div id="uploadStatus" class="status"></div>
         <div class="toolbar">

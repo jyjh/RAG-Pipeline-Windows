@@ -173,6 +173,28 @@ main {
   min-width: 52px;
 }
 
+.upload-drop-zone {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 12px;
+  margin-bottom: 10px;
+}
+
+.upload-drop-zone.drag-over {
+  border-color: var(--accent);
+  background: #eef7fa;
+}
+
+.upload-drop-zone .toolbar {
+  margin-bottom: 8px;
+}
+
+.selected-files-label {
+  color: var(--muted);
+  font-size: 13px;
+}
+
 input[type="search"],
 select,
 textarea {

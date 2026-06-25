@@ -27,6 +27,7 @@ const state = {
   updateApplying: false,
   indexAbortController: null,
   indexLoadToken: 0,
+  uploadDragDepth: 0,
 };
 
 const LIVE_RENDER_INTERVAL_MS = 200;
@@ -43,7 +44,9 @@ const CHAT_UI_STORAGE_KEY = "rag.chatUi.v1";
 const els = {
   statusLine: document.getElementById("statusLine"),
   updateButton: document.getElementById("updateButton"),
+  uploadDropZone: document.getElementById("uploadDropZone"),
   fileInput: document.getElementById("fileInput"),
+  selectedFilesLabel: document.getElementById("selectedFilesLabel"),
   uploadButton: document.getElementById("uploadButton"),
   reindexButton: document.getElementById("reindexButton"),
   uploadStatus: document.getElementById("uploadStatus"),
@@ -975,6 +978,90 @@ function duplicateUploadMessage(detail) {
   return `${detail.message || "Duplicate PDF upload detected."}\n\n${names}`;
 }
 
+function pdfFilesFromList(files) {
+  const accepted = [];
+  const rejected = [];
+  for (const file of Array.from(files || [])) {
+    const name = file.name || "";
+    const isPdf = file.type === "application/pdf" || name.toLowerCase().endsWith(".pdf");
+    if (isPdf) {
+      accepted.push(file);
+    } else {
+      rejected.push(name || "unnamed file");
+    }
+  }
+  return { accepted, rejected };
+}
+
+function updateSelectedFilesLabel() {
+  const files = Array.from(els.fileInput.files || []);
+  if (!files.length) {
+    els.selectedFilesLabel.textContent = "Drop PDFs";
+    return;
+  }
+  const names = files.map((file) => file.name || "unnamed.pdf");
+  const shown = names.slice(0, 3).join(", ");
+  const extra = names.length > 3 ? ` +${names.length - 3} more` : "";
+  els.selectedFilesLabel.textContent = `${names.length} selected: ${shown}${extra}`;
+}
+
+function setSelectedUploadFiles(files) {
+  const { accepted, rejected } = pdfFilesFromList(files);
+  if (!accepted.length) {
+    setStatus(els.uploadStatus, "Drop one or more PDF files.", true);
+    updateSelectedFilesLabel();
+    return;
+  }
+
+  const transfer = new DataTransfer();
+  for (const file of accepted) {
+    transfer.items.add(file);
+  }
+  els.fileInput.files = transfer.files;
+  updateSelectedFilesLabel();
+  if (rejected.length) {
+    setStatus(els.uploadStatus, `Skipped non-PDF file(s): ${rejected.join(", ")}`, true);
+  } else {
+    setStatus(els.uploadStatus, "");
+  }
+}
+
+function uploadDragHasFiles(event) {
+  return Array.from(event.dataTransfer?.types || []).includes("Files");
+}
+
+function handleUploadDrag(event) {
+  if (!uploadDragHasFiles(event)) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  if (event.type === "dragenter") {
+    state.uploadDragDepth += 1;
+  }
+  els.uploadDropZone.classList.add("drag-over");
+}
+
+function clearUploadDrag(event) {
+  if (!uploadDragHasFiles(event)) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  state.uploadDragDepth = Math.max(0, state.uploadDragDepth - 1);
+  if (!state.uploadDragDepth) {
+    els.uploadDropZone.classList.remove("drag-over");
+  }
+}
+
+function handleUploadDrop(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  state.uploadDragDepth = 0;
+  els.uploadDropZone.classList.remove("drag-over");
+  setSelectedUploadFiles(event.dataTransfer?.files || []);
+}
+
 async function uploadFiles(forceDuplicates = false) {
   const files = Array.from(els.fileInput.files || []);
   if (!files.length) {
@@ -996,6 +1083,7 @@ async function uploadFiles(forceDuplicates = false) {
     const result = await requestJson("/api/uploads", { method: "POST", body });
     const jobs = Array.isArray(result.jobs) && result.jobs.length ? result.jobs : [result];
     els.fileInput.value = "";
+    updateSelectedFilesLabel();
     state.jobsOffset = 0;
     state.pdfOffset = 0;
     if (jobs.length === 1) {
@@ -2115,6 +2203,11 @@ document.querySelectorAll("[data-tab-target]").forEach((button) => {
 });
 
 els.updateButton.addEventListener("click", applyUpdate);
+els.fileInput.addEventListener("change", updateSelectedFilesLabel);
+els.uploadDropZone.addEventListener("dragenter", handleUploadDrag);
+els.uploadDropZone.addEventListener("dragover", handleUploadDrag);
+els.uploadDropZone.addEventListener("dragleave", clearUploadDrag);
+els.uploadDropZone.addEventListener("drop", handleUploadDrop);
 els.uploadButton.addEventListener("click", uploadFiles);
 els.reindexButton.addEventListener("click", enqueueReindex);
 els.pdfSearchButton.addEventListener("click", () => {
