@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 import src.local_rag as local_rag
 import src.query as query
 import src.web_app as web_app
-from src.asset_store import ImageAssetStore
+from src.asset_store import ImageAssetStore, image_asset_marker
 from src.pdf_registry import load_source_map, write_source_entry
 from src.vector_store import LanceDBVectorStore
 
@@ -324,6 +324,89 @@ def test_index_children_endpoint_pages_descendants(monkeypatch, lancedb_tmp):
     assert [row["id"] for row in payload["rows"]] == ["leaf-summary", "chunk-1"]
     assert payload["rows"][0]["node_level"] == 2
     assert payload["rows"][1]["node_level"] == 2
+
+
+def test_index_review_rows_include_image_asset_metadata(monkeypatch, workspace_tmp, lancedb_tmp):
+    asset_dir = workspace_tmp / "assets"
+    store = ImageAssetStore(asset_dir)
+    asset = store.save_image(
+        image_data=b"asset-png",
+        source_hash="hash-assets",
+        source_pdf_name="assets.pdf",
+        page_no=2,
+        description="Suspension graph",
+    )
+    db_dir = lancedb_tmp / "db"
+    LanceDBVectorStore(db_dir).write_records(
+        [
+            {
+                "id": "asset-summary",
+                "doc_id": "asset-doc",
+                "parent_id": "",
+                "node_type": "document_summary",
+                "file_path": "processed_docs/assets.md",
+                "chunk_index": -1,
+                "content": "document summary",
+                "title": "Assets",
+                "section_path": "Assets",
+                "page_start": 1,
+                "page_end": 2,
+                "summary": "document summary",
+                "tags": [],
+                "source_hash": "hash-assets",
+                "source_pdf_name": "assets.pdf",
+                "source_pdf_path": "data/assets.pdf",
+                "vector": [1.0, 0.0, 0.0],
+            },
+            {
+                "id": "asset-chunk",
+                "doc_id": "asset-doc",
+                "parent_id": "asset-summary",
+                "node_type": "chunk",
+                "file_path": "processed_docs/assets.md",
+                "chunk_index": 0,
+                "content": f"graph detail\n{image_asset_marker(asset['asset_id'])}",
+                "title": "Assets",
+                "section_path": "Assets",
+                "page_start": 2,
+                "page_end": 2,
+                "summary": "graph summary",
+                "tags": ["graph"],
+                "source_hash": "hash-assets",
+                "source_pdf_name": "assets.pdf",
+                "source_pdf_path": "data/assets.pdf",
+                "vector": [0.0, 1.0, 0.0],
+            },
+        ],
+        embedding_model="nomic-embed-text",
+        embedding_dim=3,
+    )
+    monkeypatch.setattr(web_app, "ASSET_DIR", asset_dir)
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+
+    client = TestClient(web_app.app)
+    index = client.get("/api/index", params={"search": "graph"})
+    children = client.get("/api/index/children", params={"parent_id": "asset-summary"})
+    stream = client.get("/api/index/stream", params={"batch_size": 1, "search": "graph"})
+
+    expected = {
+        "asset_id": asset["asset_id"],
+        "source_hash": "hash-assets",
+        "source_pdf_name": "assets.pdf",
+        "page_no": 2,
+        "description": "Suspension graph",
+        "mime_type": "image/png",
+        "image_sha": asset["image_sha"],
+        "url": f"/api/assets/{asset['asset_id']}",
+    }
+    assert index.status_code == 200
+    assert index.json()["rows"][0]["assets"] == [expected]
+    assert children.status_code == 200
+    assert children.json()["rows"][0]["assets"] == [expected]
+    assert stream.status_code == 200
+    events = [json.loads(line) for line in stream.text.splitlines()]
+    rows_event = next(event for event in events if event["type"] == "rows")
+    assert rows_event["rows"][0]["assets"] == [expected]
 
 
 def test_index_summary_search_matches_child_rows(monkeypatch, lancedb_tmp):
@@ -1747,11 +1830,14 @@ def test_sources_panel_frontend_includes_image_asset_preview():
     styles = Path("web/styles.css").read_text(encoding="utf-8")
 
     assert "source.assets" in script
+    assert "item.assets" in script
     assert "source-assets" in script
     assert "source-asset" in script
+    assert "index-assets" in script
     assert "Open image" in script
     assert ".source-assets" in styles
     assert ".source-asset img" in styles
+    assert ".index-assets .source-asset img" in styles
 
 
 def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):

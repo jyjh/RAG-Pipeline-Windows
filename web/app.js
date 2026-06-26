@@ -1449,7 +1449,7 @@ function createIndexRow(item, options = {}) {
           </div>
         </div>
       </td>
-      <td>
+      <td class="index-content-cell">
         <textarea class="content-edit" spellcheck="false"></textarea>
       </td>
       <td>
@@ -1460,6 +1460,11 @@ function createIndexRow(item, options = {}) {
       </td>
     `;
   row.querySelector("textarea").value = item.content || "";
+  appendAssetPreviewGrid(row.querySelector(".index-content-cell"), item.assets, {
+    className: "source-assets index-assets",
+    itemClassName: "index-asset",
+    fallbackAlt: "Extracted source image",
+  });
   return row;
 }
 
@@ -1865,6 +1870,47 @@ function sourceLocation(source) {
   return [source.section_path, source.page_label].filter(Boolean).join(" | ");
 }
 
+function createAssetPreviewGrid(assets, options = {}) {
+  const assetGrid = document.createElement("div");
+  assetGrid.className = options.className || "source-assets";
+  const itemClassName = options.itemClassName || "";
+  const fallbackAlt = options.fallbackAlt || "Stored source image";
+  const captionAction = options.captionAction || "Open image";
+  for (const asset of Array.isArray(assets) ? assets : []) {
+    if (!asset || !asset.url) {
+      continue;
+    }
+    const link = document.createElement("a");
+    link.className = ["source-asset", itemClassName].filter(Boolean).join(" ");
+    link.href = asset.url;
+    link.target = "_blank";
+    link.rel = "noreferrer";
+    if (asset.description) {
+      link.title = asset.description;
+    }
+
+    const image = document.createElement("img");
+    image.src = asset.url;
+    image.alt = asset.description || fallbackAlt;
+    link.appendChild(image);
+
+    const caption = document.createElement("span");
+    caption.textContent = [asset.page_no ? `page ${asset.page_no}` : "", captionAction].filter(Boolean).join(" | ");
+    link.appendChild(caption);
+    assetGrid.appendChild(link);
+  }
+  return assetGrid;
+}
+
+function appendAssetPreviewGrid(container, assets, options = {}) {
+  const assetGrid = createAssetPreviewGrid(assets, options);
+  if (!assetGrid.childElementCount) {
+    return false;
+  }
+  container.appendChild(assetGrid);
+  return true;
+}
+
 function renderSourcePanel(parts) {
   const sources = Array.isArray(parts.sources) ? parts.sources : [];
   parts.sourcesPanel.hidden = sources.length === 0;
@@ -1893,33 +1939,7 @@ function renderSourcePanel(parts) {
       <span class="source-links">${links.join("")}</span>
     `;
     const assets = Array.isArray(source.assets) ? source.assets : [];
-    if (assets.length) {
-      const assetGrid = document.createElement("div");
-      assetGrid.className = "source-assets";
-      for (const asset of assets) {
-        if (!asset || !asset.url) {
-          continue;
-        }
-        const link = document.createElement("a");
-        link.className = "source-asset";
-        link.href = asset.url;
-        link.target = "_blank";
-        link.rel = "noreferrer";
-
-        const image = document.createElement("img");
-        image.src = asset.url;
-        image.alt = asset.description || "Stored source image";
-        link.appendChild(image);
-
-        const caption = document.createElement("span");
-        caption.textContent = [asset.page_no ? `page ${asset.page_no}` : "", "Open image"].filter(Boolean).join(" | ");
-        link.appendChild(caption);
-        assetGrid.appendChild(link);
-      }
-      if (assetGrid.childElementCount) {
-        item.appendChild(assetGrid);
-      }
-    }
+    appendAssetPreviewGrid(item, assets);
     parts.sourcesBody.appendChild(item);
   }
 }

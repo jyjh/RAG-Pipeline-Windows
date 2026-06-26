@@ -391,6 +391,23 @@ input[type="file"] {
   padding: 8px;
 }
 
+.index-content-cell {
+  min-width: 320px;
+}
+
+.index-assets {
+  margin-top: 8px;
+}
+
+.index-assets .source-asset {
+  width: 132px;
+}
+
+.index-assets .source-asset img {
+  width: 132px;
+  height: 92px;
+}
+
 .row-actions {
   display: flex;
   gap: 8px;

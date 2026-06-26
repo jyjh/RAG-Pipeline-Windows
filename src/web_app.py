@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import urllib.parse
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
@@ -98,6 +99,9 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_index_child_candidates",
     "_index_section_depth",
     "_index_sort_key",
+    "_asset_url",
+    "_with_index_assets",
+    "_with_index_assets_for_rows",
     "_with_index_hierarchy_metadata",
     "list_index_summary_rows",
     "list_index_child_rows",
@@ -435,6 +439,36 @@ def _index_store(db_dir: Path | None = None):
     return default_store(db_dir or DB_DIR)
 
 
+def _asset_url(asset_id: str) -> str:
+    encoded = urllib.parse.quote(str(asset_id or ""), safe="")
+    return f"/api/assets/{encoded}" if encoded else ""
+
+
+def _with_index_assets(row: dict[str, Any], *, asset_store: Any | None = None) -> dict[str, Any]:
+    item = dict(row)
+    content = str(item.get("content") or "")
+    if "[Image Asset:" not in content:
+        return item
+    if asset_store is None:
+        from src.asset_store import ImageAssetStore
+
+        asset_store = ImageAssetStore(ASSET_DIR)
+    assets = asset_store.assets_for_text(content, url_for=_asset_url)
+    if assets:
+        item["assets"] = assets
+    return item
+
+
+def _with_index_assets_for_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not any("[Image Asset:" in str(row.get("content") or "") for row in rows):
+        return rows
+
+    from src.asset_store import ImageAssetStore
+
+    asset_store = ImageAssetStore(ASSET_DIR)
+    return [_with_index_assets(row, asset_store=asset_store) for row in rows]
+
+
 def _git_target_valid(value: str) -> bool:
     if not value or value.startswith(("-", "/", "\\")):
         return False
@@ -755,7 +789,9 @@ def list_index_rows(
     offset = max(0, int(offset))
     limit = min(max(1, int(limit)), 200)
     with INDEX_LOCK:
-        return _index_store(db_dir).list_records(offset=offset, limit=limit, search=search)
+        payload = _index_store(db_dir).list_records(offset=offset, limit=limit, search=search)
+    payload["rows"] = _with_index_assets_for_rows(list(payload.get("rows") or []))
+    return payload
 
 
 def _index_records_snapshot(db_dir: Path | None = None) -> tuple[list[dict[str, Any]], str, int]:
@@ -908,6 +944,7 @@ def list_index_summary_rows(
         )
         for row in page["rows"]
     ]
+    page_rows = _with_index_assets_for_rows(page_rows)
     return {
         "offset": page["offset"],
         "limit": page["limit"],
@@ -952,10 +989,10 @@ def list_index_child_rows(
         "offset": page["offset"],
         "limit": page["limit"],
         "total": page["total"],
-        "rows": [
+        "rows": _with_index_assets_for_rows([
             _with_index_hierarchy_metadata(row, children=[], parent=parent)
             for row in page["rows"]
-        ],
+        ]),
         "embedding_model": embedding_model,
         "embedding_dim": embedding_dim,
         "view": "hierarchy_children",
@@ -997,7 +1034,7 @@ def iter_index_row_events(
         received += len(rows)
         yield {
             "type": "rows",
-            "rows": rows,
+            "rows": _with_index_assets_for_rows(rows),
             "received": received,
         }
 
@@ -1111,7 +1148,7 @@ def vector_search_index_rows(
         row["source_id"] = str(item.get("source_id") or "")
         row["location"] = str(item.get("location") or "")
         row["vector_query"] = query
-        rows.append(row)
+        rows.append(_with_index_assets(row, asset_store=getattr(engine, "asset_store", None)))
 
     return {
         "query": query,
