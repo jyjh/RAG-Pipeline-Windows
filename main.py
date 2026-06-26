@@ -55,11 +55,7 @@ def run_indexing(*args, **kwargs):
     return _run_indexing(*args, **kwargs)
 
 
-class QueryEngine:
-    def __new__(cls, *args, **kwargs):
-        from src.query import QueryEngine as _QueryEngine
-
-        return _QueryEngine(*args, **kwargs)
+from src.cli_query_engine import QueryEngine
 
 
 def _configure_console() -> None:

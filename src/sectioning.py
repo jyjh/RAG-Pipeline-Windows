@@ -6,6 +6,36 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from src._class_module_support import import_split_class
+
+_CLASS_MODULE_PROXY_FUNCTIONS = (
+    "has_enriched_markdown",
+    "build_section_records",
+    "records_for_section",
+    "find_source_pdf",
+    "sections_from_pdf",
+    "outline_sections",
+    "toc_sections_from_pages",
+    "parse_toc_entries",
+    "sections_from_markdown",
+    "markdown_headings",
+    "strip_front_matter",
+    "content_for_section",
+    "trim_to_heading",
+    "find_heading_line",
+    "split_text",
+    "normalize_page_text",
+    "collapse_repeated_edge_lines",
+    "is_noise_line",
+    "deterministic_summary",
+    "tags_for",
+    "flatten_sections",
+    "format_page_range",
+    "clean_title",
+    "normalized_heading",
+    "stable_id",
+)
+
 
 DEFAULT_CHUNK_TARGET_TOKENS = 900
 DEFAULT_CHUNK_OVERLAP_TOKENS = 120
@@ -13,62 +43,16 @@ CHARS_PER_TOKEN = 4
 ENRICHED_MARKDOWN_MARKERS = ("[Vision Analysis]", "[Page Image Analysis]")
 
 
-@dataclass
-class PageText:
-    page_no: int
-    text: str
+PageText = import_split_class("src.sectioning_classes.page_text", "PageText")
+PageText.__module__ = __name__
 
 
-@dataclass
-class SectionNode:
-    node_id: str
-    parent_id: str
-    title: str
-    level: int
-    page_start: int | None = None
-    page_end: int | None = None
-    children: list["SectionNode"] = field(default_factory=list)
-    next_title: str = ""
+SectionNode = import_split_class("src.sectioning_classes.section_node", "SectionNode")
+SectionNode.__module__ = __name__
 
 
-@dataclass
-class SectionChunk:
-    doc_id: str
-    node_id: str
-    parent_id: str
-    node_type: str
-    title: str
-    section_path: str
-    page_start: int | None
-    page_end: int | None
-    content: str
-    summary: str
-    tags: list[str]
-    chunk_index: int
-    source_path: str
-    source_hash: str = ""
-    source_pdf_name: str = ""
-    source_pdf_path: str = ""
-
-    def to_record(self) -> dict[str, Any]:
-        return {
-            "id": self.node_id,
-            "doc_id": self.doc_id,
-            "parent_id": self.parent_id,
-            "node_type": self.node_type,
-            "file_path": self.source_path,
-            "chunk_index": self.chunk_index,
-            "content": self.content,
-            "title": self.title,
-            "section_path": self.section_path,
-            "page_start": self.page_start,
-            "page_end": self.page_end,
-            "summary": self.summary,
-            "tags": list(self.tags),
-            "source_hash": self.source_hash,
-            "source_pdf_name": self.source_pdf_name,
-            "source_pdf_path": self.source_pdf_path,
-        }
+SectionChunk = import_split_class("src.sectioning_classes.section_chunk", "SectionChunk")
+SectionChunk.__module__ = __name__
 
 
 def has_enriched_markdown(content: str) -> bool:
