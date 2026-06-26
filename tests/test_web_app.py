@@ -1894,14 +1894,21 @@ def test_pdf_trust_endpoint_marks_stale_source(monkeypatch, workspace_tmp):
     client = TestClient(web_app.app)
     update = client.post(
         f"/api/pdfs/{source_hash}/trust",
-        json={"review_status": "stale", "source_type": "student_project", "notes": "old design rules"},
+        json={
+            "review_status": "stale",
+            "source_type": "student_project",
+            "reviewed_by": "  Alex Reviewer  ",
+            "notes": "old design rules",
+        },
     )
     listing = client.get("/api/pdfs")
 
     assert update.status_code == 200
     assert update.json()["trust"]["review_status"] == "stale"
+    assert update.json()["trust"]["reviewed_by"] == "Alex Reviewer"
     document = listing.json()["pdfs"][0]
     assert document["trust"]["source_type"] == "student_project"
+    assert document["trust"]["reviewed_by"] == "Alex Reviewer"
     assert document["trust"]["notes"] == "old design rules"
     assert "marked_stale" in document["quality"]["warnings"]
     assert document["quality"]["label"] == "review"
@@ -2166,6 +2173,23 @@ def test_frontend_includes_new_user_guide_and_walkthrough():
     assert ".guide-layout" in styles
     assert ".walkthrough-dialog" in styles
     assert ".modal-dialog" in styles
+
+
+def test_frontend_pdf_trust_actions_record_reviewer_name():
+    markup = Path("web/index.html").read_text(encoding="utf-8")
+    script = Path("web/app.js").read_text(encoding="utf-8")
+    styles = Path("web/styles.css").read_text(encoding="utf-8")
+
+    assert 'id="reviewerNameInput"' in markup
+    assert "REVIEWER_NAME_COOKIE" in script
+    assert "normalizeReviewerName" in script
+    assert "ensureReviewerName" in script
+    assert "formatBrowserTimestamp" in script
+    assert "timeZoneName" in script
+    assert "body.reviewed_by = reviewer" in script
+    assert "Reviewed by:" in script
+    assert "saveReviewerName(els.reviewerNameInput.value)" in script
+    assert "#reviewerNameInput" in styles
 
 
 def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):

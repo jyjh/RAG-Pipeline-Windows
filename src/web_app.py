@@ -1378,6 +1378,9 @@ def _normalize_trust_entry(source_hash: str, entry: dict[str, Any] | None = None
     if isinstance(entry, dict):
         normalized.update({key: entry.get(key, value) for key, value in normalized.items()})
     normalized["source_hash"] = source_hash
+    for key in ("review_status", "source_type", "expires_at", "reviewed_by", "reviewed_at", "notes", "updated_at"):
+        normalized[key] = str(normalized.get(key) or "").strip()
+    normalized["reviewed_by"] = normalized["reviewed_by"][:80]
     if normalized["review_status"] not in TRUST_REVIEW_STATUSES:
         normalized["review_status"] = "unreviewed"
     if normalized["source_type"] not in TRUST_SOURCE_TYPES:
@@ -1450,9 +1453,9 @@ def update_document_trust(
             if key in updates:
                 next_entry[key] = updates[key]
         next_entry = _normalize_trust_entry(source_hash, next_entry)
-        if "review_status" in updates and next_entry["review_status"] != current.get("review_status"):
+        if "review_status" in updates:
             next_entry["reviewed_at"] = _utcnow()
-        if next_entry["review_status"] == "approved" and not next_entry.get("reviewed_at"):
+        elif next_entry["review_status"] == "approved" and not next_entry.get("reviewed_at"):
             next_entry["reviewed_at"] = _utcnow()
         next_entry["updated_at"] = _utcnow()
         documents[source_hash] = next_entry

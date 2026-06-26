@@ -49,6 +49,7 @@ const CHAT_STORAGE_KEY = "rag.chatHistory.v1";
 const CHAT_UI_STORAGE_KEY = "rag.chatUi.v1";
 const TUTORIAL_SEEN_COOKIE = "rag_tutorial_seen";
 const SITE_VERSION_COOKIE = "rag_site_version";
+const REVIEWER_NAME_COOKIE = "rag_reviewer_name";
 const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
 
 const els = {
@@ -65,6 +66,7 @@ const els = {
   forceUploadButton: document.getElementById("forceUploadButton"),
   pdfSearchInput: document.getElementById("pdfSearchInput"),
   pdfSearchButton: document.getElementById("pdfSearchButton"),
+  reviewerNameInput: document.getElementById("reviewerNameInput"),
   prevPdfPageButton: document.getElementById("prevPdfPageButton"),
   pdfPageLabel: document.getElementById("pdfPageLabel"),
   nextPdfPageButton: document.getElementById("nextPdfPageButton"),
@@ -294,6 +296,41 @@ function setCookie(name, value, maxAgeSeconds = COOKIE_MAX_AGE_SECONDS) {
   const encodedName = encodeURIComponent(name);
   const encodedValue = encodeURIComponent(value);
   document.cookie = `${encodedName}=${encodedValue}; Max-Age=${maxAgeSeconds}; Path=/; SameSite=Lax`;
+}
+
+function normalizeReviewerName(value) {
+  return String(value || "").trim().replace(/\s+/g, " ").slice(0, 80);
+}
+
+function saveReviewerName(value) {
+  const reviewer = normalizeReviewerName(value);
+  els.reviewerNameInput.value = reviewer;
+  if (reviewer) {
+    setCookie(REVIEWER_NAME_COOKIE, reviewer);
+  } else {
+    setCookie(REVIEWER_NAME_COOKIE, "", 0);
+  }
+  return reviewer;
+}
+
+function loadReviewerName() {
+  saveReviewerName(getCookie(REVIEWER_NAME_COOKIE));
+}
+
+function ensureReviewerName() {
+  let reviewer = saveReviewerName(els.reviewerNameInput.value || getCookie(REVIEWER_NAME_COOKIE));
+  if (reviewer) {
+    return reviewer;
+  }
+  const prompted = window.prompt("Enter your name to record who approved or flagged this source:", "");
+  if (prompted === null) {
+    return "";
+  }
+  reviewer = saveReviewerName(prompted);
+  if (!reviewer) {
+    setStatus(els.uploadStatus, "Enter a reviewer name before approving or flagging sources.", true);
+  }
+  return reviewer;
 }
 
 async function renderMarkdown(text) {
@@ -994,6 +1031,26 @@ function sourceTypeTitle(value) {
   return String(value || "unknown").replaceAll("_", " ");
 }
 
+function formatBrowserTimestamp(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) {
+    return text;
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+  }).format(date);
+}
+
 function renderQualityCell(item) {
   const quality = item.quality;
   const trust = item.trust && typeof item.trust === "object" ? item.trust : {};
@@ -1001,6 +1058,8 @@ function renderQualityCell(item) {
   const label = data.label || "review";
   const warningText = qualityWarnings(data.warnings).join(", ");
   const trustNotes = String(trust.notes || "").trim();
+  const reviewedBy = String(trust.reviewed_by || "").trim();
+  const reviewedAt = formatBrowserTimestamp(trust.reviewed_at);
   const metrics = [
     Number(data.chunk_count || 0) ? `${Number(data.chunk_count)} chunks` : "",
     Number(data.markdown_char_count || 0) ? `${Number(data.markdown_char_count)} chars` : "",
@@ -1011,6 +1070,7 @@ function renderQualityCell(item) {
     <span class="quality-badge quality-${escapeHtml(label)}">${escapeHtml(qualityTitle(label))}</span>
     <span class="quality-detail">${escapeHtml(metrics.join(" | "))}</span>
     <span class="quality-detail">Trust: ${escapeHtml(trustTitle(trust.review_status))} | ${escapeHtml(sourceTypeTitle(trust.source_type))}</span>
+    ${reviewedBy ? `<span class="quality-detail">Reviewed by: ${escapeHtml(reviewedBy)}${reviewedAt ? ` | ${escapeHtml(reviewedAt)}` : ""}</span>` : ""}
     <span class="quality-warning">${escapeHtml(warningText)}</span>
     ${trustNotes ? `<span class="quality-note">Note: ${escapeHtml(trustNotes)}</span>` : ""}
     <span class="quality-actions">
@@ -1132,6 +1192,13 @@ async function handlePdfAction(event) {
     }
   } else {
     return;
+  }
+  if (action === "approve" || action === "stale") {
+    const reviewer = ensureReviewerName();
+    if (!reviewer) {
+      return;
+    }
+    body.reviewed_by = reviewer;
   }
   button.disabled = true;
   try {
@@ -2742,6 +2809,15 @@ els.pdfSearchInput.addEventListener("keydown", (event) => {
     refreshPdfs();
   }
 });
+els.reviewerNameInput.addEventListener("change", () => saveReviewerName(els.reviewerNameInput.value));
+els.reviewerNameInput.addEventListener("blur", () => saveReviewerName(els.reviewerNameInput.value));
+els.reviewerNameInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    saveReviewerName(els.reviewerNameInput.value);
+    els.reviewerNameInput.blur();
+  }
+});
 els.pdfsBody.addEventListener("click", handlePdfAction);
 els.prevPdfPageButton.addEventListener("click", () => {
   state.pdfOffset = Math.max(0, state.pdfOffset - state.pdfLimit);
@@ -2814,6 +2890,7 @@ els.newChatButton.addEventListener("click", () => {
 els.collapseChatSidebarButton.addEventListener("click", () => setChatSidebarCollapsed(true));
 els.expandChatSidebarButton.addEventListener("click", () => setChatSidebarCollapsed(false));
 
+loadReviewerName();
 loadChatState();
 setChatSidebarCollapsed(state.chatSidebarCollapsed);
 renderSavedChats();
