@@ -8,7 +8,9 @@ from typing import Any
 
 from src.defaults import (
     DEFAULT_ASSET_TRIGGERS,
+    DEFAULT_CODE_ENRICHMENT,
     DEFAULT_DOCLING_ACCELERATOR,
+    DEFAULT_FORMULA_ENRICHMENT,
     DEFAULT_OCR_BACKEND,
     DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
     DEFAULT_OCR_FORCE_FULL_PAGE,
@@ -129,6 +131,8 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
         "parser_mode": str(ingestion.get("parser_mode") or DEFAULT_PDF_PARSER_MODE),
         "accelerator": str(ingestion.get("accelerator") or DEFAULT_DOCLING_ACCELERATOR),
         "asset_triggers": str(ingestion.get("asset_triggers") or DEFAULT_ASSET_TRIGGERS),
+        "code_enrichment": _as_bool(ingestion.get("code_enrichment"), DEFAULT_CODE_ENRICHMENT),
+        "formula_enrichment": _as_bool(ingestion.get("formula_enrichment"), DEFAULT_FORMULA_ENRICHMENT),
         "vision_model": str(models.get("vision_model") or DEFAULT_VISION_MODEL),
         "vision_enabled": _as_bool(ingestion.get("vision_enabled"), DEFAULT_VISION_ENABLED),
         "ocr_backend": str(ingestion.get("ocr_backend") or DEFAULT_OCR_BACKEND),
@@ -151,6 +155,8 @@ def _ingestion_args(args: argparse.Namespace) -> dict[str, Any]:
         "parser_mode": args.parser_mode or config["parser_mode"],
         "accelerator": args.accelerator or config["accelerator"],
         "asset_triggers": args.asset_triggers or config["asset_triggers"],
+        "code_enrichment": _as_bool(args.code_enrichment, config["code_enrichment"]),
+        "formula_enrichment": _as_bool(args.formula_enrichment, config["formula_enrichment"]),
         "vision_model": args.vision_model or config["vision_model"],
         "vision_enabled": _as_bool(args.vision_enabled, config["vision_enabled"]),
         "ocr_backend": args.ocr_backend or config["ocr_backend"],
@@ -319,12 +325,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--asset_triggers",
-        choices=["none", "images", "all"],
+        choices=["none", "images", "auto", "all"],
         default=None,
         help=(
             "When hybrid/manual ingest should run Docling asset enrichment after pypdf text succeeds. "
-            "Use 'all' to include table/equation heuristics."
+            "Use 'auto' for pictures/code/formulas or 'all' to include table heuristics."
         ),
+    )
+    parser.add_argument(
+        "--code_enrichment",
+        choices=["true", "false", "1", "0", "yes", "no", "on", "off"],
+        default=None,
+        help="Enable Docling code enrichment for detected code pages.",
+    )
+    parser.add_argument(
+        "--formula_enrichment",
+        choices=["true", "false", "1", "0", "yes", "no", "on", "off"],
+        default=None,
+        help="Enable Docling formula enrichment for detected formula pages.",
     )
     parser.add_argument("--vision_model", default=None, help="Ollama vision model for figure/page analysis.")
     parser.add_argument(

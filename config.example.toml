@@ -23,11 +23,12 @@ tesseract_psm = 3
 ocr_strategy = "auto"
 vision_enabled = true
 figure_crop_enabled = true
-formula_enrichment = false
+code_enrichment = true
+formula_enrichment = true
 table_structure = true
 accelerator = "auto"
 num_threads = 8
-asset_triggers = "images"
+asset_triggers = "auto"
 progress_enabled = true
 
 [chunking]

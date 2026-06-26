@@ -11,6 +11,8 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         parser_mode,
         accelerator,
         asset_triggers,
+        code_enrichment,
+        formula_enrichment,
         vision_model,
         vision_enabled,
         ocr_backend,
@@ -28,6 +30,8 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         calls["parser_mode"] = parser_mode
         calls["accelerator"] = accelerator
         calls["asset_triggers"] = asset_triggers
+        calls["code_enrichment"] = code_enrichment
+        calls["formula_enrichment"] = formula_enrichment
         calls["vision_model"] = vision_model
         calls["vision_enabled"] = vision_enabled
         calls["ocr_backend"] = ocr_backend
@@ -56,6 +60,10 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
             "cpu",
             "--asset_triggers",
             "none",
+            "--code_enrichment",
+            "false",
+            "--formula_enrichment",
+            "true",
             "--vision_model",
             "vision-test",
             "--vision_enabled",
@@ -87,6 +95,8 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         "parser_mode": "docling",
         "accelerator": "cpu",
         "asset_triggers": "none",
+        "code_enrichment": False,
+        "formula_enrichment": True,
         "vision_model": "vision-test",
         "vision_enabled": False,
         "ocr_backend": "tesseract_cli",

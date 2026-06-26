@@ -135,7 +135,7 @@ python main.py --mode index --md_dir processed_docs --db_dir db
 python main.py --mode query --db_dir db --question "Explain the bias-variance tradeoff"
 ```
 
-For born-digital PDFs, ingest defaults to pypdf text extraction plus targeted Docling enrichment on pages with embedded images. Use `--asset_triggers none` for text-only extraction, or `--asset_triggers all` to also enrich table/equation heuristic pages. Scanned/image-only PDFs fall back to Docling OCR with RapidOCR/ONNX Runtime by default. If OCR fails or returns no content, ingestion analyzes page images with the configured vision model and writes searchable `[Page Image Analysis]` Markdown instead of silently producing an empty file. Ingestion shows per-document and per-page progress bars by default; pass `--no_progress` to disable them.
+For born-digital PDFs, ingest defaults to pypdf text extraction plus targeted Docling enrichment on pages that appear to contain embedded images, code, or formulas. Pictures keep the local Ollama vision-description path, while detected code/formula pages use Docling code/formula enrichment before Markdown is chunked. Use `--asset_triggers none` for text-only extraction, `--asset_triggers images` for legacy picture-only enrichment, or `--asset_triggers all` to also enrich table heuristic pages. Scanned/image-only PDFs fall back to Docling OCR with RapidOCR/ONNX Runtime by default. If OCR fails or returns no content, ingestion analyzes page images with the configured vision model and writes searchable `[Page Image Analysis]` Markdown instead of silently producing an empty file. Ingestion shows per-document and per-page progress bars by default; pass `--no_progress` to disable them.
 
 OCR defaults live under `[ingestion]` in `config.toml`:
 

@@ -13,7 +13,9 @@ from typing import Any, Callable, Protocol
 
 from src.defaults import (
     DEFAULT_ASSET_TRIGGERS,
+    DEFAULT_CODE_ENRICHMENT,
     DEFAULT_DOCLING_ACCELERATOR,
+    DEFAULT_FORMULA_ENRICHMENT,
     DEFAULT_OCR_BACKEND,
     DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
     DEFAULT_OCR_FORCE_FULL_PAGE,
@@ -416,6 +418,7 @@ def _build_docling_converter(
     num_threads: int = 8,
     generate_picture_images: bool = True,
     table_structure: bool = True,
+    code_enrichment: bool = False,
     formula_enrichment: bool = False,
     ocr_enabled: bool = True,
     ocr_backend: str = DEFAULT_OCR_BACKEND,
@@ -445,6 +448,7 @@ def _build_docling_converter(
             tesseract_psm=tesseract_psm,
         )
     pipeline_options.do_table_structure = table_structure
+    pipeline_options.do_code_enrichment = code_enrichment
     pipeline_options.do_formula_enrichment = formula_enrichment
 
     return DocumentConverter(
@@ -456,7 +460,9 @@ def _build_docling_converter(
 
 class DoclingMarkdownRenderer:
     PICTURE_LABELS = ("picture", "figure", "chart")
-    ASSET_LABELS = PICTURE_LABELS + ("table", "formula", "equation")
+    CODE_LABELS = ("code",)
+    FORMULA_LABELS = ("formula", "equation")
+    ASSET_LABELS = PICTURE_LABELS + CODE_LABELS + FORMULA_LABELS + ("table",)
 
     def __init__(self, vision_describer: VisionDescriber):
         self.vision_describer = vision_describer
@@ -488,6 +494,10 @@ class DoclingMarkdownRenderer:
     def render_item(self, item, doc) -> str:
         if self.is_picture_item(item):
             return self._render_picture(item, doc)
+        if self.is_code_item(item):
+            return self._render_code(item)
+        if self.is_formula_item(item):
+            return self._render_formula(item)
         return self.item_to_markdown(item)
 
     def is_asset_item(self, item) -> bool:
@@ -497,6 +507,14 @@ class DoclingMarkdownRenderer:
     def is_picture_item(self, item) -> bool:
         label = self.item_label(item)
         return any(token in label for token in self.PICTURE_LABELS)
+
+    def is_code_item(self, item) -> bool:
+        label = self.item_label(item)
+        return any(token in label for token in self.CODE_LABELS)
+
+    def is_formula_item(self, item) -> bool:
+        label = self.item_label(item)
+        return any(token in label for token in self.FORMULA_LABELS)
 
     @staticmethod
     def item_label(item) -> str:
@@ -561,6 +579,36 @@ class DoclingMarkdownRenderer:
             logger.warning("Could not process figure: %s", exc)
             return ""
 
+    def _render_code(self, item) -> str:
+        content = self.item_to_markdown(item).strip()
+        if not content:
+            content = str(getattr(item, "orig", "") or "").strip()
+        if not content:
+            return ""
+        if content.startswith("```"):
+            return content
+
+        language = self._code_language(item)
+        return f"```{language}\n{content}\n```"
+
+    @staticmethod
+    def _code_language(item) -> str:
+        raw_language = getattr(item, "code_language", None)
+        value = str(getattr(raw_language, "value", raw_language) or "").strip().lower()
+        if not value or value == "unknown":
+            return ""
+        return re.sub(r"[^a-z0-9_+.#-]", "", value)
+
+    def _render_formula(self, item) -> str:
+        content = self.item_to_markdown(item).strip()
+        if not content:
+            return ""
+        if content.startswith(("$", r"\(", r"\[")):
+            return content
+        if "\n" in content:
+            return f"$$\n{content}\n$$"
+        return f"${content}$"
+
 
 @dataclass
 class DoclingPdfParser:
@@ -568,6 +616,7 @@ class DoclingPdfParser:
     accelerator: str | Any = DEFAULT_DOCLING_ACCELERATOR
     num_threads: int = 8
     table_structure: bool = True
+    code_enrichment: bool = False
     formula_enrichment: bool = False
     ocr_enabled: bool = True
     ocr_backend: str = DEFAULT_OCR_BACKEND
@@ -653,6 +702,7 @@ class DoclingPdfParser:
                 accelerator="cpu",
                 num_threads=self.num_threads,
                 table_structure=self.table_structure,
+                code_enrichment=self.code_enrichment,
                 formula_enrichment=self.formula_enrichment,
                 ocr_enabled=self.ocr_enabled,
                 ocr_backend=self.ocr_backend,
@@ -679,6 +729,7 @@ class DoclingPdfParser:
             accelerator=self.accelerator,
             num_threads=self.num_threads,
             table_structure=self.table_structure,
+            code_enrichment=self.code_enrichment,
             formula_enrichment=self.formula_enrichment,
             ocr_enabled=self.ocr_enabled,
             ocr_backend=self.ocr_backend,
@@ -695,8 +746,28 @@ class DoclingPdfParser:
 class ManualTextPdfParser:
     ASSET_TRIGGER_NONE = "none"
     ASSET_TRIGGER_IMAGES = "images"
+    ASSET_TRIGGER_AUTO = "auto"
     ASSET_TRIGGER_ALL = "all"
-    ASSET_TRIGGERS = {ASSET_TRIGGER_NONE, ASSET_TRIGGER_IMAGES, ASSET_TRIGGER_ALL}
+    ASSET_TRIGGERS = {ASSET_TRIGGER_NONE, ASSET_TRIGGER_IMAGES, ASSET_TRIGGER_AUTO, ASSET_TRIGGER_ALL}
+    LATEX_MARKERS = (
+        r"\frac",
+        r"\sum",
+        r"\int",
+        r"\sqrt",
+        r"\begin{equation",
+        r"\begin{align",
+        r"\left",
+        r"\right",
+    )
+    CODE_KEYWORD_PATTERNS = (
+        r"^\s*(def|class|import|from|return|async\s+def|await)\b",
+        r"^\s*(for|while|if|elif|else|try|except|finally|with)\b.*:",
+        r"^\s*(const|let|var|function|return|export|import)\b",
+        r"^\s*(public|private|protected|static|class|interface|void|int|double|float|bool|string)\b",
+        r"^\s*#\s*include\b",
+        r"^\s*(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b",
+        r"^\s*(fn|let|mut|impl|pub|use|struct|enum|trait)\b",
+    )
 
     EQUATION_MARKERS = ("=", "+", "-", "*", "/", "^", "_", "∑", "∫", "√", "≤", "≥", "≈", "≠")
 
@@ -704,6 +775,7 @@ class ManualTextPdfParser:
         self,
         *,
         docling_parser: DoclingPdfParser,
+        enriched_docling_parser: DoclingPdfParser | None = None,
         reader_factory: Callable[[str], Any] = _default_pdf_reader,
         extraction_mode: str = "plain",
         min_text_chars: int = 20,
@@ -712,6 +784,7 @@ class ManualTextPdfParser:
         progress_enabled: bool = False,
     ):
         self.docling_parser = docling_parser
+        self.enriched_docling_parser = enriched_docling_parser or docling_parser
         self.reader_factory = reader_factory
         self.extraction_mode = extraction_mode
         self.min_text_chars = min_text_chars
@@ -728,9 +801,17 @@ class ManualTextPdfParser:
         *,
         include_assets: bool = False,
         asset_pages: set[int] | None = None,
+        enriched_asset_pages: set[int] | None = None,
         page_texts: list[str] | None = None,
     ) -> str:
         page_texts = page_texts if page_texts is not None else self.extract_page_texts(file_path)
+        if not include_assets and asset_pages is None and self.asset_triggers != self.ASSET_TRIGGER_NONE:
+            hints = self.asset_enrichment_page_hints(file_path, page_texts)
+            asset_pages = set(hints)
+            if enriched_asset_pages is None:
+                enriched_asset_pages = self._enriched_pages_from_hints(hints)
+            include_assets = bool(asset_pages)
+
         if asset_pages is not None and not asset_pages:
             include_assets = False
 
@@ -740,25 +821,32 @@ class ManualTextPdfParser:
 
         if asset_pages is None:
             logger.info("Parsing PDF with pypdf text plus Docling assets: %s", file_path)
-            assets_by_page = self.extract_docling_assets(file_path)
+            hints = self.asset_enrichment_page_hints(file_path, page_texts)
+            enriched = self._has_code_or_formula_hints(hints)
+            assets_by_page = self.extract_docling_assets(file_path, enriched=enriched)
         else:
             logger.info(
                 "Parsing PDF with pypdf text plus Docling assets for pages %s: %s",
                 sorted(asset_pages),
                 file_path,
             )
-            assets_by_page = self.extract_docling_assets_for_pages(file_path, asset_pages)
+            assets_by_page = self.extract_docling_assets_for_pages(
+                file_path,
+                asset_pages,
+                enriched_asset_pages=enriched_asset_pages,
+            )
 
         return self.render_page_texts(page_texts, assets_by_page=assets_by_page)
 
-    def extract_docling_assets(self, file_path: str) -> dict[int, list[str]]:
+    def extract_docling_assets(self, file_path: str, *, enriched: bool = False) -> dict[int, list[str]]:
+        parser = self.enriched_docling_parser if enriched else self.docling_parser
         try:
             _progress_status(
                 f"Docling asset extraction: {Path(file_path).name}",
                 enabled=self.progress_enabled,
             )
-            doc = self.docling_parser.convert(file_path).document
-            return self.docling_parser.renderer.render_assets_by_page(doc)
+            doc = parser.convert(file_path).document
+            return parser.renderer.render_assets_by_page(doc)
         except Exception as exc:
             logger.warning(
                 "Docling asset extraction failed; continuing with manual text only: %s",
@@ -770,6 +858,8 @@ class ManualTextPdfParser:
         self,
         file_path: str,
         page_numbers: set[int],
+        *,
+        enriched_asset_pages: set[int] | None = None,
     ) -> dict[int, list[str]]:
         try:
             reader = self.reader_factory(file_path)
@@ -778,6 +868,7 @@ class ManualTextPdfParser:
             return {}
 
         assets_by_page: dict[int, list[str]] = {}
+        enriched_asset_pages = enriched_asset_pages or set()
         page_count = len(getattr(reader, "pages", []))
         desc = f"Docling asset pages: {Path(file_path).name}"
         with tempfile.TemporaryDirectory(prefix="rag_pdf_assets_") as temp_dir:
@@ -802,7 +893,10 @@ class ManualTextPdfParser:
                     logger.warning("Could not isolate PDF page %s for Docling assets: %s", page_no, exc)
                     continue
 
-                page_assets = self.extract_docling_assets(str(page_path))
+                page_assets = self.extract_docling_assets(
+                    str(page_path),
+                    enriched=page_no in enriched_asset_pages,
+                )
                 for assets in page_assets.values():
                     assets_by_page.setdefault(page_no, []).extend(assets)
 
@@ -850,11 +944,22 @@ class ManualTextPdfParser:
         return bool(self.asset_enrichment_pages(file_path, page_texts))
 
     def asset_enrichment_pages(self, file_path: str, page_texts: list[str]) -> set[int]:
-        if self.asset_triggers == self.ASSET_TRIGGER_NONE:
-            return set()
+        return set(self.asset_enrichment_page_hints(file_path, page_texts))
 
-        pages = self.image_pages(file_path)
-        if self.asset_triggers == self.ASSET_TRIGGER_ALL:
+    def asset_enrichment_page_hints(self, file_path: str, page_texts: list[str]) -> dict[int, set[str]]:
+        if self.asset_triggers == self.ASSET_TRIGGER_NONE:
+            return {}
+
+        hints: dict[int, set[str]] = {}
+        if self.asset_triggers in {
+            self.ASSET_TRIGGER_IMAGES,
+            self.ASSET_TRIGGER_AUTO,
+            self.ASSET_TRIGGER_ALL,
+        }:
+            for page_no in self.image_pages(file_path):
+                hints.setdefault(page_no, set()).add("picture")
+
+        if self.asset_triggers in {self.ASSET_TRIGGER_AUTO, self.ASSET_TRIGGER_ALL}:
             page_iter = _iter_with_progress(
                 enumerate(page_texts, start=1),
                 enabled=self.progress_enabled,
@@ -863,9 +968,25 @@ class ManualTextPdfParser:
                 unit="page",
             )
             for index, text in page_iter:
-                if self.text_suggests_table(text) or self.text_suggests_equation(text):
-                    pages.add(index)
-        return pages
+                if self.text_suggests_formula(text):
+                    hints.setdefault(index, set()).add("formula")
+                if self.text_suggests_code(text):
+                    hints.setdefault(index, set()).add("code")
+                if self.asset_triggers == self.ASSET_TRIGGER_ALL and self.text_suggests_table(text):
+                    hints.setdefault(index, set()).add("table")
+        return hints
+
+    @staticmethod
+    def _has_code_or_formula_hints(hints: dict[int, set[str]]) -> bool:
+        return any({"code", "formula"} & page_hints for page_hints in hints.values())
+
+    @staticmethod
+    def _enriched_pages_from_hints(hints: dict[int, set[str]]) -> set[int]:
+        return {
+            page_no
+            for page_no, page_hints in hints.items()
+            if {"code", "formula"} & page_hints
+        }
 
     def has_images(self, file_path: str) -> bool:
         return bool(self.image_pages(file_path))
@@ -915,10 +1036,8 @@ class ManualTextPdfParser:
     @classmethod
     def _normalize_asset_triggers(cls, asset_triggers: str) -> str:
         mode = asset_triggers.lower()
-        if mode == "auto":
-            mode = cls.ASSET_TRIGGER_IMAGES
         if mode not in cls.ASSET_TRIGGERS:
-            raise ValueError("asset_triggers must be one of: none, images, all")
+            raise ValueError("asset_triggers must be one of: none, images, auto, all")
         return mode
 
     @staticmethod
@@ -949,6 +1068,78 @@ class ManualTextPdfParser:
                 return True
             if re.search(r"\b[A-Za-z]\s*=\s*[^=]+", stripped):
                 return True
+        return False
+
+    @classmethod
+    def text_suggests_formula(cls, text: str) -> bool:
+        if any(marker in text for marker in cls.LATEX_MARKERS):
+            return True
+        if re.search(r"(?<!\$)\$[^$\n]{2,}\$(?!\$)", text):
+            return True
+        if re.search(r"\\\[[\s\S]{2,}?\\\]|\\\([\s\S]{2,}?\\\)", text):
+            return True
+        if cls.text_suggests_equation(text):
+            return True
+        return cls.text_suggests_broken_formula_area(text)
+
+    @staticmethod
+    def text_suggests_broken_formula_area(text: str) -> bool:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if len(stripped) < 6:
+                continue
+            if "�" in stripped or "\ufffd" in stripped or "□" in stripped:
+                if re.search(r"[A-Za-z0-9=+\-*/^_<>()[\]{}]", stripped):
+                    return True
+            compact = stripped.replace(" ", "")
+            if len(compact) < 4:
+                continue
+            operator_count = len(re.findall(r"(?:<=|>=|!=|==|[=+\-*/^_<>])", compact))
+            symbol_count = sum(not char.isalnum() for char in compact)
+            if operator_count >= 2 and symbol_count / max(len(compact), 1) >= 0.2:
+                return True
+        return False
+
+    @classmethod
+    def text_suggests_code(cls, text: str) -> bool:
+        if re.search(r"(?m)^\s*(```|~~~)", text):
+            return True
+        if re.search(r"(?m)^\s*(>>>|\.\.\.|In \[\d+\]:|\$ )", text):
+            return True
+
+        nonblank_lines = [line for line in text.splitlines() if line.strip()]
+        if not nonblank_lines:
+            return False
+
+        code_like_lines = 0
+        indented_code_lines = 0
+        for line in nonblank_lines:
+            stripped = line.strip()
+            if cls._line_suggests_code(stripped):
+                code_like_lines += 1
+            if line.startswith(("    ", "\t")) and cls._line_suggests_code(stripped, allow_plain_assignment=True):
+                indented_code_lines += 1
+
+        if code_like_lines >= 3:
+            return True
+        if code_like_lines >= 2 and len(nonblank_lines) <= 12:
+            return True
+        return indented_code_lines >= 2
+
+    @classmethod
+    def _line_suggests_code(cls, stripped: str, *, allow_plain_assignment: bool = False) -> bool:
+        if not stripped:
+            return False
+        if any(re.search(pattern, stripped, flags=re.IGNORECASE) for pattern in cls.CODE_KEYWORD_PATTERNS):
+            return True
+        if re.search(r"[{};]$", stripped) and re.search(r"[A-Za-z_]", stripped):
+            return True
+        if re.search(r"(->|=>|::|:=|==|!=|&&|\|\|)", stripped):
+            return True
+        if re.search(r"^\s*</?[A-Za-z][A-Za-z0-9-]*(\s+[^>]*)?>", stripped):
+            return True
+        if allow_plain_assignment and re.search(r"^[A-Za-z_][A-Za-z0-9_.$\[\]]*\s*=\s*[^=]", stripped):
+            return True
         return False
 
     def extract_page_texts(self, file_path: str) -> list[str]:
@@ -1090,11 +1281,18 @@ class HybridPdfParser:
     def parse(self, file_path: str) -> str:
         page_texts = self.manual_parser.extract_page_texts(file_path)
         if self.manual_parser.is_text_usable(page_texts):
-            asset_pages = self.manual_parser.asset_enrichment_pages(file_path, page_texts)
+            if hasattr(self.manual_parser, "asset_enrichment_page_hints"):
+                asset_hints = self.manual_parser.asset_enrichment_page_hints(file_path, page_texts)
+                asset_pages = set(asset_hints)
+                enriched_asset_pages = self.manual_parser._enriched_pages_from_hints(asset_hints)
+            else:
+                asset_pages = self.manual_parser.asset_enrichment_pages(file_path, page_texts)
+                enriched_asset_pages = set()
             return self.manual_parser.parse(
                 file_path,
                 include_assets=bool(asset_pages),
                 asset_pages=asset_pages,
+                enriched_asset_pages=enriched_asset_pages,
                 page_texts=page_texts,
             )
 
@@ -1128,6 +1326,8 @@ class DocumentProcessor:
         vision_enabled: bool = DEFAULT_VISION_ENABLED,
         min_text_chars: int = 20,
         asset_triggers: str = DEFAULT_ASSET_TRIGGERS,
+        code_enrichment: bool = DEFAULT_CODE_ENRICHMENT,
+        formula_enrichment: bool = DEFAULT_FORMULA_ENRICHMENT,
         ocr_backend: str = DEFAULT_OCR_BACKEND,
         ocr_langs: str | list[str] | tuple[str, ...] | None = None,
         ocr_force_full_page: bool = DEFAULT_OCR_FORCE_FULL_PAGE,
@@ -1140,6 +1340,8 @@ class DocumentProcessor:
     ):
         self.vision_model = vision_model
         vision_enabled = _normalize_bool(vision_enabled, DEFAULT_VISION_ENABLED)
+        code_enrichment = _normalize_bool(code_enrichment, DEFAULT_CODE_ENRICHMENT)
+        formula_enrichment = _normalize_bool(formula_enrichment, DEFAULT_FORMULA_ENRICHMENT)
         if vision_enabled:
             self.vision_describer: VisionDescriber = OllamaVisionDescriber(vision_model=vision_model)
         else:
@@ -1149,6 +1351,8 @@ class DocumentProcessor:
             vision_describer=self.vision_describer,
             accelerator=accelerator,
             num_threads=num_threads,
+            code_enrichment=code_enrichment,
+            formula_enrichment=formula_enrichment,
             ocr_enabled=True,
             ocr_backend=ocr_backend,
             ocr_langs=ocr_langs,
@@ -1175,8 +1379,26 @@ class DocumentProcessor:
             tesseract_psm=tesseract_psm,
             progress_enabled=progress_enabled,
         )
+        self.enriched_asset_docling_parser = DoclingPdfParser(
+            vision_describer=self.vision_describer,
+            accelerator=accelerator,
+            num_threads=num_threads,
+            code_enrichment=code_enrichment,
+            formula_enrichment=formula_enrichment,
+            ocr_enabled=False,
+            ocr_backend=ocr_backend,
+            ocr_langs=ocr_langs,
+            ocr_force_full_page=ocr_force_full_page,
+            ocr_bitmap_area_threshold=ocr_bitmap_area_threshold,
+            rapidocr_backend=rapidocr_backend,
+            tesseract_cmd=tesseract_cmd,
+            tesseract_data_path=tesseract_data_path,
+            tesseract_psm=tesseract_psm,
+            progress_enabled=progress_enabled,
+        )
         self.manual_parser = ManualTextPdfParser(
             docling_parser=self.asset_docling_parser,
+            enriched_docling_parser=self.enriched_asset_docling_parser,
             min_text_chars=min_text_chars,
             asset_triggers=asset_triggers,
             progress_enabled=progress_enabled,
@@ -1226,6 +1448,8 @@ def run_ingestion(
     parser_mode: str = DEFAULT_PDF_PARSER_MODE,
     accelerator: str | Any = DEFAULT_DOCLING_ACCELERATOR,
     asset_triggers: str = DEFAULT_ASSET_TRIGGERS,
+    code_enrichment: bool = DEFAULT_CODE_ENRICHMENT,
+    formula_enrichment: bool = DEFAULT_FORMULA_ENRICHMENT,
     vision_model: str = DEFAULT_VISION_MODEL,
     vision_enabled: bool = DEFAULT_VISION_ENABLED,
     ocr_backend: str = DEFAULT_OCR_BACKEND,
@@ -1261,6 +1485,8 @@ def run_ingestion(
                 accelerator=accelerator,
                 vision_enabled=vision_enabled,
                 asset_triggers=asset_triggers,
+                code_enrichment=code_enrichment,
+                formula_enrichment=formula_enrichment,
                 ocr_backend=ocr_backend,
                 ocr_langs=ocr_langs,
                 ocr_force_full_page=ocr_force_full_page,

@@ -4,6 +4,7 @@ import pytest
 
 from src.ingestion import (
     DisabledVisionDescriber,
+    DoclingMarkdownRenderer,
     DoclingPdfParser,
     HybridPdfParser,
     ManualTextPdfParser,
@@ -46,10 +47,12 @@ class FakeReader:
 
 
 class FakeItem:
-    def __init__(self, label, *, text="", markdown=None, page_no=1):
+    def __init__(self, label, *, text="", markdown=None, page_no=1, code_language=None, orig=None):
         self.label = label
         self.text = text
         self.markdown = markdown
+        self.code_language = code_language
+        self.orig = text if orig is None else orig
         self.prov = [SimpleNamespace(page_no=page_no)]
 
     def export_to_markdown(self):
@@ -121,6 +124,37 @@ def test_docling_converter_defaults_to_rapidocr_onnx_full_page():
     assert ocr_options.backend == "onnxruntime"
     assert ocr_options.lang == ["english"]
     assert ocr_options.force_full_page_ocr is True
+    assert options.do_code_enrichment is False
+    assert options.do_formula_enrichment is False
+
+
+def test_docling_converter_sets_code_and_formula_enrichment_flags():
+    from docling.datamodel.base_models import InputFormat
+
+    converter = _build_docling_converter(code_enrichment=True, formula_enrichment=True)
+    options = converter.format_to_options[InputFormat.PDF].pipeline_options
+
+    assert options.do_code_enrichment is True
+    assert options.do_formula_enrichment is True
+
+
+def test_docling_renderer_formats_code_and_formula_items():
+    renderer = DoclingMarkdownRenderer(DisabledVisionDescriber())
+    doc = FakeDoc(
+        [
+            FakeItem(
+                "code",
+                text="def solve(value):\n    return value",
+                code_language=SimpleNamespace(value="python"),
+            ),
+            FakeItem("formula", text="E = m c^2"),
+        ]
+    )
+
+    output = renderer.render_document(doc)
+
+    assert "```python\ndef solve(value):\n    return value\n```" in output
+    assert "$E = m c^2$" in output
 
 
 def test_docling_ocr_options_support_tesseract_and_easyocr():
@@ -273,6 +307,63 @@ def test_manual_parser_detects_images_from_pypdf_resources():
     assert parser.needs_asset_enrichment("fake.pdf", ["Clean extracted text"])
 
 
+def test_manual_parser_auto_detects_picture_code_and_formula_pages():
+    resources = {
+        1: {
+            "/XObject": {
+                "/Im1": {
+                    "/Subtype": "/Image",
+                }
+            }
+        }
+    }
+    page_texts = [
+        "Clean caption text",
+        "def solve(value):\n    return value\nclass Solver:",
+        "E = m * c ^ 2",
+    ]
+    parser = ManualTextPdfParser(
+        docling_parser=docling_parser_for([]),
+        reader_factory=reader_factory(page_texts, resources),
+        min_text_chars=1,
+        asset_triggers="auto",
+    )
+
+    hints = parser.asset_enrichment_page_hints("fake.pdf", page_texts)
+
+    assert hints == {
+        1: {"picture"},
+        2: {"code"},
+        3: {"formula"},
+    }
+    assert parser.asset_enrichment_pages("fake.pdf", page_texts) == {1, 2, 3}
+
+
+def test_manual_parser_images_trigger_remains_picture_only():
+    resources = {
+        1: {
+            "/XObject": {
+                "/Im1": {
+                    "/Subtype": "/Image",
+                }
+            }
+        }
+    }
+    page_texts = [
+        "Clean caption text",
+        "def solve(value):\n    return value\nclass Solver:",
+        "E = m * c ^ 2",
+    ]
+    parser = ManualTextPdfParser(
+        docling_parser=docling_parser_for([]),
+        reader_factory=reader_factory(page_texts, resources),
+        min_text_chars=1,
+        asset_triggers="images",
+    )
+
+    assert parser.asset_enrichment_page_hints("fake.pdf", page_texts) == {1: {"picture"}}
+
+
 def test_manual_parser_detects_table_and_equation_text():
     parser = ManualTextPdfParser(
         docling_parser=docling_parser_for([]),
@@ -300,6 +391,64 @@ def test_manual_parser_can_opt_into_table_and_equation_asset_pages():
     equation_text = "E = m * c ^ 2"
 
     assert parser.asset_enrichment_pages("fake.pdf", [table_text, equation_text]) == {1, 2}
+    assert parser.asset_enrichment_page_hints("fake.pdf", [table_text, equation_text]) == {
+        1: {"table"},
+        2: {"formula"},
+    }
+
+
+def test_manual_parser_uses_enriched_parser_when_requested():
+    light_parser = docling_parser_for([FakeItem("table", markdown="| A |\n| - |", page_no=1)])
+    enriched_parser = docling_parser_for(
+        [
+            FakeItem(
+                "code",
+                text="def solve(value):\n    return value",
+                code_language=SimpleNamespace(value="python"),
+                page_no=1,
+            )
+        ]
+    )
+    parser = ManualTextPdfParser(
+        docling_parser=light_parser,
+        enriched_docling_parser=enriched_parser,
+        reader_factory=reader_factory(["unused"]),
+        min_text_chars=1,
+    )
+
+    assert parser.extract_docling_assets("fake.pdf", enriched=False) == {1: ["| A |\n| - |"]}
+    assert parser.extract_docling_assets("fake.pdf", enriched=True) == {
+        1: ["```python\ndef solve(value):\n    return value\n```"]
+    }
+
+
+def test_manual_parser_direct_parse_auto_includes_detected_assets():
+    calls = {}
+    page_texts = [
+        "Plain text",
+        "def solve(value):\n    return value\nclass Solver:",
+        "E = m * c ^ 2",
+    ]
+
+    class RecordingManualParser(ManualTextPdfParser):
+        def extract_docling_assets_for_pages(self, file_path, page_numbers, *, enriched_asset_pages=None):
+            calls["page_numbers"] = page_numbers
+            calls["enriched_asset_pages"] = enriched_asset_pages
+            return {2: ["```python\nreturn value\n```"], 3: ["$E = mc^2$"]}
+
+    parser = RecordingManualParser(
+        docling_parser=docling_parser_for([]),
+        reader_factory=reader_factory(page_texts),
+        min_text_chars=1,
+        asset_triggers="auto",
+    )
+
+    output = parser.parse("fake.pdf")
+
+    assert calls == {"page_numbers": {2, 3}, "enriched_asset_pages": {2, 3}}
+    assert "Plain text" in output
+    assert "```python\nreturn value\n```" in output
+    assert "$E = mc^2$" in output
 
 
 def test_hybrid_parser_routes_to_manual_text_only_when_clean_text_has_no_assets():
@@ -313,9 +462,10 @@ def test_hybrid_parser_routes_to_manual_text_only_when_clean_text_has_no_assets(
         def asset_enrichment_pages(self, file_path, page_texts):
             return set()
 
-        def parse(self, file_path, *, include_assets=False, asset_pages=None, page_texts=None):
+        def parse(self, file_path, *, include_assets=False, asset_pages=None, enriched_asset_pages=None, page_texts=None):
             assert not include_assets
             assert asset_pages == set()
+            assert enriched_asset_pages == set()
             assert page_texts == ["clean text"]
             return "manual text"
 
@@ -339,9 +489,10 @@ def test_hybrid_parser_routes_to_manual_with_assets_when_asset_detected():
         def asset_enrichment_pages(self, file_path, page_texts):
             return {1}
 
-        def parse(self, file_path, *, include_assets=False, asset_pages=None, page_texts=None):
+        def parse(self, file_path, *, include_assets=False, asset_pages=None, enriched_asset_pages=None, page_texts=None):
             assert include_assets
             assert asset_pages == {1}
+            assert enriched_asset_pages == set()
             return "manual plus assets"
 
     class Docling:
@@ -457,10 +608,10 @@ def test_scanned_page_fallback_rejects_failed_vision_descriptions():
         fallback.parse("fake.pdf")
 
 
-def test_run_ingestion_refuses_empty_markdown(monkeypatch, tmp_path):
-    input_pdf = tmp_path / "scan.pdf"
+def test_run_ingestion_refuses_empty_markdown(monkeypatch, safe_tmp_path):
+    input_pdf = safe_tmp_path / "scan.pdf"
     input_pdf.write_bytes(b"%PDF-1.4")
-    output_dir = tmp_path / "processed"
+    output_dir = safe_tmp_path / "processed"
 
     class EmptyProcessor:
         def __init__(self, **kwargs):

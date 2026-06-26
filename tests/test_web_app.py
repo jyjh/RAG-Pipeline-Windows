@@ -870,6 +870,8 @@ def test_queue_passes_ingestion_options_to_worker(workspace_tmp):
         {
             "vision_model": "vision-test",
             "vision_enabled": False,
+            "code_enrichment": False,
+            "formula_enrichment": True,
             "ocr_backend": "tesseract_cli",
             "ocr_langs": ["eng"],
             "ocr_force_full_page": False,
@@ -883,6 +885,8 @@ def test_queue_passes_ingestion_options_to_worker(workspace_tmp):
 
     assert captured["vision_model"] == "vision-test"
     assert captured["vision_enabled"] is False
+    assert captured["code_enrichment"] is False
+    assert captured["formula_enrichment"] is True
     assert captured["ocr_backend"] == "tesseract_cli"
     assert captured["ocr_langs"] == ["eng"]
     assert captured["ocr_force_full_page"] is False
@@ -1544,7 +1548,12 @@ def test_pdf_reprocess_endpoint_queues_single_source_upload(monkeypatch, workspa
     registry.register_queued(
         job_id="old-job",
         files=[file_upload],
-        options={"ocr_backend": "tesseract_cli", "embedding_model": "old-embed"},
+        options={
+            "ocr_backend": "tesseract_cli",
+            "embedding_model": "old-embed",
+            "code_enrichment": False,
+            "formula_enrichment": True,
+        },
     )
     registry.mark_job_status(job_id="old-job", files=[file_upload], status="indexed")
     captured = {}
@@ -1580,6 +1589,8 @@ def test_pdf_reprocess_endpoint_queues_single_source_upload(monkeypatch, workspa
     assert staged_path.read_bytes() == pdf_bytes
     assert captured["options"]["ocr_backend"] == "tesseract_cli"
     assert captured["options"]["embedding_model"] == "old-embed"
+    assert captured["options"]["code_enrichment"] is False
+    assert captured["options"]["formula_enrichment"] is True
     queued = web_app.PdfRegistry(registry_path).load()["pdfs"][source_hash]
     assert queued["status"] == "queued"
     assert queued["previous_entry"]["status"] == "indexed"
