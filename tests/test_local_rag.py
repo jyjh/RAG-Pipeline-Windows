@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 import src.local_rag as local_rag
+from src.asset_store import ImageAssetStore, image_asset_marker
 from src.vector_store import LanceDBVectorStore
 
 
@@ -155,6 +156,46 @@ def test_local_citation_includes_pdf_page_link():
     assert source["open_url"] == "/api/pdfs/hash%2Fa/view#page=7"
     assert source["download_url"] == "/api/pdfs/hash%2Fa/download"
     assert source["page_label"] == "pages 7-9"
+
+
+def test_local_tool_resolves_image_asset_markers_without_url_in_tool_payload(safe_tmp_path):
+    store = ImageAssetStore(safe_tmp_path / "assets")
+    asset = store.save_image(
+        image_data=b"graph-png",
+        source_hash="hash-a",
+        source_pdf_name="report.pdf",
+        page_no=4,
+        description="A line graph of roll gradient.",
+    )
+    record = {
+        "id": "chunk-a",
+        "source_hash": "hash-a",
+        "source_pdf_name": "report.pdf",
+        "page_start": 4,
+        "page_end": 4,
+        "content": f"> [Vision Analysis]: A line graph of roll gradient.\n{image_asset_marker(asset['asset_id'])}",
+        "score": 0.91,
+    }
+    engine = local_rag.LocalQueryEngine.__new__(local_rag.LocalQueryEngine)
+    engine.asset_store = store
+    engine._context_token_budget = lambda: 4000
+    engine._retrieve = lambda *args, **kwargs: [record]
+    citations = local_rag.CitationRegistry(asset_store=store)
+
+    result = local_rag.LocalQueryEngine._local_tool_result(
+        engine,
+        query="roll gradient graph",
+        exclude_ids=set(),
+        citations=citations,
+        token_budget=4000,
+    )
+
+    assert result["result_count"] == 1
+    assert "/api/assets/" not in json.dumps(result)
+    sources = citations.all_sources()
+    assert sources[0]["assets"][0]["asset_id"] == asset["asset_id"]
+    assert sources[0]["assets"][0]["url"] == f"/api/assets/{asset['asset_id']}"
+    assert sources[0]["assets"][0]["description"] == "A line graph of roll gradient."
 
 
 def test_ollama_chat_posts_directly_to_api_chat(monkeypatch):

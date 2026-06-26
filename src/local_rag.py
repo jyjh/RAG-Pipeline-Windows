@@ -538,17 +538,22 @@ def _pdf_source_url(source_hash: str, *, mode: str, page: int = 0) -> str:
 
 
 class CitationRegistry:
-    def __init__(self):
+    def __init__(self, *, asset_store: Any | None = None):
+        self.asset_store = asset_store
         self._local_by_record_id: dict[str, dict[str, Any]] = {}
         self._web_by_url: dict[str, dict[str, Any]] = {}
         self._local_sources: list[dict[str, Any]] = []
         self._web_sources: list[dict[str, Any]] = []
 
+    def _asset_url(self, asset_id: str) -> str:
+        encoded = urllib.parse.quote(asset_id, safe="")
+        return f"/api/assets/{encoded}"
+
     def _local_source(self, record: dict[str, Any], index: int) -> dict[str, Any]:
         record_id = str(record.get("id") or "")
         source_hash = str(record.get("source_hash") or "")
         page_start = int(record.get("page_start") or 0)
-        return {
+        source = {
             "id": f"S{index}",
             "kind": "local",
             "label": f"[S{index}]",
@@ -567,6 +572,14 @@ class CitationRegistry:
             "open_url": _pdf_source_url(source_hash, mode="view", page=page_start),
             "download_url": _pdf_source_url(source_hash, mode="download"),
         }
+        if self.asset_store is not None:
+            assets = self.asset_store.assets_for_text(
+                str(record.get("content") or ""),
+                url_for=self._asset_url,
+            )
+            if assets:
+                source["assets"] = assets
+        return source
 
     def preview_local(self, record: dict[str, Any]) -> dict[str, Any]:
         record_id = str(record.get("id") or "")
@@ -1154,6 +1167,7 @@ class LocalQueryEngine:
         self,
         working_dir: str = "./db",
         *,
+        asset_dir: str | Path | None = None,
         model: str = "gemma4",
         embedding_model: str = "nomic-embed-text",
         embedding_batch_size: int | None = None,
@@ -1180,8 +1194,11 @@ class LocalQueryEngine:
         system_prompt: str | None = None,
     ):
         from src.embeddings import EmbeddingEngine
+        from src.asset_store import ImageAssetStore
 
         self.working_dir = working_dir
+        self.asset_dir = Path(asset_dir) if asset_dir is not None else Path(working_dir) / "assets"
+        self.asset_store = ImageAssetStore(self.asset_dir)
         self.model = model
         self.progress_enabled = progress_enabled
         self.top_k = _positive_int(top_k, 5) if top_k is not None else 5
@@ -1609,7 +1626,7 @@ class LocalQueryEngine:
             return self._local_tool_result(
                 query=query,
                 exclude_ids=set(),
-                citations=CitationRegistry(),
+                citations=CitationRegistry(asset_store=self.asset_store),
                 token_budget=token_budget,
             )
         finally:
@@ -1809,7 +1826,7 @@ class LocalQueryEngine:
         return result, text
 
     def _run_tool_rounds(self, question: str):
-        citations = CitationRegistry()
+        citations = CitationRegistry(asset_store=self.asset_store)
         messages = self._tool_messages(question)
         local_search_used = False
         tool_calls_used = 0

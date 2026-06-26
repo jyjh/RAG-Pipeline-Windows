@@ -42,6 +42,7 @@ def test_query_engine_delegates_to_local_query_engine(monkeypatch):
     assert calls == {
         "init": {
             "working_dir": "db",
+            "asset_dir": None,
             "model": "gemma4",
             "embedding_model": "nomic-embed-text",
             "embedding_batch_size": 4,

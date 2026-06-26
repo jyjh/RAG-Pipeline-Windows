@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from src.defaults import (
+    DEFAULT_ASSET_DIR,
     DEFAULT_ASSET_TRIGGERS,
     DEFAULT_CODE_ENRICHMENT,
     DEFAULT_DOCLING_ACCELERATOR,
@@ -53,6 +54,11 @@ FAILED_VISION_DESCRIPTIONS = {
     "[Image description empty]",
     "[Vision analysis disabled]",
 }
+
+
+def _usable_vision_description(description: str) -> bool:
+    text = (description or "").strip()
+    return bool(text) and text not in FAILED_VISION_DESCRIPTIONS
 
 
 class _LegacyDocumentProcessor:
@@ -464,36 +470,43 @@ class DoclingMarkdownRenderer:
     FORMULA_LABELS = ("formula", "equation")
     ASSET_LABELS = PICTURE_LABELS + CODE_LABELS + FORMULA_LABELS + ("table",)
 
-    def __init__(self, vision_describer: VisionDescriber):
+    def __init__(self, vision_describer: VisionDescriber, image_asset_store: Any | None = None):
         self.vision_describer = vision_describer
+        self.image_asset_store = image_asset_store
+        self.source_hash = ""
+        self.source_pdf_name = ""
 
-    def render_document(self, doc) -> str:
+    def set_source_context(self, *, source_hash: str = "", source_pdf_name: str = "") -> None:
+        self.source_hash = str(source_hash or "")
+        self.source_pdf_name = str(source_pdf_name or "")
+
+    def render_document(self, doc, *, page_no_override: int | None = None) -> str:
         parts: list[str] = []
         for item, _ in doc.iterate_items():
-            content = self.render_item(item, doc)
+            content = self.render_item(item, doc, page_no_override=page_no_override)
             if content:
                 parts.append(content)
         return "\n\n".join(parts)
 
-    def render_assets_by_page(self, doc) -> dict[int, list[str]]:
+    def render_assets_by_page(self, doc, *, page_no_override: int | None = None) -> dict[int, list[str]]:
         pages: dict[int, list[str]] = {}
         for item, _ in doc.iterate_items():
             if not self.is_asset_item(item):
                 continue
 
-            content = self.render_item(item, doc)
+            content = self.render_item(item, doc, page_no_override=page_no_override)
             if not content:
                 continue
 
-            page_no = self.item_page_no(item)
+            page_no = page_no_override or self.item_page_no(item)
             if page_no is None:
                 page_no = 1
             pages.setdefault(page_no, []).append(content)
         return pages
 
-    def render_item(self, item, doc) -> str:
+    def render_item(self, item, doc, *, page_no_override: int | None = None) -> str:
         if self.is_picture_item(item):
-            return self._render_picture(item, doc)
+            return self._render_picture(item, doc, page_no_override=page_no_override)
         if self.is_code_item(item):
             return self._render_code(item)
         if self.is_formula_item(item):
@@ -561,7 +574,7 @@ class DoclingMarkdownRenderer:
             return str(text)
         return ""
 
-    def _render_picture(self, item, doc) -> str:
+    def _render_picture(self, item, doc, *, page_no_override: int | None = None) -> str:
         try:
             get_image = getattr(item, "get_image", None)
             if not callable(get_image):
@@ -573,8 +586,22 @@ class DoclingMarkdownRenderer:
 
             buffered = io.BytesIO()
             image.save(buffered, format="PNG")
-            description = self.vision_describer.describe(buffered.getvalue())
-            return f"\n> [Vision Analysis]: {description}\n"
+            image_data = buffered.getvalue()
+            description = self.vision_describer.describe(image_data)
+            marker = ""
+            if image_data and _usable_vision_description(description) and self.image_asset_store is not None:
+                from src.asset_store import image_asset_marker
+
+                page_no = page_no_override or self.item_page_no(item) or 1
+                asset = self.image_asset_store.save_image(
+                    image_data=image_data,
+                    source_hash=self.source_hash,
+                    source_pdf_name=self.source_pdf_name,
+                    page_no=page_no,
+                    description=description,
+                )
+                marker = f"\n{image_asset_marker(str(asset.get('asset_id') or ''))}\n"
+            return f"\n> [Vision Analysis]: {description}\n{marker}"
         except Exception as exc:
             logger.warning("Could not process figure: %s", exc)
             return ""
@@ -629,10 +656,14 @@ class DoclingPdfParser:
     tesseract_psm: int | str | None = DEFAULT_TESSERACT_PSM
     progress_enabled: bool = False
     reader_factory: Callable[[str], Any] = _default_pdf_reader
+    image_asset_store: Any | None = None
     converter: Any | None = None
 
     def __post_init__(self) -> None:
-        self.renderer = DoclingMarkdownRenderer(self.vision_describer)
+        self.renderer = DoclingMarkdownRenderer(self.vision_describer, image_asset_store=self.image_asset_store)
+
+    def set_source_context(self, *, source_hash: str = "", source_pdf_name: str = "") -> None:
+        self.renderer.set_source_context(source_hash=source_hash, source_pdf_name=source_pdf_name)
 
     def parse(self, file_path: str) -> str:
         logger.info("Parsing PDF with Docling: %s", file_path)
@@ -673,7 +704,7 @@ class DoclingPdfParser:
                     with page_path.open("wb") as handle:
                         writer.write(handle)
                     page_doc = self.convert(str(page_path)).document
-                    page_md = self.renderer.render_document(page_doc)
+                    page_md = self.renderer.render_document(page_doc, page_no_override=page_no)
                 except Exception as exc:
                     logger.warning("Docling failed on page %s; continuing: %s", page_no, exc)
                     page_md = ""
@@ -838,7 +869,13 @@ class ManualTextPdfParser:
 
         return self.render_page_texts(page_texts, assets_by_page=assets_by_page)
 
-    def extract_docling_assets(self, file_path: str, *, enriched: bool = False) -> dict[int, list[str]]:
+    def extract_docling_assets(
+        self,
+        file_path: str,
+        *,
+        enriched: bool = False,
+        page_no_override: int | None = None,
+    ) -> dict[int, list[str]]:
         parser = self.enriched_docling_parser if enriched else self.docling_parser
         try:
             _progress_status(
@@ -846,7 +883,7 @@ class ManualTextPdfParser:
                 enabled=self.progress_enabled,
             )
             doc = parser.convert(file_path).document
-            return parser.renderer.render_assets_by_page(doc)
+            return parser.renderer.render_assets_by_page(doc, page_no_override=page_no_override)
         except Exception as exc:
             logger.warning(
                 "Docling asset extraction failed; continuing with manual text only: %s",
@@ -896,6 +933,7 @@ class ManualTextPdfParser:
                 page_assets = self.extract_docling_assets(
                     str(page_path),
                     enriched=page_no in enriched_asset_pages,
+                    page_no_override=page_no,
                 )
                 for assets in page_assets.values():
                     assets_by_page.setdefault(page_no, []).extend(assets)
@@ -1326,6 +1364,7 @@ class DocumentProcessor:
         vision_enabled: bool = DEFAULT_VISION_ENABLED,
         min_text_chars: int = 20,
         asset_triggers: str = DEFAULT_ASSET_TRIGGERS,
+        asset_dir: str | Path = DEFAULT_ASSET_DIR,
         code_enrichment: bool = DEFAULT_CODE_ENRICHMENT,
         formula_enrichment: bool = DEFAULT_FORMULA_ENRICHMENT,
         ocr_backend: str = DEFAULT_OCR_BACKEND,
@@ -1346,9 +1385,13 @@ class DocumentProcessor:
             self.vision_describer: VisionDescriber = OllamaVisionDescriber(vision_model=vision_model)
         else:
             self.vision_describer = DisabledVisionDescriber()
+        from src.asset_store import ImageAssetStore
+
+        self.image_asset_store = ImageAssetStore(asset_dir)
 
         self.docling_parser = DoclingPdfParser(
             vision_describer=self.vision_describer,
+            image_asset_store=self.image_asset_store,
             accelerator=accelerator,
             num_threads=num_threads,
             code_enrichment=code_enrichment,
@@ -1366,6 +1409,7 @@ class DocumentProcessor:
         )
         self.asset_docling_parser = DoclingPdfParser(
             vision_describer=self.vision_describer,
+            image_asset_store=self.image_asset_store,
             accelerator=accelerator,
             num_threads=num_threads,
             ocr_enabled=False,
@@ -1381,6 +1425,7 @@ class DocumentProcessor:
         )
         self.enriched_asset_docling_parser = DoclingPdfParser(
             vision_describer=self.vision_describer,
+            image_asset_store=self.image_asset_store,
             accelerator=accelerator,
             num_threads=num_threads,
             code_enrichment=code_enrichment,
@@ -1409,6 +1454,10 @@ class DocumentProcessor:
             progress_enabled=progress_enabled,
         )
         self.parser = self._select_parser(parser_mode)
+
+    def set_source_context(self, *, source_hash: str = "", source_pdf_name: str = "") -> None:
+        for parser in (self.docling_parser, self.asset_docling_parser, self.enriched_asset_docling_parser):
+            parser.set_source_context(source_hash=source_hash, source_pdf_name=source_pdf_name)
 
     def _select_parser(self, parser_mode: str) -> PdfParser:
         mode = parser_mode.lower()
@@ -1448,6 +1497,7 @@ def run_ingestion(
     parser_mode: str = DEFAULT_PDF_PARSER_MODE,
     accelerator: str | Any = DEFAULT_DOCLING_ACCELERATOR,
     asset_triggers: str = DEFAULT_ASSET_TRIGGERS,
+    asset_dir: str | Path = DEFAULT_ASSET_DIR,
     code_enrichment: bool = DEFAULT_CODE_ENRICHMENT,
     formula_enrichment: bool = DEFAULT_FORMULA_ENRICHMENT,
     vision_model: str = DEFAULT_VISION_MODEL,
@@ -1463,6 +1513,7 @@ def run_ingestion(
     progress_enabled: bool = True,
 ):
     os.makedirs(output_dir, exist_ok=True)
+    from src.asset_store import ImageAssetStore
     from src.pdf_registry import sha256_file, write_source_entry
 
     _progress_status(f"Discovering PDFs in {input_dir}...", enabled=progress_enabled)
@@ -1477,6 +1528,7 @@ def run_ingestion(
         unit="doc",
     ):
         _progress_status(f"Starting ingest: {input_path.name}", enabled=progress_enabled)
+        source_hash = sha256_file(input_path)
         if processor is None:
             _progress_status("Preparing PDF parser...", enabled=progress_enabled)
             processor = DocumentProcessor(
@@ -1485,6 +1537,7 @@ def run_ingestion(
                 accelerator=accelerator,
                 vision_enabled=vision_enabled,
                 asset_triggers=asset_triggers,
+                asset_dir=asset_dir,
                 code_enrichment=code_enrichment,
                 formula_enrichment=formula_enrichment,
                 ocr_backend=ocr_backend,
@@ -1498,6 +1551,8 @@ def run_ingestion(
                 progress_enabled=progress_enabled,
             )
 
+        ImageAssetStore(asset_dir).remove_source_assets(source_hash)
+        processor.set_source_context(source_hash=source_hash, source_pdf_name=input_path.name)
         md_content = processor.process_pdf(str(input_path))
         if not md_content.strip():
             raise RuntimeError(
@@ -1511,7 +1566,7 @@ def run_ingestion(
         write_source_entry(
             processed_dir=output_dir,
             markdown_path=output_path,
-            source_hash=sha256_file(input_path),
+            source_hash=source_hash,
             source_pdf_name=input_path.name,
             source_pdf_path=input_path,
         )

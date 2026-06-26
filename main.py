@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from src.defaults import (
+    DEFAULT_ASSET_DIR,
     DEFAULT_ASSET_TRIGGERS,
     DEFAULT_CODE_ENRICHMENT,
     DEFAULT_DOCLING_ACCELERATOR,
@@ -127,7 +128,9 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
     payload = _load_toml_config(config_path)
     ingestion = payload.get("ingestion", {}) if isinstance(payload.get("ingestion"), dict) else {}
     models = payload.get("models", {}) if isinstance(payload.get("models"), dict) else {}
+    paths = payload.get("paths", {}) if isinstance(payload.get("paths"), dict) else {}
     return {
+        "asset_dir": str(paths.get("asset_dir") or DEFAULT_ASSET_DIR),
         "parser_mode": str(ingestion.get("parser_mode") or DEFAULT_PDF_PARSER_MODE),
         "accelerator": str(ingestion.get("accelerator") or DEFAULT_DOCLING_ACCELERATOR),
         "asset_triggers": str(ingestion.get("asset_triggers") or DEFAULT_ASSET_TRIGGERS),
@@ -153,6 +156,7 @@ def _ingestion_args(args: argparse.Namespace) -> dict[str, Any]:
     config = _load_ingestion_config()
     return {
         "parser_mode": args.parser_mode or config["parser_mode"],
+        "asset_dir": args.asset_dir or config["asset_dir"],
         "accelerator": args.accelerator or config["accelerator"],
         "asset_triggers": args.asset_triggers or config["asset_triggers"],
         "code_enrichment": _as_bool(args.code_enrichment, config["code_enrichment"]),
@@ -180,6 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data_dir", default="data", help="Input PDF directory or PDF file")
     parser.add_argument("--md_dir", default="processed_docs", help="Generated Markdown directory")
     parser.add_argument("--db_dir", default="db", help="Local vector index directory")
+    parser.add_argument("--asset_dir", default=None, help="Directory for stored image assets.")
     parser.add_argument("--llm_model", default=default_llm_model(), help="Ollama LLM model")
     parser.add_argument(
         "--embedding_model",
@@ -426,6 +431,7 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error("--question is required when --mode query")
             answer = QueryEngine(
                 working_dir=args.db_dir,
+                asset_dir=args.asset_dir or _load_ingestion_config()["asset_dir"],
                 model=args.llm_model,
                 embedding_model=args.embedding_model,
                 embedding_batch_size=args.embedding_batch_size,

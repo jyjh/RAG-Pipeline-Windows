@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 import src.local_rag as local_rag
 import src.query as query
 import src.web_app as web_app
+from src.asset_store import ImageAssetStore
 from src.pdf_registry import load_source_map, write_source_entry
 from src.vector_store import LanceDBVectorStore
 
@@ -384,6 +385,7 @@ def test_index_vector_search_endpoint_uses_local_tool(monkeypatch, lancedb_tmp):
     assert response.status_code == 200
     payload = response.json()
     assert calls["init"]["working_dir"] == str(db_dir)
+    assert calls["init"]["asset_dir"] == str(web_app.ASSET_DIR)
     assert calls["init"]["retrieval_min_score"] == 0.72
     assert calls["init"]["web_search_enabled"] is False
     assert calls["search"] == {"query": "delta dynamics", "relevance_floor": 0.72}
@@ -868,6 +870,7 @@ def test_queue_passes_ingestion_options_to_worker(workspace_tmp):
         "input",
         "output",
         {
+            "asset_dir": str(workspace_tmp / "assets"),
             "vision_model": "vision-test",
             "vision_enabled": False,
             "code_enrichment": False,
@@ -883,6 +886,7 @@ def test_queue_passes_ingestion_options_to_worker(workspace_tmp):
         },
     )
 
+    assert captured["asset_dir"] == str(workspace_tmp / "assets")
     assert captured["vision_model"] == "vision-test"
     assert captured["vision_enabled"] is False
     assert captured["code_enrichment"] is False
@@ -897,10 +901,12 @@ def test_queue_passes_ingestion_options_to_worker(workspace_tmp):
     assert captured["tesseract_psm"] == 6
 
 
-def test_force_duplicate_cleanup_waits_until_ingestion_phase(workspace_tmp, lancedb_tmp):
+def test_force_duplicate_cleanup_waits_until_ingestion_phase(monkeypatch, workspace_tmp, lancedb_tmp):
     calls = []
     processed_dir = workspace_tmp / "processed"
     db_dir = lancedb_tmp / "db"
+    asset_dir = workspace_tmp / "assets"
+    monkeypatch.setattr(web_app, "ASSET_DIR", asset_dir)
     processed_dir.mkdir()
     old_markdown = processed_dir / "old.md"
     old_markdown.write_text("old content", encoding="utf-8")
@@ -939,10 +945,25 @@ def test_force_duplicate_cleanup_waits_until_ingestion_phase(workspace_tmp, lanc
         embedding_model="fake-embed",
         embedding_dim=3,
     )
+    asset_store = ImageAssetStore(asset_dir)
+    stale_asset = asset_store.save_image(
+        image_data=b"old-graph",
+        source_hash="hash-a",
+        source_pdf_name="old.pdf",
+        page_no=1,
+        description="old graph",
+    )
 
     def fake_ingest(input_dir, output_dir, **kwargs):
         old_content = old_markdown.read_text(encoding="utf-8") if old_markdown.exists() else ""
-        calls.append(("ingest", bool(old_content), LanceDBVectorStore(db_dir).count()))
+        calls.append(
+            (
+                "ingest",
+                bool(old_content),
+                LanceDBVectorStore(db_dir).count(),
+                asset_store.asset_path(stale_asset["asset_id"]) is not None,
+            )
+        )
 
     def fake_index(md_dir, db_dir_arg, **kwargs):
         calls.append(("index", Path(md_dir).name, Path(db_dir_arg).name))
@@ -970,12 +991,14 @@ def test_force_duplicate_cleanup_waits_until_ingestion_phase(workspace_tmp, lanc
     _wait_for(lambda: queue.get_job(job.id)["status"] == "paused_for_queries")
     assert old_markdown.exists()
     assert LanceDBVectorStore(db_dir).count() == 2
+    assert asset_store.asset_path(stale_asset["asset_id"]) is not None
 
     queue.finish_query()
     _wait_for(lambda: queue.get_job(job.id)["status"] == "done")
 
-    assert calls[0] == ("ingest", False, 1)
+    assert calls[0] == ("ingest", False, 1, False)
     assert load_source_map(processed_dir)["documents"] == {}
+    assert asset_store.load_manifest()["assets"] == {}
 
 
 def test_startup_recovery_resumes_saved_upload(workspace_tmp):
@@ -1111,6 +1134,7 @@ def test_upload_endpoint_enqueues_pdf_batch(monkeypatch, workspace_tmp):
     assert captured["uploads"][0]["filename"] == "notes.pdf"
     assert len(captured["uploads"][0]["hash"]) == 64
     assert captured["options"]["ocr_backend"] == "rapidocr"
+    assert captured["options"]["asset_dir"] == str(web_app.ASSET_DIR)
     assert captured["options"]["rapidocr_backend"] == "onnxruntime"
     assert captured["options"]["ocr_force_full_page"] is True
     assert captured["options"]["ocr_langs"] == ["english"]
@@ -1589,6 +1613,7 @@ def test_pdf_reprocess_endpoint_queues_single_source_upload(monkeypatch, workspa
     assert staged_path.read_bytes() == pdf_bytes
     assert captured["options"]["ocr_backend"] == "tesseract_cli"
     assert captured["options"]["embedding_model"] == "old-embed"
+    assert captured["options"]["asset_dir"] == str(web_app.ASSET_DIR)
     assert captured["options"]["code_enrichment"] is False
     assert captured["options"]["formula_enrichment"] is True
     queued = web_app.PdfRegistry(registry_path).load()["pdfs"][source_hash]
@@ -1678,6 +1703,57 @@ def test_pdf_download_rejects_paths_outside_data_dir(monkeypatch, workspace_tmp)
     assert client.get("/api/pdfs/hash-unsafe/download").status_code == 403
 
 
+def test_image_asset_endpoint_serves_manifest_known_files(monkeypatch, workspace_tmp):
+    asset_dir = workspace_tmp / "assets"
+    store = ImageAssetStore(asset_dir)
+    asset = store.save_image(
+        image_data=b"graph-png",
+        source_hash="hash-a",
+        source_pdf_name="report.pdf",
+        page_no=2,
+        description="graph description",
+    )
+    outside = workspace_tmp / "outside.png"
+    outside.write_bytes(b"outside")
+    manifest = store.load_manifest()
+    manifest["assets"]["unsafe"] = {
+        "asset_id": "unsafe",
+        "source_hash": "hash-a",
+        "source_pdf_name": "report.pdf",
+        "page_no": 2,
+        "description": "unsafe",
+        "mime_type": "image/png",
+        "relative_path": "../outside.png",
+        "image_sha": "unsafe",
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    store.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(web_app, "ASSET_DIR", asset_dir)
+
+    client = TestClient(web_app.app)
+    served = client.get(f"/api/assets/{asset['asset_id']}")
+    unknown = client.get("/api/assets/no-such-asset")
+    unsafe = client.get("/api/assets/unsafe")
+
+    assert served.status_code == 200
+    assert served.content == b"graph-png"
+    assert served.headers["content-type"].startswith("image/png")
+    assert unknown.status_code == 404
+    assert unsafe.status_code == 404
+
+
+def test_sources_panel_frontend_includes_image_asset_preview():
+    script = Path("web/app.js").read_text(encoding="utf-8")
+    styles = Path("web/styles.css").read_text(encoding="utf-8")
+
+    assert "source.assets" in script
+    assert "source-assets" in script
+    assert "source-asset" in script
+    assert "Open image" in script
+    assert ".source-assets" in styles
+    assert ".source-asset img" in styles
+
+
 def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
     events = []
 
@@ -1755,6 +1831,7 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
     ]
     assert events[0] == "begin"
     assert events[1][1]["temperature"] == 0.65
+    assert events[1][1]["asset_dir"] == str(web_app.ASSET_DIR)
     assert events[1][1]["sampler_top_k"] == 25
     assert events[1][1]["context_window"] == 4096
     assert events[1][1]["llm_num_predict"] == 512

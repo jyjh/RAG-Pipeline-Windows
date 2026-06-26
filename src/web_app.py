@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from src.defaults import (
+    DEFAULT_ASSET_DIR,
     DEFAULT_ASSET_TRIGGERS,
     DEFAULT_CODE_ENRICHMENT,
     DEFAULT_DOCLING_ACCELERATOR,
@@ -64,6 +65,13 @@ DOCUMENT_TRUST_PATH = DATA_DIR / ".document_trust.json"
 PROCESSED_DIR = ROOT_DIR / "processed_docs"
 DB_DIR = ROOT_DIR / "db"
 WEB_DIR = ROOT_DIR / "web"
+
+
+def _resolve_root_path(raw_path: Any, *, default: str | Path | None = None) -> Path:
+    value = raw_path if raw_path not in (None, "") else default
+    path = Path(str(value or ""))
+    return path if path.is_absolute() else ROOT_DIR / path
+
 
 DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
 DEFAULT_EMBEDDING_BATCH_SIZE = 8
@@ -278,8 +286,10 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
     payload = _load_toml_config(config_path)
     ingestion = payload.get("ingestion", {}) if isinstance(payload.get("ingestion"), dict) else {}
     models = payload.get("models", {}) if isinstance(payload.get("models"), dict) else {}
+    paths = payload.get("paths", {}) if isinstance(payload.get("paths"), dict) else {}
 
     return {
+        "asset_dir": _nonempty_str(paths.get("asset_dir"), DEFAULT_ASSET_DIR),
         "parser_mode": _nonempty_str(ingestion.get("parser_mode"), DEFAULT_PDF_PARSER_MODE),
         "accelerator": _nonempty_str(ingestion.get("accelerator"), DEFAULT_DOCLING_ACCELERATOR),
         "asset_triggers": _nonempty_str(ingestion.get("asset_triggers"), DEFAULT_ASSET_TRIGGERS),
@@ -304,6 +314,7 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
 SERVER_CONFIG = _load_server_config()
 CHAT_CONFIG = _load_chat_config()
 INGESTION_CONFIG = _load_ingestion_config()
+ASSET_DIR = _resolve_root_path(INGESTION_CONFIG["asset_dir"], default=DEFAULT_ASSET_DIR)
 
 
 def _index_store(db_dir: Path | None = None):
@@ -952,6 +963,7 @@ def vector_search_index_rows(
 
     engine = LocalQueryEngine(
         working_dir=str(db_dir or DB_DIR),
+        asset_dir=str(ASSET_DIR),
         embedding_model=embedding_model or DEFAULT_EMBEDDING_MODEL,
         embedding_batch_size=embedding_batch_size,
         embedding_timeout=embedding_timeout,
@@ -1762,6 +1774,11 @@ class RagJobQueue:
         hashes = {value for value in job.force_duplicate_hashes if value}
         if not hashes:
             return
+        from src.asset_store import ImageAssetStore
+
+        asset_store = ImageAssetStore(_resolve_root_path(job.options.get("asset_dir") or ASSET_DIR))
+        for source_hash in hashes:
+            asset_store.remove_source_assets(source_hash)
         removed_entries = remove_source_entries_by_hash(self.processed_dir, hashes)
         legacy_paths: list[str] = []
         legacy_doc_ids: list[str] = []
@@ -1822,6 +1839,7 @@ class RagJobQueue:
             parser_mode=options.get("parser_mode", INGESTION_CONFIG["parser_mode"]),
             accelerator=options.get("accelerator", INGESTION_CONFIG["accelerator"]),
             asset_triggers=options.get("asset_triggers", INGESTION_CONFIG["asset_triggers"]),
+            asset_dir=str(_resolve_root_path(options.get("asset_dir", INGESTION_CONFIG["asset_dir"]))),
             code_enrichment=options.get("code_enrichment", INGESTION_CONFIG["code_enrichment"]),
             formula_enrichment=options.get("formula_enrichment", INGESTION_CONFIG["formula_enrichment"]),
             vision_model=options.get("vision_model", INGESTION_CONFIG["vision_model"]),
@@ -2115,6 +2133,7 @@ def health():
             "upload_dir": str(UPLOAD_DIR),
             "processed_dir": str(PROCESSED_DIR),
             "db_dir": str(DB_DIR),
+            "asset_dir": str(ASSET_DIR),
             "index_file": str(path),
         },
         "index_exists": index_exists,
@@ -2149,6 +2168,7 @@ def render_markdown(payload: RenderRequest):
 
 def _upload_options_from_form(form: Any) -> dict[str, Any]:
     return {
+        "asset_dir": str(_resolve_root_path(form.get("asset_dir") or INGESTION_CONFIG["asset_dir"])),
         "parser_mode": str(form.get("parser_mode") or INGESTION_CONFIG["parser_mode"]),
         "accelerator": str(form.get("accelerator") or INGESTION_CONFIG["accelerator"]),
         "asset_triggers": str(form.get("asset_triggers") or INGESTION_CONFIG["asset_triggers"]),
@@ -2626,6 +2646,23 @@ def pdf_documents(search: str = "", offset: int = 0, limit: int = 10):
     return list_pdf_documents(search=search, offset=offset, limit=limit)
 
 
+@app.get("/api/assets/{asset_id}")
+def image_asset(asset_id: str):
+    from src.asset_store import ImageAssetStore
+
+    store = ImageAssetStore(ASSET_DIR)
+    entry = store.get_asset(asset_id)
+    path = store.asset_path(asset_id)
+    if entry is None or path is None:
+        raise HTTPException(status_code=404, detail="Image asset not found.")
+    return FileResponse(
+        path,
+        media_type=str(entry.get("mime_type") or "image/png"),
+        filename=path.name,
+        content_disposition_type="inline",
+    )
+
+
 @app.get("/api/pdfs/{source_hash}/download")
 def download_pdf(source_hash: str):
     try:
@@ -2818,6 +2855,7 @@ def chat_stream(payload: ChatRequest):
 
             engine = QueryEngine(
                 working_dir=str(DB_DIR),
+                asset_dir=str(ASSET_DIR),
                 model=payload.llm_model,
                 embedding_model=payload.embedding_model,
                 embedding_batch_size=payload.embedding_batch_size,

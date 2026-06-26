@@ -9,6 +9,7 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         md_dir,
         *,
         parser_mode,
+        asset_dir,
         accelerator,
         asset_triggers,
         code_enrichment,
@@ -28,6 +29,7 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         calls["data_dir"] = data_dir
         calls["md_dir"] = md_dir
         calls["parser_mode"] = parser_mode
+        calls["asset_dir"] = asset_dir
         calls["accelerator"] = accelerator
         calls["asset_triggers"] = asset_triggers
         calls["code_enrichment"] = code_enrichment
@@ -56,6 +58,8 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
             "md_out",
             "--parser_mode",
             "docling",
+            "--asset_dir",
+            "asset_out",
             "--accelerator",
             "cpu",
             "--asset_triggers",
@@ -93,6 +97,7 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         "data_dir": "data_in",
         "md_dir": "md_out",
         "parser_mode": "docling",
+        "asset_dir": "asset_out",
         "accelerator": "cpu",
         "asset_triggers": "none",
         "code_enrichment": False,
@@ -164,6 +169,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
         def __init__(
             self,
             working_dir,
+            asset_dir,
             model,
             embedding_model,
             embedding_batch_size,
@@ -186,6 +192,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
             progress_enabled,
         ):
             calls["working_dir"] = working_dir
+            calls["asset_dir"] = asset_dir
             calls["model"] = model
             calls["embedding_model"] = embedding_model
             calls["embedding_batch_size"] = embedding_batch_size
@@ -229,6 +236,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
     assert result == 0
     assert calls == {
         "working_dir": "db_in",
+        "asset_dir": "db/assets",
         "model": "custom-model",
         "embedding_model": "nomic-embed-text",
         "embedding_batch_size": 8,

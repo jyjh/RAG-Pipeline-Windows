@@ -629,6 +629,35 @@ input[type="file"] {
   color: var(--accent-strong);
 }
 
+.source-assets {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.source-asset {
+  display: grid;
+  gap: 4px;
+  width: 112px;
+  color: var(--accent-strong);
+  text-decoration: none;
+}
+
+.source-asset img {
+  width: 112px;
+  height: 78px;
+  object-fit: contain;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.source-asset span {
+  font-size: 12px;
+  line-height: 1.25;
+}
+
 .quality-badge {
   display: inline-flex;
   align-items: center;

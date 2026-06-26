@@ -1892,6 +1892,34 @@ function renderSourcePanel(parts) {
       <span>${escapeHtml(source.snippet || "")}</span>
       <span class="source-links">${links.join("")}</span>
     `;
+    const assets = Array.isArray(source.assets) ? source.assets : [];
+    if (assets.length) {
+      const assetGrid = document.createElement("div");
+      assetGrid.className = "source-assets";
+      for (const asset of assets) {
+        if (!asset || !asset.url) {
+          continue;
+        }
+        const link = document.createElement("a");
+        link.className = "source-asset";
+        link.href = asset.url;
+        link.target = "_blank";
+        link.rel = "noreferrer";
+
+        const image = document.createElement("img");
+        image.src = asset.url;
+        image.alt = asset.description || "Stored source image";
+        link.appendChild(image);
+
+        const caption = document.createElement("span");
+        caption.textContent = [asset.page_no ? `page ${asset.page_no}` : "", "Open image"].filter(Boolean).join(" | ");
+        link.appendChild(caption);
+        assetGrid.appendChild(link);
+      }
+      if (assetGrid.childElementCount) {
+        item.appendChild(assetGrid);
+      }
+    }
     parts.sourcesBody.appendChild(item);
   }
 }
@@ -1946,6 +1974,15 @@ function sourceAsToolResultItem(source) {
     score: source.score,
     location: [source.source_pdf_name, source.section_path, source.page_label].filter(Boolean).join(" :: "),
     snippet: source.snippet || "",
+    assets: Array.isArray(source.assets)
+      ? source.assets.map((asset) => ({
+          asset_id: asset.asset_id || "",
+          page_no: asset.page_no || 0,
+          url: asset.url || "",
+          description: asset.description || "",
+          mime_type: asset.mime_type || "",
+        }))
+      : [],
   };
 }
 

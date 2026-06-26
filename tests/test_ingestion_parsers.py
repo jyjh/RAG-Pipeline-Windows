@@ -1,7 +1,9 @@
+import hashlib
 from types import SimpleNamespace
 
 import pytest
 
+from src.asset_store import ImageAssetStore, image_asset_ids
 from src.ingestion import (
     DisabledVisionDescriber,
     DoclingMarkdownRenderer,
@@ -102,6 +104,15 @@ class FakeImage:
         handle.write(b"fake-png")
 
 
+class FakePictureItem(FakeItem):
+    def __init__(self, *, page_no=1, image=None):
+        super().__init__("picture", page_no=page_no)
+        self._image = image or FakeImage()
+
+    def get_image(self, doc):
+        return self._image
+
+
 class RecordingVisionDescriber:
     def __init__(self, response="described scanned vibration diagram"):
         self.response = response
@@ -155,6 +166,43 @@ def test_docling_renderer_formats_code_and_formula_items():
 
     assert "```python\ndef solve(value):\n    return value\n```" in output
     assert "$E = m c^2$" in output
+
+
+def test_docling_renderer_stores_described_picture_assets(safe_tmp_path):
+    store = ImageAssetStore(safe_tmp_path / "assets")
+    vision = RecordingVisionDescriber("A plotted suspension response with labeled axes.")
+    renderer = DoclingMarkdownRenderer(vision, image_asset_store=store)
+    renderer.set_source_context(source_hash="source-hash-a", source_pdf_name="report.pdf")
+
+    output = renderer.render_document(FakeDoc([FakePictureItem(page_no=3)]))
+
+    asset_ids = image_asset_ids(output)
+    assert len(asset_ids) == 1
+    assert "[Vision Analysis]: A plotted suspension response with labeled axes." in output
+    asset = store.get_asset(asset_ids[0])
+    assert asset is not None
+    assert asset["source_hash"] == "source-hash-a"
+    assert asset["source_pdf_name"] == "report.pdf"
+    assert asset["page_no"] == 3
+    assert asset["description"] == "A plotted suspension response with labeled axes."
+    assert asset["mime_type"] == "image/png"
+    assert asset["image_sha"] == hashlib.sha256(b"fake-png").hexdigest()
+    assert store.asset_path(asset_ids[0]).read_bytes() == b"fake-png"
+
+
+def test_docling_renderer_skips_failed_picture_asset_descriptions(safe_tmp_path):
+    store = ImageAssetStore(safe_tmp_path / "assets")
+    renderer = DoclingMarkdownRenderer(
+        RecordingVisionDescriber("[Image description failed]"),
+        image_asset_store=store,
+    )
+    renderer.set_source_context(source_hash="source-hash-a", source_pdf_name="report.pdf")
+
+    output = renderer.render_document(FakeDoc([FakePictureItem(page_no=2)]))
+
+    assert "[Vision Analysis]: [Image description failed]" in output
+    assert "[Image Asset:" not in output
+    assert store.load_manifest()["assets"] == {}
 
 
 def test_docling_ocr_options_support_tesseract_and_easyocr():
@@ -617,6 +665,9 @@ def test_run_ingestion_refuses_empty_markdown(monkeypatch, safe_tmp_path):
         def __init__(self, **kwargs):
             pass
 
+        def set_source_context(self, **kwargs):
+            pass
+
         def process_pdf(self, file_path):
             return ""
 
@@ -627,3 +678,41 @@ def test_run_ingestion_refuses_empty_markdown(monkeypatch, safe_tmp_path):
 
     assert not (output_dir / "scan.md").exists()
     assert not (output_dir / ".source_map.json").exists()
+
+
+def test_run_ingestion_removes_stale_assets_before_processing(monkeypatch, safe_tmp_path):
+    input_pdf = safe_tmp_path / "source.pdf"
+    input_pdf.write_bytes(b"%PDF-1.4 source")
+    source_hash = hashlib.sha256(input_pdf.read_bytes()).hexdigest()
+    output_dir = safe_tmp_path / "processed"
+    asset_dir = safe_tmp_path / "assets"
+    store = ImageAssetStore(asset_dir)
+    stale = store.save_image(
+        image_data=b"stale-png",
+        source_hash=source_hash,
+        source_pdf_name="source.pdf",
+        page_no=1,
+        description="stale graph",
+    )
+    calls = {}
+
+    class Processor:
+        def __init__(self, **kwargs):
+            calls["asset_dir"] = kwargs["asset_dir"]
+
+        def set_source_context(self, **kwargs):
+            calls["context"] = kwargs
+
+        def process_pdf(self, file_path):
+            calls["asset_exists_during_process"] = store.asset_path(stale["asset_id"]) is not None
+            return "fresh markdown"
+
+    monkeypatch.setattr("src.ingestion.DocumentProcessor", Processor)
+
+    run_ingestion(str(input_pdf), str(output_dir), asset_dir=asset_dir, progress_enabled=False)
+
+    assert calls["asset_dir"] == asset_dir
+    assert calls["context"] == {"source_hash": source_hash, "source_pdf_name": "source.pdf"}
+    assert calls["asset_exists_during_process"] is False
+    assert store.load_manifest()["assets"] == {}
+    assert (output_dir / "source.md").read_text(encoding="utf-8") == "fresh markdown"
