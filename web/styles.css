@@ -41,6 +41,18 @@ h1 {
   font-weight: 650;
 }
 
+h2 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 650;
+}
+
+h3 {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 700;
+}
+
 p {
   margin: 4px 0 0;
   color: var(--muted);
@@ -420,6 +432,166 @@ input[type="file"] {
 
 .chat-panel {
   max-width: none;
+}
+
+.guide-panel {
+  max-width: 1160px;
+}
+
+.guide-header {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.guide-header p {
+  max-width: 760px;
+}
+
+.guide-layout {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.guide-section {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 14px;
+}
+
+.guide-section:first-child {
+  grid-row: span 2;
+}
+
+.guide-steps,
+.guide-list {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.guide-steps {
+  display: grid;
+  gap: 12px;
+}
+
+.guide-steps li,
+.guide-list li {
+  padding-left: 4px;
+}
+
+.guide-steps strong {
+  display: block;
+  margin-bottom: 2px;
+}
+
+.guide-steps span,
+.guide-list {
+  color: var(--muted);
+}
+
+.guide-list {
+  display: grid;
+  gap: 8px;
+}
+
+.walkthrough-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  pointer-events: none;
+}
+
+.walkthrough-overlay[hidden] {
+  display: none;
+}
+
+.walkthrough-dialog {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  width: min(420px, calc(100vw - 32px));
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 18px 42px rgba(28, 36, 48, 0.18);
+  padding: 14px;
+  pointer-events: auto;
+}
+
+.walkthrough-count {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.walkthrough-dialog h2 {
+  margin-top: 4px;
+  font-size: 18px;
+}
+
+.walkthrough-dialog p {
+  margin: 8px 0 14px;
+}
+
+.walkthrough-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.walkthrough-highlight {
+  position: relative;
+  z-index: 45;
+  outline: 3px solid #d9b456;
+  outline-offset: 3px;
+  box-shadow: 0 0 0 6px rgba(217, 180, 86, 0.18);
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(28, 36, 48, 0.36);
+}
+
+.modal-overlay[hidden] {
+  display: none;
+}
+
+.modal-dialog {
+  width: min(460px, 100%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 18px 42px rgba(28, 36, 48, 0.24);
+  padding: 16px;
+}
+
+.modal-dialog p {
+  margin: 8px 0 14px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+#cachePromptReloadButton,
+#welcomeTutorialStartButton {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #ffffff;
 }
 
 .chat-layout {
@@ -888,6 +1060,24 @@ input[type="file"] {
   .data-table {
     display: block;
     overflow-x: auto;
+  }
+
+  .guide-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .guide-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .guide-section:first-child {
+    grid-row: auto;
+  }
+
+  .walkthrough-dialog {
+    right: 16px;
+    bottom: 16px;
   }
 
   .chat-form {

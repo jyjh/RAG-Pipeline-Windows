@@ -31,6 +31,9 @@ const state = {
   indexLoadToken: 0,
   uploadDragDepth: 0,
   pendingForceUploadToken: "",
+  walkthroughIndex: -1,
+  pendingSiteVersion: "",
+  pendingVersionPrompt: false,
 };
 
 const LIVE_RENDER_INTERVAL_MS = 200;
@@ -44,6 +47,9 @@ const INDEX_STREAM_BATCH_SIZE = 250;
 const INDEX_CHILD_BATCH_SIZE = 100;
 const CHAT_STORAGE_KEY = "rag.chatHistory.v1";
 const CHAT_UI_STORAGE_KEY = "rag.chatUi.v1";
+const TUTORIAL_SEEN_COOKIE = "rag_tutorial_seen";
+const SITE_VERSION_COOKIE = "rag_site_version";
+const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
 
 const els = {
   statusLine: document.getElementById("statusLine"),
@@ -94,7 +100,67 @@ const els = {
   newChatButton: document.getElementById("newChatButton"),
   savedChatsList: document.getElementById("savedChatsList"),
   chatMessages: document.getElementById("chatMessages"),
+  startGuideButton: document.getElementById("startGuideButton"),
+  walkthroughOverlay: document.getElementById("walkthroughOverlay"),
+  walkthroughStepLabel: document.getElementById("walkthroughStepLabel"),
+  walkthroughTitle: document.getElementById("walkthroughTitle"),
+  walkthroughText: document.getElementById("walkthroughText"),
+  walkthroughPrevButton: document.getElementById("walkthroughPrevButton"),
+  walkthroughNextButton: document.getElementById("walkthroughNextButton"),
+  walkthroughCloseButton: document.getElementById("walkthroughCloseButton"),
+  welcomeTutorialOverlay: document.getElementById("welcomeTutorialOverlay"),
+  welcomeTutorialStartButton: document.getElementById("welcomeTutorialStartButton"),
+  welcomeTutorialSkipButton: document.getElementById("welcomeTutorialSkipButton"),
+  cachePromptOverlay: document.getElementById("cachePromptOverlay"),
+  cachePromptText: document.getElementById("cachePromptText"),
+  cachePromptReloadButton: document.getElementById("cachePromptReloadButton"),
+  cachePromptDoneButton: document.getElementById("cachePromptDoneButton"),
 };
+
+const walkthroughSteps = [
+  {
+    tab: "upload",
+    target: "#uploadDropZone",
+    title: "Add source PDFs",
+    text: "Drop PDFs here or use the file picker. Each PDF is queued as a background job that extracts Markdown, images, formulas, tables, and retrieval chunks.",
+  },
+  {
+    tab: "upload",
+    target: "#jobsTable",
+    title: "Track ingestion and indexing",
+    text: "The Jobs table shows queued, running, paused, completed, and failed work. Long jobs continue in the background while the published index remains available.",
+  },
+  {
+    tab: "upload",
+    target: "#pdfsTable",
+    title: "Review source readiness",
+    text: "Use the PDF table to check extraction quality, trust status, downloads, source approval, stale flags, and targeted re-runs for individual documents.",
+  },
+  {
+    tab: "index",
+    target: "#indexTable",
+    title: "Inspect indexed content",
+    text: "Review summaries and detail chunks before relying on them. Expand summary rows, search text, and edit or delete records after indexing has settled.",
+  },
+  {
+    tab: "index",
+    target: "#vectorSearchInput",
+    title: "Test retrieval",
+    text: "Advanced retrieval search embeds a query and shows likely source chunks. Use it to diagnose whether the index can find the evidence you expect.",
+  },
+  {
+    tab: "chat",
+    target: "#questionInput",
+    title: "Ask cited questions",
+    text: "Ask focused engineering questions here. The assistant retrieves local context first, streams the answer, and exposes Sources and Tool results for inspection.",
+  },
+  {
+    tab: "chat",
+    target: "#savedChatsList",
+    title: "Keep investigation threads",
+    text: "Saved chats stay in this browser. Use separate chats for separate design questions, source audits, or debugging sessions.",
+  },
+];
 
 function setStatus(element, text, isError = false) {
   element.textContent = text || "";
@@ -211,6 +277,23 @@ async function readNdjson(response, onEvent) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getCookie(name) {
+  const prefix = `${encodeURIComponent(name)}=`;
+  for (const part of document.cookie.split(";")) {
+    const trimmed = part.trim();
+    if (trimmed.startsWith(prefix)) {
+      return decodeURIComponent(trimmed.slice(prefix.length));
+    }
+  }
+  return "";
+}
+
+function setCookie(name, value, maxAgeSeconds = COOKIE_MAX_AGE_SECONDS) {
+  const encodedName = encodeURIComponent(name);
+  const encodedValue = encodeURIComponent(value);
+  document.cookie = `${encodedName}=${encodedValue}; Max-Age=${maxAgeSeconds}; Path=/; SameSite=Lax`;
 }
 
 async function renderMarkdown(text) {
@@ -795,6 +878,7 @@ function shortSha(value) {
 
 function renderUpdateStatus(data) {
   const message = data.message || "Update status unavailable.";
+  handleSiteVersionFromUpdateStatus(data);
   if (data.state === "current") {
     const sha = shortSha(data.current_sha);
     setUpdateButton("current", sha ? `Current ${sha}` : "Current", message, true);
@@ -2413,19 +2497,221 @@ async function sendQuestion(event) {
   }
 }
 
+function activateTab(tabTarget) {
+  const target = document.getElementById(tabTarget);
+  const button = document.querySelector(`.tab[data-tab-target="${tabTarget}"]`);
+  if (!target || !button) {
+    return;
+  }
+  document.querySelectorAll(".tab").forEach((tab) => tab.classList.remove("active"));
+  document.querySelectorAll(".panel").forEach((panel) => panel.classList.remove("active"));
+  button.classList.add("active");
+  target.classList.add("active");
+  if (tabTarget === "index") {
+    loadIndex();
+  } else {
+    abortIndexLoad();
+  }
+}
+
+function clearWalkthroughHighlight() {
+  document.querySelectorAll(".walkthrough-highlight").forEach((element) => {
+    element.classList.remove("walkthrough-highlight");
+  });
+}
+
+function highlightWalkthroughTarget(selector) {
+  clearWalkthroughHighlight();
+  const target = document.querySelector(selector);
+  if (!target) {
+    return;
+  }
+  const details = target.closest("details");
+  if (details) {
+    details.open = true;
+  }
+  target.classList.add("walkthrough-highlight");
+  target.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
+}
+
+function renderWalkthroughStep() {
+  const step = walkthroughSteps[state.walkthroughIndex];
+  if (!step) {
+    return;
+  }
+  activateTab(step.tab);
+  els.walkthroughOverlay.hidden = false;
+  els.walkthroughStepLabel.textContent = `Step ${state.walkthroughIndex + 1} of ${walkthroughSteps.length}`;
+  els.walkthroughTitle.textContent = step.title;
+  els.walkthroughText.textContent = step.text;
+  els.walkthroughPrevButton.disabled = state.walkthroughIndex === 0;
+  els.walkthroughNextButton.textContent =
+    state.walkthroughIndex === walkthroughSteps.length - 1 ? "Done" : "Next";
+  window.requestAnimationFrame(() => highlightWalkthroughTarget(step.target));
+  els.walkthroughNextButton.focus();
+}
+
+function startWalkthrough() {
+  setCookie(TUTORIAL_SEEN_COOKIE, "1");
+  state.walkthroughIndex = 0;
+  renderWalkthroughStep();
+}
+
+function closeWalkthrough() {
+  state.walkthroughIndex = -1;
+  els.walkthroughOverlay.hidden = true;
+  clearWalkthroughHighlight();
+  if (state.pendingVersionPrompt) {
+    showCachePrompt(state.pendingSiteVersion);
+  }
+}
+
+function nextWalkthroughStep() {
+  if (state.walkthroughIndex < 0) {
+    return;
+  }
+  if (state.walkthroughIndex >= walkthroughSteps.length - 1) {
+    closeWalkthrough();
+    return;
+  }
+  state.walkthroughIndex += 1;
+  renderWalkthroughStep();
+}
+
+function previousWalkthroughStep() {
+  if (state.walkthroughIndex <= 0) {
+    return;
+  }
+  state.walkthroughIndex -= 1;
+  renderWalkthroughStep();
+}
+
+function maybeStartFirstVisitWalkthrough() {
+  if (getCookie(TUTORIAL_SEEN_COOKIE) === "1") {
+    return;
+  }
+  showWelcomeTutorialPrompt();
+}
+
+function showWelcomeTutorialPrompt() {
+  els.welcomeTutorialOverlay.hidden = false;
+  els.welcomeTutorialStartButton.focus();
+}
+
+function welcomeTutorialPromptOpen() {
+  return !els.welcomeTutorialOverlay.hidden;
+}
+
+function closeWelcomeTutorialPrompt() {
+  setCookie(TUTORIAL_SEEN_COOKIE, "1");
+  els.welcomeTutorialOverlay.hidden = true;
+  if (state.pendingVersionPrompt && state.walkthroughIndex < 0) {
+    showCachePrompt(state.pendingSiteVersion);
+  }
+}
+
+function acceptWelcomeTutorialPrompt() {
+  closeWelcomeTutorialPrompt();
+  startWalkthrough();
+}
+
+function siteVersionFromStatus(data) {
+  const current = String(data?.current_sha || "").trim();
+  return current || "";
+}
+
+function handleSiteVersionFromUpdateStatus(data) {
+  const version = siteVersionFromStatus(data);
+  if (!version) {
+    return;
+  }
+  const previous = getCookie(SITE_VERSION_COOKIE);
+  if (!previous) {
+    setCookie(SITE_VERSION_COOKIE, version);
+    return;
+  }
+  if (previous === version || state.pendingSiteVersion === version) {
+    return;
+  }
+  if (state.walkthroughIndex >= 0 || welcomeTutorialPromptOpen()) {
+    state.pendingSiteVersion = version;
+    state.pendingVersionPrompt = true;
+    return;
+  }
+  showCachePrompt(version);
+}
+
+function showCachePrompt(version) {
+  state.pendingSiteVersion = version;
+  state.pendingVersionPrompt = false;
+  els.cachePromptText.textContent =
+    `A new app version is running (${shortSha(version)}). Empty your browser cache or use a hard reload so the latest interface files are loaded before continuing.`;
+  els.cachePromptOverlay.hidden = false;
+  els.cachePromptReloadButton.focus();
+}
+
+function closeCachePrompt({ acknowledgeVersion = true } = {}) {
+  if (acknowledgeVersion && state.pendingSiteVersion) {
+    setCookie(SITE_VERSION_COOKIE, state.pendingSiteVersion);
+  }
+  state.pendingSiteVersion = "";
+  state.pendingVersionPrompt = false;
+  els.cachePromptOverlay.hidden = true;
+}
+
+async function clearBrowserCaches() {
+  if (!("caches" in window)) {
+    return;
+  }
+  const names = await caches.keys();
+  await Promise.all(names.map((name) => caches.delete(name)));
+}
+
+async function reloadAfterCacheClear() {
+  const version = state.pendingSiteVersion;
+  if (version) {
+    setCookie(SITE_VERSION_COOKIE, version);
+  }
+  try {
+    await clearBrowserCaches();
+  } catch (_) {
+    // Browser HTTP cache cannot be fully controlled from application JavaScript.
+  }
+  const url = new URL(window.location.href);
+  url.searchParams.set("v", version || String(Date.now()));
+  window.location.replace(url.toString());
+}
+
 document.querySelectorAll("[data-tab-target]").forEach((button) => {
   button.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach((tab) => tab.classList.remove("active"));
-    document.querySelectorAll(".panel").forEach((panel) => panel.classList.remove("active"));
-    button.classList.add("active");
-    document.getElementById(button.dataset.tabTarget).classList.add("active");
-    if (button.dataset.tabTarget === "index") {
-      loadIndex();
-    } else {
-      abortIndexLoad();
+    activateTab(button.dataset.tabTarget);
+    if (state.walkthroughIndex >= 0) {
+      closeWalkthrough();
     }
   });
 });
+
+els.startGuideButton.addEventListener("click", startWalkthrough);
+els.walkthroughPrevButton.addEventListener("click", previousWalkthroughStep);
+els.walkthroughNextButton.addEventListener("click", nextWalkthroughStep);
+els.walkthroughCloseButton.addEventListener("click", closeWalkthrough);
+els.welcomeTutorialStartButton.addEventListener("click", acceptWelcomeTutorialPrompt);
+els.welcomeTutorialSkipButton.addEventListener("click", closeWelcomeTutorialPrompt);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.walkthroughIndex >= 0) {
+    closeWalkthrough();
+    return;
+  }
+  if (event.key === "Escape" && welcomeTutorialPromptOpen()) {
+    closeWelcomeTutorialPrompt();
+    return;
+  }
+  if (event.key === "Escape" && !els.cachePromptOverlay.hidden) {
+    closeCachePrompt();
+  }
+});
+els.cachePromptReloadButton.addEventListener("click", reloadAfterCacheClear);
+els.cachePromptDoneButton.addEventListener("click", () => closeCachePrompt());
 
 els.updateButton.addEventListener("click", applyUpdate);
 els.fileInput.addEventListener("change", () => {
@@ -2533,6 +2819,7 @@ setChatSidebarCollapsed(state.chatSidebarCollapsed);
 renderSavedChats();
 renderActiveChat();
 persistChatState();
+maybeStartFirstVisitWalkthrough();
 refreshHealth();
 refreshUpdateStatus();
 refreshJobs();

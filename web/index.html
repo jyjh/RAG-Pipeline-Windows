@@ -17,6 +17,7 @@
           <button class="tab active" data-tab-target="upload">Documents</button>
           <button class="tab" data-tab-target="index">Review</button>
           <button class="tab" data-tab-target="chat">Ask</button>
+          <button class="tab" data-tab-target="guide">Guide</button>
         </nav>
         <button id="updateButton" class="update-button update-checking" type="button" title="Checking for updates">
           Checking
@@ -49,7 +50,7 @@
           <span id="pdfPageLabel"></span>
           <button id="nextPdfPageButton" type="button">Next</button>
         </div>
-        <table class="data-table pdf-table">
+        <table id="pdfsTable" class="data-table pdf-table">
           <thead>
             <tr>
               <th>PDF</th>
@@ -66,7 +67,7 @@
           <span id="jobsPageLabel"></span>
           <button id="nextJobsPageButton" type="button">Next</button>
         </div>
-        <table class="data-table">
+        <table id="jobsTable" class="data-table">
           <thead>
             <tr>
               <th>Job</th>
@@ -109,7 +110,7 @@
           </div>
         </details>
         <div id="indexStatus" class="status"></div>
-        <table class="data-table index-table">
+        <table id="indexTable" class="data-table index-table">
           <thead>
             <tr>
               <th>Structure</th>
@@ -172,7 +173,114 @@
           </div>
         </div>
       </section>
+
+      <section id="guide" class="panel guide-panel">
+        <div class="guide-header">
+          <div>
+            <h2>New User Guide</h2>
+            <p>
+              Use this app to turn trusted local PDFs into a searchable engineering knowledge base,
+              review extracted content, and ask source-cited questions from the local index.
+            </p>
+          </div>
+          <button id="startGuideButton" type="button">Start walkthrough</button>
+        </div>
+
+        <div class="guide-layout">
+          <section class="guide-section">
+            <h3>Core Workflow</h3>
+            <ol class="guide-steps">
+              <li>
+                <strong>Add PDFs</strong>
+                <span>Upload team reports, textbooks, notes, papers, or standards that should become searchable.</span>
+              </li>
+              <li>
+                <strong>Wait for jobs</strong>
+                <span>Ingestion extracts Markdown and assets; indexing builds the retrieval database in the background.</span>
+              </li>
+              <li>
+                <strong>Review sources</strong>
+                <span>Check quality badges, trust status, downloads, and extracted index rows before relying on answers.</span>
+              </li>
+              <li>
+                <strong>Ask questions</strong>
+                <span>Use the chat panel for evidence-backed answers, then inspect Sources and Tool results.</span>
+              </li>
+            </ol>
+          </section>
+
+          <section class="guide-section">
+            <h3>Intended Use</h3>
+            <ul class="guide-list">
+              <li>Keep FSAE knowledge transfer local and reproducible across uploaded source documents.</li>
+              <li>Prefer reviewed, approved sources for design decisions, calculations, and team documentation.</li>
+              <li>Use web search only as supporting context when local PDFs are incomplete or outdated.</li>
+            </ul>
+          </section>
+
+          <section class="guide-section">
+            <h3>Review Checklist</h3>
+            <ul class="guide-list">
+              <li>Confirm each PDF has useful extracted text and nonzero chunks.</li>
+              <li>Open cited pages or downloads when an answer affects engineering decisions.</li>
+              <li>Flag stale or rejected sources so future users see the risk before relying on them.</li>
+              <li>Re-run a single PDF when OCR, figures, formulas, or source metadata look wrong.</li>
+            </ul>
+          </section>
+
+          <section class="guide-section">
+            <h3>Operating Notes</h3>
+            <ul class="guide-list">
+              <li>Long ingestion and indexing jobs run in the background; chat can still use the last published index.</li>
+              <li>Index edits are disabled while indexing is active to avoid writing into a changing database.</li>
+              <li>Saved chats live in this browser only and are useful for recurring investigation threads.</li>
+            </ul>
+          </section>
+        </div>
+      </section>
     </main>
+
+    <div id="walkthroughOverlay" class="walkthrough-overlay" hidden>
+      <div class="walkthrough-dialog" role="dialog" aria-modal="true" aria-labelledby="walkthroughTitle">
+        <div class="walkthrough-count" id="walkthroughStepLabel"></div>
+        <h2 id="walkthroughTitle"></h2>
+        <p id="walkthroughText"></p>
+        <div class="walkthrough-actions">
+          <button id="walkthroughPrevButton" type="button">Back</button>
+          <button id="walkthroughNextButton" type="button">Next</button>
+          <button id="walkthroughCloseButton" type="button">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="welcomeTutorialOverlay" class="modal-overlay" hidden>
+      <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="welcomeTutorialTitle">
+        <h2 id="welcomeTutorialTitle">Welcome to Local FSAE RAG</h2>
+        <p>
+          This app helps you upload trusted PDFs, build a local searchable index, review source quality,
+          and ask cited engineering questions from your team knowledge base.
+        </p>
+        <p>Start the short walkthrough to see the main workflow, or skip it and use the Guide tab later.</p>
+        <div class="modal-actions">
+          <button id="welcomeTutorialStartButton" type="button">Start walkthrough</button>
+          <button id="welcomeTutorialSkipButton" type="button">Skip</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="cachePromptOverlay" class="modal-overlay" hidden>
+      <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="cachePromptTitle">
+        <h2 id="cachePromptTitle">Site updated</h2>
+        <p id="cachePromptText">
+          A new app version is running. Empty your browser cache or use a hard reload so the latest
+          interface files are loaded before continuing.
+        </p>
+        <div class="modal-actions">
+          <button id="cachePromptReloadButton" type="button">Clear cache + reload</button>
+          <button id="cachePromptDoneButton" type="button">I already refreshed</button>
+        </div>
+      </div>
+    </div>
 
     <script src="/static/app.js"></script>
   </body>

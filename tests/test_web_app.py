@@ -2132,6 +2132,42 @@ def test_frontend_jobs_polling_uses_active_count():
     assert "state.jobsActive ? JOBS_ACTIVE_POLL_INTERVAL_MS : state.jobsPollIntervalMs" in script
 
 
+def test_frontend_includes_new_user_guide_and_walkthrough():
+    markup = Path("web/index.html").read_text(encoding="utf-8")
+    script = Path("web/app.js").read_text(encoding="utf-8")
+    styles = Path("web/styles.css").read_text(encoding="utf-8")
+
+    assert 'data-tab-target="guide"' in markup
+    assert 'id="guide"' in markup
+    assert 'id="startGuideButton"' in markup
+    assert 'id="walkthroughOverlay"' in markup
+    assert 'id="welcomeTutorialOverlay"' in markup
+    assert 'id="welcomeTutorialStartButton"' in markup
+    assert 'id="welcomeTutorialSkipButton"' in markup
+    assert 'id="cachePromptOverlay"' in markup
+    assert "New User Guide" in markup
+    assert "Welcome to Local FSAE RAG" in markup
+    assert "TUTORIAL_SEEN_COOKIE" in script
+    assert "SITE_VERSION_COOKIE" in script
+    assert "getCookie" in script
+    assert "setCookie" in script
+    assert "maybeStartFirstVisitWalkthrough()" in script
+    assert "showWelcomeTutorialPrompt" in script
+    assert "acceptWelcomeTutorialPrompt" in script
+    assert "welcomeTutorialPromptOpen()" in script
+    assert "handleSiteVersionFromUpdateStatus(data)" in script
+    assert "reloadAfterCacheClear" in script
+    assert "caches.delete" in script
+    assert "walkthroughSteps" in script
+    assert "activateTab(step.tab)" in script
+    assert 'target.closest("details")' in script
+    assert "details.open = true" in script
+    assert "walkthrough-highlight" in script
+    assert ".guide-layout" in styles
+    assert ".walkthrough-dialog" in styles
+    assert ".modal-dialog" in styles
+
+
 def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
     events = []
 
