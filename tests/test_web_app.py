@@ -3,6 +3,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -596,6 +597,7 @@ def test_server_config_defaults_to_minute_when_missing(workspace_tmp):
         "port": 8000,
         "health_poll_interval_ms": 60000,
         "jobs_poll_interval_ms": 60000,
+        "background_worker_threads": web_app.DEFAULT_BACKGROUND_WORKER_THREADS,
         "update_remote": "origin",
         "update_branch": "main",
     }
@@ -625,6 +627,7 @@ def test_server_config_reads_polling_intervals(workspace_tmp):
         "port": 8081,
         "health_poll_interval_ms": 120032,
         "jobs_poll_interval_ms": 90000,
+        "background_worker_threads": web_app.DEFAULT_BACKGROUND_WORKER_THREADS,
         "update_remote": "upstream",
         "update_branch": "web-ui",
     }
@@ -982,6 +985,208 @@ def test_queue_passes_ingestion_options_to_worker(workspace_tmp):
     assert captured["tesseract_cmd"] == "C:/Tools/tesseract.exe"
     assert captured["tesseract_data_path"] == "C:/Tools/tessdata"
     assert captured["tesseract_psm"] == 6
+
+
+def test_queue_runs_ingestion_in_subprocess_with_capped_env(monkeypatch, workspace_tmp):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(web_app.subprocess, "run", fake_run)
+    monkeypatch.setitem(web_app.SERVER_CONFIG, "background_worker_threads", 2)
+    monkeypatch.setenv("OMP_NUM_THREADS", "16")
+
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=workspace_tmp / "db",
+        registry_path=workspace_tmp / "registry.json",
+    )
+
+    queue._run_ingestion(
+        str(workspace_tmp / "input"),
+        str(workspace_tmp / "processed"),
+        {
+            "parser_mode": "manual",
+            "asset_dir": str(workspace_tmp / "assets"),
+            "accelerator": "cpu",
+            "num_threads": 3,
+            "asset_triggers": "none",
+            "code_enrichment": False,
+            "formula_enrichment": True,
+            "vision_enabled": False,
+            "ocr_backend": "tesseract_cli",
+            "ocr_langs": ["eng"],
+        },
+    )
+
+    command, kwargs = calls[0]
+    assert command[:4] == [web_app.sys.executable, str(web_app.ROOT_DIR / "main.py"), "--mode", "ingest"]
+    assert command[command.index("--num_threads") + 1] == "3"
+    assert command[command.index("--code_enrichment") + 1] == "false"
+    assert command[command.index("--formula_enrichment") + 1] == "true"
+    assert command[command.index("--ocr_langs") + 1] == "eng"
+    assert command[-1] == "--no_progress"
+    assert kwargs["cwd"] == web_app.ROOT_DIR
+    assert kwargs["env"]["PYTHONUNBUFFERED"] == "1"
+    assert kwargs["env"]["TOKENIZERS_PARALLELISM"] == "false"
+    assert kwargs["env"]["OMP_NUM_THREADS"] == "2"
+
+
+def test_queue_subprocess_failure_reports_tail(monkeypatch, workspace_tmp):
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 5, stdout="ignored", stderr="failure detail")
+
+    monkeypatch.setattr(web_app.subprocess, "run", fake_run)
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=workspace_tmp / "db",
+        registry_path=workspace_tmp / "registry.json",
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        queue._run_ingestion("input", "output", {})
+
+    message = str(exc_info.value)
+    assert "exit code 5" in message
+    assert "failure detail" in message
+
+
+def test_queue_staged_index_publish_swaps_live_index(monkeypatch, workspace_tmp, lancedb_tmp):
+    live_db = lancedb_tmp / "db"
+    old_records = [
+        {
+            "id": "old",
+            "doc_id": "old-doc",
+            "parent_id": "",
+            "node_type": "chunk",
+            "file_path": "old.md",
+            "chunk_index": 0,
+            "content": "old content",
+            "vector": [1.0, 0.0, 0.0],
+        }
+    ]
+    LanceDBVectorStore(live_db).write_records(old_records, embedding_model="old-embed", embedding_dim=3)
+    local_rag.write_index_manifest(live_db, old_records, embedding_model="old-embed", embedding_dim=3)
+    commands = []
+
+    def fake_job_subprocess(command, *, worker_threads=None):
+        commands.append(command)
+        staged_db = Path(command[command.index("--db_dir") + 1])
+        records = [
+            {
+                "id": "new",
+                "doc_id": "new-doc",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": "new.md",
+                "chunk_index": 0,
+                "content": "new content",
+                "vector": [0.0, 1.0, 0.0],
+            }
+        ]
+        LanceDBVectorStore(staged_db).write_records(records, embedding_model="new-embed", embedding_dim=3)
+        local_rag.write_index_manifest(staged_db, records, embedding_model="new-embed", embedding_dim=3)
+
+    monkeypatch.setattr(web_app, "_run_job_subprocess", fake_job_subprocess)
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=live_db,
+        registry_path=workspace_tmp / "registry.json",
+    )
+
+    queue._run_indexing(str(workspace_tmp / "processed"), str(live_db), {})
+
+    command = commands[0]
+    assert command[command.index("--reuse_db_dir") + 1] == str(live_db)
+    assert LanceDBVectorStore(live_db).get_record("new")["content"] == "new content"
+    with pytest.raises(KeyError):
+        LanceDBVectorStore(live_db).get_record("old")
+    manifest = json.loads(live_db.joinpath(local_rag.INDEX_MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    assert manifest["embedding_model"] == "new-embed"
+
+
+def test_queue_failed_staged_index_keeps_live_index(monkeypatch, workspace_tmp, lancedb_tmp):
+    live_db = lancedb_tmp / "db"
+    records = [
+        {
+            "id": "old",
+            "doc_id": "old-doc",
+            "parent_id": "",
+            "node_type": "chunk",
+            "file_path": "old.md",
+            "chunk_index": 0,
+            "content": "old content",
+            "vector": [1.0, 0.0, 0.0],
+        }
+    ]
+    LanceDBVectorStore(live_db).write_records(records, embedding_model="old-embed", embedding_dim=3)
+
+    def fake_job_subprocess(command, *, worker_threads=None):
+        raise RuntimeError("index failed")
+
+    monkeypatch.setattr(web_app, "_run_job_subprocess", fake_job_subprocess)
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=live_db,
+        registry_path=workspace_tmp / "registry.json",
+    )
+
+    with pytest.raises(RuntimeError, match="index failed"):
+        queue._run_indexing(str(workspace_tmp / "processed"), str(live_db), {})
+
+    assert LanceDBVectorStore(live_db).get_record("old")["content"] == "old content"
+
+
+def test_queue_waits_for_queries_before_publishing_index(monkeypatch, workspace_tmp, lancedb_tmp):
+    live_db = lancedb_tmp / "db"
+
+    def fake_job_subprocess(command, *, worker_threads=None):
+        staged_db = Path(command[command.index("--db_dir") + 1])
+        records = [
+            {
+                "id": "new",
+                "doc_id": "new-doc",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": "new.md",
+                "chunk_index": 0,
+                "content": "new content",
+                "vector": [0.0, 1.0, 0.0],
+            }
+        ]
+        LanceDBVectorStore(staged_db).write_records(records, embedding_model="new-embed", embedding_dim=3)
+        local_rag.write_index_manifest(staged_db, records, embedding_model="new-embed", embedding_dim=3)
+
+    monkeypatch.setattr(web_app, "_run_job_subprocess", fake_job_subprocess)
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=live_db,
+        registry_path=workspace_tmp / "registry.json",
+    )
+    job = web_app.QueueJob(id="job-publish", kind="reindex")
+    queue.begin_query()
+    thread = threading.Thread(
+        target=queue._run_indexing,
+        args=(str(workspace_tmp / "processed"), str(live_db), {}),
+        kwargs={"job": job},
+    )
+    thread.start()
+
+    _wait_for(lambda: job.status == "paused_for_queries" and job.phase == "publishing_index")
+    assert not LanceDBVectorStore(live_db).exists()
+
+    queue.finish_query()
+    thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert LanceDBVectorStore(live_db).get_record("new")["content"] == "new content"
 
 
 def test_force_duplicate_cleanup_waits_until_ingestion_phase(monkeypatch, workspace_tmp, lancedb_tmp):
@@ -1482,6 +1687,84 @@ def test_jobs_endpoint_paginates(monkeypatch):
     assert payload["offset"] == 10
     assert payload["limit"] == 10
     assert [job["id"] for job in payload["jobs"]] == ["job-10", "job-11"]
+    assert payload["active_count"] == 0
+
+
+def test_jobs_endpoint_reports_active_job_count(monkeypatch):
+    class FakeQueue:
+        def list_jobs(self):
+            return [
+                {"id": "job-running", "status": "running"},
+                {"id": "job-paused", "status": "paused_for_queries"},
+                {"id": "job-done", "status": "done"},
+            ]
+
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    client = TestClient(web_app.app)
+    response = client.get("/api/jobs")
+
+    assert response.status_code == 200
+    assert response.json()["active_count"] == 2
+
+
+def test_index_mutation_endpoints_reject_active_indexing(monkeypatch):
+    class IndexingQueue:
+        def summary(self):
+            return {
+                "active_query_count": 0,
+                "queued_count": 0,
+                "running_job_ids": ["job-index"],
+                "indexing_job_ids": ["job-index"],
+                "job_count": 1,
+            }
+
+    monkeypatch.setattr(web_app, "job_queue", IndexingQueue())
+
+    client = TestClient(web_app.app)
+    update = client.post("/api/index/update", json={"record_id": "row", "content": "updated"})
+    delete = client.post("/api/index/delete", json={"record_ids": ["row"]})
+
+    assert update.status_code == 409
+    assert delete.status_code == 409
+    assert "indexing is running" in update.json()["detail"]
+
+
+def test_read_endpoints_remain_available_during_active_indexing(monkeypatch, workspace_tmp):
+    class ActiveIndexingQueue:
+        def summary(self):
+            return {
+                "active_query_count": 0,
+                "queued_count": 0,
+                "running_job_ids": ["job-index"],
+                "indexing_job_ids": ["job-index"],
+                "active_job_count": 1,
+                "job_count": 1,
+            }
+
+        def list_jobs(self):
+            return [{"id": "job-index", "status": "running", "phase": "indexing", "filenames": []}]
+
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    monkeypatch.setattr(web_app, "job_queue", ActiveIndexingQueue())
+    monkeypatch.setattr(web_app, "DB_DIR", workspace_tmp / "db")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+
+    client = TestClient(web_app.app)
+
+    health = client.get("/api/health")
+    jobs = client.get("/api/jobs")
+    pdfs = client.get("/api/pdfs")
+
+    assert health.status_code == 200
+    assert health.json()["queue"]["indexing_job_ids"] == ["job-index"]
+    assert jobs.status_code == 200
+    assert jobs.json()["active_count"] == 1
+    assert pdfs.status_code == 200
+    assert pdfs.json()["pdfs"] == []
 
 
 def test_pdf_documents_endpoint_paginates(monkeypatch, workspace_tmp):
@@ -1838,6 +2121,15 @@ def test_sources_panel_frontend_includes_image_asset_preview():
     assert ".source-assets" in styles
     assert ".source-asset img" in styles
     assert ".index-assets .source-asset img" in styles
+
+
+def test_frontend_jobs_polling_uses_active_count():
+    script = Path("web/app.js").read_text(encoding="utf-8")
+
+    assert "JOBS_ACTIVE_POLL_INTERVAL_MS" in script
+    assert "state.jobsActive = Number(data.active_count || 0) > 0" in script
+    assert "wasActive && !state.jobsActive" in script
+    assert "state.jobsActive ? JOBS_ACTIVE_POLL_INTERVAL_MS : state.jobsPollIntervalMs" in script
 
 
 def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):

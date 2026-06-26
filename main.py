@@ -110,6 +110,14 @@ def _as_optional_int(value: Any, default: int | None) -> int | None:
         return default
 
 
+def _as_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def _as_langs(value: Any, default: tuple[str, ...]) -> list[str]:
     if isinstance(value, str):
         parts = [part.strip() for part in value.split(",") if part.strip()]
@@ -129,6 +137,7 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
         "asset_dir": str(paths.get("asset_dir") or DEFAULT_ASSET_DIR),
         "parser_mode": str(ingestion.get("parser_mode") or DEFAULT_PDF_PARSER_MODE),
         "accelerator": str(ingestion.get("accelerator") or DEFAULT_DOCLING_ACCELERATOR),
+        "num_threads": _as_positive_int(ingestion.get("num_threads"), 8),
         "asset_triggers": str(ingestion.get("asset_triggers") or DEFAULT_ASSET_TRIGGERS),
         "code_enrichment": _as_bool(ingestion.get("code_enrichment"), DEFAULT_CODE_ENRICHMENT),
         "formula_enrichment": _as_bool(ingestion.get("formula_enrichment"), DEFAULT_FORMULA_ENRICHMENT),
@@ -154,6 +163,7 @@ def _ingestion_args(args: argparse.Namespace) -> dict[str, Any]:
         "parser_mode": args.parser_mode or config["parser_mode"],
         "asset_dir": args.asset_dir or config["asset_dir"],
         "accelerator": args.accelerator or config["accelerator"],
+        "num_threads": args.num_threads if args.num_threads is not None else config["num_threads"],
         "asset_triggers": args.asset_triggers or config["asset_triggers"],
         "code_enrichment": _as_bool(args.code_enrichment, config["code_enrichment"]),
         "formula_enrichment": _as_bool(args.formula_enrichment, config["formula_enrichment"]),
@@ -204,6 +214,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["lancedb"],
         default="lancedb",
         help="Vector index storage backend for index mode. LanceDB is the only supported backend.",
+    )
+    parser.add_argument(
+        "--reuse_db_dir",
+        default=None,
+        help="Existing DB directory to inspect for reusable vectors while writing a new index.",
     )
     parser.add_argument(
         "--summary_mode",
@@ -325,6 +340,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Docling accelerator selection",
     )
     parser.add_argument(
+        "--num_threads",
+        type=int,
+        default=None,
+        help="Docling/native worker thread count for ingest mode.",
+    )
+    parser.add_argument(
         "--asset_triggers",
         choices=["none", "images", "auto", "all"],
         default=None,
@@ -416,6 +437,7 @@ def main(argv: list[str] | None = None) -> int:
                 embedding_batch_size=args.embedding_batch_size,
                 embedding_timeout=args.embedding_timeout,
                 index_backend=args.index_backend,
+                reuse_db_dir=args.reuse_db_dir,
                 summary_mode=args.summary_mode,
                 chunk_target_tokens=args.chunk_target_tokens,
                 chunk_overlap_tokens=args.chunk_overlap_tokens,

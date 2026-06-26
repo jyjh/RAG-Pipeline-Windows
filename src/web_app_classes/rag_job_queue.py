@@ -141,7 +141,7 @@ class RagJobQueue:
 
         if job.kind == "reindex":
             self._wait_for_no_queries(job, "indexing")
-            self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options)
+            self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
             return
 
         raise ValueError(f"Unknown job kind: {job.kind}")
@@ -150,7 +150,7 @@ class RagJobQueue:
         resume_status = job.resume_status or "queued"
         if resume_status == "ingested" and self._job_processed_paths_exist(job):
             self._wait_for_no_queries(job, "indexing")
-            self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options)
+            self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
             self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="indexed")
             return
 
@@ -162,7 +162,7 @@ class RagJobQueue:
         self._mark_processed_paths(job)
         self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="ingested")
         self._wait_for_no_queries(job, "indexing")
-        self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options)
+        self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
         self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="indexed")
 
     def _wait_for_no_queries(self, job: QueueJob, phase: str) -> None:
@@ -171,9 +171,11 @@ class RagJobQueue:
             while self.active_query_count > 0:
                 job.status = "paused_for_queries"
                 job.phase = phase
+                self._condition.notify_all()
                 self._condition.wait(timeout=0.2)
             job.status = "running"
             job.phase = phase
+            self._condition.notify_all()
 
     def _save_staged_uploads(self, job: QueueJob) -> Path:
         self._wait_for_no_queries(job, "saving_uploads")
@@ -326,51 +328,116 @@ class RagJobQueue:
 
     def _run_ingestion(self, input_dir: str, output_dir: str, options: dict[str, Any]) -> None:
         run_ingestion_func = self._run_ingestion_func
-        if run_ingestion_func is None:
-            from src.ingestion import run_ingestion as run_ingestion_func
-
-        run_ingestion_func(
-            input_dir,
-            output_dir,
-            parser_mode=options.get("parser_mode", INGESTION_CONFIG["parser_mode"]),
-            accelerator=options.get("accelerator", INGESTION_CONFIG["accelerator"]),
-            asset_triggers=options.get("asset_triggers", INGESTION_CONFIG["asset_triggers"]),
-            asset_dir=str(_resolve_root_path(options.get("asset_dir", INGESTION_CONFIG["asset_dir"]))),
-            code_enrichment=options.get("code_enrichment", INGESTION_CONFIG["code_enrichment"]),
-            formula_enrichment=options.get("formula_enrichment", INGESTION_CONFIG["formula_enrichment"]),
-            vision_model=options.get("vision_model", INGESTION_CONFIG["vision_model"]),
-            vision_enabled=options.get("vision_enabled", INGESTION_CONFIG["vision_enabled"]),
-            ocr_backend=options.get("ocr_backend", INGESTION_CONFIG["ocr_backend"]),
-            ocr_langs=options.get("ocr_langs", INGESTION_CONFIG["ocr_langs"]),
-            ocr_force_full_page=options.get("ocr_force_full_page", INGESTION_CONFIG["ocr_force_full_page"]),
-            ocr_bitmap_area_threshold=options.get(
+        resolved = {
+            "parser_mode": options.get("parser_mode", INGESTION_CONFIG["parser_mode"]),
+            "accelerator": options.get("accelerator", INGESTION_CONFIG["accelerator"]),
+            "num_threads": options.get("num_threads", INGESTION_CONFIG["num_threads"]),
+            "asset_triggers": options.get("asset_triggers", INGESTION_CONFIG["asset_triggers"]),
+            "asset_dir": str(_resolve_root_path(options.get("asset_dir", INGESTION_CONFIG["asset_dir"]))),
+            "code_enrichment": options.get("code_enrichment", INGESTION_CONFIG["code_enrichment"]),
+            "formula_enrichment": options.get("formula_enrichment", INGESTION_CONFIG["formula_enrichment"]),
+            "vision_model": options.get("vision_model", INGESTION_CONFIG["vision_model"]),
+            "vision_enabled": options.get("vision_enabled", INGESTION_CONFIG["vision_enabled"]),
+            "ocr_backend": options.get("ocr_backend", INGESTION_CONFIG["ocr_backend"]),
+            "ocr_langs": options.get("ocr_langs", INGESTION_CONFIG["ocr_langs"]),
+            "ocr_force_full_page": options.get("ocr_force_full_page", INGESTION_CONFIG["ocr_force_full_page"]),
+            "ocr_bitmap_area_threshold": options.get(
                 "ocr_bitmap_area_threshold",
                 INGESTION_CONFIG["ocr_bitmap_area_threshold"],
             ),
-            rapidocr_backend=options.get("rapidocr_backend", INGESTION_CONFIG["rapidocr_backend"]),
-            tesseract_cmd=options.get("tesseract_cmd", INGESTION_CONFIG["tesseract_cmd"]),
-            tesseract_data_path=options.get("tesseract_data_path", INGESTION_CONFIG["tesseract_data_path"]),
-            tesseract_psm=options.get("tesseract_psm", INGESTION_CONFIG["tesseract_psm"]),
-            progress_enabled=options.get("progress_enabled", False),
-        )
+            "rapidocr_backend": options.get("rapidocr_backend", INGESTION_CONFIG["rapidocr_backend"]),
+            "tesseract_cmd": options.get("tesseract_cmd", INGESTION_CONFIG["tesseract_cmd"]),
+            "tesseract_data_path": options.get("tesseract_data_path", INGESTION_CONFIG["tesseract_data_path"]),
+            "tesseract_psm": options.get("tesseract_psm", INGESTION_CONFIG["tesseract_psm"]),
+            "progress_enabled": options.get("progress_enabled", False),
+        }
+        if run_ingestion_func is not None:
+            run_ingestion_func(input_dir, output_dir, **resolved)
+            return
 
-    def _run_indexing(self, md_dir: str, db_dir: str, options: dict[str, Any]) -> None:
+        command = [
+            sys.executable,
+            str(ROOT_DIR / "main.py"),
+            "--mode",
+            "ingest",
+            "--data_dir",
+            input_dir,
+            "--md_dir",
+            output_dir,
+        ]
+        _append_cli_option(command, "--parser_mode", resolved["parser_mode"])
+        _append_cli_option(command, "--asset_dir", resolved["asset_dir"])
+        _append_cli_option(command, "--accelerator", resolved["accelerator"])
+        _append_cli_option(command, "--num_threads", resolved["num_threads"])
+        _append_cli_option(command, "--asset_triggers", resolved["asset_triggers"])
+        _append_cli_option(command, "--code_enrichment", resolved["code_enrichment"])
+        _append_cli_option(command, "--formula_enrichment", resolved["formula_enrichment"])
+        _append_cli_option(command, "--vision_model", resolved["vision_model"])
+        _append_cli_option(command, "--vision_enabled", resolved["vision_enabled"])
+        _append_cli_option(command, "--ocr_backend", resolved["ocr_backend"])
+        _append_cli_option(command, "--ocr_langs", resolved["ocr_langs"])
+        _append_cli_option(command, "--ocr_force_full_page", resolved["ocr_force_full_page"])
+        _append_cli_option(command, "--ocr_bitmap_area_threshold", resolved["ocr_bitmap_area_threshold"])
+        _append_cli_option(command, "--rapidocr_backend", resolved["rapidocr_backend"])
+        _append_cli_option(command, "--tesseract_cmd", resolved["tesseract_cmd"])
+        _append_cli_option(command, "--tesseract_data_path", resolved["tesseract_data_path"])
+        _append_cli_option(command, "--tesseract_psm", resolved["tesseract_psm"])
+        command.append("--no_progress")
+        _source_module._run_job_subprocess(command, worker_threads=_source_module._background_worker_threads())
+
+    def _run_indexing(
+        self,
+        md_dir: str,
+        db_dir: str,
+        options: dict[str, Any],
+        *,
+        job: QueueJob | None = None,
+    ) -> None:
         run_indexing_func = self._run_indexing_func
-        if run_indexing_func is None:
-            from src.indexing import run_indexing as run_indexing_func
+        resolved = {
+            "progress_enabled": options.get("progress_enabled", False),
+            "embedding_model": options.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
+            "embedding_batch_size": options.get("embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE),
+            "embedding_timeout": options.get("embedding_timeout", DEFAULT_EMBEDDING_TIMEOUT),
+            "index_backend": options.get("index_backend", DEFAULT_INDEX_BACKEND),
+            "summary_mode": options.get("summary_mode", DEFAULT_SUMMARY_MODE),
+            "chunk_target_tokens": options.get("chunk_target_tokens", DEFAULT_CHUNK_TARGET_TOKENS),
+            "chunk_overlap_tokens": options.get("chunk_overlap_tokens", DEFAULT_CHUNK_OVERLAP_TOKENS),
+        }
+        if run_indexing_func is not None:
+            run_indexing_func(md_dir, db_dir, **resolved)
+            return
 
-        run_indexing_func(
+        staged_db_dir = _source_module._staged_index_dir(db_dir)
+        command = [
+            sys.executable,
+            str(ROOT_DIR / "main.py"),
+            "--mode",
+            "index",
+            "--md_dir",
             md_dir,
+            "--db_dir",
+            str(staged_db_dir),
+            "--reuse_db_dir",
             db_dir,
-            progress_enabled=options.get("progress_enabled", False),
-            embedding_model=options.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
-            embedding_batch_size=options.get("embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE),
-            embedding_timeout=options.get("embedding_timeout", DEFAULT_EMBEDDING_TIMEOUT),
-            index_backend=options.get("index_backend", DEFAULT_INDEX_BACKEND),
-            summary_mode=options.get("summary_mode", DEFAULT_SUMMARY_MODE),
-            chunk_target_tokens=options.get("chunk_target_tokens", DEFAULT_CHUNK_TARGET_TOKENS),
-            chunk_overlap_tokens=options.get("chunk_overlap_tokens", DEFAULT_CHUNK_OVERLAP_TOKENS),
-        )
+        ]
+        _append_cli_option(command, "--embedding_model", resolved["embedding_model"])
+        _append_cli_option(command, "--embedding_batch_size", resolved["embedding_batch_size"])
+        _append_cli_option(command, "--embedding_timeout", resolved["embedding_timeout"])
+        _append_cli_option(command, "--index_backend", resolved["index_backend"])
+        _append_cli_option(command, "--summary_mode", resolved["summary_mode"])
+        _append_cli_option(command, "--chunk_target_tokens", resolved["chunk_target_tokens"])
+        _append_cli_option(command, "--chunk_overlap_tokens", resolved["chunk_overlap_tokens"])
+        command.append("--no_progress")
+
+        try:
+            _source_module._run_job_subprocess(command, worker_threads=_source_module._background_worker_threads())
+            if job is not None:
+                self._wait_for_no_queries(job, "publishing_index")
+            with INDEX_LOCK:
+                _source_module._publish_staged_index(staged_db_dir, db_dir)
+        finally:
+            shutil.rmtree(staged_db_dir, ignore_errors=True)
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._condition:
@@ -479,10 +546,18 @@ class RagJobQueue:
                 for job in self._jobs.values()
                 if job.status in {"running", "paused_for_queries"}
             ]
+            indexing = [
+                job.id
+                for job in self._jobs.values()
+                if job.status in {"running", "paused_for_queries"}
+                and job.phase in {"indexing", "publishing_index"}
+            ]
             return {
                 "active_query_count": self.active_query_count,
                 "queued_count": len(self._queue),
                 "running_job_ids": running,
+                "indexing_job_ids": indexing,
+                "active_job_count": len(running) + len(self._queue),
                 "job_count": len(self._jobs),
             }
 

@@ -39,6 +39,7 @@ def test_run_indexing_uses_local_vector_indexer(monkeypatch):
                 "embedding_batch_size": 2,
                 "embedding_timeout": 15.0,
                 "index_backend": "lancedb",
+                "reuse_db_dir": None,
                 "summary_mode": "hybrid",
                 "chunk_target_tokens": 900,
                 "chunk_overlap_tokens": 120,

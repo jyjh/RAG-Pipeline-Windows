@@ -73,3 +73,4 @@ update_remote = "origin"
 update_branch = "main"
 health_poll_interval_ms = 60000
 jobs_poll_interval_ms = 60000
+background_worker_threads = 2

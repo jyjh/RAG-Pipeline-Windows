@@ -11,6 +11,7 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         parser_mode,
         asset_dir,
         accelerator,
+        num_threads,
         asset_triggers,
         code_enrichment,
         formula_enrichment,
@@ -31,6 +32,7 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         calls["parser_mode"] = parser_mode
         calls["asset_dir"] = asset_dir
         calls["accelerator"] = accelerator
+        calls["num_threads"] = num_threads
         calls["asset_triggers"] = asset_triggers
         calls["code_enrichment"] = code_enrichment
         calls["formula_enrichment"] = formula_enrichment
@@ -62,6 +64,8 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
             "asset_out",
             "--accelerator",
             "cpu",
+            "--num_threads",
+            "3",
             "--asset_triggers",
             "none",
             "--code_enrichment",
@@ -99,6 +103,7 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         "parser_mode": "docling",
         "asset_dir": "asset_out",
         "accelerator": "cpu",
+        "num_threads": 3,
         "asset_triggers": "none",
         "code_enrichment": False,
         "formula_enrichment": True,
@@ -128,6 +133,7 @@ def test_main_index_dispatches_to_current_indexing(monkeypatch):
         embedding_batch_size,
         embedding_timeout,
         index_backend,
+        reuse_db_dir,
         summary_mode,
         chunk_target_tokens,
         chunk_overlap_tokens,
@@ -139,13 +145,16 @@ def test_main_index_dispatches_to_current_indexing(monkeypatch):
         calls["embedding_batch_size"] = embedding_batch_size
         calls["embedding_timeout"] = embedding_timeout
         calls["index_backend"] = index_backend
+        calls["reuse_db_dir"] = reuse_db_dir
         calls["summary_mode"] = summary_mode
         calls["chunk_target_tokens"] = chunk_target_tokens
         calls["chunk_overlap_tokens"] = chunk_overlap_tokens
 
     monkeypatch.setattr(main, "run_indexing", fake_run_indexing)
 
-    result = main.main(["--mode", "index", "--md_dir", "md_in", "--db_dir", "db_out"])
+    result = main.main(
+        ["--mode", "index", "--md_dir", "md_in", "--db_dir", "db_out", "--reuse_db_dir", "db_live"]
+    )
 
     assert result == 0
     assert calls == {
@@ -156,6 +165,7 @@ def test_main_index_dispatches_to_current_indexing(monkeypatch):
         "embedding_batch_size": 8,
         "embedding_timeout": 30.0,
         "index_backend": "lancedb",
+        "reuse_db_dir": "db_live",
         "summary_mode": "hybrid",
         "chunk_target_tokens": 900,
         "chunk_overlap_tokens": 120,

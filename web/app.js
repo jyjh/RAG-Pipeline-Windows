@@ -14,6 +14,7 @@ const state = {
   jobsOffset: 0,
   jobsLimit: 10,
   jobsTotal: 0,
+  jobsActive: false,
   chats: [],
   activeChatId: null,
   streamingChatId: null,
@@ -23,6 +24,7 @@ const state = {
   jobsPollIntervalMs: 60000,
   healthTimer: null,
   jobsTimer: null,
+  jobsTimerIntervalMs: 0,
   updateTimer: null,
   updateApplying: false,
   indexAbortController: null,
@@ -37,6 +39,7 @@ const STREAM_TAIL_MAX_CHARS = 2200;
 const UPDATE_POLL_INTERVAL_MS = 5 * 60 * 1000;
 const RESTART_POLL_INTERVAL_MS = 1000;
 const RESTART_POLL_TIMEOUT_MS = 120000;
+const JOBS_ACTIVE_POLL_INTERVAL_MS = 2000;
 const INDEX_STREAM_BATCH_SIZE = 250;
 const INDEX_CHILD_BATCH_SIZE = 100;
 const CHAT_STORAGE_KEY = "rag.chatHistory.v1";
@@ -942,6 +945,8 @@ async function refreshJobs() {
     });
     const data = await requestJson(`/api/jobs?${params}`);
     state.jobsTotal = data.total || 0;
+    const wasActive = state.jobsActive;
+    state.jobsActive = Number(data.active_count || 0) > 0;
     if (state.jobsOffset >= state.jobsTotal && state.jobsOffset > 0) {
       state.jobsOffset = Math.max(0, Math.floor((state.jobsTotal - 1) / state.jobsLimit) * state.jobsLimit);
       return refreshJobs();
@@ -966,6 +971,13 @@ async function refreshJobs() {
       prevButton: els.prevJobsPageButton,
       nextButton: els.nextJobsPageButton,
     });
+    if (wasActive && !state.jobsActive) {
+      await refreshPdfs();
+      await refreshHealth();
+    }
+    if (wasActive !== state.jobsActive) {
+      scheduleJobsPolling();
+    }
   } catch (error) {
     setStatus(els.uploadStatus, error.message, true);
   }
@@ -1068,10 +1080,15 @@ function scheduleHealthPolling() {
 }
 
 function scheduleJobsPolling() {
+  const interval = state.jobsActive ? JOBS_ACTIVE_POLL_INTERVAL_MS : state.jobsPollIntervalMs;
+  if (state.jobsTimer && state.jobsTimerIntervalMs === interval) {
+    return;
+  }
   if (state.jobsTimer) {
     clearInterval(state.jobsTimer);
   }
-  state.jobsTimer = setInterval(refreshJobs, state.jobsPollIntervalMs);
+  state.jobsTimerIntervalMs = interval;
+  state.jobsTimer = setInterval(refreshJobs, interval);
 }
 
 function scheduleUpdatePolling() {

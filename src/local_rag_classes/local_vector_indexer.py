@@ -19,6 +19,7 @@ class LocalVectorIndexer:
         embedding_batch_size: int | None = None,
         embedding_timeout: float | None = None,
         index_backend: str = "lancedb",
+        reuse_db_dir: str | None = None,
         summary_mode: str = "hybrid",
         chunk_target_tokens: int = DEFAULT_CHUNK_TARGET_TOKENS,
         chunk_overlap_tokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS,
@@ -27,6 +28,7 @@ class LocalVectorIndexer:
         from src.embeddings import EmbeddingEngine
 
         self.working_dir = working_dir
+        self.reuse_db_dir = reuse_db_dir
         self.progress_enabled = progress_enabled
         self.index_backend = index_backend
         self.summary_mode = summary_mode
@@ -210,7 +212,8 @@ class LocalVectorIndexer:
             raise ValueError("index_backend must be lancedb; JSON chunk storage has been removed.")
 
         store = LanceDBVectorStore(self.working_dir)
-        reused, embedded = self._attach_vectors(records, store=store)
+        reuse_store = LanceDBVectorStore(self.reuse_db_dir) if self.reuse_db_dir else store
+        reused, embedded = self._attach_vectors(records, store=reuse_store)
         output_target = store.db_path / "chunks"
         store.write_records(
             records,

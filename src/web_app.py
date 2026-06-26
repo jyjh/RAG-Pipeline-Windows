@@ -54,7 +54,7 @@ from src.local_rag import (
     write_index_manifest,
 )
 from src.pdf_registry import PdfRegistry, load_source_map, remove_source_entries_by_hash, sha256_file
-from src.vector_store import default_store, lancedb_path, record_matches, record_row
+from src.vector_store import LANCEDB_DIRNAME, default_store, lancedb_path, record_matches, record_row
 
 from src._class_module_support import import_split_class
 
@@ -74,6 +74,17 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_load_chat_config",
     "_load_ingestion_config",
     "_index_store",
+    "_background_worker_threads",
+    "_bool_cli_value",
+    "_append_cli_option",
+    "_job_subprocess_env",
+    "_job_subprocess_creationflags",
+    "_process_output_tail",
+    "_run_job_subprocess",
+    "_staged_index_dir",
+    "_remove_path",
+    "_publish_staged_index",
+    "_index_mutation_blocker",
     "_git_target_valid",
     "_run_git",
     "_git_failure_message",
@@ -217,6 +228,7 @@ DEFAULT_HEALTH_POLL_INTERVAL_MS = 60_000
 DEFAULT_JOBS_POLL_INTERVAL_MS = 60_000
 DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 8000
+DEFAULT_BACKGROUND_WORKER_THREADS = min(4, max(1, (os.cpu_count() or 2) // 2))
 DEFAULT_UPDATE_REMOTE = "origin"
 DEFAULT_UPDATE_BRANCH = "main"
 GIT_TIMEOUT_SECONDS = 30.0
@@ -362,6 +374,10 @@ def _load_server_config(config_path: Path | None = None) -> dict[str, Any]:
             server_config.get("jobs_poll_interval_ms"),
             DEFAULT_JOBS_POLL_INTERVAL_MS,
         ),
+        "background_worker_threads": _positive_int(
+            server_config.get("background_worker_threads"),
+            DEFAULT_BACKGROUND_WORKER_THREADS,
+        ),
         "update_remote": _nonempty_str(server_config.get("update_remote"), DEFAULT_UPDATE_REMOTE),
         "update_branch": _nonempty_str(server_config.get("update_branch"), DEFAULT_UPDATE_BRANCH),
     }
@@ -410,6 +426,7 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
         "asset_dir": _nonempty_str(paths.get("asset_dir"), DEFAULT_ASSET_DIR),
         "parser_mode": _nonempty_str(ingestion.get("parser_mode"), DEFAULT_PDF_PARSER_MODE),
         "accelerator": _nonempty_str(ingestion.get("accelerator"), DEFAULT_DOCLING_ACCELERATOR),
+        "num_threads": _positive_int(ingestion.get("num_threads"), 8),
         "asset_triggers": _nonempty_str(ingestion.get("asset_triggers"), DEFAULT_ASSET_TRIGGERS),
         "code_enrichment": _bool_value(ingestion.get("code_enrichment"), DEFAULT_CODE_ENRICHMENT),
         "formula_enrichment": _bool_value(ingestion.get("formula_enrichment"), DEFAULT_FORMULA_ENRICHMENT),
@@ -437,6 +454,146 @@ ASSET_DIR = _resolve_root_path(INGESTION_CONFIG["asset_dir"], default=DEFAULT_AS
 
 def _index_store(db_dir: Path | None = None):
     return default_store(db_dir or DB_DIR)
+
+
+def _background_worker_threads() -> int:
+    return _positive_int(
+        SERVER_CONFIG.get("background_worker_threads"),
+        DEFAULT_BACKGROUND_WORKER_THREADS,
+    )
+
+
+def _bool_cli_value(value: Any) -> str:
+    return "true" if _bool_value(value, False) else "false"
+
+
+def _append_cli_option(command: list[str], name: str, value: Any) -> None:
+    if value is None or value == "":
+        return
+    if isinstance(value, bool):
+        value = _bool_cli_value(value)
+    elif isinstance(value, (list, tuple)):
+        value = ",".join(str(item) for item in value)
+    command.extend([name, str(value)])
+
+
+def _job_subprocess_env(worker_threads: int | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    thread_cap = (
+        _positive_int(worker_threads, _background_worker_threads())
+        if worker_threads
+        else _background_worker_threads()
+    )
+    env["PYTHONUNBUFFERED"] = "1"
+    env["TOKENIZERS_PARALLELISM"] = "false"
+    for key in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        current = env.get(key)
+        try:
+            current_value = int(current) if current is not None else thread_cap
+        except ValueError:
+            current_value = thread_cap
+        env[key] = str(max(1, min(current_value, thread_cap)))
+    return env
+
+
+def _job_subprocess_creationflags() -> int:
+    if os.name != "nt":
+        return 0
+    return int(getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000))
+
+
+def _process_output_tail(result: subprocess.CompletedProcess[str], *, limit: int = 4000) -> str:
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip())
+    if len(output) <= limit:
+        return output
+    return output[-limit:]
+
+
+def _run_job_subprocess(command: list[str], *, worker_threads: int | None = None) -> None:
+    kwargs: dict[str, Any] = {
+        "cwd": ROOT_DIR,
+        "env": _job_subprocess_env(worker_threads),
+        "capture_output": True,
+        "text": True,
+        "check": False,
+    }
+    creationflags = _job_subprocess_creationflags()
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+    result = subprocess.run(command, **kwargs)
+    if result.returncode == 0:
+        return
+    detail = _process_output_tail(result)
+    command_text = " ".join(command)
+    message = f"Background pipeline command failed with exit code {result.returncode}: {command_text}"
+    if detail:
+        message = f"{message}\n{detail}"
+    raise RuntimeError(message)
+
+
+def _staged_index_dir(live_db_dir: str | Path) -> Path:
+    live_path = Path(live_db_dir)
+    return live_path.parent / f".index_build_{uuid.uuid4().hex}"
+
+
+def _remove_path(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _publish_staged_index(staged_db_dir: str | Path, live_db_dir: str | Path) -> None:
+    staged_db = Path(staged_db_dir)
+    live_db = Path(live_db_dir)
+    staged_lancedb = lancedb_path(staged_db)
+    staged_manifest = staged_db / INDEX_MANIFEST_FILENAME
+    live_lancedb = lancedb_path(live_db)
+    live_manifest = live_db / INDEX_MANIFEST_FILENAME
+
+    if not staged_lancedb.exists():
+        raise RuntimeError(f"Indexing did not create a LanceDB directory at {staged_lancedb}")
+    if not staged_manifest.exists():
+        raise RuntimeError(f"Indexing did not create an index manifest at {staged_manifest}")
+
+    live_db.mkdir(parents=True, exist_ok=True)
+    backup_dir = live_db.parent / f".index_backup_{uuid.uuid4().hex}"
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    backup_lancedb = backup_dir / LANCEDB_DIRNAME
+    backup_manifest = backup_dir / INDEX_MANIFEST_FILENAME
+
+    try:
+        if live_lancedb.exists():
+            shutil.move(str(live_lancedb), str(backup_lancedb))
+        if live_manifest.exists():
+            shutil.move(str(live_manifest), str(backup_manifest))
+        shutil.move(str(staged_lancedb), str(live_lancedb))
+        shutil.move(str(staged_manifest), str(live_manifest))
+    except Exception:
+        _remove_path(live_lancedb)
+        _remove_path(live_manifest)
+        if backup_lancedb.exists():
+            shutil.move(str(backup_lancedb), str(live_lancedb))
+        if backup_manifest.exists():
+            shutil.move(str(backup_manifest), str(live_manifest))
+        raise
+    finally:
+        shutil.rmtree(backup_dir, ignore_errors=True)
+
+
+def _index_mutation_blocker() -> str:
+    summary = job_queue.summary()
+    if summary.get("indexing_job_ids"):
+        return "Index edits are disabled while indexing is running. Try again after the job finishes."
+    return ""
 
 
 def _asset_url(asset_id: str) -> str:
@@ -1531,12 +1688,19 @@ def list_pdf_documents(
 
 
 def list_job_rows(*, offset: int = 0, limit: int | None = 10) -> dict[str, Any]:
-    page = _page_slice(job_queue.list_jobs(), offset=offset, limit=limit)
+    jobs = job_queue.list_jobs()
+    active_count = sum(
+        1
+        for job in jobs
+        if str(job.get("status") or "") in {"queued", "running", "paused_for_queries"}
+    )
+    page = _page_slice(jobs, offset=offset, limit=limit)
     return {
         "jobs": page["rows"],
         "total": page["total"],
         "offset": page["offset"],
         "limit": page["limit"],
+        "active_count": active_count,
     }
 
 
@@ -2395,6 +2559,9 @@ def index_rows_stream(
 
 @app.post("/api/index/update")
 def update_index(payload: IndexUpdateRequest):
+    blocker = _index_mutation_blocker()
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
     try:
         row = update_index_record(
             record_id=payload.record_id,
@@ -2414,6 +2581,9 @@ def update_index(payload: IndexUpdateRequest):
 
 @app.post("/api/index/delete")
 def delete_index(payload: IndexDeleteRequest):
+    blocker = _index_mutation_blocker()
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
     try:
         return delete_index_records(record_ids=payload.record_ids)
     except FileNotFoundError as exc:
