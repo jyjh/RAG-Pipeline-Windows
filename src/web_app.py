@@ -58,6 +58,7 @@ DATA_DIR = ROOT_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 STAGING_DIR = DATA_DIR / ".upload_queue"
 PDF_REGISTRY_PATH = DATA_DIR / ".pdf_upload_registry.json"
+DOCUMENT_TRUST_PATH = DATA_DIR / ".document_trust.json"
 PROCESSED_DIR = ROOT_DIR / "processed_docs"
 DB_DIR = ROOT_DIR / "db"
 WEB_DIR = ROOT_DIR / "web"
@@ -110,6 +111,18 @@ UPLOAD_RESUME_STATUS_ORDER = {
 }
 
 INDEX_LOCK = threading.RLock()
+TRUST_LOCK = threading.RLock()
+TRUST_REVIEW_STATUSES = {"unreviewed", "approved", "rejected", "stale"}
+TRUST_SOURCE_TYPES = {
+    "unknown",
+    "textbook",
+    "research_paper",
+    "lecture_notes",
+    "student_project",
+    "team_report",
+    "standard",
+    "web",
+}
 
 
 def _utcnow() -> str:
@@ -999,6 +1012,130 @@ def _pdf_download_url(source_hash: str) -> str:
     return f"/api/pdfs/{source_hash}/download" if source_hash else ""
 
 
+def _load_trust_registry(path: Path | None = None) -> dict[str, Any]:
+    trust_path = path or DOCUMENT_TRUST_PATH
+    if not trust_path.exists():
+        return {"version": 1, "documents": {}}
+    try:
+        payload = json.loads(trust_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "documents": {}}
+    if not isinstance(payload, dict):
+        return {"version": 1, "documents": {}}
+    payload.setdefault("version", 1)
+    payload.setdefault("documents", {})
+    if not isinstance(payload["documents"], dict):
+        payload["documents"] = {}
+    return payload
+
+
+def _write_trust_registry(payload: dict[str, Any], path: Path | None = None) -> None:
+    trust_path = path or DOCUMENT_TRUST_PATH
+    trust_path.parent.mkdir(parents=True, exist_ok=True)
+    trust_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _default_trust_entry(source_hash: str) -> dict[str, Any]:
+    return {
+        "source_hash": source_hash,
+        "review_status": "unreviewed",
+        "source_type": "unknown",
+        "publication_year": None,
+        "expires_at": "",
+        "reviewed_by": "",
+        "reviewed_at": "",
+        "notes": "",
+        "updated_at": "",
+    }
+
+
+def _normalize_trust_entry(source_hash: str, entry: dict[str, Any] | None = None) -> dict[str, Any]:
+    normalized = _default_trust_entry(source_hash)
+    if isinstance(entry, dict):
+        normalized.update({key: entry.get(key, value) for key, value in normalized.items()})
+    normalized["source_hash"] = source_hash
+    if normalized["review_status"] not in TRUST_REVIEW_STATUSES:
+        normalized["review_status"] = "unreviewed"
+    if normalized["source_type"] not in TRUST_SOURCE_TYPES:
+        normalized["source_type"] = "unknown"
+    try:
+        year = normalized.get("publication_year")
+        normalized["publication_year"] = int(year) if year not in {None, ""} else None
+    except (TypeError, ValueError):
+        normalized["publication_year"] = None
+    return normalized
+
+
+def _parse_expiry(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if "T" not in text:
+            text = f"{text}T23:59:59+00:00"
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def _trust_warnings(trust: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    status = str(trust.get("review_status") or "unreviewed")
+    if status == "unreviewed":
+        warnings.append("unreviewed_source")
+    if status == "rejected":
+        warnings.append("rejected_source")
+    if status == "stale":
+        warnings.append("marked_stale")
+    expires_at = _parse_expiry(str(trust.get("expires_at") or ""))
+    if expires_at is not None and expires_at < datetime.now(timezone.utc):
+        warnings.append("review_expired")
+    return warnings
+
+
+def update_document_trust(
+    source_hash: str,
+    updates: dict[str, Any],
+    *,
+    trust_path: Path | None = None,
+) -> dict[str, Any]:
+    if not source_hash:
+        raise ValueError("source_hash is required.")
+    with TRUST_LOCK:
+        payload = _load_trust_registry(trust_path)
+        documents = payload.setdefault("documents", {})
+        current = _normalize_trust_entry(source_hash, documents.get(source_hash))
+        next_entry = dict(current)
+        if "review_status" in updates and updates["review_status"] not in TRUST_REVIEW_STATUSES:
+            choices = ", ".join(sorted(TRUST_REVIEW_STATUSES))
+            raise ValueError(f"review_status must be one of: {choices}")
+        if "source_type" in updates and updates["source_type"] not in TRUST_SOURCE_TYPES:
+            choices = ", ".join(sorted(TRUST_SOURCE_TYPES))
+            raise ValueError(f"source_type must be one of: {choices}")
+        for key in (
+            "review_status",
+            "source_type",
+            "publication_year",
+            "expires_at",
+            "reviewed_by",
+            "notes",
+        ):
+            if key in updates:
+                next_entry[key] = updates[key]
+        next_entry = _normalize_trust_entry(source_hash, next_entry)
+        if "review_status" in updates and next_entry["review_status"] != current.get("review_status"):
+            next_entry["reviewed_at"] = _utcnow()
+        if next_entry["review_status"] == "approved" and not next_entry.get("reviewed_at"):
+            next_entry["reviewed_at"] = _utcnow()
+        next_entry["updated_at"] = _utcnow()
+        documents[source_hash] = next_entry
+        _write_trust_registry(payload, trust_path)
+        return dict(next_entry)
+
+
 def _resolve_workspace_path(raw_path: str, *, root_dir: Path = ROOT_DIR) -> Path | None:
     text = str(raw_path or "").strip()
     if not text:
@@ -1075,6 +1212,7 @@ def _document_quality(
     entry: dict[str, Any],
     *,
     manifest: dict[str, Any],
+    trust: dict[str, Any],
     root_dir: Path = ROOT_DIR,
 ) -> dict[str, Any]:
     stats = _index_manifest_stats(entry, manifest)
@@ -1091,10 +1229,11 @@ def _document_quality(
         warnings.append("missing_index_manifest")
     elif int(stats.get("chunk_count") or 0) <= 0:
         warnings.append("no_chunks")
+    warnings.extend(_trust_warnings(trust))
 
     if not warnings:
         label = "ready"
-    elif "not_indexed" in warnings or "no_chunks" in warnings:
+    elif "not_indexed" in warnings or "no_chunks" in warnings or "rejected_source" in warnings:
         label = "not_ready"
     else:
         label = "review"
@@ -1164,6 +1303,8 @@ def list_pdf_documents(
     processed_dir = processed_dir or PROCESSED_DIR
     entries: dict[str, dict[str, Any]] = {}
     manifest = _load_index_manifest(DB_DIR)
+    trust_payload = _load_trust_registry()
+    trust_documents = trust_payload.get("documents", {}) if isinstance(trust_payload.get("documents"), dict) else {}
 
     payload = PdfRegistry(registry_path).load()
     for source_hash, entry in payload.get("pdfs", {}).items():
@@ -1202,7 +1343,9 @@ def list_pdf_documents(
 
     rows = sorted(entries.values(), key=lambda item: (item.get("filename", ""), item.get("hash", "")))
     for item in rows:
-        item["quality"] = _document_quality(item, manifest=manifest, root_dir=root_dir)
+        trust = _normalize_trust_entry(str(item.get("hash") or ""), trust_documents.get(str(item.get("hash") or "")))
+        item["trust"] = trust
+        item["quality"] = _document_quality(item, manifest=manifest, trust=trust, root_dir=root_dir)
     query = search.strip().lower()
     if query:
         rows = [
@@ -1253,6 +1396,66 @@ def resolve_pdf_download_path(
     if not path.exists():
         raise FileNotFoundError(f"PDF file is missing for source hash: {source_hash}")
     return path, str(match.get("filename") or path.name)
+
+
+def _reprocess_options_for_source(source_hash: str, *, registry_path: Path = PDF_REGISTRY_PATH) -> dict[str, Any]:
+    payload = PdfRegistry(registry_path).load()
+    entry = payload.get("pdfs", {}).get(source_hash, {})
+    options = entry.get("options") if isinstance(entry, dict) else {}
+    return _upload_options_from_form(options if isinstance(options, dict) else {})
+
+
+def enqueue_source_reprocess(
+    source_hash: str,
+    *,
+    registry_path: Path | None = None,
+    processed_dir: Path | None = None,
+    staging_root: Path | None = None,
+    root_dir: Path = ROOT_DIR,
+    data_dir: Path = DATA_DIR,
+) -> QueueJob:
+    registry_path = registry_path or PDF_REGISTRY_PATH
+    processed_dir = processed_dir or PROCESSED_DIR
+    staging_root = staging_root or STAGING_DIR
+    path, filename = resolve_pdf_download_path(
+        source_hash,
+        registry_path=registry_path,
+        processed_dir=processed_dir,
+        root_dir=root_dir,
+        data_dir=data_dir,
+    )
+    actual_hash = sha256_file(path)
+    job_id = uuid.uuid4().hex
+    staging_dir = staging_root / job_id
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    staged_name = _safe_filename(filename or path.name)
+    staged_path = staging_dir / staged_name
+    try:
+        shutil.copy2(path, staged_path)
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+    upload = {
+        "filename": staged_name,
+        "hash": actual_hash,
+        "staging_path": str(staged_path),
+    }
+    options = _reprocess_options_for_source(source_hash, registry_path=registry_path)
+    PdfRegistry(registry_path).register_queued(
+        job_id=job_id,
+        files=[upload],
+        forced_hashes={actual_hash},
+        options=options,
+    )
+    return job_queue.enqueue_upload(
+        staging_dir=staging_dir,
+        filenames=[staged_name],
+        uploads=[upload],
+        force_duplicate_hashes=[source_hash],
+        job_id=job_id,
+        options=options,
+    )
 
 
 @dataclass
@@ -1817,8 +2020,24 @@ class ReindexRequest(BaseModel):
     chunk_overlap_tokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS
 
 
+class DocumentTrustRequest(BaseModel):
+    review_status: str | None = None
+    source_type: str | None = None
+    publication_year: int | None = None
+    expires_at: str | None = None
+    reviewed_by: str | None = None
+    notes: str | None = None
+
+
 class RenderRequest(BaseModel):
     text: str
+
+
+def _model_dump(model: BaseModel) -> dict[str, Any]:
+    dumper = getattr(model, "model_dump", None)
+    if callable(dumper):
+        return dumper()
+    return model.dict()
 
 
 def render_markdown_text(text: str) -> str:
@@ -2374,7 +2593,7 @@ async def _optional_json(request: Request) -> dict[str, Any]:
 @app.post("/api/reindex")
 async def reindex(request: Request):
     payload = ReindexRequest(**await _optional_json(request))
-    job = job_queue.enqueue_reindex(options=payload.dict())
+    job = job_queue.enqueue_reindex(options=_model_dump(payload))
     return job.to_dict()
 
 
@@ -2405,6 +2624,52 @@ def download_pdf(source_hash: str):
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return FileResponse(path, media_type="application/pdf", filename=filename)
+
+
+@app.get("/api/pdfs/{source_hash}/view")
+def view_pdf(source_hash: str):
+    try:
+        path, filename = resolve_pdf_download_path(source_hash)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename=filename,
+        content_disposition_type="inline",
+    )
+
+
+@app.post("/api/pdfs/{source_hash}/reprocess")
+def reprocess_pdf(source_hash: str):
+    try:
+        job = enqueue_source_reprocess(
+            source_hash,
+            registry_path=PDF_REGISTRY_PATH,
+            processed_dir=PROCESSED_DIR,
+            staging_root=STAGING_DIR,
+            root_dir=ROOT_DIR,
+            data_dir=DATA_DIR,
+        )
+        return job.to_dict()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/pdfs/{source_hash}/trust")
+def update_pdf_trust(source_hash: str, payload: DocumentTrustRequest):
+    try:
+        entry = update_document_trust(
+            source_hash,
+            {key: value for key, value in _model_dump(payload).items() if value is not None},
+        )
+        return {"trust": entry}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/index")

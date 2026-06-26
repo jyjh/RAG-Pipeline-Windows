@@ -885,23 +885,52 @@ function qualityWarnings(warnings) {
     missing_markdown: "missing Markdown",
     no_chunks: "no chunks",
     not_indexed: "not indexed",
+    marked_stale: "marked stale",
+    rejected_source: "rejected",
+    review_expired: "review expired",
+    unreviewed_source: "unreviewed",
   };
   return (Array.isArray(warnings) ? warnings : []).map((warning) => labels[warning] || warning);
 }
 
-function renderQualityCell(quality) {
+function trustTitle(value) {
+  const labels = {
+    approved: "approved",
+    rejected: "rejected",
+    stale: "stale",
+    unreviewed: "unreviewed",
+  };
+  return labels[value] || "unreviewed";
+}
+
+function sourceTypeTitle(value) {
+  return String(value || "unknown").replaceAll("_", " ");
+}
+
+function renderQualityCell(item) {
+  const quality = item.quality;
+  const trust = item.trust && typeof item.trust === "object" ? item.trust : {};
   const data = quality && typeof quality === "object" ? quality : {};
   const label = data.label || "review";
   const warningText = qualityWarnings(data.warnings).join(", ");
+  const trustNotes = String(trust.notes || "").trim();
   const metrics = [
     Number(data.chunk_count || 0) ? `${Number(data.chunk_count)} chunks` : "",
     Number(data.markdown_char_count || 0) ? `${Number(data.markdown_char_count)} chars` : "",
     Number(data.enrichment_markers || 0) ? `${Number(data.enrichment_markers)} enriched` : "",
   ].filter(Boolean);
+  const reprocessDisabled = item.can_download ? "" : " disabled";
   return `
     <span class="quality-badge quality-${escapeHtml(label)}">${escapeHtml(qualityTitle(label))}</span>
     <span class="quality-detail">${escapeHtml(metrics.join(" | "))}</span>
+    <span class="quality-detail">Trust: ${escapeHtml(trustTitle(trust.review_status))} | ${escapeHtml(sourceTypeTitle(trust.source_type))}</span>
     <span class="quality-warning">${escapeHtml(warningText)}</span>
+    ${trustNotes ? `<span class="quality-note">Note: ${escapeHtml(trustNotes)}</span>` : ""}
+    <span class="quality-actions">
+      <button type="button" data-pdf-action="approve" data-source-hash="${escapeHtml(item.hash || "")}">Approve</button>
+      <button type="button" data-pdf-action="stale" data-source-hash="${escapeHtml(item.hash || "")}">Flag stale</button>
+      <button type="button" data-pdf-action="reprocess" data-source-hash="${escapeHtml(item.hash || "")}"${reprocessDisabled}>Re-run</button>
+    </span>
   `;
 }
 
@@ -967,7 +996,7 @@ async function refreshPdfs() {
           ${escapeHtml(item.hash || "")}
         </td>
         <td>${escapeHtml(item.status || "")}</td>
-        <td>${renderQualityCell(item.quality)}</td>
+        <td>${renderQualityCell(item)}</td>
         <td>${download}</td>
       `;
       els.pdfsBody.appendChild(row);
@@ -982,6 +1011,52 @@ async function refreshPdfs() {
     });
   } catch (error) {
     setStatus(els.uploadStatus, error.message, true);
+  }
+}
+
+async function handlePdfAction(event) {
+  const button = event.target.closest("[data-pdf-action]");
+  if (!button) {
+    return;
+  }
+  const sourceHash = button.dataset.sourceHash || "";
+  const action = button.dataset.pdfAction || "";
+  if (!sourceHash) {
+    return;
+  }
+  const body = {};
+  if (action === "approve") {
+    body.review_status = "approved";
+  } else if (action === "stale") {
+    body.review_status = "stale";
+    body.notes = window.prompt("Why is this source stale?", "") || "";
+  } else if (action === "reprocess") {
+    if (!window.confirm("Re-run ingestion and indexing for this source?")) {
+      return;
+    }
+  } else {
+    return;
+  }
+  button.disabled = true;
+  try {
+    if (action === "reprocess") {
+      const job = await requestJson(`/api/pdfs/${encodeURIComponent(sourceHash)}/reprocess`, {
+        method: "POST",
+      });
+      setStatus(els.uploadStatus, `Queued re-run job ${String(job.id || "").slice(0, 8)}.`);
+      await refreshJobs();
+    } else {
+      await requestJson(`/api/pdfs/${encodeURIComponent(sourceHash)}/trust`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    }
+    await refreshPdfs();
+  } catch (error) {
+    setStatus(els.uploadStatus, error.message, true);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -1802,6 +1877,9 @@ function renderSourcePanel(parts) {
     if (source.kind === "web" && source.url) {
       links.push(`<a href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">Open</a>`);
     }
+    if (source.kind === "local" && source.open_url) {
+      links.push(`<a href="${escapeHtml(source.open_url)}" target="_blank">Open page</a>`);
+    }
     if (source.kind === "local" && source.download_url) {
       links.push(`<a href="${escapeHtml(source.download_url)}">Download PDF</a>`);
     }
@@ -2304,6 +2382,7 @@ els.pdfSearchInput.addEventListener("keydown", (event) => {
     refreshPdfs();
   }
 });
+els.pdfsBody.addEventListener("click", handlePdfAction);
 els.prevPdfPageButton.addEventListener("click", () => {
   state.pdfOffset = Math.max(0, state.pdfOffset - state.pdfLimit);
   refreshPdfs();

@@ -670,6 +670,26 @@ input[type="file"] {
   color: var(--warn);
 }
 
+.quality-note {
+  display: block;
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.quality-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.quality-actions button {
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
 .tool-results-block {
   margin: 10px 0 0;
   border: 1px solid var(--line);

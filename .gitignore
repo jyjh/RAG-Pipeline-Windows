@@ -47,6 +47,8 @@ data/
 .tmp_test_*/
 logs/
 *.log
+.tmp_uvicorn_*.err
+.tmp_uvicorn_*.out
 *.sqlite
 *.sqlite3
 *.sqlite-shm

@@ -83,6 +83,8 @@ class VectorStore(Protocol):
 
     def metadata(self) -> tuple[str, int]: ...
 
+    def all_records(self) -> list[dict[str, Any]]: ...
+
     def get_record(self, record_id: str) -> dict[str, Any]: ...
 
     def update_record(
@@ -286,6 +288,11 @@ class LanceDBVectorStore:
     def metadata(self) -> tuple[str, int]:
         rows = self._scan_rows(limit=1, columns=["embedding_model", "embedding_dim"])
         return self._metadata(rows)
+
+    def all_records(self) -> list[dict[str, Any]]:
+        if not self.exists():
+            return []
+        return self._scan_rows()
 
     def get_record(self, record_id: str) -> dict[str, Any]:
         matches = self._where(f"id = {sql_string(record_id)}", limit=1)

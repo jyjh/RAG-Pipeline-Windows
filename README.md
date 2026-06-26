@@ -148,7 +148,7 @@ rapidocr_backend = "onnxruntime"
 
 Optional backends are `auto`, `tesseract_cli`, `tesseract`, and `easyocr`. Tesseract backends require a system Tesseract install and language data; set `tesseract_cmd`, `tesseract_data_path`, and `tesseract_psm` when using them. Diagram support is currently search-oriented: diagrams are represented as inline vision descriptions embedded with nearby OCR/page text, not as retrieved image thumbnails.
 
-Indexing and query use Ollama embeddings only. Use `--embedding_model` to select a different Ollama embedding model, `--embedding_batch_size 1` if Ollama struggles with larger embedding batches, and `--embedding_timeout 30` to fail clearly instead of waiting indefinitely. Indexing writes chunks to LanceDB, with `--summary_mode hybrid`, `--chunk_target_tokens 900`, and `--chunk_overlap_tokens 120` by default; the overlap is only used when a detected section is too large. Query mode defaults for `context_window`, `llm_num_predict`, and `min_relevance_score` are set in `config.toml`. Ollama chat generation does not use a request timeout; after a connection loss it cancels only after `--ollama_max_lost_health_checks` failed health checks spaced by `--ollama_health_check_interval`.
+Indexing and query use Ollama embeddings only. Use `--embedding_model` to select a different Ollama embedding model, `--embedding_batch_size 1` if Ollama struggles with larger embedding batches, and `--embedding_timeout 30` to fail clearly instead of waiting indefinitely. Indexing writes chunks to LanceDB, with `--summary_mode hybrid`, `--chunk_target_tokens 900`, and `--chunk_overlap_tokens 120` by default; the overlap is only used when a detected section is too large. Reindexing reuses existing vectors when a record ID, content hash, embedding model, and embedding dimension are unchanged, and writes `db/index_manifest.json` with per-document chunk/quality counts for the browser UI. Query mode defaults for `context_window`, `llm_num_predict`, and `min_relevance_score` are set in `config.toml`; local retrieval also reranks vector candidates with a bounded lexical score, controlled by `LOCAL_RAG_RETRIEVAL_LEXICAL_WEIGHT` when needed. Ollama chat generation does not use a request timeout; after a connection loss it cancels only after `--ollama_max_lost_health_checks` failed health checks spaced by `--ollama_health_check_interval`.
 
 The module entrypoints can also be used for the default directories:
 
@@ -176,7 +176,7 @@ health_poll_interval_ms = 60000
 jobs_poll_interval_ms = 60000
 ```
 
-Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/indexing work in the background, lets users inspect/edit/delete index records, and streams chat answers as Ollama produces them. Uploaded and indexed PDFs are searchable by title/hash and listed with download links for source verification. The top-right update button checks the configured remote branch, pulls fast-forward updates when available, and restarts the uvicorn server. It blocks updates if tracked files are dirty, the server is not running the configured branch, Git history diverged, or chat/indexing work is active. The Index page defaults to 20 rows, can show 50 or 100 rows per page, and can load all matching rows in 100-row HTTP batches. The chat panel saves conversations in the browser's `localStorage` and includes a collapsible saved-chat sidebar with rename/delete controls. Uploads are tracked by PDF SHA-256 hash across queued and ingested files; duplicate uploads are rejected unless the browser confirmation prompt is accepted for a forced re-upload. Forced re-upload cleanup waits until the job reaches ingestion, then removes existing indexed records for that parent PDF before fresh ingestion/indexing. The chat panel exposes sampler controls for temperature, top-k (`Max K`), context window, relevance floor, maximum output tokens, and web-search enablement. When Ollama returns model thinking, the chat UI shows it in a collapsible block above the answer and reports clearly if the model stops before producing final answer text. Chat output is rendered as Markdown with local LaTeX-to-MathML formatting and includes a Sources panel populated from retrieved chunks and web results. Queued ingestion/indexing waits before expensive phases while chat queries are active; a phase already running is not forcibly interrupted.
+Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/indexing work in the background, lets users inspect/edit/delete index records, and streams chat answers as Ollama produces them. Uploaded and indexed PDFs are searchable by title/hash and listed with quality badges, chunk counts, trust status, visible trust notes, approve/stale review actions, targeted re-run actions, and download links for source verification. Trust metadata is stored in `data/.document_trust.json`; unreviewed, rejected, stale, expired, missing, or poorly extracted sources are flagged before users rely on them. The top-right update button checks the configured remote branch, pulls fast-forward updates when available, and restarts the uvicorn server. It blocks updates if tracked files are dirty, the server is not running the configured branch, Git history diverged, or chat/indexing work is active. The Index page defaults to 20 rows, can show 50 or 100 rows per page, and can load all matching rows in 100-row HTTP batches. The chat panel saves conversations in the browser's `localStorage` and includes a collapsible saved-chat sidebar with rename/delete controls. Uploads are tracked by PDF SHA-256 hash across queued and ingested files; duplicate uploads are rejected unless the browser confirmation prompt is accepted for a forced re-upload. Forced re-upload cleanup waits until the job reaches ingestion, then removes existing indexed records for that parent PDF before fresh ingestion/indexing. The PDF table's `Re-run` action stages only the selected source PDF, re-runs ingestion for that source, then reindexes the corpus. The chat panel exposes sampler controls for temperature, top-k (`Max K`), context window, relevance floor, maximum output tokens, and web-search enablement. When Ollama returns model thinking, the chat UI shows it in a collapsible block above the answer and reports clearly if the model stops before producing final answer text. Chat output is rendered as Markdown with local LaTeX-to-MathML formatting and includes a Sources panel populated from retrieved chunks and web results. Local sources include an `Open page` link to the cited PDF page when page metadata is available, plus a download link for the full PDF. Queued ingestion/indexing waits before expensive phases while chat queries are active; a phase already running is not forcibly interrupted.
 
 ## Architecture
 
@@ -197,15 +197,18 @@ Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/
    - PDFs are partitioned by outline/bookmark, contents-page entries, or Markdown heading fallback.
    - Title/cover and contents pages are excluded from retrieval records.
    - Document and section summary rows plus leaf chunk rows are embedded through Ollama.
+   - Reindexing reuses unchanged vectors from the existing LanceDB table and writes `db/index_manifest.json` with per-document record, chunk, page, and extraction-quality counts.
    - The local index is written to LanceDB under `db/lancedb` by default.
 
 4. **Querying**
    - Questions are embedded locally through Ollama.
    - Summary hits are expanded to child chunks, while direct chunk hits are used as answer context.
    - Context selection uses a stricter relevance floor plus an input-prompt budget capped at 60% of the model context window instead of a fixed chunk count.
+   - Candidate order is a hybrid of vector score and lexical query-term support, while the initial relevance gate still uses the vector score.
    - Ollama native tool calls let the model pull additional local context and optional keyless web-search results before final answer streaming; web search is skipped once the current prompt already exceeds the input-prompt budget.
    - The default chat system prompt can be set in `config.toml` under `[chat] system_prompt` or overridden with `--system_prompt`.
    - `gemma4` synthesizes an answer from tool-returned sources and cites `[S#]` local chunks or `[W#]` web results shown in the Sources panel.
+   - Final answers are checked for unknown source IDs and weak lexical support against cited tool results; warnings are shown in the chat notice area when citations look suspect.
 
 ## Hardware And Runtime Notes
 
@@ -324,7 +327,7 @@ Medium term:
 
 - Add a citation-safe structured block store as the durable source of truth.
 - Add a local FastAPI service and browser UI for team members.
-- Add local reranking and retrieval evaluation.
+- Add broader retrieval evaluation with golden question sets.
 - Preserve all source block/page references through chunking and deduplication.
 
 ## Development Notes

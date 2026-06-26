@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -32,6 +33,7 @@ DEFAULT_LLM_TIMEOUT = 120.0
 DEFAULT_RETRIEVAL_CANDIDATE_K = 80
 DEFAULT_RETRIEVAL_MIN_SCORE = 0.50
 DEFAULT_RETRIEVAL_RELATIVE_CUTOFF = 0.72
+DEFAULT_RETRIEVAL_LEXICAL_WEIGHT = 0.20
 DEFAULT_CONTEXT_TOKEN_FRACTION = 0.60
 DEFAULT_TOOL_MAX_ROUNDS = 4
 DEFAULT_TOOL_MAX_CALLS = 8
@@ -269,6 +271,10 @@ def _positive_float(value: float | str | None, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return max(0.0, parsed)
+
+
+def _bounded_float(value: float | str | None, default: float, *, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    return min(maximum, max(minimum, _positive_float(value, default)))
 
 
 def _ollama_response_content(response: Any) -> str:
@@ -521,6 +527,16 @@ def _short_snippet(text: str, *, limit: int = 360) -> str:
     return normalized[: max(0, limit - 1)].rstrip() + "..."
 
 
+def _pdf_source_url(source_hash: str, *, mode: str, page: int = 0) -> str:
+    if not source_hash:
+        return ""
+    encoded = urllib.parse.quote(source_hash, safe="")
+    url = f"/api/pdfs/{encoded}/{mode}"
+    if mode == "view" and page:
+        return f"{url}#page={page}"
+    return url
+
+
 class CitationRegistry:
     def __init__(self):
         self._local_by_record_id: dict[str, dict[str, Any]] = {}
@@ -531,6 +547,7 @@ class CitationRegistry:
     def _local_source(self, record: dict[str, Any], index: int) -> dict[str, Any]:
         record_id = str(record.get("id") or "")
         source_hash = str(record.get("source_hash") or "")
+        page_start = int(record.get("page_start") or 0)
         return {
             "id": f"S{index}",
             "kind": "local",
@@ -542,12 +559,13 @@ class CitationRegistry:
             "source_pdf_path": str(record.get("source_pdf_path") or ""),
             "file_path": str(record.get("file_path") or ""),
             "section_path": str(record.get("section_path") or ""),
-            "page_start": int(record.get("page_start") or 0),
+            "page_start": page_start,
             "page_end": int(record.get("page_end") or 0),
             "page_label": _page_label(record),
             "score": round(float(record.get("score") or 0.0), 4),
             "snippet": _short_snippet(str(record.get("content") or "")),
-            "download_url": f"/api/pdfs/{source_hash}/download" if source_hash else "",
+            "open_url": _pdf_source_url(source_hash, mode="view", page=page_start),
+            "download_url": _pdf_source_url(source_hash, mode="download"),
         }
 
     def preview_local(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -652,6 +670,32 @@ def _claim_keywords(text: str) -> set[str]:
     return words
 
 
+def _record_text_for_lexical_score(record: dict[str, Any]) -> str:
+    tags = record.get("tags") or []
+    if isinstance(tags, (list, tuple)):
+        tag_text = " ".join(str(tag) for tag in tags)
+    else:
+        tag_text = str(tags)
+    return " ".join(
+        str(record.get(field) or "")
+        for field in ("title", "section_path", "summary", "content")
+    ) + f" {tag_text}"
+
+
+def _lexical_relevance(query_terms: set[str], record: dict[str, Any]) -> float:
+    if not query_terms:
+        return 0.0
+    record_terms = _claim_keywords(_record_text_for_lexical_score(record))
+    if not record_terms:
+        return 0.0
+    overlap = len(query_terms & record_terms) / max(len(query_terms), 1)
+    title_terms = _claim_keywords(
+        " ".join(str(record.get(field) or "") for field in ("title", "section_path"))
+    )
+    title_overlap = len(query_terms & title_terms) / max(len(query_terms), 1) if title_terms else 0.0
+    return min(1.0, overlap + (0.15 * title_overlap))
+
+
 def _claim_fragments(answer_text: str) -> list[str]:
     fragments = []
     for line in re.split(r"\n+", answer_text or ""):
@@ -723,6 +767,11 @@ def _manifest_source_key(record: dict[str, Any]) -> str:
     return source_path or str(record.get("doc_id") or "unknown")
 
 
+def index_record_content_hash(record: dict[str, Any]) -> str:
+    content = str(record.get("content") or "")
+    return hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
+
+
 def _build_index_manifest(records: list[dict[str, Any]], *, embedding_model: str, embedding_dim: int) -> dict[str, Any]:
     documents: dict[str, dict[str, Any]] = {}
     for record in records:
@@ -744,6 +793,9 @@ def _build_index_manifest(records: list[dict[str, Any]], *, embedding_model: str
         )
         node_type = str(record.get("node_type") or "")
         content = str(record.get("content") or "")
+        existing_hashes = document.setdefault("content_hashes", {})
+        if isinstance(existing_hashes, dict):
+            existing_hashes[str(record.get("id") or "")] = index_record_content_hash(record)
         document["record_count"] += 1
         document["content_char_count"] += len(content)
         if node_type == "chunk":
@@ -763,6 +815,8 @@ def _build_index_manifest(records: list[dict[str, Any]], *, embedding_model: str
         "embedding_model": embedding_model,
         "embedding_dim": int(embedding_dim),
         "total_records": len(records),
+        "embedded_records": sum(1 for record in records if not record.get("vector_reused")),
+        "reused_records": sum(1 for record in records if record.get("vector_reused")),
         "documents": documents,
     }
 
@@ -957,9 +1011,88 @@ class LocalVectorIndexer:
             vectors.extend(batch_vectors)
         return np.asarray(vectors)
 
+    def _reuse_candidates(self, store: LanceDBVectorStore) -> dict[str, dict[str, Any]]:
+        if not store.exists():
+            return {}
+        try:
+            model, dim = store.metadata()
+            if model != self.embedding_model or dim != 768:
+                return {}
+            candidates: dict[str, dict[str, Any]] = {}
+            for record in store.all_records():
+                record_id = str(record.get("id") or "")
+                vector = record.get("vector")
+                if not record_id or vector is None:
+                    continue
+                if len(vector) != 768:
+                    continue
+                candidates[record_id] = {
+                    "content_hash": index_record_content_hash(record),
+                    "vector": [float(value) for value in vector],
+                }
+            return candidates
+        except Exception as exc:
+            _status(
+                f"Local index: existing index could not be inspected for vector reuse: {exc}",
+                enabled=self.progress_enabled,
+            )
+            return {}
+
+    def _attach_vectors(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        store: LanceDBVectorStore,
+    ) -> tuple[int, int]:
+        reuse_candidates = self._reuse_candidates(store)
+        pending: list[tuple[int, dict[str, Any]]] = []
+        reused = 0
+        for index, record in enumerate(records):
+            record_id = str(record.get("id") or "")
+            candidate = reuse_candidates.get(record_id)
+            if candidate and candidate["content_hash"] == index_record_content_hash(record):
+                record["vector"] = list(candidate["vector"])
+                record["vector_reused"] = True
+                reused += 1
+            else:
+                pending.append((index, record))
+
+        if not pending:
+            _status(
+                f"Local index: reused all {reused} existing vector(s); no embedding batches needed.",
+                enabled=self.progress_enabled,
+            )
+            return reused, 0
+
+        self._preflight_embeddings()
+        embedded = 0
+        for file_name, grouped in self._group_pending_by_file(pending).items():
+            _status(
+                f"Local index: embedding {len(grouped)} changed/new record(s) from {file_name}",
+                enabled=self.progress_enabled,
+            )
+            vectors = self._embed_texts(
+                [record["content"] for _, record in grouped],
+                file_name=file_name,
+            )
+            for (record_index, _), vector in zip(grouped, vectors):
+                records[record_index]["vector"] = vector.tolist()
+                embedded += 1
+
+        return reused, embedded
+
+    @staticmethod
+    def _group_pending_by_file(
+        pending: list[tuple[int, dict[str, Any]]],
+    ) -> dict[str, list[tuple[int, dict[str, Any]]]]:
+        grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        for item in pending:
+            file_name = Path(str(item[1].get("file_path") or "records")).name
+            grouped.setdefault(file_name, []).append(item)
+        return grouped
+
     def index_markdown(self, markdown_dir: str) -> None:
         os.makedirs(self.working_dir, exist_ok=True)
-        self._preflight_embeddings()
         files = sorted(Path(markdown_dir).glob("*.md"))
         _status(f"Local index: found {len(files)} Markdown file(s).", enabled=self.progress_enabled)
 
@@ -986,22 +1119,17 @@ class LocalVectorIndexer:
                 continue
 
             _status(
-                f"Local index: embedding {len(file_records)} structured record(s) from {file_path.name}",
+                f"Local index: prepared {len(file_records)} structured record(s) from {file_path.name}",
                 enabled=self.progress_enabled,
             )
-            vectors = self._embed_texts(
-                [record["content"] for record in file_records],
-                file_name=file_path.name,
-            )
-            for record, vector in zip(file_records, vectors):
-                record["vector"] = vector.tolist()
-                records.append(record)
+            records.extend(file_records)
 
         backend = (self.index_backend or "lancedb").lower()
         if backend != "lancedb":
             raise ValueError("index_backend must be lancedb; JSON chunk storage has been removed.")
 
         store = LanceDBVectorStore(self.working_dir)
+        reused, embedded = self._attach_vectors(records, store=store)
         output_target = store.db_path / "chunks"
         store.write_records(
             records,
@@ -1015,7 +1143,8 @@ class LocalVectorIndexer:
             embedding_dim=768,
         )
         _status(
-            f"Local index: wrote {len(records)} structured record(s) to {output_target}",
+            f"Local index: wrote {len(records)} structured record(s) to {output_target} "
+            f"({embedded} embedded, {reused} reused)",
             enabled=self.progress_enabled,
         )
 
@@ -1039,6 +1168,7 @@ class LocalQueryEngine:
         retrieval_candidate_k: int | None = None,
         retrieval_min_score: float | None = None,
         retrieval_relative_cutoff: float | None = None,
+        retrieval_lexical_weight: float | None = None,
         context_token_fraction: float | None = None,
         web_search_enabled: bool = True,
         web_search_timeout: float | None = None,
@@ -1105,6 +1235,12 @@ class LocalQueryEngine:
             if retrieval_relative_cutoff is not None
             else os.environ.get("LOCAL_RAG_RETRIEVAL_RELATIVE_CUTOFF"),
             DEFAULT_RETRIEVAL_RELATIVE_CUTOFF,
+        )
+        self.retrieval_lexical_weight = _bounded_float(
+            retrieval_lexical_weight
+            if retrieval_lexical_weight is not None
+            else os.environ.get("LOCAL_RAG_RETRIEVAL_LEXICAL_WEIGHT"),
+            DEFAULT_RETRIEVAL_LEXICAL_WEIGHT,
         )
         self.context_token_fraction = _positive_float(
             context_token_fraction
@@ -1293,6 +1429,7 @@ class LocalQueryEngine:
 
         best_score = max(float(candidate.get("score") or 0.0) for candidate in candidates)
         score_cutoff = max(self.retrieval_min_score, best_score * self.retrieval_relative_cutoff)
+        query_terms = _claim_keywords(question)
         token_budget = self._context_token_budget() if token_budget is None else max(0, int(token_budget))
         if token_budget <= 0:
             return []
@@ -1300,14 +1437,28 @@ class LocalQueryEngine:
         seen: set[str] = set()
         results: list[dict[str, Any]] = []
 
+        def rank_record(record: dict[str, Any], *, inherited_score: float | None = None) -> dict[str, Any]:
+            vector_score = float(record.get("score") or inherited_score or 0.0)
+            lexical_score = _lexical_relevance(query_terms, record)
+            hybrid_score = (
+                (1.0 - self.retrieval_lexical_weight) * vector_score
+                + self.retrieval_lexical_weight * lexical_score
+            )
+            ranked = dict(record)
+            ranked["vector_score"] = round(vector_score, 4)
+            ranked["lexical_score"] = round(lexical_score, 4)
+            ranked["hybrid_score"] = round(hybrid_score, 4)
+            return ranked
+
         def maybe_add(record: dict[str, Any], *, inherited_score: float | None = None) -> bool:
             nonlocal used_tokens
             record_id = str(record.get("id") or "")
             if not record_id or record_id in seen or record_id in exclude_ids:
                 return False
-            score = float(record.get("score") or inherited_score or 0.0)
-            if score < score_cutoff:
+            vector_score = float(record.get("vector_score") or record.get("score") or inherited_score or 0.0)
+            if vector_score < score_cutoff:
                 return False
+            score = float(record.get("hybrid_score") or vector_score)
             content = str(record.get("content") or "")
             tokens = estimate_context_tokens(content)
             original_tokens = tokens
@@ -1322,6 +1473,9 @@ class LocalQueryEngine:
             item = dict(record)
             item["content"] = content
             item["score"] = score
+            item["vector_score"] = round(vector_score, 4)
+            item["lexical_score"] = round(float(record.get("lexical_score") or 0.0), 4)
+            item["hybrid_score"] = round(score, 4)
             item["estimated_tokens"] = tokens
             if content_truncated:
                 item["content_truncated"] = True
@@ -1331,7 +1485,12 @@ class LocalQueryEngine:
             used_tokens += tokens
             return True
 
-        for candidate in candidates:
+        ranked_candidates = sorted(
+            (rank_record(candidate) for candidate in candidates),
+            key=lambda item: (float(item.get("hybrid_score") or 0.0), float(item.get("vector_score") or 0.0)),
+            reverse=True,
+        )
+        for candidate in ranked_candidates:
             score = float(candidate.get("score") or 0.0)
             if score < score_cutoff:
                 continue
@@ -1339,7 +1498,18 @@ class LocalQueryEngine:
             if node_type == "chunk":
                 maybe_add(candidate)
             else:
-                for child in self.store.child_chunks(candidate, limit=self.retrieval_candidate_k):
+                children = sorted(
+                    (
+                        rank_record(child, inherited_score=score)
+                        for child in self.store.child_chunks(candidate, limit=self.retrieval_candidate_k)
+                    ),
+                    key=lambda item: (
+                        float(item.get("hybrid_score") or 0.0),
+                        float(item.get("vector_score") or 0.0),
+                    ),
+                    reverse=True,
+                )
+                for child in children:
                     if not maybe_add(child, inherited_score=score) and results:
                         if used_tokens >= token_budget:
                             break

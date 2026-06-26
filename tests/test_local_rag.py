@@ -138,6 +138,25 @@ def test_citation_support_warnings_flag_weak_cited_claims():
     assert "[S1]" in weak[0]
 
 
+def test_local_citation_includes_pdf_page_link():
+    citations = local_rag.CitationRegistry()
+
+    source = citations.add_local(
+        {
+            "id": "chunk-a",
+            "source_hash": "hash/a",
+            "source_pdf_name": "report.pdf",
+            "page_start": 7,
+            "page_end": 9,
+            "content": "alpha context",
+        }
+    )
+
+    assert source["open_url"] == "/api/pdfs/hash%2Fa/view#page=7"
+    assert source["download_url"] == "/api/pdfs/hash%2Fa/download"
+    assert source["page_label"] == "pages 7-9"
+
+
 def test_ollama_chat_posts_directly_to_api_chat(monkeypatch):
     calls = []
 
@@ -408,6 +427,109 @@ def test_retrieval_uses_relevance_cutoff_without_fixed_chunk_limit(monkeypatch):
         matches = engine._retrieve("alpha?")
 
         assert [match["id"] for match in matches] == ["a", "b"]
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_retrieval_reranks_vector_candidates_with_query_terms(monkeypatch):
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+            return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+    class FakeStore:
+        def exists(self):
+            return True
+
+        def count(self):
+            return 2
+
+        def search(self, vector, *, top_k):
+            return [
+                {
+                    "id": "vector-best",
+                    "node_type": "chunk",
+                    "title": "General notes",
+                    "content": "generic optimization background",
+                    "score": 0.95,
+                },
+                {
+                    "id": "lexical-best",
+                    "node_type": "chunk",
+                    "title": "Ridge regularization",
+                    "content": "ridge regularization uses a lambda penalty",
+                    "score": 0.90,
+                },
+            ]
+
+        def child_chunks(self, parent, *, limit):
+            return []
+
+    monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    try:
+        engine = local_rag.LocalQueryEngine(working_dir=str(tmp_path), progress_enabled=False)
+        engine.store = FakeStore()
+        engine.record_count = 2
+
+        matches = engine._retrieve("ridge regularization lambda")
+
+        assert [match["id"] for match in matches] == ["lexical-best", "vector-best"]
+        assert matches[0]["vector_score"] == 0.9
+        assert matches[0]["lexical_score"] > matches[1]["lexical_score"]
+        assert matches[0]["score"] == matches[0]["hybrid_score"]
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_retrieval_lexical_weight_zero_keeps_vector_order(monkeypatch):
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+            return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+    class FakeStore:
+        def exists(self):
+            return True
+
+        def count(self):
+            return 2
+
+        def search(self, vector, *, top_k):
+            return [
+                {"id": "vector-best", "node_type": "chunk", "content": "generic", "score": 0.95},
+                {
+                    "id": "lexical-best",
+                    "node_type": "chunk",
+                    "content": "ridge regularization lambda",
+                    "score": 0.90,
+                },
+            ]
+
+        def child_chunks(self, parent, *, limit):
+            return []
+
+    monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    try:
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            retrieval_lexical_weight=0.0,
+            progress_enabled=False,
+        )
+        engine.store = FakeStore()
+        engine.record_count = 2
+
+        matches = engine._retrieve("ridge regularization lambda")
+
+        assert [match["id"] for match in matches] == ["vector-best", "lexical-best"]
+        assert [match["score"] for match in matches] == [0.95, 0.9]
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -896,6 +1018,137 @@ def test_local_indexer_batches_chunk_embeddings(monkeypatch):
         from src.vector_store import LanceDBVectorStore
 
         assert LanceDBVectorStore(db_dir).count() == 5
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_local_indexer_reuses_unchanged_vectors(monkeypatch):
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    md_dir = tmp_path / "md"
+    db_dir = tmp_path / "db"
+    md_dir.mkdir(parents=True)
+    try:
+        md_dir.joinpath("doc.md").write_text("content", encoding="utf-8")
+        reused_vector = [1.0] + [0.0] * 767
+        changed_vector = [0.0, 1.0] + [0.0] * 766
+        new_vector = [0.0, 0.0, 1.0] + [0.0] * 765
+
+        LanceDBVectorStore(db_dir).write_records(
+            [
+                {
+                    "id": "same",
+                    "doc_id": "doc",
+                    "parent_id": "",
+                    "node_type": "chunk",
+                    "file_path": "doc.md",
+                    "chunk_index": 0,
+                    "content": "same content",
+                    "title": "Same",
+                    "section_path": "Doc > Same",
+                    "page_start": 1,
+                    "page_end": 1,
+                    "summary": "summary",
+                    "tags": [],
+                    "vector": reused_vector,
+                },
+                {
+                    "id": "changed",
+                    "doc_id": "doc",
+                    "parent_id": "",
+                    "node_type": "chunk",
+                    "file_path": "doc.md",
+                    "chunk_index": 1,
+                    "content": "old content",
+                    "title": "Changed",
+                    "section_path": "Doc > Changed",
+                    "page_start": 2,
+                    "page_end": 2,
+                    "summary": "summary",
+                    "tags": [],
+                    "vector": [0.5] + [0.0] * 767,
+                },
+            ],
+            embedding_model="nomic-embed-text",
+            embedding_dim=768,
+        )
+
+        calls = []
+
+        class FakeEngine:
+            def __init__(self, **kwargs):
+                pass
+
+            def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+                calls.append(list(texts))
+                if list(texts) == ["embedding health check"]:
+                    return np.asarray([[1.0] + [0.0] * 7], dtype=np.float32)
+                vectors = []
+                for text in texts:
+                    if text == "changed content":
+                        vectors.append(changed_vector)
+                    elif text == "new content":
+                        vectors.append(new_vector)
+                    else:
+                        raise AssertionError(f"Unexpected embedding request: {text}")
+                return np.asarray(vectors, dtype=np.float32)
+
+        monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+
+        def fake_build_section_records(*args, **kwargs):
+            base = {
+                "doc_id": "doc",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": "doc.md",
+                "summary": "summary",
+                "tags": [],
+            }
+            return [
+                {
+                    **base,
+                    "id": "same",
+                    "chunk_index": 0,
+                    "content": "same content",
+                    "title": "Same",
+                    "section_path": "Doc > Same",
+                    "page_start": 1,
+                    "page_end": 1,
+                },
+                {
+                    **base,
+                    "id": "changed",
+                    "chunk_index": 1,
+                    "content": "changed content",
+                    "title": "Changed",
+                    "section_path": "Doc > Changed",
+                    "page_start": 2,
+                    "page_end": 2,
+                },
+                {
+                    **base,
+                    "id": "new",
+                    "chunk_index": 2,
+                    "content": "new content",
+                    "title": "New",
+                    "section_path": "Doc > New",
+                    "page_start": 3,
+                    "page_end": 3,
+                },
+            ]
+
+        monkeypatch.setattr(local_rag, "build_section_records", fake_build_section_records)
+
+        indexer = local_rag.LocalVectorIndexer(working_dir=str(db_dir), embedding_batch_size=8, progress_enabled=False)
+        indexer.index_markdown(str(md_dir))
+
+        assert calls == [["embedding health check"], ["changed content", "new content"]]
+        store = LanceDBVectorStore(db_dir)
+        assert store.count() == 3
+        assert store.get_record("same")["vector"] == reused_vector
+        assert store.get_record("changed")["vector"] == changed_vector
+        manifest = json.loads(db_dir.joinpath(local_rag.INDEX_MANIFEST_FILENAME).read_text(encoding="utf-8"))
+        assert manifest["reused_records"] == 1
+        assert manifest["embedded_records"] == 2
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 

@@ -1446,6 +1446,8 @@ def test_pdf_documents_include_quality_payload(monkeypatch, workspace_tmp):
     monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
     monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
     monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+    web_app.update_document_trust(source_hash, {"review_status": "approved"})
 
     client = TestClient(web_app.app)
     response = client.get("/api/pdfs")
@@ -1456,6 +1458,131 @@ def test_pdf_documents_include_quality_payload(monkeypatch, workspace_tmp):
     assert quality["chunk_count"] == 1
     assert quality["record_count"] == 2
     assert quality["markdown_exists"] is True
+    assert response.json()["pdfs"][0]["trust"]["review_status"] == "approved"
+
+
+def test_pdf_trust_endpoint_marks_stale_source(monkeypatch, workspace_tmp):
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    markdown_path = processed_dir / "stale.md"
+    markdown_path.write_text("# Overview\n\n" + ("alpha context " * 80), encoding="utf-8")
+    source_hash = "hash-stale"
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=markdown_path,
+        source_hash=source_hash,
+        source_pdf_name="stale.pdf",
+        source_pdf_path=web_app.DATA_DIR / "stale.pdf",
+    )
+    db_dir = workspace_tmp / "db"
+    local_rag.write_index_manifest(
+        db_dir,
+        [
+            {
+                "id": "chunk",
+                "node_type": "chunk",
+                "content": "alpha context",
+                "source_hash": source_hash,
+                "source_pdf_name": "stale.pdf",
+                "source_pdf_path": str(web_app.DATA_DIR / "stale.pdf"),
+                "page_start": 1,
+                "page_end": 1,
+            },
+        ],
+        embedding_model="fake-embed",
+        embedding_dim=3,
+    )
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+
+    client = TestClient(web_app.app)
+    update = client.post(
+        f"/api/pdfs/{source_hash}/trust",
+        json={"review_status": "stale", "source_type": "student_project", "notes": "old design rules"},
+    )
+    listing = client.get("/api/pdfs")
+
+    assert update.status_code == 200
+    assert update.json()["trust"]["review_status"] == "stale"
+    document = listing.json()["pdfs"][0]
+    assert document["trust"]["source_type"] == "student_project"
+    assert document["trust"]["notes"] == "old design rules"
+    assert "marked_stale" in document["quality"]["warnings"]
+    assert document["quality"]["label"] == "review"
+
+
+def test_pdf_reprocess_endpoint_queues_single_source_upload(monkeypatch, workspace_tmp):
+    data_dir = workspace_tmp / "data"
+    upload_dir = data_dir / "uploads" / "old-job"
+    upload_dir.mkdir(parents=True)
+    pdf_bytes = b"%PDF-1.4 reprocess source"
+    pdf_path = upload_dir / "source.pdf"
+    pdf_path.write_bytes(pdf_bytes)
+    source_hash = hashlib.sha256(pdf_bytes).hexdigest()
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    markdown_path = processed_dir / "source.md"
+    markdown_path.write_text("old markdown", encoding="utf-8")
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=markdown_path,
+        source_hash=source_hash,
+        source_pdf_name="source.pdf",
+        source_pdf_path=pdf_path,
+    )
+    registry_path = workspace_tmp / "registry.json"
+    file_upload = {
+        "filename": "source.pdf",
+        "hash": source_hash,
+        "staging_path": "",
+        "upload_path": str(pdf_path),
+        "processed_markdown_path": str(markdown_path),
+    }
+    registry = web_app.PdfRegistry(registry_path)
+    registry.register_queued(
+        job_id="old-job",
+        files=[file_upload],
+        options={"ocr_backend": "tesseract_cli", "embedding_model": "old-embed"},
+    )
+    registry.mark_job_status(job_id="old-job", files=[file_upload], status="indexed")
+    captured = {}
+
+    class FakeQueue:
+        def enqueue_upload(self, **kwargs):
+            captured.update(kwargs)
+            return web_app.QueueJob(
+                id=kwargs["job_id"],
+                kind="upload",
+                filenames=kwargs["filenames"],
+                uploads=kwargs["uploads"],
+                force_duplicate_hashes=kwargs["force_duplicate_hashes"],
+                staging_dir=str(kwargs["staging_dir"]),
+                options=kwargs["options"],
+            )
+
+    monkeypatch.setattr(web_app, "DATA_DIR", data_dir)
+    monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", registry_path)
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    client = TestClient(web_app.app)
+    response = client.post(f"/api/pdfs/{source_hash}/reprocess")
+
+    assert response.status_code == 200
+    assert response.json()["kind"] == "upload"
+    assert captured["force_duplicate_hashes"] == [source_hash]
+    assert captured["uploads"][0]["hash"] == source_hash
+    staged_path = Path(captured["uploads"][0]["staging_path"])
+    assert staged_path.exists()
+    assert staged_path.read_bytes() == pdf_bytes
+    assert captured["options"]["ocr_backend"] == "tesseract_cli"
+    assert captured["options"]["embedding_model"] == "old-embed"
+    queued = web_app.PdfRegistry(registry_path).load()["pdfs"][source_hash]
+    assert queued["status"] == "queued"
+    assert queued["previous_entry"]["status"] == "indexed"
 
 
 def test_pdf_documents_list_and_download_endpoint(monkeypatch, workspace_tmp):
@@ -1484,6 +1611,12 @@ def test_pdf_documents_list_and_download_endpoint(monkeypatch, workspace_tmp):
     download = client.get("/api/pdfs/hash-download/download")
     assert download.status_code == 200
     assert download.content.startswith(b"%PDF")
+    assert download.headers["content-disposition"].startswith("attachment;")
+
+    view = client.get("/api/pdfs/hash-download/view")
+    assert view.status_code == 200
+    assert view.content.startswith(b"%PDF")
+    assert view.headers["content-disposition"].startswith("inline;")
 
     by_title = client.get("/api/pdfs", params={"search": "ST231"})
     by_hash = client.get("/api/pdfs", params={"search": "hash-download"})
