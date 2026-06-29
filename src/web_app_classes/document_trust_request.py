@@ -13,6 +13,7 @@ bind_module_namespace(
 class DocumentTrustRequest(BaseModel):
     review_status: str | None = None
     source_type: str | None = None
+    source_group: str | None = None
     publication_year: int | None = None
     expires_at: str | None = None
     reviewed_by: str | None = None

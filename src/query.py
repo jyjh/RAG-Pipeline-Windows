@@ -9,6 +9,7 @@ class QueryEngine:
         self,
         working_dir="./db",
         asset_dir: str | None = None,
+        trust_path: str | None = None,
         model=DEFAULT_LLM_MODEL,
         embedding_model: str = "nomic-embed-text",
         embedding_batch_size: int | None = None,
@@ -35,6 +36,7 @@ class QueryEngine:
         self.local_engine = LocalQueryEngine(
             working_dir=working_dir,
             asset_dir=asset_dir,
+            trust_path=trust_path,
             model=model,
             embedding_model=embedding_model,
             embedding_batch_size=embedding_batch_size,

@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from src._class_module_support import bind_module_namespace, finalize_split_class
 import src.local_rag as _source_module
+from src.reliability import (
+    SOURCE_GROUP_UNGROUPED,
+    load_source_group_map,
+    source_group_details,
+    source_group_weight,
+)
 
 bind_module_namespace(
     _source_module,
@@ -16,6 +22,7 @@ class LocalQueryEngine:
         working_dir: str = "./db",
         *,
         asset_dir: str | Path | None = None,
+        trust_path: str | Path | None = None,
         model: str = "gemma4",
         embedding_model: str = "nomic-embed-text",
         embedding_batch_size: int | None = None,
@@ -46,6 +53,10 @@ class LocalQueryEngine:
 
         self.working_dir = working_dir
         self.asset_dir = Path(asset_dir) if asset_dir is not None else Path(working_dir) / "assets"
+        env_trust_path = os.environ.get("LOCAL_RAG_TRUST_PATH")
+        inferred_trust_path = Path(working_dir).resolve().parent / "data" / ".document_trust.json"
+        self.trust_path = Path(trust_path or env_trust_path or inferred_trust_path)
+        self.source_group_by_hash = load_source_group_map(self.trust_path)
         self.asset_store = ImageAssetStore(self.asset_dir)
         self.model = model
         self.progress_enabled = progress_enabled
@@ -133,6 +144,19 @@ class LocalQueryEngine:
         )
         self.store = default_store(working_dir, prefer_lancedb=True)
         self.record_count = self._load_record_count()
+
+    def _reliability_details(self, record: dict[str, Any]) -> dict[str, Any]:
+        explicit_group = str(record.get("source_group") or "").strip()
+        if explicit_group:
+            return source_group_details(explicit_group)
+        source_hash = str(record.get("source_hash") or "").strip()
+        details = dict(self.source_group_by_hash.get(source_hash) or {})
+        if not details:
+            details = {
+                "key": SOURCE_GROUP_UNGROUPED,
+                "weight": source_group_weight(SOURCE_GROUP_UNGROUPED),
+            }
+        return details
 
     def _ollama_options(self) -> dict[str, int | float]:
         return {
@@ -309,10 +333,16 @@ class LocalQueryEngine:
                 (1.0 - self.retrieval_lexical_weight) * vector_score
                 + self.retrieval_lexical_weight * lexical_score
             )
+            reliability = self._reliability_details(record)
+            reliability_modifier = float(reliability.get("weight") or source_group_weight(SOURCE_GROUP_UNGROUPED))
+            final_score = hybrid_score * reliability_modifier
             ranked = dict(record)
             ranked["vector_score"] = round(vector_score, 4)
             ranked["lexical_score"] = round(lexical_score, 4)
             ranked["hybrid_score"] = round(hybrid_score, 4)
+            ranked["source_group"] = str(reliability.get("key") or SOURCE_GROUP_UNGROUPED)
+            ranked["reliability_modifier"] = round(reliability_modifier, 4)
+            ranked["score"] = round(final_score, 4)
             return ranked
 
         def maybe_add(record: dict[str, Any], *, inherited_score: float | None = None) -> bool:
@@ -323,7 +353,7 @@ class LocalQueryEngine:
             vector_score = float(record.get("vector_score") or record.get("score") or inherited_score or 0.0)
             if vector_score < score_cutoff:
                 return False
-            score = float(record.get("hybrid_score") or vector_score)
+            score = float(record.get("score") or record.get("hybrid_score") or vector_score)
             content = str(record.get("content") or "")
             tokens = estimate_context_tokens(content)
             original_tokens = tokens
@@ -340,7 +370,12 @@ class LocalQueryEngine:
             item["score"] = score
             item["vector_score"] = round(vector_score, 4)
             item["lexical_score"] = round(float(record.get("lexical_score") or 0.0), 4)
-            item["hybrid_score"] = round(score, 4)
+            item["hybrid_score"] = round(float(record.get("hybrid_score") or vector_score), 4)
+            item["source_group"] = str(record.get("source_group") or SOURCE_GROUP_UNGROUPED)
+            item["reliability_modifier"] = round(
+                float(record.get("reliability_modifier") or source_group_weight(SOURCE_GROUP_UNGROUPED)),
+                4,
+            )
             item["estimated_tokens"] = tokens
             if content_truncated:
                 item["content_truncated"] = True
@@ -352,12 +387,12 @@ class LocalQueryEngine:
 
         ranked_candidates = sorted(
             (rank_record(candidate) for candidate in candidates),
-            key=lambda item: (float(item.get("hybrid_score") or 0.0), float(item.get("vector_score") or 0.0)),
+            key=lambda item: (float(item.get("score") or 0.0), float(item.get("vector_score") or 0.0)),
             reverse=True,
         )
         for candidate in ranked_candidates:
-            score = float(candidate.get("score") or 0.0)
-            if score < score_cutoff:
+            vector_score = float(candidate.get("vector_score") or candidate.get("score") or 0.0)
+            if vector_score < score_cutoff:
                 continue
             node_type = str(candidate.get("node_type", "chunk"))
             if node_type == "chunk":
@@ -365,17 +400,17 @@ class LocalQueryEngine:
             else:
                 children = sorted(
                     (
-                        rank_record(child, inherited_score=score)
+                        rank_record(child, inherited_score=vector_score)
                         for child in self.store.child_chunks(candidate, limit=self.retrieval_candidate_k)
                     ),
                     key=lambda item: (
-                        float(item.get("hybrid_score") or 0.0),
+                        float(item.get("score") or 0.0),
                         float(item.get("vector_score") or 0.0),
                     ),
                     reverse=True,
                 )
                 for child in children:
-                    if not maybe_add(child, inherited_score=score) and results:
+                    if not maybe_add(child, inherited_score=vector_score) and results:
                         if used_tokens >= token_budget:
                             break
             if used_tokens >= token_budget:
@@ -427,6 +462,11 @@ class LocalQueryEngine:
                 "citation": source["label"],
                 "chunk_id": source["chunk_id"],
                 "score": source["score"],
+                "vector_score": round(float(match.get("vector_score") or 0.0), 4),
+                "lexical_score": round(float(match.get("lexical_score") or 0.0), 4),
+                "hybrid_score": round(float(match.get("hybrid_score") or 0.0), 4),
+                "reliability_modifier": round(float(match.get("reliability_modifier") or 0.0), 4),
+                "source_group": str(match.get("source_group") or SOURCE_GROUP_UNGROUPED),
                 "location": location,
                 "content": str(match.get("content") or ""),
             }

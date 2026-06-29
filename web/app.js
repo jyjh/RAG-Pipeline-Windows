@@ -51,6 +51,18 @@ const TUTORIAL_SEEN_COOKIE = "rag_tutorial_seen";
 const SITE_VERSION_COOKIE = "rag_site_version";
 const REVIEWER_NAME_COOKIE = "rag_reviewer_name";
 const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
+const SOURCE_GROUP_LABELS = {
+  official: "Official",
+  student_research: "Student Research",
+  unofficial: "Unofficial",
+  ungrouped: "Ungrouped",
+};
+const SOURCE_GROUP_WEIGHTS = {
+  official: 1.0,
+  student_research: 0.8,
+  unofficial: 0.5,
+  ungrouped: 0.1,
+};
 
 const els = {
   statusLine: document.getElementById("statusLine"),
@@ -58,6 +70,7 @@ const els = {
   uploadDropZone: document.getElementById("uploadDropZone"),
   fileInput: document.getElementById("fileInput"),
   selectedFilesLabel: document.getElementById("selectedFilesLabel"),
+  uploadGroupsPanel: document.getElementById("uploadGroupsPanel"),
   uploadButton: document.getElementById("uploadButton"),
   reindexButton: document.getElementById("reindexButton"),
   uploadStatus: document.getElementById("uploadStatus"),
@@ -1031,6 +1044,28 @@ function sourceTypeTitle(value) {
   return String(value || "unknown").replaceAll("_", " ");
 }
 
+function sourceGroupTitle(value) {
+  return SOURCE_GROUP_LABELS[String(value || "ungrouped")] || SOURCE_GROUP_LABELS.ungrouped;
+}
+
+function sourceGroupWeight(value) {
+  return Number(SOURCE_GROUP_WEIGHTS[String(value || "ungrouped")] || SOURCE_GROUP_WEIGHTS.ungrouped);
+}
+
+function parseSourceGroupInput(value) {
+  const text = String(value || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+  if (!text) {
+    return "";
+  }
+  if (text === "student" || text === "studentresearch") {
+    return "student_research";
+  }
+  if (text in SOURCE_GROUP_LABELS && text !== "ungrouped") {
+    return text;
+  }
+  return "";
+}
+
 function formatBrowserTimestamp(value) {
   const text = String(value || "").trim();
   if (!text) {
@@ -1060,20 +1095,27 @@ function renderQualityCell(item) {
   const trustNotes = String(trust.notes || "").trim();
   const reviewedBy = String(trust.reviewed_by || "").trim();
   const reviewedAt = formatBrowserTimestamp(trust.reviewed_at);
+  const sourceGroup = String(trust.source_group || "ungrouped");
+  const reliabilityWeight = Number(trust.reliability_weight || sourceGroupWeight(sourceGroup));
   const metrics = [
     Number(data.chunk_count || 0) ? `${Number(data.chunk_count)} chunks` : "",
     Number(data.markdown_char_count || 0) ? `${Number(data.markdown_char_count)} chars` : "",
     Number(data.enrichment_markers || 0) ? `${Number(data.enrichment_markers)} enriched` : "",
   ].filter(Boolean);
   const reprocessDisabled = item.can_download ? "" : " disabled";
+  const tagGroupButton = sourceGroup === "ungrouped"
+    ? `<button type="button" data-pdf-action="tag-group" data-source-hash="${escapeHtml(item.hash || "")}">Tag group</button>`
+    : "";
   return `
     <span class="quality-badge quality-${escapeHtml(label)}">${escapeHtml(qualityTitle(label))}</span>
     <span class="quality-detail">${escapeHtml(metrics.join(" | "))}</span>
     <span class="quality-detail">Trust: ${escapeHtml(trustTitle(trust.review_status))} | ${escapeHtml(sourceTypeTitle(trust.source_type))}</span>
+    <span class="quality-detail">Group: ${escapeHtml(sourceGroupTitle(sourceGroup))} | weight ${escapeHtml(reliabilityWeight.toFixed(2))}</span>
     ${reviewedBy ? `<span class="quality-detail">Reviewed by: ${escapeHtml(reviewedBy)}${reviewedAt ? ` | ${escapeHtml(reviewedAt)}` : ""}</span>` : ""}
     <span class="quality-warning">${escapeHtml(warningText)}</span>
     ${trustNotes ? `<span class="quality-note">Note: ${escapeHtml(trustNotes)}</span>` : ""}
     <span class="quality-actions">
+      ${tagGroupButton}
       <button type="button" data-pdf-action="approve" data-source-hash="${escapeHtml(item.hash || "")}">Approve</button>
       <button type="button" data-pdf-action="stale" data-source-hash="${escapeHtml(item.hash || "")}">Flag stale</button>
       <button type="button" data-pdf-action="reprocess" data-source-hash="${escapeHtml(item.hash || "")}"${reprocessDisabled}>Re-run</button>
@@ -1183,6 +1225,20 @@ async function handlePdfAction(event) {
   const body = {};
   if (action === "approve") {
     body.review_status = "approved";
+  } else if (action === "tag-group") {
+    const prompted = window.prompt(
+      "Set source group: official, student_research, or unofficial",
+      "official",
+    );
+    if (prompted === null) {
+      return;
+    }
+    const sourceGroup = parseSourceGroupInput(prompted);
+    if (!sourceGroup) {
+      setStatus(els.uploadStatus, "Choose one of: official, student_research, unofficial.", true);
+      return;
+    }
+    body.source_group = sourceGroup;
   } else if (action === "stale") {
     body.review_status = "stale";
     body.notes = window.prompt("Why is this source stale?", "") || "";
@@ -1308,12 +1364,55 @@ function updateSelectedFilesLabel() {
   els.selectedFilesLabel.textContent = `${names.length} selected: ${shown}${extra}`;
 }
 
+function renderUploadGroupSelectors() {
+  const files = Array.from(els.fileInput.files || []);
+  els.uploadGroupsPanel.innerHTML = "";
+  els.uploadGroupsPanel.hidden = files.length === 0;
+  for (const file of files) {
+    const row = document.createElement("label");
+    row.className = "upload-group-row";
+    const name = document.createElement("span");
+    name.className = "upload-group-name";
+    name.textContent = file.name || "unnamed.pdf";
+    const select = document.createElement("select");
+    select.className = "upload-group-select";
+    select.dataset.uploadGroup = "true";
+    select.innerHTML = `
+      <option value="">Choose group</option>
+      <option value="official">Official</option>
+      <option value="student_research">Student Research</option>
+      <option value="unofficial">Unofficial</option>
+    `;
+    row.append(name, select);
+    els.uploadGroupsPanel.appendChild(row);
+  }
+}
+
+function selectedUploadSourceGroups() {
+  const selects = Array.from(els.uploadGroupsPanel.querySelectorAll("[data-upload-group='true']"));
+  if (!selects.length) {
+    return [];
+  }
+  const groups = [];
+  for (const select of selects) {
+    const value = parseSourceGroupInput(select.value);
+    if (!value) {
+      select.focus();
+      setStatus(els.uploadStatus, "Choose a source group for each selected PDF.", true);
+      return null;
+    }
+    groups.push(value);
+  }
+  return groups;
+}
+
 function setSelectedUploadFiles(files) {
   clearDuplicatePrompt();
   const { accepted, rejected } = pdfFilesFromList(files);
   if (!accepted.length) {
     setStatus(els.uploadStatus, "Drop one or more PDF files.", true);
     updateSelectedFilesLabel();
+    renderUploadGroupSelectors();
     return;
   }
 
@@ -1323,6 +1422,7 @@ function setSelectedUploadFiles(files) {
   }
   els.fileInput.files = transfer.files;
   updateSelectedFilesLabel();
+  renderUploadGroupSelectors();
   if (rejected.length) {
     setStatus(els.uploadStatus, `Skipped non-PDF file(s): ${rejected.join(", ")}`, true);
   } else {
@@ -1376,10 +1476,17 @@ async function uploadFiles(forceDuplicates = false, forceToken = "") {
   if (!isForced) {
     clearDuplicatePrompt();
   }
+  const sourceGroups = selectedUploadSourceGroups();
+  if (sourceGroups === null) {
+    return;
+  }
 
   const body = new FormData();
-  for (const file of files) {
+  for (const [index, file] of files.entries()) {
     body.append("files", file);
+    if (sourceGroups[index]) {
+      body.append("source_groups", sourceGroups[index]);
+    }
   }
   if (isForced) {
     body.append("force_duplicates", "true");
@@ -1396,6 +1503,7 @@ async function uploadFiles(forceDuplicates = false, forceToken = "") {
     const jobs = Array.isArray(result.jobs) && result.jobs.length ? result.jobs : [result];
     els.fileInput.value = "";
     updateSelectedFilesLabel();
+    renderUploadGroupSelectors();
     clearDuplicatePrompt();
     state.jobsOffset = 0;
     state.pdfOffset = 0;
@@ -1575,6 +1683,15 @@ function indexScoreLabel(item) {
   return `score ${score.toFixed(3)}`;
 }
 
+function indexReliabilityLabel(item) {
+  const sourceGroup = String(item.source_group || "");
+  if (!sourceGroup) {
+    return "";
+  }
+  const reliability = Number(item.reliability_modifier || sourceGroupWeight(sourceGroup));
+  return `${sourceGroupTitle(sourceGroup)} x${reliability.toFixed(2)}`;
+}
+
 function createIndexRow(item, options = {}) {
   const row = document.createElement("tr");
   row.dataset.recordId = item.id;
@@ -1601,7 +1718,7 @@ function createIndexRow(item, options = {}) {
   const sourceName = item.source_pdf_name || item.file_path || item.title || item.id;
   const pageRange = indexPageRange(item);
   const childCount = indexChildCountLabel(item);
-  const meta = [indexNodeLabel(item), indexScoreLabel(item), pageRange, childCount]
+  const meta = [indexNodeLabel(item), indexScoreLabel(item), indexReliabilityLabel(item), pageRange, childCount]
     .filter(Boolean)
     .join(" | ");
   row.innerHTML = `
@@ -2100,9 +2217,12 @@ function renderSourcePanel(parts) {
     const score = source.kind === "local" && Number.isFinite(Number(source.score))
       ? `score ${Number(source.score).toFixed(3)}`
       : "";
+    const reliability = source.kind === "local"
+      ? `${sourceGroupTitle(source.source_group)} | weight ${Number(source.reliability_modifier || sourceGroupWeight(source.source_group)).toFixed(2)}`
+      : "";
     item.innerHTML = `
       <strong>${escapeHtml(source.label || source.id || "")} ${escapeHtml(sourceTitle(source))}</strong>
-      <span>${escapeHtml([sourceLocation(source), score].filter(Boolean).join(" | "))}</span>
+      <span>${escapeHtml([sourceLocation(source), reliability, score].filter(Boolean).join(" | "))}</span>
       <span>${escapeHtml(source.snippet || "")}</span>
       <span class="source-links">${links.join("")}</span>
     `;
@@ -2160,6 +2280,11 @@ function sourceAsToolResultItem(source) {
     citation: source.label || source.id || "",
     chunk_id: source.chunk_id || "",
     score: source.score,
+    vector_score: source.vector_score,
+    lexical_score: source.lexical_score,
+    hybrid_score: source.hybrid_score,
+    reliability_modifier: source.reliability_modifier,
+    source_group: source.source_group || "ungrouped",
     location: [source.source_pdf_name, source.section_path, source.page_label].filter(Boolean).join(" :: "),
     snippet: source.snippet || "",
     assets: Array.isArray(source.assets)
@@ -2784,6 +2909,7 @@ els.updateButton.addEventListener("click", applyUpdate);
 els.fileInput.addEventListener("change", () => {
   clearDuplicatePrompt();
   updateSelectedFilesLabel();
+  renderUploadGroupSelectors();
 });
 els.uploadDropZone.addEventListener("dragenter", handleUploadDrag);
 els.uploadDropZone.addEventListener("dragover", handleUploadDrag);

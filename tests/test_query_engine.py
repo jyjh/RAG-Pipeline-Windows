@@ -43,6 +43,7 @@ def test_query_engine_delegates_to_local_query_engine(monkeypatch):
         "init": {
             "working_dir": "db",
             "asset_dir": None,
+            "trust_path": None,
             "model": "gemma4",
             "embedding_model": "nomic-embed-text",
             "embedding_batch_size": 4,

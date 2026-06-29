@@ -54,6 +54,12 @@ from src.local_rag import (
     write_index_manifest,
 )
 from src.pdf_registry import PdfRegistry, load_source_map, remove_source_entries_by_hash, sha256_file
+from src.reliability import (
+    SOURCE_GROUP_UNGROUPED,
+    normalize_source_group,
+    source_group_weight,
+    valid_assignable_source_groups,
+)
 from src.vector_store import LANCEDB_DIRNAME, default_store, lancedb_path, record_matches, record_row
 
 from src._class_module_support import import_split_class
@@ -263,6 +269,7 @@ TRUST_SOURCE_TYPES = {
     "standard",
     "web",
 }
+TRUST_SOURCE_GROUPS = set(valid_assignable_source_groups())
 
 
 def _utcnow() -> str:
@@ -1272,6 +1279,7 @@ def vector_search_index_rows(
     engine = LocalQueryEngine(
         working_dir=str(db_dir or DB_DIR),
         asset_dir=str(ASSET_DIR),
+        trust_path=str(DOCUMENT_TRUST_PATH),
         embedding_model=embedding_model or DEFAULT_EMBEDDING_MODEL,
         embedding_batch_size=embedding_batch_size,
         embedding_timeout=embedding_timeout,
@@ -1301,6 +1309,11 @@ def vector_search_index_rows(
                 "chunk_index": "",
             }
         row["score"] = float(item.get("score") or 0.0)
+        row["vector_score"] = float(item.get("vector_score") or 0.0)
+        row["lexical_score"] = float(item.get("lexical_score") or 0.0)
+        row["hybrid_score"] = float(item.get("hybrid_score") or 0.0)
+        row["reliability_modifier"] = float(item.get("reliability_modifier") or 0.0)
+        row["source_group"] = str(item.get("source_group") or SOURCE_GROUP_UNGROUPED)
         row["citation"] = str(item.get("citation") or "")
         row["source_id"] = str(item.get("source_id") or "")
         row["location"] = str(item.get("location") or "")
@@ -1364,6 +1377,8 @@ def _default_trust_entry(source_hash: str) -> dict[str, Any]:
         "source_hash": source_hash,
         "review_status": "unreviewed",
         "source_type": "unknown",
+        "source_group": SOURCE_GROUP_UNGROUPED,
+        "reliability_weight": source_group_weight(SOURCE_GROUP_UNGROUPED),
         "publication_year": None,
         "expires_at": "",
         "reviewed_by": "",
@@ -1376,15 +1391,32 @@ def _default_trust_entry(source_hash: str) -> dict[str, Any]:
 def _normalize_trust_entry(source_hash: str, entry: dict[str, Any] | None = None) -> dict[str, Any]:
     normalized = _default_trust_entry(source_hash)
     if isinstance(entry, dict):
-        normalized.update({key: entry.get(key, value) for key, value in normalized.items()})
+        normalized.update(
+            {
+                key: entry.get(key, value)
+                for key, value in normalized.items()
+                if key != "reliability_weight"
+            }
+        )
     normalized["source_hash"] = source_hash
-    for key in ("review_status", "source_type", "expires_at", "reviewed_by", "reviewed_at", "notes", "updated_at"):
+    for key in (
+        "review_status",
+        "source_type",
+        "source_group",
+        "expires_at",
+        "reviewed_by",
+        "reviewed_at",
+        "notes",
+        "updated_at",
+    ):
         normalized[key] = str(normalized.get(key) or "").strip()
     normalized["reviewed_by"] = normalized["reviewed_by"][:80]
     if normalized["review_status"] not in TRUST_REVIEW_STATUSES:
         normalized["review_status"] = "unreviewed"
     if normalized["source_type"] not in TRUST_SOURCE_TYPES:
         normalized["source_type"] = "unknown"
+    normalized["source_group"] = normalize_source_group(normalized.get("source_group"))
+    normalized["reliability_weight"] = source_group_weight(normalized["source_group"])
     try:
         year = normalized.get("publication_year")
         normalized["publication_year"] = int(year) if year not in {None, ""} else None
@@ -1442,9 +1474,13 @@ def update_document_trust(
         if "source_type" in updates and updates["source_type"] not in TRUST_SOURCE_TYPES:
             choices = ", ".join(sorted(TRUST_SOURCE_TYPES))
             raise ValueError(f"source_type must be one of: {choices}")
+        if "source_group" in updates and updates["source_group"] not in TRUST_SOURCE_GROUPS:
+            choices = ", ".join(sorted(TRUST_SOURCE_GROUPS))
+            raise ValueError(f"source_group must be one of: {choices}")
         for key in (
             "review_status",
             "source_type",
+            "source_group",
             "publication_year",
             "expires_at",
             "reviewed_by",
@@ -1673,6 +1709,13 @@ def list_pdf_documents(
         trust = _normalize_trust_entry(str(item.get("hash") or ""), trust_documents.get(str(item.get("hash") or "")))
         item["trust"] = trust
         item["quality"] = _document_quality(item, manifest=manifest, trust=trust, root_dir=root_dir)
+    rows.sort(
+        key=lambda item: (
+            0 if str(item.get("trust", {}).get("source_group") or "") == SOURCE_GROUP_UNGROUPED else 1,
+            str(item.get("filename") or ""),
+            str(item.get("hash") or ""),
+        )
+    )
     query = search.strip().lower()
     if query:
         rows = [
@@ -1974,6 +2017,49 @@ def _upload_options_from_form(form: Any) -> dict[str, Any]:
     }
 
 
+def _sha256_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _is_sha256_hash(value: Any) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{64}", _sha256_text(value)))
+
+
+def _assign_upload_source_groups(
+    uploads: list[dict[str, Any]],
+    raw_groups: list[str],
+    *,
+    require_groups: bool,
+) -> None:
+    groups = [str(value or "").strip().lower() for value in raw_groups]
+    if require_groups and len(groups) != len(uploads):
+        raise HTTPException(status_code=400, detail="Each uploaded PDF must include a source group.")
+    if not require_groups and groups and len(groups) != len(uploads):
+        raise HTTPException(status_code=400, detail="source_groups count must match uploaded files when provided.")
+
+    if not groups:
+        for upload in uploads:
+            upload["source_group"] = SOURCE_GROUP_UNGROUPED
+        return
+
+    valid_choices = ", ".join(sorted(TRUST_SOURCE_GROUPS))
+    for upload, group in zip(uploads, groups):
+        if group not in TRUST_SOURCE_GROUPS:
+            raise HTTPException(status_code=400, detail=f"source_group must be one of: {valid_choices}")
+        upload["source_group"] = group
+
+
+def _apply_upload_source_groups(uploads: list[dict[str, Any]]) -> None:
+    for upload in uploads:
+        source_hash = str(upload.get("hash") or "")
+        if not source_hash:
+            continue
+        group = normalize_source_group(upload.get("source_group"))
+        if group == SOURCE_GROUP_UNGROUPED:
+            continue
+        update_document_trust(source_hash, {"source_group": group})
+
+
 def _upload_hashes(files: list[dict[str, Any]]) -> list[str]:
     return sorted({str(item.get("hash", "")) for item in files if item.get("hash")})
 
@@ -2228,8 +2314,13 @@ def _blocking_duplicate_entries(files: list[dict[str, Any]]) -> list[dict[str, A
     return duplicates
 
 
-@app.post("/api/uploads")
-async def upload_files(request: Request):
+def _duplicate_entries_for_hash(file_hash: str) -> list[dict[str, Any]]:
+    if not _is_sha256_hash(file_hash):
+        raise HTTPException(status_code=400, detail="hash must be a 64-character SHA-256 hex string.")
+    return _blocking_duplicate_entries([{"filename": "", "hash": _sha256_text(file_hash)}])
+
+
+async def _handle_upload_request(request: Request, *, require_source_groups: bool) -> dict[str, Any]:
     filenames: list[str] = []
     uploads: list[dict[str, Any]] = []
     used_names: set[str] = set()
@@ -2240,6 +2331,11 @@ async def upload_files(request: Request):
     try:
         form = await request.form()
         force_duplicates = str(form.get("force_duplicates") or "").lower() in {"1", "true", "yes", "on"}
+        raw_source_groups = [
+            str(value or "")
+            for key, value in form.multi_items()
+            if key == "source_groups" and not isinstance(value, StarletteUploadFile)
+        ]
         for _, value in form.multi_items():
             if not isinstance(value, StarletteUploadFile):
                 continue
@@ -2283,6 +2379,12 @@ async def upload_files(request: Request):
 
         if not filenames:
             raise HTTPException(status_code=400, detail="No PDF files were uploaded.")
+
+        _assign_upload_source_groups(
+            uploads,
+            raw_source_groups,
+            require_groups=require_source_groups,
+        )
 
         batch_duplicate_hashes = {
             item["hash"]
@@ -2331,6 +2433,7 @@ async def upload_files(request: Request):
 
         forced_hashes = {entry["hash"] for entry in duplicate_entries} if force_token_valid else set()
         options = _upload_options_from_form(form)
+        _apply_upload_source_groups(uploads)
         jobs: list[QueueJob] = []
         for upload in uploads:
             job_id = str(upload["job_id"])
@@ -2338,6 +2441,7 @@ async def upload_files(request: Request):
                 "filename": str(upload["filename"]),
                 "hash": str(upload["hash"]),
                 "staging_path": str(upload["staging_path"]),
+                "source_group": normalize_source_group(upload.get("source_group")),
             }
             file_forced_hashes = {file_upload["hash"]} if file_upload["hash"] in forced_hashes else set()
             registry.register_queued(
@@ -2377,6 +2481,26 @@ async def upload_files(request: Request):
             if staging_job_id not in queued_job_ids:
                 shutil.rmtree(staging_dir, ignore_errors=True)
         raise
+
+
+@app.get("/api/uploads/check-hash")
+def check_upload_hash(hash: str):
+    duplicates = _duplicate_entries_for_hash(hash)
+    return {
+        "hash": _sha256_text(hash),
+        "exists": bool(duplicates),
+        "duplicates": duplicates,
+    }
+
+
+@app.post("/api/uploads")
+async def upload_files(request: Request):
+    return await _handle_upload_request(request, require_source_groups=True)
+
+
+@app.post("/api/uploads/direct")
+async def upload_files_direct(request: Request):
+    return await _handle_upload_request(request, require_source_groups=False)
 
 
 async def _optional_json(request: Request) -> dict[str, Any]:
@@ -2633,6 +2757,7 @@ def chat_stream(payload: ChatRequest):
             engine = QueryEngine(
                 working_dir=str(DB_DIR),
                 asset_dir=str(ASSET_DIR),
+                trust_path=str(DOCUMENT_TRUST_PATH),
                 model=payload.llm_model,
                 embedding_model=payload.embedding_model,
                 embedding_batch_size=payload.embedding_batch_size,

@@ -495,6 +495,7 @@ def test_retrieval_reranks_vector_candidates_with_query_terms(monkeypatch):
                     "title": "General notes",
                     "content": "generic optimization background",
                     "score": 0.95,
+                    "source_group": "official",
                 },
                 {
                     "id": "lexical-best",
@@ -502,6 +503,7 @@ def test_retrieval_reranks_vector_candidates_with_query_terms(monkeypatch):
                     "title": "Ridge regularization",
                     "content": "ridge regularization uses a lambda penalty",
                     "score": 0.90,
+                    "source_group": "official",
                 },
             ]
 
@@ -526,6 +528,64 @@ def test_retrieval_reranks_vector_candidates_with_query_terms(monkeypatch):
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
+def test_retrieval_applies_source_group_reliability_weight(monkeypatch):
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+            return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+    class FakeStore:
+        def exists(self):
+            return True
+
+        def count(self):
+            return 2
+
+        def search(self, vector, *, top_k):
+            return [
+                {
+                    "id": "unofficial-best",
+                    "node_type": "chunk",
+                    "content": "ridge regularization uses lambda",
+                    "score": 0.92,
+                    "source_group": "unofficial",
+                },
+                {
+                    "id": "official-second",
+                    "node_type": "chunk",
+                    "content": "ridge regularization uses lambda",
+                    "score": 0.88,
+                    "source_group": "official",
+                },
+            ]
+
+        def child_chunks(self, parent, *, limit):
+            return []
+
+    monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    try:
+        engine = local_rag.LocalQueryEngine(working_dir=str(tmp_path), progress_enabled=False)
+        engine.store = FakeStore()
+        engine.record_count = 2
+
+        matches = engine._retrieve("ridge regularization lambda")
+
+        assert [match["id"] for match in matches] == ["official-second", "unofficial-best"]
+        assert matches[0]["source_group"] == "official"
+        assert matches[0]["reliability_modifier"] == 1.0
+        assert matches[1]["source_group"] == "unofficial"
+        assert matches[1]["reliability_modifier"] == 0.5
+        assert matches[1]["vector_score"] > matches[0]["vector_score"]
+        assert matches[1]["hybrid_score"] > matches[0]["hybrid_score"]
+        assert matches[0]["score"] > matches[1]["score"]
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def test_retrieval_lexical_weight_zero_keeps_vector_order(monkeypatch):
     class FakeEngine:
         def __init__(self, **kwargs):
@@ -543,12 +603,19 @@ def test_retrieval_lexical_weight_zero_keeps_vector_order(monkeypatch):
 
         def search(self, vector, *, top_k):
             return [
-                {"id": "vector-best", "node_type": "chunk", "content": "generic", "score": 0.95},
+                {
+                    "id": "vector-best",
+                    "node_type": "chunk",
+                    "content": "generic",
+                    "score": 0.95,
+                    "source_group": "official",
+                },
                 {
                     "id": "lexical-best",
                     "node_type": "chunk",
                     "content": "ridge regularization lambda",
                     "score": 0.90,
+                    "source_group": "official",
                 },
             ]
 
@@ -663,6 +730,43 @@ def test_retrieval_truncates_oversized_first_match_to_context_budget(monkeypatch
         assert matches[0]["content"].endswith(local_rag.CONTEXT_TRUNCATION_NOTICE)
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_local_tool_result_exposes_reliability_fields():
+    record = {
+        "id": "chunk-a",
+        "source_hash": "hash-a",
+        "source_pdf_name": "report.pdf",
+        "page_start": 4,
+        "page_end": 4,
+        "content": "alpha context",
+        "score": 0.72,
+        "vector_score": 0.9,
+        "lexical_score": 0.8,
+        "hybrid_score": 0.9,
+        "reliability_modifier": 0.8,
+        "source_group": "student_research",
+    }
+    engine = local_rag.LocalQueryEngine.__new__(local_rag.LocalQueryEngine)
+    engine.asset_store = None
+    engine._context_token_budget = lambda: 4000
+    engine._retrieve = lambda *args, **kwargs: [record]
+    citations = local_rag.CitationRegistry()
+
+    result = local_rag.LocalQueryEngine._local_tool_result(
+        engine,
+        query="alpha context",
+        exclude_ids=set(),
+        citations=citations,
+        token_budget=4000,
+    )
+
+    item = result["results"][0]
+    assert item["vector_score"] == 0.9
+    assert item["lexical_score"] == 0.8
+    assert item["hybrid_score"] == 0.9
+    assert item["reliability_modifier"] == 0.8
+    assert item["source_group"] == "student_research"
 
 
 def test_forced_local_tool_call_keeps_final_prompt_under_input_context_budget(monkeypatch):

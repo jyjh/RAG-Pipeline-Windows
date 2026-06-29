@@ -207,6 +207,36 @@ main {
   font-size: 13px;
 }
 
+.upload-groups-panel {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.upload-groups-panel[hidden] {
+  display: none;
+}
+
+.upload-group-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 180px;
+  gap: 10px;
+  align-items: center;
+}
+
+.upload-group-name {
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-group-select {
+  width: 100%;
+}
+
 input[type="search"],
 input[type="text"],
 select,

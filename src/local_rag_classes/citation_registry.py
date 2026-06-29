@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from src._class_module_support import bind_module_namespace, finalize_split_class
 import src.local_rag as _source_module
+from src.reliability import SOURCE_GROUP_UNGROUPED
 
 bind_module_namespace(
     _source_module,
@@ -41,6 +42,11 @@ class CitationRegistry:
             "page_end": int(record.get("page_end") or 0),
             "page_label": _page_label(record),
             "score": round(float(record.get("score") or 0.0), 4),
+            "vector_score": round(float(record.get("vector_score") or 0.0), 4),
+            "lexical_score": round(float(record.get("lexical_score") or 0.0), 4),
+            "hybrid_score": round(float(record.get("hybrid_score") or 0.0), 4),
+            "reliability_modifier": round(float(record.get("reliability_modifier") or 0.0), 4),
+            "source_group": str(record.get("source_group") or SOURCE_GROUP_UNGROUPED),
             "snippet": _short_snippet(str(record.get("content") or "")),
             "open_url": _pdf_source_url(source_hash, mode="view", page=page_start),
             "download_url": _pdf_source_url(source_hash, mode="download"),

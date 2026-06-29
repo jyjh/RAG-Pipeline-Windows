@@ -470,6 +470,7 @@ def test_index_vector_search_endpoint_uses_local_tool(monkeypatch, lancedb_tmp):
     payload = response.json()
     assert calls["init"]["working_dir"] == str(db_dir)
     assert calls["init"]["asset_dir"] == str(web_app.ASSET_DIR)
+    assert calls["init"]["trust_path"] == str(web_app.DOCUMENT_TRUST_PATH)
     assert calls["init"]["retrieval_min_score"] == 0.72
     assert calls["init"]["web_search_enabled"] is False
     assert calls["search"] == {"query": "delta dynamics", "relevance_floor": 0.72}
@@ -478,6 +479,7 @@ def test_index_vector_search_endpoint_uses_local_tool(monkeypatch, lancedb_tmp):
     assert payload["total"] == 1
     assert payload["rows"][0]["id"] == "chunk-2"
     assert payload["rows"][0]["score"] == 0.82
+    assert payload["rows"][0]["source_group"] == "ungrouped"
     assert payload["rows"][0]["citation"] == "[S1]"
     assert payload["tool_result"]["tool"] == "search_local_context"
 
@@ -1408,11 +1410,13 @@ def test_upload_endpoint_enqueues_pdf_batch(monkeypatch, workspace_tmp):
 
     monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
     monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
     monkeypatch.setattr(web_app, "job_queue", FakeQueue())
 
     client = TestClient(web_app.app)
     response = client.post(
         "/api/uploads",
+        data={"source_groups": "official"},
         files=[("files", ("notes.pdf", b"%PDF-1.4", "application/pdf"))],
     )
 
@@ -1427,6 +1431,7 @@ def test_upload_endpoint_enqueues_pdf_batch(monkeypatch, workspace_tmp):
     assert captured["options"]["ocr_force_full_page"] is True
     assert captured["options"]["ocr_langs"] == ["english"]
     assert captured["options"]["vision_enabled"] is True
+    assert captured["uploads"][0]["source_group"] == "official"
     assert Path(captured["staging_dir"]).joinpath("notes.pdf").exists()
 
 
@@ -1446,12 +1451,15 @@ def test_upload_endpoint_splits_multiple_pdfs_into_jobs(monkeypatch, workspace_t
 
     monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
     monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
     monkeypatch.setattr(web_app, "job_queue", FakeQueue())
 
     client = TestClient(web_app.app)
     response = client.post(
         "/api/uploads",
         files=[
+            ("source_groups", (None, "official")),
+            ("source_groups", (None, "unofficial")),
             ("files", ("one.pdf", b"%PDF-1.4 one", "application/pdf")),
             ("files", ("two.pdf", b"%PDF-1.4 two", "application/pdf")),
         ],
@@ -1465,8 +1473,59 @@ def test_upload_endpoint_splits_multiple_pdfs_into_jobs(monkeypatch, workspace_t
     assert [item["filenames"] for item in captured] == [["one.pdf"], ["two.pdf"]]
     assert captured[0]["job_id"] != captured[1]["job_id"]
     assert captured[0]["staging_dir"] != captured[1]["staging_dir"]
+    assert captured[0]["uploads"][0]["source_group"] == "official"
+    assert captured[1]["uploads"][0]["source_group"] == "unofficial"
     assert Path(captured[0]["staging_dir"]).joinpath("one.pdf").exists()
     assert Path(captured[1]["staging_dir"]).joinpath("two.pdf").exists()
+
+
+def test_upload_endpoint_requires_source_groups(monkeypatch, workspace_tmp):
+    class FakeQueue:
+        def enqueue_upload(self, **kwargs):
+            raise AssertionError("upload should not be queued")
+
+    monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/uploads",
+        files=[("files", ("notes.pdf", b"%PDF-1.4", "application/pdf"))],
+    )
+
+    assert response.status_code == 400
+    assert "source group" in response.json()["detail"]
+
+
+def test_direct_upload_endpoint_allows_missing_source_groups(monkeypatch, workspace_tmp):
+    captured = {}
+
+    class FakeQueue:
+        def enqueue_upload(self, **kwargs):
+            captured.update(kwargs)
+            return web_app.QueueJob(
+                id=kwargs["job_id"],
+                kind="upload",
+                filenames=kwargs["filenames"],
+                uploads=kwargs["uploads"],
+                staging_dir=str(kwargs["staging_dir"]),
+            )
+
+    monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/uploads/direct",
+        files=[("files", ("notes.pdf", b"%PDF-1.4", "application/pdf"))],
+    )
+
+    assert response.status_code == 200
+    assert captured["uploads"][0]["source_group"] == "ungrouped"
 
 
 def test_upload_endpoint_rejects_duplicate_pdf_without_force(monkeypatch, workspace_tmp):
@@ -1482,15 +1541,18 @@ def test_upload_endpoint_rejects_duplicate_pdf_without_force(monkeypatch, worksp
 
     monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
     monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
     monkeypatch.setattr(web_app, "job_queue", FakeQueue())
 
     client = TestClient(web_app.app)
     first = client.post(
         "/api/uploads",
+        data={"source_groups": "official"},
         files=[("files", ("notes.pdf", b"%PDF-1.4 same", "application/pdf"))],
     )
     second = client.post(
         "/api/uploads",
+        data={"source_groups": "official"},
         files=[("files", ("copy.pdf", b"%PDF-1.4 same", "application/pdf"))],
     )
 
@@ -1522,11 +1584,13 @@ def test_upload_endpoint_rejects_duplicate_from_index_source_map(monkeypatch, wo
     monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
     monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
     monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
     monkeypatch.setattr(web_app, "job_queue", FakeQueue())
 
     client = TestClient(web_app.app)
     response = client.post(
         "/api/uploads",
+        data={"source_groups": "official"},
         files=[("files", ("copy.pdf", content, "application/pdf"))],
     )
 
@@ -1576,11 +1640,13 @@ def test_upload_endpoint_rejects_duplicate_from_vector_store(monkeypatch, worksp
     monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
     monkeypatch.setattr(web_app, "PROCESSED_DIR", workspace_tmp / "processed")
     monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
     monkeypatch.setattr(web_app, "job_queue", FakeQueue())
 
     client = TestClient(web_app.app)
     response = client.post(
         "/api/uploads",
+        data={"source_groups": "official"},
         files=[("files", ("copy.pdf", content, "application/pdf"))],
     )
 
@@ -1607,11 +1673,13 @@ def test_upload_endpoint_rejects_duplicate_from_existing_data_pdf(monkeypatch, w
     monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", data_dir / "registry.json")
     monkeypatch.setattr(web_app, "PROCESSED_DIR", workspace_tmp / "processed")
     monkeypatch.setattr(web_app, "DB_DIR", workspace_tmp / "db")
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
     monkeypatch.setattr(web_app, "job_queue", FakeQueue())
 
     client = TestClient(web_app.app)
     response = client.post(
         "/api/uploads",
+        data={"source_groups": "official"},
         files=[("files", ("copy.pdf", content, "application/pdf"))],
     )
 
@@ -1639,20 +1707,23 @@ def test_upload_endpoint_allows_forced_duplicate(monkeypatch, workspace_tmp):
 
     monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
     monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
     monkeypatch.setattr(web_app, "job_queue", FakeQueue())
 
     client = TestClient(web_app.app)
     client.post(
         "/api/uploads",
+        data={"source_groups": "official"},
         files=[("files", ("notes.pdf", b"%PDF-1.4 same", "application/pdf"))],
     )
     duplicate = client.post(
         "/api/uploads",
+        data={"source_groups": "official"},
         files=[("files", ("copy.pdf", b"%PDF-1.4 same", "application/pdf"))],
     )
     direct_force = client.post(
         "/api/uploads",
-        data={"force_duplicates": "true"},
+        data={"force_duplicates": "true", "source_groups": "official"},
         files=[("files", ("copy.pdf", b"%PDF-1.4 same", "application/pdf"))],
     )
     response = client.post(
@@ -1660,6 +1731,7 @@ def test_upload_endpoint_allows_forced_duplicate(monkeypatch, workspace_tmp):
         data={
             "force_duplicates": "true",
             "force_token": duplicate.json()["detail"]["force_token"],
+            "source_groups": "official",
         },
         files=[("files", ("copy.pdf", b"%PDF-1.4 same", "application/pdf"))],
     )
@@ -1669,6 +1741,47 @@ def test_upload_endpoint_allows_forced_duplicate(monkeypatch, workspace_tmp):
     assert response.status_code == 200
     assert response.json()["force_duplicate_hashes"] == captured["force_duplicate_hashes"]
     assert captured["force_duplicate_hashes"] == [captured["uploads"][0]["hash"]]
+
+
+def test_check_upload_hash_endpoint_reports_duplicates(monkeypatch, workspace_tmp):
+    class FakeQueue:
+        def enqueue_upload(self, **kwargs):
+            return web_app.QueueJob(
+                id=kwargs["job_id"],
+                kind="upload",
+                filenames=kwargs["filenames"],
+                uploads=kwargs["uploads"],
+                staging_dir=str(kwargs["staging_dir"]),
+            )
+
+    monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    content = b"%PDF-1.4 same"
+    source_hash = hashlib.sha256(content).hexdigest()
+    client = TestClient(web_app.app)
+    client.post(
+        "/api/uploads",
+        data={"source_groups": "official"},
+        files=[("files", ("notes.pdf", content, "application/pdf"))],
+    )
+
+    response = client.get("/api/uploads/check-hash", params={"hash": source_hash})
+
+    assert response.status_code == 200
+    assert response.json()["hash"] == source_hash
+    assert response.json()["exists"] is True
+    assert response.json()["duplicates"][0]["existing_filename"] == "notes.pdf"
+
+
+def test_check_upload_hash_endpoint_rejects_invalid_hash():
+    client = TestClient(web_app.app)
+    response = client.get("/api/uploads/check-hash", params={"hash": "bad"})
+
+    assert response.status_code == 400
+    assert "SHA-256" in response.json()["detail"]
 
 
 def test_jobs_endpoint_paginates(monkeypatch):
@@ -1853,6 +1966,42 @@ def test_pdf_documents_include_quality_payload(monkeypatch, workspace_tmp):
     assert quality["record_count"] == 2
     assert quality["markdown_exists"] is True
     assert response.json()["pdfs"][0]["trust"]["review_status"] == "approved"
+    assert response.json()["pdfs"][0]["trust"]["source_group"] == "ungrouped"
+    assert response.json()["pdfs"][0]["trust"]["reliability_weight"] == 0.1
+
+
+def test_update_document_trust_rejects_invalid_source_group(monkeypatch, workspace_tmp):
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+
+    with pytest.raises(ValueError, match="source_group must be one of"):
+        web_app.update_document_trust("hash-a", {"source_group": "bad-group"})
+
+
+def test_pdf_documents_sort_ungrouped_first(monkeypatch, workspace_tmp):
+    registry_path = workspace_tmp / "registry.json"
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    trust_path = workspace_tmp / "trust.json"
+    registry = web_app.PdfRegistry(registry_path)
+    registry.register_queued(
+        job_id="job-a",
+        files=[{"filename": "zeta.pdf", "hash": "hash-zeta", "staging_path": ""}],
+    )
+    registry.register_queued(
+        job_id="job-b",
+        files=[{"filename": "alpha.pdf", "hash": "hash-alpha", "staging_path": ""}],
+    )
+    web_app.update_document_trust("hash-alpha", {"source_group": "official"}, trust_path=trust_path)
+
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", registry_path)
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", trust_path)
+
+    client = TestClient(web_app.app)
+    response = client.get("/api/pdfs")
+
+    assert response.status_code == 200
+    assert [item["hash"] for item in response.json()["pdfs"]] == ["hash-zeta", "hash-alpha"]
 
 
 def test_pdf_trust_endpoint_marks_stale_source(monkeypatch, workspace_tmp):
@@ -2181,14 +2330,21 @@ def test_frontend_pdf_trust_actions_record_reviewer_name():
     styles = Path("web/styles.css").read_text(encoding="utf-8")
 
     assert 'id="reviewerNameInput"' in markup
+    assert 'id="uploadGroupsPanel"' in markup
     assert "REVIEWER_NAME_COOKIE" in script
     assert "normalizeReviewerName" in script
     assert "ensureReviewerName" in script
     assert "formatBrowserTimestamp" in script
+    assert "renderUploadGroupSelectors" in script
+    assert "selectedUploadSourceGroups" in script
+    assert "source_groups" in script
+    assert "data-pdf-action=\"tag-group\"" in script
+    assert "Group:" in script
     assert "timeZoneName" in script
     assert "body.reviewed_by = reviewer" in script
     assert "Reviewed by:" in script
     assert "saveReviewerName(els.reviewerNameInput.value)" in script
+    assert ".upload-groups-panel" in styles
     assert "#reviewerNameInput" in styles
 
 
