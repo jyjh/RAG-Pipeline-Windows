@@ -43,6 +43,54 @@ class RagJobQueue:
             self.active_query_count = max(0, self.active_query_count - 1)
             self._condition.notify_all()
 
+    def cancel_job(self, job_id: str) -> dict[str, Any]:
+        with self._condition:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(job_id)
+            if job.status in {"done", "failed", "cancelled"}:
+                raise ValueError(f"Job {job_id} is already {job.status}.")
+
+            job.cancel_requested = True
+            job._cancel_event.set()
+            if job.status == "queued":
+                self._queue = deque(existing_id for existing_id in self._queue if existing_id != job.id)
+                self._mark_cancelled_locked(job, "Job cancelled by user.")
+                payload = job.to_dict()
+            else:
+                job.error = "Cancellation requested."
+                payload = job.to_dict()
+            self._condition.notify_all()
+
+        if payload["status"] == "cancelled":
+            self._record_interrupted(job, "Job cancelled by user.")
+        return payload
+
+    def _mark_cancelled_locked(self, job: QueueJob, message: str) -> None:
+        job.status = "cancelled"
+        job.phase = "cancelled"
+        job.error = message
+        job.finished_at = _utcnow()
+
+    def _record_interrupted(self, job: QueueJob, message: str) -> None:
+        if job.kind == "upload" and job.uploads:
+            self.registry.mark_job_status(
+                job_id=job.id,
+                files=job.uploads,
+                status="interrupted",
+                error=message,
+            )
+        if job.source_hashes:
+            self.registry.mark_sources_interrupted(
+                job_id=job.id,
+                source_hashes=job.source_hashes,
+                error=message,
+            )
+
+    def _raise_if_cancelled(self, job: QueueJob | None) -> None:
+        if job is not None and (job.cancel_requested or job._cancel_event.is_set()):
+            raise JobCancelled("Job cancelled by user.")
+
     def enqueue_upload(
         self,
         *,
@@ -85,6 +133,22 @@ class RagJobQueue:
         )
         return self._enqueue(job, auto_start=auto_start)
 
+    def enqueue_reindex_source(
+        self,
+        *,
+        source_hashes: list[str],
+        job_id: str | None = None,
+        options: dict[str, Any] | None = None,
+        auto_start: bool = True,
+    ) -> QueueJob:
+        job = QueueJob(
+            id=job_id or uuid.uuid4().hex,
+            kind="reindex_source",
+            source_hashes=[str(value) for value in source_hashes if value],
+            options=options or {},
+        )
+        return self._enqueue(job, auto_start=auto_start)
+
     def _enqueue(self, job: QueueJob, *, auto_start: bool) -> QueueJob:
         with self._condition:
             self._jobs[job.id] = job
@@ -107,13 +171,37 @@ class RagJobQueue:
                     self._worker = None
                     return
                 job = self._jobs[self._queue.popleft()]
-                job.status = "running"
-                job.phase = "starting"
-                job.started_at = job.started_at or _utcnow()
+                if job.cancel_requested:
+                    self._mark_cancelled_locked(job, "Job cancelled by user.")
+                    self._condition.notify_all()
+                    cancelled_before_start = True
+                else:
+                    cancelled_before_start = False
+                    job.status = "running"
+                    job.phase = "starting"
+                    job.started_at = job.started_at or _utcnow()
+
+            if cancelled_before_start:
+                self._record_interrupted(job, "Job cancelled by user.")
+                continue
 
             try:
+                self._raise_if_cancelled(job)
                 self._run_job(job)
+            except JobCancelled as exc:
+                message = str(exc) or "Job cancelled by user."
+                self._record_interrupted(job, message)
+                with self._condition:
+                    self._mark_cancelled_locked(job, message)
+                    self._condition.notify_all()
             except Exception as exc:
+                if job.cancel_requested:
+                    message = "Job cancelled by user."
+                    self._record_interrupted(job, message)
+                    with self._condition:
+                        self._mark_cancelled_locked(job, message)
+                        self._condition.notify_all()
+                    continue
                 if job.kind == "upload" and job.uploads:
                     self.registry.mark_job_status(
                         job_id=job.id,
@@ -129,18 +217,35 @@ class RagJobQueue:
                     self._condition.notify_all()
             else:
                 with self._condition:
-                    job.status = "done"
-                    job.phase = "done"
-                    job.finished_at = _utcnow()
+                    if job.cancel_requested:
+                        self._mark_cancelled_locked(job, "Job cancelled by user.")
+                        record_cancelled = True
+                    else:
+                        job.status = "done"
+                        job.phase = "done"
+                        job.finished_at = _utcnow()
+                        record_cancelled = False
                     self._condition.notify_all()
+                if record_cancelled:
+                    self._record_interrupted(job, "Job cancelled by user.")
 
     def _run_job(self, job: QueueJob) -> None:
         if job.kind == "upload":
+            self._raise_if_cancelled(job)
             self._run_upload_job(job)
             return
 
         if job.kind == "reindex":
             self._wait_for_no_queries(job, "indexing")
+            self._raise_if_cancelled(job)
+            self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
+            return
+
+        if job.kind == "reindex_source":
+            self._wait_for_no_queries(job, "indexing")
+            self._raise_if_cancelled(job)
+            self._delete_source_index_records(job.source_hashes)
+            self._raise_if_cancelled(job)
             self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
             return
 
@@ -150,29 +255,37 @@ class RagJobQueue:
         resume_status = job.resume_status or "queued"
         if resume_status == "ingested" and self._job_processed_paths_exist(job):
             self._wait_for_no_queries(job, "indexing")
+            self._raise_if_cancelled(job)
             self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
             self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="indexed")
             return
 
         upload_dir = self._ensure_upload_dir(job)
         self._wait_for_no_queries(job, "ingesting")
+        self._raise_if_cancelled(job)
         self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="ingesting")
         self._prepare_for_forced_duplicates(job)
-        self._run_ingestion(str(upload_dir), str(self.processed_dir), job.options)
+        self._raise_if_cancelled(job)
+        self._run_ingestion(str(upload_dir), str(self.processed_dir), job.options, job=job)
+        self._raise_if_cancelled(job)
         self._mark_processed_paths(job)
         self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="ingested")
         self._wait_for_no_queries(job, "indexing")
+        self._raise_if_cancelled(job)
         self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
         self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="indexed")
 
     def _wait_for_no_queries(self, job: QueueJob, phase: str) -> None:
         with self._condition:
+            self._raise_if_cancelled(job)
             job.phase = phase
             while self.active_query_count > 0:
+                self._raise_if_cancelled(job)
                 job.status = "paused_for_queries"
                 job.phase = phase
                 self._condition.notify_all()
                 self._condition.wait(timeout=0.2)
+            self._raise_if_cancelled(job)
             job.status = "running"
             job.phase = phase
             self._condition.notify_all()
@@ -326,7 +439,29 @@ class RagJobQueue:
             if filename:
                 item["processed_markdown_path"] = str(self.processed_dir / f"{Path(filename).stem}.md")
 
-    def _run_ingestion(self, input_dir: str, output_dir: str, options: dict[str, Any]) -> None:
+    def _run_pipeline_subprocess(self, command: list[str], *, job: QueueJob | None = None) -> None:
+        worker_threads = _source_module._background_worker_threads()
+        if job is None:
+            _source_module._run_job_subprocess(command, worker_threads=worker_threads)
+            return
+        self._raise_if_cancelled(job)
+        try:
+            _source_module._run_job_subprocess(command, worker_threads=worker_threads, cancel_event=job._cancel_event)
+        except TypeError as exc:
+            if "cancel_event" not in str(exc):
+                raise
+            self._raise_if_cancelled(job)
+            _source_module._run_job_subprocess(command, worker_threads=worker_threads)
+        self._raise_if_cancelled(job)
+
+    def _run_ingestion(
+        self,
+        input_dir: str,
+        output_dir: str,
+        options: dict[str, Any],
+        *,
+        job: QueueJob | None = None,
+    ) -> None:
         run_ingestion_func = self._run_ingestion_func
         resolved = {
             "parser_mode": options.get("parser_mode", INGESTION_CONFIG["parser_mode"]),
@@ -352,7 +487,9 @@ class RagJobQueue:
             "progress_enabled": options.get("progress_enabled", False),
         }
         if run_ingestion_func is not None:
+            self._raise_if_cancelled(job)
             run_ingestion_func(input_dir, output_dir, **resolved)
+            self._raise_if_cancelled(job)
             return
 
         command = [
@@ -383,7 +520,7 @@ class RagJobQueue:
         _append_cli_option(command, "--tesseract_data_path", resolved["tesseract_data_path"])
         _append_cli_option(command, "--tesseract_psm", resolved["tesseract_psm"])
         command.append("--no_progress")
-        _source_module._run_job_subprocess(command, worker_threads=_source_module._background_worker_threads())
+        self._run_pipeline_subprocess(command, job=job)
 
     def _run_indexing(
         self,
@@ -405,7 +542,9 @@ class RagJobQueue:
             "chunk_overlap_tokens": options.get("chunk_overlap_tokens", DEFAULT_CHUNK_OVERLAP_TOKENS),
         }
         if run_indexing_func is not None:
+            self._raise_if_cancelled(job)
             run_indexing_func(md_dir, db_dir, **resolved)
+            self._raise_if_cancelled(job)
             return
 
         staged_db_dir = _source_module._staged_index_dir(db_dir)
@@ -431,13 +570,28 @@ class RagJobQueue:
         command.append("--no_progress")
 
         try:
-            _source_module._run_job_subprocess(command, worker_threads=_source_module._background_worker_threads())
+            self._run_pipeline_subprocess(command, job=job)
             if job is not None:
                 self._wait_for_no_queries(job, "publishing_index")
             with INDEX_LOCK:
                 _source_module._publish_staged_index(staged_db_dir, db_dir)
         finally:
             shutil.rmtree(staged_db_dir, ignore_errors=True)
+
+    def _delete_source_index_records(self, source_hashes: list[str]) -> None:
+        """Drop existing vectors for the given sources so re-indexing rebuilds them.
+
+        Markdown and source-map entries are left intact; only the vector store
+        records are removed. Re-indexing rebuilds a fresh staged index from all
+        processed Markdown, reusing every other source's vectors.
+        """
+        hashes = {str(value) for value in source_hashes or () if value}
+        if not hashes:
+            return
+        with INDEX_LOCK:
+            store = _index_store(self.db_dir)
+            if store.exists():
+                store.delete_records_by_source_hash(source_hashes=sorted(hashes))
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._condition:

@@ -158,7 +158,7 @@ const walkthroughSteps = [
     tab: "index",
     target: "#indexTable",
     title: "Inspect indexed content",
-    text: "Review summaries and detail chunks before relying on them. Expand summary rows, search text, and edit or delete records after indexing has settled.",
+    text: "Review summaries and detail chunks before relying on them. Expand summary rows, search text, and edit records after indexing has settled.",
   },
   {
     tab: "index",
@@ -1025,6 +1025,7 @@ function qualityWarnings(warnings) {
     missing_markdown: "missing Markdown",
     no_chunks: "no chunks",
     not_indexed: "not indexed",
+    job_interrupted: "job interrupted",
     marked_stale: "marked stale",
     rejected_source: "rejected",
     review_expired: "review expired",
@@ -1105,10 +1106,6 @@ function renderQualityCell(item) {
     Number(data.markdown_char_count || 0) ? `${Number(data.markdown_char_count)} chars` : "",
     Number(data.enrichment_markers || 0) ? `${Number(data.enrichment_markers)} enriched` : "",
   ].filter(Boolean);
-  const reprocessDisabled = item.can_download ? "" : " disabled";
-  const tagGroupButton = sourceGroup === "ungrouped"
-    ? `<button type="button" data-pdf-action="tag-group" data-source-hash="${escapeHtml(item.hash || "")}">Tag group</button>`
-    : "";
   return `
     <span class="quality-badge quality-${escapeHtml(label)}">${escapeHtml(qualityTitle(label))}</span>
     ${sourceGroup === "ungrouped" ? '<span class="quality-badge quality-untagged">Untagged</span>' : ""}
@@ -1118,13 +1115,40 @@ function renderQualityCell(item) {
     ${reviewedBy ? `<span class="quality-detail">Reviewed by: ${escapeHtml(reviewedBy)}${reviewedAt ? ` | ${escapeHtml(reviewedAt)}` : ""}</span>` : ""}
     <span class="quality-warning">${escapeHtml(warningText)}</span>
     ${trustNotes ? `<span class="quality-note">Note: ${escapeHtml(trustNotes)}</span>` : ""}
-    <span class="quality-actions">
-      ${tagGroupButton}
-      <button type="button" data-pdf-action="approve" data-source-hash="${escapeHtml(item.hash || "")}">Approve</button>
-      <button type="button" data-pdf-action="stale" data-source-hash="${escapeHtml(item.hash || "")}">Flag stale</button>
-      <button type="button" data-pdf-action="reprocess" data-source-hash="${escapeHtml(item.hash || "")}"${reprocessDisabled}>Re-run</button>
-    </span>
   `;
+}
+
+function renderPdfActions(item) {
+  const trust = item.trust && typeof item.trust === "object" ? item.trust : {};
+  const sourceGroup = String(trust.source_group || "ungrouped");
+  const sourceHash = escapeHtml(item.hash || "");
+  const warnings = Array.isArray(item.quality?.warnings) ? item.quality.warnings : [];
+  const reprocessDisabled = item.can_download ? "" : " disabled";
+  const reindexDisabled = warnings.includes("missing_markdown") ? " disabled" : "";
+  const tagGroupButton = sourceGroup === "ungrouped"
+    ? `<button type="button" data-pdf-action="tag-group" data-source-hash="${sourceHash}">Tag group</button>`
+    : "";
+  return `
+    <div class="pdf-actions">
+      ${tagGroupButton}
+      <button type="button" data-pdf-action="approve" data-source-hash="${sourceHash}">Approve</button>
+      <button type="button" data-pdf-action="stale" data-source-hash="${sourceHash}">Flag stale</button>
+      <button type="button" data-pdf-action="reindex" data-source-hash="${sourceHash}" title="Rebuild this source's index without re-running ingestion"${reindexDisabled}>Re-index</button>
+      <button type="button" data-pdf-action="reprocess" data-source-hash="${sourceHash}" title="Re-run ingestion and indexing"${reprocessDisabled}>Re-run</button>
+      <button type="button" class="danger" data-pdf-action="delete" data-source-hash="${sourceHash}" title="Delete this PDF, its processed Markdown, assets, and index records">Delete</button>
+    </div>
+  `;
+}
+
+function renderPdfInterruptedBadge(item) {
+  const interruptedAt = formatBrowserTimestamp(item.last_interrupted_at);
+  if (!interruptedAt && item.status !== "interrupted") {
+    return "";
+  }
+  const title = interruptedAt
+    ? `Job interrupted ${interruptedAt}`
+    : "Job interrupted";
+  return `<span class="pdf-warning-badge" title="${escapeHtml(title)}">Interrupted</span>`;
 }
 
 function createPdfRow(item, options = {}) {
@@ -1141,8 +1165,12 @@ function createPdfRow(item, options = {}) {
     : escapeHtml(item.path_error || "");
   row.innerHTML = `
     <td>
-      <strong>${escapeHtml(item.filename || item.hash)}</strong><br />
-      ${escapeHtml(item.hash || "")}
+      <div class="pdf-title-line">
+        <strong>${escapeHtml(item.filename || item.hash)}</strong>
+        ${renderPdfInterruptedBadge(item)}
+      </div>
+      <span class="pdf-hash">${escapeHtml(item.hash || "")}</span>
+      ${renderPdfActions(item)}
     </td>
     <td>${escapeHtml(item.status || "")}</td>
     <td>${renderQualityCell(item)}</td>
@@ -1168,12 +1196,18 @@ async function refreshJobs() {
     els.jobsBody.innerHTML = "";
     for (const job of data.jobs || []) {
       const row = document.createElement("tr");
+      const canCancel = ["queued", "running", "paused_for_queries"].includes(String(job.status || ""))
+        && !job.cancel_requested;
+      const cancelButton = canCancel
+        ? `<button type="button" class="danger" data-job-action="cancel" data-job-id="${escapeHtml(job.id || "")}">Cancel</button>`
+        : "";
       row.innerHTML = `
         <td>${escapeHtml(job.id.slice(0, 8))}</td>
         <td>${escapeHtml(job.status)}</td>
         <td>${escapeHtml(job.phase)}</td>
         <td>${escapeHtml((job.filenames || []).join(", "))}</td>
         <td>${escapeHtml(job.error || "")}</td>
+        <td><div class="job-actions">${cancelButton}</div></td>
       `;
       els.jobsBody.appendChild(row);
     }
@@ -1194,6 +1228,34 @@ async function refreshJobs() {
     }
   } catch (error) {
     setStatus(els.uploadStatus, error.message, true);
+  }
+}
+
+async function handleJobAction(event) {
+  const button = event.target.closest("[data-job-action]");
+  if (!button) {
+    return;
+  }
+  const action = button.dataset.jobAction || "";
+  const jobId = button.dataset.jobId || "";
+  if (action !== "cancel" || !jobId) {
+    return;
+  }
+  if (!window.confirm("Cancel this job?")) {
+    return;
+  }
+  button.disabled = true;
+  try {
+    const job = await requestJson(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: "POST",
+    });
+    setStatus(els.uploadStatus, `Cancelled job ${String(job.id || jobId).slice(0, 8)}.`);
+    await refreshJobs();
+    await refreshPdfs();
+  } catch (error) {
+    setStatus(els.uploadStatus, error.message, true);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -1265,6 +1327,14 @@ async function handlePdfAction(event) {
     if (!window.confirm("Re-run ingestion and indexing for this source?")) {
       return;
     }
+  } else if (action === "reindex") {
+    if (!window.confirm("Re-index this source without re-running ingestion?")) {
+      return;
+    }
+  } else if (action === "delete") {
+    if (!window.confirm("Delete this source, including its PDF, processed Markdown, assets, and index records?")) {
+      return;
+    }
   } else {
     return;
   }
@@ -1282,6 +1352,19 @@ async function handlePdfAction(event) {
         method: "POST",
       });
       setStatus(els.uploadStatus, `Queued re-run job ${String(job.id || "").slice(0, 8)}.`);
+      await refreshJobs();
+    } else if (action === "reindex") {
+      const job = await requestJson(`/api/pdfs/${encodeURIComponent(sourceHash)}/reindex`, {
+        method: "POST",
+      });
+      setStatus(els.uploadStatus, `Queued re-index job ${String(job.id || "").slice(0, 8)}.`);
+      await refreshJobs();
+    } else if (action === "delete") {
+      const result = await requestJson(`/api/pdfs/${encodeURIComponent(sourceHash)}`, {
+        method: "DELETE",
+      });
+      const deletedVectors = Number(result.vectors?.deleted || 0);
+      setStatus(els.uploadStatus, `Deleted source ${sourceHash.slice(0, 8)} and ${deletedVectors} index record${deletedVectors === 1 ? "" : "s"}.`);
       await refreshJobs();
     } else {
       await requestJson(`/api/pdfs/${encodeURIComponent(sourceHash)}/trust`, {
@@ -1759,7 +1842,6 @@ function createIndexRow(item, options = {}) {
       <td>
         <div class="row-actions">
           <button type="button" data-action="save">Save</button>
-          <button type="button" class="danger" data-action="delete">Delete</button>
         </div>
       </td>
     `;
@@ -2023,19 +2105,6 @@ async function handleIndexAction(event) {
       setStatus(els.indexStatus, `Saved ${recordId}.`);
     }
 
-    if (action === "delete") {
-      await requestJson("/api/index/delete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ record_ids: [recordId] }),
-      });
-      setStatus(els.indexStatus, `Deleted ${recordId}.`);
-      if (state.indexMode === "vector") {
-        await runIndexVectorSearch();
-      } else {
-        await loadIndex();
-      }
-    }
   } catch (error) {
     setStatus(els.indexStatus, error.message, true);
   } finally {
@@ -2723,6 +2792,9 @@ function activateTab(tabTarget) {
   } else {
     abortIndexLoad();
   }
+  if (tabTarget === "upload") {
+    refreshPdfs();
+  }
 }
 
 function walkthroughFakePdfItem() {
@@ -3010,6 +3082,7 @@ els.reviewerNameInput.addEventListener("keydown", (event) => {
   }
 });
 els.pdfsBody.addEventListener("click", handlePdfAction);
+els.jobsBody.addEventListener("click", handleJobAction);
 els.prevPdfPageButton.addEventListener("click", () => {
   state.pdfOffset = Math.max(0, state.pdfOffset - state.pdfLimit);
   refreshPdfs();

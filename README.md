@@ -160,15 +160,18 @@ python -m src.indexing
 Run the local browser UI:
 
 ```bash
-uvicorn src.web_app:app --host 127.0.0.1 --port 8000
+python -m src.web_app
 ```
 
 The browser UI reads server host, port, polling intervals, and update target from `config.toml` under `[server]`.
+Use `bind_all = true` to listen on all IPv4 interfaces (`0.0.0.0`) instead of only loopback. If you start
+with `uvicorn` directly, pass the same bind explicitly, for example `uvicorn src.web_app:app --host 0.0.0.0 --port 8000`.
 By default, `/api/health` and `/api/jobs` are polled once per minute:
 
 ```toml
 [server]
 host = "127.0.0.1"
+bind_all = false
 port = 8000
 update_remote = "origin"
 update_branch = "main"

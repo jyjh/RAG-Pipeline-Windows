@@ -389,6 +389,34 @@ input[type="file"] {
   outline-offset: -4px;
 }
 
+.pdf-title-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pdf-hash {
+  display: inline-block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.pdf-warning-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid #d9b456;
+  border-radius: 999px;
+  background: #fff4cb;
+  color: #6e4a0d;
+  font-size: 12px;
+  font-weight: 650;
+}
+
 .source-cell {
   width: 260px;
   color: var(--muted);
@@ -478,6 +506,12 @@ input[type="file"] {
 .row-actions {
   display: flex;
   gap: 8px;
+}
+
+.job-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .danger {
@@ -950,14 +984,14 @@ input[type="file"] {
   font-size: 12px;
 }
 
-.quality-actions {
+.pdf-actions {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
-  margin-top: 6px;
+  margin-top: 8px;
 }
 
-.quality-actions button {
+.pdf-actions button {
   min-height: 28px;
   padding: 4px 8px;
   font-size: 12px;

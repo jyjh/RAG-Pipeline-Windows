@@ -19,15 +19,18 @@ class QueueJob:
     filenames: list[str] = field(default_factory=list)
     uploads: list[dict[str, Any]] = field(default_factory=list)
     force_duplicate_hashes: list[str] = field(default_factory=list)
+    source_hashes: list[str] = field(default_factory=list)
     staging_dir: str | None = None
     upload_dir: str | None = None
     resume_status: str | None = None
     recovered: bool = False
     options: dict[str, Any] = field(default_factory=dict)
+    cancel_requested: bool = False
     error: str | None = None
     created_at: str = field(default_factory=_utcnow)
     started_at: str | None = None
     finished_at: str | None = None
+    _cancel_event: Any = field(default_factory=threading.Event, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -38,11 +41,13 @@ class QueueJob:
             "filenames": list(self.filenames),
             "uploads": [dict(item) for item in self.uploads],
             "force_duplicate_hashes": list(self.force_duplicate_hashes),
+            "source_hashes": list(self.source_hashes),
             "staging_dir": self.staging_dir,
             "upload_dir": self.upload_dir,
             "resume_status": self.resume_status,
             "recovered": self.recovered,
             "options": dict(self.options),
+            "cancel_requested": self.cancel_requested,
             "error": self.error,
             "created_at": self.created_at,
             "started_at": self.started_at,

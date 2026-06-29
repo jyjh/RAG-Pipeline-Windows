@@ -67,7 +67,7 @@ system_prompt = """You are a retrieval-augmented assistant. Before answering, yo
 [server]
 host = "127.0.0.1"
 port = 8000
-lan = false
+bind_all = false
 api_token = ""
 update_remote = "origin"
 update_branch = "main"

@@ -129,6 +129,7 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "vector_search_index_rows",
     "_resolve_pdf_path",
     "_pdf_download_url",
+    "delete_pdf_document",
     "_load_trust_registry",
     "_write_trust_registry",
     "_default_trust_entry",
@@ -174,10 +175,12 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "reindex",
     "list_jobs",
     "get_job",
+    "cancel_job",
     "pdf_documents",
     "image_asset",
     "download_pdf",
     "view_pdf",
+    "delete_pdf",
     "reprocess_pdf",
     "update_pdf_trust",
     "index_rows",
@@ -233,6 +236,7 @@ DEFAULT_CHUNK_OVERLAP_TOKENS = 120
 DEFAULT_HEALTH_POLL_INTERVAL_MS = 60_000
 DEFAULT_JOBS_POLL_INTERVAL_MS = 60_000
 DEFAULT_SERVER_HOST = "127.0.0.1"
+DEFAULT_BIND_ALL_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8000
 DEFAULT_BACKGROUND_WORKER_THREADS = min(4, max(1, (os.cpu_count() or 2) // 2))
 DEFAULT_UPDATE_REMOTE = "origin"
@@ -270,6 +274,10 @@ TRUST_SOURCE_TYPES = {
     "web",
 }
 TRUST_SOURCE_GROUPS = set(valid_assignable_source_groups())
+
+
+class JobCancelled(RuntimeError):
+    """Raised when a queued background job is cancelled by the user."""
 
 
 def _utcnow() -> str:
@@ -365,13 +373,37 @@ def _load_toml_config(config_path: Path) -> dict[str, Any]:
         return {}
 
 
+def _normalize_server_host(raw_host: Any, *, bind_all: bool) -> str:
+    if bind_all:
+        return DEFAULT_BIND_ALL_HOST
+    host = _nonempty_str(raw_host, DEFAULT_SERVER_HOST).strip()
+    if host.lower() in {"*", "all"}:
+        return DEFAULT_BIND_ALL_HOST
+    return host
+
+
+def _server_bind_all_enabled(server_config: dict[str, Any], host: str) -> bool:
+    requested = _bool_value(
+        server_config.get("bind_all"),
+        _bool_value(server_config.get("lan"), False),
+    )
+    return requested or host.strip().lower() in {DEFAULT_BIND_ALL_HOST, "::"}
+
+
 def _load_server_config(config_path: Path | None = None) -> dict[str, Any]:
     config_path = config_path or (ROOT_DIR / "config.toml")
     payload = _load_toml_config(config_path)
     server_config = payload.get("server", {}) if isinstance(payload.get("server"), dict) else {}
+    bind_all_requested = _bool_value(
+        server_config.get("bind_all"),
+        _bool_value(server_config.get("lan"), False),
+    )
+    host = _normalize_server_host(server_config.get("host"), bind_all=bind_all_requested)
+    bind_all = _server_bind_all_enabled(server_config, host)
 
     return {
-        "host": _nonempty_str(server_config.get("host"), DEFAULT_SERVER_HOST),
+        "host": host,
+        "bind_all": bind_all,
         "port": _positive_int(server_config.get("port"), DEFAULT_SERVER_PORT),
         "health_poll_interval_ms": _positive_int(
             server_config.get("health_poll_interval_ms"),
@@ -522,18 +554,55 @@ def _process_output_tail(result: subprocess.CompletedProcess[str], *, limit: int
     return output[-limit:]
 
 
-def _run_job_subprocess(command: list[str], *, worker_threads: int | None = None) -> None:
+def _run_job_subprocess(
+    command: list[str],
+    *,
+    worker_threads: int | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
     kwargs: dict[str, Any] = {
         "cwd": ROOT_DIR,
         "env": _job_subprocess_env(worker_threads),
-        "capture_output": True,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
         "text": True,
-        "check": False,
     }
     creationflags = _job_subprocess_creationflags()
     if creationflags:
         kwargs["creationflags"] = creationflags
-    result = subprocess.run(command, **kwargs)
+    if cancel_event is None:
+        result = subprocess.run(command, **kwargs, check=False)
+        if result.returncode == 0:
+            return
+        detail = _process_output_tail(result)
+        command_text = " ".join(command)
+        message = f"Background pipeline command failed with exit code {result.returncode}: {command_text}"
+        if detail:
+            message = f"{message}\n{detail}"
+        raise RuntimeError(message)
+
+    if cancel_event.is_set():
+        raise JobCancelled("Job cancelled by user.")
+
+    process = subprocess.Popen(command, **kwargs)
+    stdout = ""
+    stderr = ""
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=0.2)
+            break
+        except subprocess.TimeoutExpired:
+            if not cancel_event.is_set():
+                continue
+            process.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+            raise JobCancelled("Job cancelled by user.")
+
+    result = subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr=stderr)
     if result.returncode == 0:
         return
     detail = _process_output_tail(result)
@@ -1257,7 +1326,17 @@ def delete_index_records(*, record_ids: list[str], db_dir: Path | None = None) -
         raise ValueError("At least one record ID is required.")
 
     with INDEX_LOCK:
-        return _index_store(db_dir).delete_records(record_ids=list(ids))
+        resolved_db_dir = Path(db_dir or DB_DIR)
+        store = _index_store(resolved_db_dir)
+        result = store.delete_records(record_ids=list(ids))
+        model, dim = store.metadata()
+        write_index_manifest(
+            resolved_db_dir,
+            store.all_records(),
+            embedding_model=model,
+            embedding_dim=dim,
+        )
+        return result
 
 
 def vector_search_index_rows(
@@ -1588,6 +1667,8 @@ def _document_quality(
         warnings.append("low_extracted_text")
     if status != "indexed":
         warnings.append("not_indexed")
+    if status == "interrupted" or str(entry.get("last_interrupted_at") or ""):
+        warnings.append("job_interrupted")
     if not stats:
         warnings.append("missing_index_manifest")
     elif int(stats.get("chunk_count") or 0) <= 0:
@@ -1623,6 +1704,9 @@ def _pdf_entry_for_response(
     source_pdf_path: str = "",
     processed_markdown_path: str = "",
     updated_at: str = "",
+    last_interrupted_at: str = "",
+    last_interrupted_job_id: str = "",
+    last_error: str = "",
     root_dir: Path = ROOT_DIR,
     data_dir: Path = DATA_DIR,
 ) -> dict[str, Any]:
@@ -1646,6 +1730,9 @@ def _pdf_entry_for_response(
         "source_pdf_path": source_pdf_path,
         "processed_markdown_path": processed_markdown_path,
         "updated_at": updated_at,
+        "last_interrupted_at": last_interrupted_at,
+        "last_interrupted_job_id": last_interrupted_job_id,
+        "last_error": last_error,
         "can_download": can_download,
         "download_url": _pdf_download_url(source_hash) if can_download else "",
         "path_error": path_error,
@@ -1680,6 +1767,9 @@ def list_pdf_documents(
             upload_path=str(entry.get("upload_path", "")),
             processed_markdown_path=str(entry.get("processed_markdown_path", "")),
             updated_at=str(entry.get("updated_at", "")),
+            last_interrupted_at=str(entry.get("last_interrupted_at", "")),
+            last_interrupted_job_id=str(entry.get("last_interrupted_job_id", "")),
+            last_error=str(entry.get("last_error", "")),
             root_dir=root_dir,
             data_dir=data_dir,
         )
@@ -1700,12 +1790,17 @@ def list_pdf_documents(
             source_pdf_path=str(entry.get("source_pdf_path", "")),
             processed_markdown_path=str(entry.get("processed_markdown_path", "")),
             updated_at=str(entry.get("updated_at", current.get("updated_at", ""))),
+            last_interrupted_at=str(current.get("last_interrupted_at", "")),
+            last_interrupted_job_id=str(current.get("last_interrupted_job_id", "")),
+            last_error=str(current.get("last_error", "")),
             root_dir=root_dir,
             data_dir=data_dir,
         )
 
     rows = sorted(entries.values(), key=lambda item: (item.get("filename", ""), item.get("hash", "")))
     for item in rows:
+        if str(item.get("status") or "") == "indexed" and not _index_manifest_stats(item, manifest):
+            item["status"] = "not_indexed"
         trust = _normalize_trust_entry(str(item.get("hash") or ""), trust_documents.get(str(item.get("hash") or "")))
         item["trust"] = trust
         item["quality"] = _document_quality(item, manifest=manifest, trust=trust, root_dir=root_dir)
@@ -1775,6 +1870,258 @@ def resolve_pdf_download_path(
     return path, str(match.get("filename") or path.name)
 
 
+def _pdf_document_by_hash(
+    source_hash: str,
+    *,
+    registry_path: Path | None = None,
+    processed_dir: Path | None = None,
+    root_dir: Path = ROOT_DIR,
+    data_dir: Path = DATA_DIR,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    documents = list_pdf_documents(
+        search="",
+        offset=0,
+        limit=None,
+        registry_path=registry_path,
+        processed_dir=processed_dir,
+        root_dir=root_dir,
+        data_dir=data_dir,
+    )["pdfs"]
+    match = next((item for item in documents if item.get("hash") == source_hash), None)
+    if match is None:
+        raise FileNotFoundError(f"PDF not found for source hash: {source_hash}")
+    return match, documents
+
+
+def _legacy_delete_identifiers(
+    source_hash: str,
+    document: dict[str, Any],
+    source_entries: list[dict[str, Any]],
+) -> tuple[list[str], list[str]]:
+    legacy_paths: list[str] = []
+    legacy_doc_ids: list[str] = []
+    for value in (
+        document.get("processed_markdown_path"),
+        document.get("source_pdf_path"),
+        document.get("upload_path"),
+        document.get("filename"),
+    ):
+        text = str(value or "")
+        if text:
+            legacy_paths.append(text)
+    for entry in source_entries:
+        for key in ("processed_markdown_path", "source_pdf_path", "source_pdf_name"):
+            value = str(entry.get(key, ""))
+            if value:
+                legacy_paths.append(value)
+        markdown_path = Path(str(entry.get("processed_markdown_path", "")))
+        if markdown_path.name:
+            from src.sectioning import stable_id
+
+            legacy_doc_ids.append(stable_id("doc", markdown_path.stem))
+    return sorted(set(legacy_paths)), sorted(set(legacy_doc_ids))
+
+
+def _source_entries_for_hash(processed_dir: Path, source_hash: str) -> list[dict[str, Any]]:
+    documents = load_source_map(processed_dir).get("documents", {})
+    return [
+        dict(entry)
+        for entry in documents.values()
+        if isinstance(entry, dict) and str(entry.get("source_hash") or "") == source_hash
+    ]
+
+
+def _delete_source_vectors(
+    source_hash: str,
+    *,
+    document: dict[str, Any],
+    source_entries: list[dict[str, Any]],
+    db_dir: Path | None = None,
+) -> dict[str, Any]:
+    resolved_db_dir = Path(db_dir or DB_DIR)
+    legacy_paths, legacy_doc_ids = _legacy_delete_identifiers(source_hash, document, source_entries)
+    with INDEX_LOCK:
+        store = _index_store(resolved_db_dir)
+        if not store.exists():
+            return {"deleted": 0, "remaining": 0}
+        result = store.delete_records_by_source_hash(
+            source_hashes=[source_hash],
+            legacy_file_paths=legacy_paths,
+            legacy_doc_ids=legacy_doc_ids,
+        )
+        model, dim = store.metadata()
+        write_index_manifest(
+            resolved_db_dir,
+            store.all_records(),
+            embedding_model=model,
+            embedding_dim=dim,
+        )
+        return result
+
+
+def _delete_processed_markdown_files(
+    source_entries: list[dict[str, Any]],
+    *,
+    processed_dir: Path,
+    root_dir: Path = ROOT_DIR,
+) -> int:
+    deleted = 0
+    processed_root = processed_dir.resolve()
+    paths: set[Path] = set()
+    for entry in source_entries:
+        path = _resolve_workspace_path(str(entry.get("processed_markdown_path", "")), root_dir=root_dir)
+        if path is not None:
+            paths.add(path)
+    for path in paths:
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(processed_root)
+        except (OSError, ValueError):
+            continue
+        if not resolved.exists():
+            continue
+        try:
+            resolved.unlink()
+        except PermissionError:
+            resolved.write_text("", encoding="utf-8")
+        deleted += 1
+    return deleted
+
+
+def _remove_document_trust(source_hash: str, *, trust_path: Path | None = None) -> bool:
+    with TRUST_LOCK:
+        payload = _load_trust_registry(trust_path)
+        documents = payload.setdefault("documents", {})
+        removed = documents.pop(source_hash, None)
+        if removed is not None:
+            _write_trust_registry(payload, trust_path)
+            return True
+        return False
+
+
+def _shared_pdf_paths(
+    source_hash: str,
+    documents: list[dict[str, Any]],
+    *,
+    root_dir: Path = ROOT_DIR,
+    data_dir: Path = DATA_DIR,
+) -> set[Path]:
+    shared: set[Path] = set()
+    for document in documents:
+        if str(document.get("hash") or "") == source_hash:
+            continue
+        for raw_path in (document.get("upload_path"), document.get("source_pdf_path")):
+            try:
+                shared.add(_resolve_pdf_path(str(raw_path or ""), root_dir=root_dir, data_dir=data_dir).resolve())
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+    return shared
+
+
+def _delete_document_pdf_files(
+    document: dict[str, Any],
+    *,
+    shared_paths: set[Path],
+    root_dir: Path = ROOT_DIR,
+    data_dir: Path = DATA_DIR,
+) -> tuple[int, list[str]]:
+    deleted = 0
+    errors: list[str] = []
+    candidates: set[Path] = set()
+    for raw_path in (document.get("upload_path"), document.get("source_pdf_path")):
+        try:
+            candidates.add(_resolve_pdf_path(str(raw_path or ""), root_dir=root_dir, data_dir=data_dir).resolve())
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+    for path in candidates:
+        if path in shared_paths or not path.exists():
+            continue
+        try:
+            path.unlink()
+            deleted += 1
+        except OSError as exc:
+            errors.append(f"{path}: {exc}")
+            continue
+        parent = path.parent
+        try:
+            if _path_is_relative_to(parent, data_dir) and not any(parent.iterdir()):
+                parent.rmdir()
+        except OSError:
+            pass
+    return deleted, errors
+
+
+def delete_pdf_document(
+    source_hash: str,
+    *,
+    registry_path: Path | None = None,
+    processed_dir: Path | None = None,
+    db_dir: Path | None = None,
+    trust_path: Path | None = None,
+    root_dir: Path = ROOT_DIR,
+    data_dir: Path = DATA_DIR,
+) -> dict[str, Any]:
+    source_hash = str(source_hash or "").strip()
+    if not source_hash:
+        raise ValueError("source_hash is required.")
+    registry_path = registry_path or PDF_REGISTRY_PATH
+    processed_dir = processed_dir or PROCESSED_DIR
+    trust_path = trust_path or DOCUMENT_TRUST_PATH
+    document, documents = _pdf_document_by_hash(
+        source_hash,
+        registry_path=registry_path,
+        processed_dir=processed_dir,
+        root_dir=root_dir,
+        data_dir=data_dir,
+    )
+    source_entries = _source_entries_for_hash(processed_dir, source_hash)
+    if document.get("processed_markdown_path") and not source_entries:
+        source_entries = [
+            {
+                "source_hash": source_hash,
+                "processed_markdown_path": str(document.get("processed_markdown_path") or ""),
+                "source_pdf_path": str(document.get("source_pdf_path") or document.get("upload_path") or ""),
+                "source_pdf_name": str(document.get("filename") or ""),
+            }
+        ]
+    vector_result = _delete_source_vectors(
+        source_hash,
+        document=document,
+        source_entries=source_entries,
+        db_dir=db_dir,
+    )
+    markdown_deleted = _delete_processed_markdown_files(
+        source_entries,
+        processed_dir=processed_dir,
+        root_dir=root_dir,
+    )
+    from src.asset_store import ImageAssetStore
+
+    assets_deleted = ImageAssetStore(ASSET_DIR).remove_source_assets(source_hash)
+    shared_paths = _shared_pdf_paths(source_hash, documents, root_dir=root_dir, data_dir=data_dir)
+    pdfs_deleted, pdf_delete_errors = _delete_document_pdf_files(
+        document,
+        shared_paths=shared_paths,
+        root_dir=root_dir,
+        data_dir=data_dir,
+    )
+    removed_source_entries = remove_source_entries_by_hash(processed_dir, {source_hash})
+    registry_entry = PdfRegistry(registry_path).delete_source(source_hash)
+    trust_deleted = _remove_document_trust(source_hash, trust_path=trust_path)
+    return {
+        "source_hash": source_hash,
+        "deleted": True,
+        "vectors": vector_result,
+        "markdown_deleted": markdown_deleted,
+        "source_map_deleted": len(removed_source_entries),
+        "assets_deleted": assets_deleted,
+        "pdfs_deleted": pdfs_deleted,
+        "pdf_delete_errors": pdf_delete_errors,
+        "registry_deleted": registry_entry is not None,
+        "trust_deleted": trust_deleted,
+    }
+
+
 def _reprocess_options_for_source(source_hash: str, *, registry_path: Path = PDF_REGISTRY_PATH) -> dict[str, Any]:
     payload = PdfRegistry(registry_path).load()
     entry = payload.get("pdfs", {}).get(source_hash, {})
@@ -1833,6 +2180,49 @@ def enqueue_source_reprocess(
         job_id=job_id,
         options=options,
     )
+
+
+def _source_markdown_path(
+    source_hash: str,
+    *,
+    processed_dir: Path | None = None,
+    root_dir: Path = ROOT_DIR,
+) -> Path | None:
+    """Resolve the processed Markdown file backing a source hash, if any."""
+    processed_dir = processed_dir or PROCESSED_DIR
+    documents = load_source_map(processed_dir).get("documents", {})
+    for entry in documents.values():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("source_hash", "")) != str(source_hash):
+            continue
+        path = _resolve_workspace_path(str(entry.get("processed_markdown_path", "")), root_dir=root_dir)
+        if path is not None:
+            return path
+    return None
+
+
+def enqueue_source_reindex(
+    source_hash: str,
+    *,
+    registry_path: Path | None = None,
+    processed_dir: Path | None = None,
+    root_dir: Path = ROOT_DIR,
+    data_dir: Path = DATA_DIR,
+) -> QueueJob:
+    """Queue an index-only rebuild for a source using its existing Markdown.
+
+    Unlike ``enqueue_source_reprocess``, ingestion (PDF -> Markdown) is skipped;
+    the source's processed Markdown must already exist. Existing vectors for the
+    source are dropped by the job so the index is genuinely rebuilt.
+    """
+    registry_path = registry_path or PDF_REGISTRY_PATH
+    processed_dir = processed_dir or PROCESSED_DIR
+    markdown_path = _source_markdown_path(source_hash, processed_dir=processed_dir, root_dir=root_dir)
+    if markdown_path is None or not markdown_path.exists():
+        raise FileNotFoundError(f"No processed Markdown to re-index for source hash: {source_hash}")
+    options = _reprocess_options_for_source(source_hash, registry_path=registry_path)
+    return job_queue.enqueue_reindex_source(source_hashes=[source_hash], options=options)
 
 
 QueueJob = import_split_class("src.web_app_classes.queue_job", "QueueJob")
@@ -2536,6 +2926,16 @@ def get_job(job_id: str):
     return job
 
 
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    try:
+        return job_queue.cancel_job(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Job not found.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/api/pdfs")
 def pdf_documents(search: str = "", offset: int = 0, limit: int = 10):
     return list_pdf_documents(search=search, offset=offset, limit=limit)
@@ -2585,6 +2985,29 @@ def view_pdf(source_hash: str):
     )
 
 
+@app.delete("/api/pdfs/{source_hash}")
+def delete_pdf(source_hash: str):
+    blocker = _index_mutation_blocker()
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
+    try:
+        return delete_pdf_document(
+            source_hash,
+            registry_path=PDF_REGISTRY_PATH,
+            processed_dir=PROCESSED_DIR,
+            db_dir=DB_DIR,
+            trust_path=DOCUMENT_TRUST_PATH,
+            root_dir=ROOT_DIR,
+            data_dir=DATA_DIR,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/pdfs/{source_hash}/reprocess")
 def reprocess_pdf(source_hash: str):
     try:
@@ -2593,6 +3016,23 @@ def reprocess_pdf(source_hash: str):
             registry_path=PDF_REGISTRY_PATH,
             processed_dir=PROCESSED_DIR,
             staging_root=STAGING_DIR,
+            root_dir=ROOT_DIR,
+            data_dir=DATA_DIR,
+        )
+        return job.to_dict()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/pdfs/{source_hash}/reindex")
+def reindex_pdf(source_hash: str):
+    try:
+        job = enqueue_source_reindex(
+            source_hash,
+            registry_path=PDF_REGISTRY_PATH,
+            processed_dir=PROCESSED_DIR,
             root_dir=ROOT_DIR,
             data_dir=DATA_DIR,
         )
@@ -2793,3 +3233,17 @@ def chat_stream(payload: ChatRequest):
             job_queue.finish_query()
 
     return StreamingResponse(generate(), media_type="application/x-ndjson; charset=utf-8")
+
+
+def run_server() -> None:
+    import uvicorn
+
+    uvicorn.run(
+        "src.web_app:app",
+        host=str(SERVER_CONFIG["host"]),
+        port=int(SERVER_CONFIG["port"]),
+    )
+
+
+if __name__ == "__main__":
+    run_server()

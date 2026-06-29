@@ -130,6 +130,25 @@ class PdfRegistry:
                 if not isinstance(entry, dict) or entry.get("job_id") != job_id:
                     continue
 
+                if status == "interrupted":
+                    interrupted = {
+                        "last_interrupted_job_id": job_id,
+                        "last_interrupted_at": now,
+                        "last_error": error or "Job interrupted.",
+                        "updated_at": now,
+                    }
+                    if isinstance(entry.get("previous_entry"), dict):
+                        restored = dict(entry["previous_entry"])
+                        restored.update(interrupted)
+                        pdfs[file_hash] = restored
+                        continue
+                    entry["status"] = "interrupted"
+                    entry.update(interrupted)
+                    for key in ("staging_path", "upload_path", "processed_markdown_path"):
+                        if item.get(key):
+                            entry[key] = str(item[key])
+                    continue
+
                 if status == "failed" and entry.get("status") in {"ingested", "indexed"}:
                     entry["last_error"] = error or ""
                     entry["last_failed_at"] = now
@@ -155,6 +174,48 @@ class PdfRegistry:
                     entry["last_error"] = error
             self._supersede_same_processed_paths(payload)
             _write_json(self.path, payload)
+
+    def mark_sources_interrupted(
+        self,
+        *,
+        job_id: str,
+        source_hashes: list[str],
+        error: str | None = None,
+    ) -> None:
+        hashes = [str(value) for value in source_hashes if value]
+        if not hashes:
+            return
+        with _LOCK:
+            payload = self.load()
+            pdfs = payload.setdefault("pdfs", {})
+            now = utcnow()
+            for source_hash in hashes:
+                entry = pdfs.get(source_hash)
+                if not isinstance(entry, dict):
+                    entry = {
+                        "hash": source_hash,
+                        "filename": "",
+                        "status": "",
+                        "job_id": "",
+                        "created_at": now,
+                    }
+                    pdfs[source_hash] = entry
+                entry["last_interrupted_job_id"] = job_id
+                entry["last_interrupted_at"] = now
+                entry["last_error"] = error or "Job interrupted."
+                entry["updated_at"] = now
+            _write_json(self.path, payload)
+
+    def delete_source(self, source_hash: str) -> dict[str, Any] | None:
+        source_hash = str(source_hash or "")
+        if not source_hash:
+            return None
+        with _LOCK:
+            payload = self.load()
+            pdfs = payload.setdefault("pdfs", {})
+            entry = pdfs.pop(source_hash, None)
+            _write_json(self.path, payload)
+            return dict(entry) if isinstance(entry, dict) else None
 
     @staticmethod
     def _supersede_same_processed_paths(payload: dict[str, Any]) -> None:

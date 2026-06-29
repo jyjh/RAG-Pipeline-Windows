@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -530,6 +531,173 @@ def test_delete_index_records_persists_remaining_records(lancedb_tmp):
     assert [row["id"] for row in LanceDBVectorStore(db_dir).list_records()["rows"]] == ["doc.md:0"]
 
 
+def test_delete_index_records_updates_pdf_status_when_source_removed(monkeypatch, workspace_tmp, lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    source_hash = "hash-delete-status"
+    LanceDBVectorStore(db_dir).write_records(
+        [
+            {
+                "id": "chunk-delete",
+                "doc_id": "doc-delete",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": "processed_docs/delete.md",
+                "chunk_index": 0,
+                "content": "delete status context",
+                "title": "Delete",
+                "section_path": "Delete",
+                "page_start": 1,
+                "page_end": 1,
+                "summary": "summary",
+                "tags": [],
+                "source_hash": source_hash,
+                "source_pdf_name": "delete.pdf",
+                "source_pdf_path": str(web_app.DATA_DIR / "delete.pdf"),
+                "vector": [1.0, 0.0, 0.0],
+            }
+        ],
+        embedding_model="fake-embed",
+        embedding_dim=3,
+    )
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    markdown_path = processed_dir / "delete.md"
+    markdown_path.write_text("# Delete\n\n" + ("indexed context " * 50), encoding="utf-8")
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=markdown_path,
+        source_hash=source_hash,
+        source_pdf_name="delete.pdf",
+        source_pdf_path=web_app.DATA_DIR / "delete.pdf",
+    )
+    local_rag.write_index_manifest(
+        db_dir,
+        LanceDBVectorStore(db_dir).all_records(),
+        embedding_model="fake-embed",
+        embedding_dim=3,
+    )
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+
+    deleted = web_app.delete_index_records(record_ids=["chunk-delete"], db_dir=db_dir)
+    response = TestClient(web_app.app).get("/api/pdfs")
+
+    assert deleted == {"deleted": 1, "remaining": 0}
+    document = response.json()["pdfs"][0]
+    assert document["hash"] == source_hash
+    assert document["status"] == "not_indexed"
+    assert "missing_index_manifest" in document["quality"]["warnings"]
+
+
+def test_delete_pdf_document_removes_source_artifacts(monkeypatch, workspace_tmp, lancedb_tmp):
+    data_dir = workspace_tmp / "data"
+    upload_dir = data_dir / "uploads" / "old-job"
+    upload_dir.mkdir(parents=True)
+    pdf_path = upload_dir / "delete.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 delete source")
+    source_hash = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    markdown_path = processed_dir / "delete.md"
+    markdown_path.write_text("# Delete\n\n" + ("indexed context " * 50), encoding="utf-8")
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=markdown_path,
+        source_hash=source_hash,
+        source_pdf_name=pdf_path.name,
+        source_pdf_path=pdf_path,
+    )
+    registry_path = workspace_tmp / "registry.json"
+    file_upload = {
+        "filename": pdf_path.name,
+        "hash": source_hash,
+        "staging_path": "",
+        "upload_path": str(pdf_path),
+        "processed_markdown_path": str(markdown_path),
+    }
+    registry = web_app.PdfRegistry(registry_path)
+    registry.register_queued(job_id="old-job", files=[file_upload])
+    registry.mark_job_status(job_id="old-job", files=[file_upload], status="indexed")
+    trust_path = workspace_tmp / "trust.json"
+    web_app.update_document_trust(source_hash, {"review_status": "approved"}, trust_path=trust_path)
+    asset_dir = workspace_tmp / "assets"
+    monkeypatch.setattr(web_app, "ASSET_DIR", asset_dir)
+    asset_store = ImageAssetStore(asset_dir)
+    asset = asset_store.save_image(
+        image_data=b"plot",
+        source_hash=source_hash,
+        source_pdf_name=pdf_path.name,
+        page_no=1,
+        description="plot",
+    )
+    db_dir = lancedb_tmp / "db"
+    LanceDBVectorStore(db_dir).write_records(
+        [
+            {
+                "id": "target",
+                "doc_id": "doc-target",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": str(markdown_path),
+                "chunk_index": 0,
+                "content": "target content",
+                "source_hash": source_hash,
+                "vector": [1.0, 0.0, 0.0],
+            },
+            {
+                "id": "kept",
+                "doc_id": "doc-kept",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": "kept.md",
+                "chunk_index": 0,
+                "content": "kept content",
+                "source_hash": "hash-other",
+                "vector": [0.0, 1.0, 0.0],
+            },
+        ],
+        embedding_model="fake-embed",
+        embedding_dim=3,
+    )
+    local_rag.write_index_manifest(
+        db_dir,
+        LanceDBVectorStore(db_dir).all_records(),
+        embedding_model="fake-embed",
+        embedding_dim=3,
+    )
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+
+    result = web_app.delete_pdf_document(
+        source_hash,
+        registry_path=registry_path,
+        processed_dir=processed_dir,
+        db_dir=db_dir,
+        trust_path=trust_path,
+        root_dir=workspace_tmp,
+        data_dir=data_dir,
+    )
+
+    assert result["vectors"]["deleted"] == 1
+    assert result["markdown_deleted"] == 1
+    assert result["assets_deleted"] == 1
+    assert result["pdfs_deleted"] in {0, 1}
+    assert bool(result["pdf_delete_errors"]) is (result["pdfs_deleted"] == 0)
+    assert result["registry_deleted"] is True
+    assert result["trust_deleted"] is True
+    assert not pdf_path.exists() or result["pdf_delete_errors"]
+    assert not markdown_path.exists() or markdown_path.read_text(encoding="utf-8") == ""
+    assert load_source_map(processed_dir)["documents"] == {}
+    assert source_hash not in web_app.PdfRegistry(registry_path).load()["pdfs"]
+    assert source_hash not in web_app._load_trust_registry(trust_path)["documents"]
+    assert asset_store.asset_path(asset["asset_id"]) is None
+    assert [row["id"] for row in LanceDBVectorStore(db_dir).list_records()["rows"]] == ["kept"]
+    manifest = json.loads(db_dir.joinpath(local_rag.INDEX_MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    assert source_hash not in manifest["documents"]
+    assert "hash-other" in manifest["documents"]
+
+
 def test_web_index_helpers_work_with_lancedb(monkeypatch):
     db_dir = Path(tempfile.gettempdir()) / f"rag_test_web_app_{uuid.uuid4().hex}" / "db"
     try:
@@ -596,6 +764,7 @@ def test_server_config_defaults_to_minute_when_missing(workspace_tmp):
 
     assert config == {
         "host": "127.0.0.1",
+        "bind_all": False,
         "port": 8000,
         "health_poll_interval_ms": 60000,
         "jobs_poll_interval_ms": 60000,
@@ -626,6 +795,7 @@ def test_server_config_reads_polling_intervals(workspace_tmp):
 
     assert config == {
         "host": "0.0.0.0",
+        "bind_all": True,
         "port": 8081,
         "health_poll_interval_ms": 120032,
         "jobs_poll_interval_ms": 90000,
@@ -633,6 +803,43 @@ def test_server_config_reads_polling_intervals(workspace_tmp):
         "update_remote": "upstream",
         "update_branch": "web-ui",
     }
+
+
+def test_server_config_bind_all_overrides_specific_host(workspace_tmp):
+    config_path = workspace_tmp / "config.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[server]",
+                'host = "127.0.0.1"',
+                "bind_all = true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = web_app._load_server_config(config_path)
+
+    assert config["host"] == "0.0.0.0"
+    assert config["bind_all"] is True
+
+
+def test_server_config_lan_alias_binds_all(workspace_tmp):
+    config_path = workspace_tmp / "config.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[server]",
+                "lan = true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = web_app._load_server_config(config_path)
+
+    assert config["host"] == "0.0.0.0"
+    assert config["bind_all"] is True
 
 
 def test_chat_config_reads_prompt_retrieval_and_ollama_health_settings(workspace_tmp):
@@ -938,6 +1145,55 @@ def test_queue_pauses_new_work_while_query_is_active(workspace_tmp):
 
     assert calls == [("ingest", job.id, "processed"), ("index", "processed", "db")]
     assert (workspace_tmp / "uploads" / job.id / "doc.pdf").exists()
+
+
+def test_queue_cancel_paused_upload_marks_document_interrupted(workspace_tmp):
+    calls = []
+    registry_path = workspace_tmp / "registry.json"
+    processed_dir = workspace_tmp / "processed"
+    staging = workspace_tmp / "staging"
+    staging.mkdir()
+    staging.joinpath("doc.pdf").write_bytes(b"%PDF-1.4")
+    file_upload = {
+        "filename": "doc.pdf",
+        "hash": "hash-cancel",
+        "staging_path": str(staging / "doc.pdf"),
+    }
+    web_app.PdfRegistry(registry_path).register_queued(job_id="job-cancel", files=[file_upload])
+
+    def fake_ingest(input_dir, output_dir, **kwargs):
+        calls.append(("ingest", input_dir, output_dir))
+
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=processed_dir,
+        db_dir=workspace_tmp / "db",
+        registry_path=registry_path,
+        run_ingestion_func=fake_ingest,
+        run_indexing_func=lambda *args, **kwargs: None,
+    )
+
+    queue.begin_query()
+    job = queue.enqueue_upload(
+        staging_dir=staging,
+        filenames=["doc.pdf"],
+        uploads=[file_upload],
+        job_id="job-cancel",
+    )
+    _wait_for(lambda: queue.get_job(job.id)["status"] == "paused_for_queries")
+
+    cancelled = queue.cancel_job(job.id)
+    _wait_for(lambda: queue.get_job(job.id)["status"] == "cancelled")
+    queue.finish_query()
+
+    entry = web_app.PdfRegistry(registry_path).load()["pdfs"]["hash-cancel"]
+    listing = web_app.list_pdf_documents(registry_path=registry_path, processed_dir=processed_dir)
+
+    assert cancelled["cancel_requested"] is True
+    assert calls == []
+    assert entry["status"] == "interrupted"
+    assert entry["last_interrupted_job_id"] == "job-cancel"
+    assert "job_interrupted" in listing["pdfs"][0]["quality"]["warnings"]
 
 
 def test_queue_passes_ingestion_options_to_worker(workspace_tmp):
@@ -1970,6 +2226,54 @@ def test_pdf_documents_include_quality_payload(monkeypatch, workspace_tmp):
     assert response.json()["pdfs"][0]["trust"]["reliability_weight"] == 0.1
 
 
+def test_pdf_documents_warn_when_source_job_was_interrupted(monkeypatch, workspace_tmp):
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    markdown_path = processed_dir / "interrupted.md"
+    markdown_path.write_text("# Interrupted\n\n" + ("alpha context " * 80), encoding="utf-8")
+    source_hash = "hash-source-interrupted"
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=markdown_path,
+        source_hash=source_hash,
+        source_pdf_name="interrupted.pdf",
+        source_pdf_path=web_app.DATA_DIR / "interrupted.pdf",
+    )
+    db_dir = workspace_tmp / "db"
+    local_rag.write_index_manifest(
+        db_dir,
+        [
+            {
+                "id": "chunk",
+                "node_type": "chunk",
+                "content": "alpha context",
+                "source_hash": source_hash,
+                "source_pdf_name": "interrupted.pdf",
+                "source_pdf_path": str(web_app.DATA_DIR / "interrupted.pdf"),
+                "page_start": 1,
+                "page_end": 1,
+            },
+        ],
+        embedding_model="fake-embed",
+        embedding_dim=3,
+    )
+    registry_path = workspace_tmp / "registry.json"
+    web_app.PdfRegistry(registry_path).mark_sources_interrupted(
+        job_id="job-source-cancel",
+        source_hashes=[source_hash],
+    )
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", registry_path)
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+
+    document = TestClient(web_app.app).get("/api/pdfs").json()["pdfs"][0]
+
+    assert document["status"] == "indexed"
+    assert document["last_interrupted_job_id"] == "job-source-cancel"
+    assert "job_interrupted" in document["quality"]["warnings"]
+
+
 def test_update_document_trust_rejects_invalid_source_group(monkeypatch, workspace_tmp):
     monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
 
@@ -2143,6 +2447,140 @@ def test_pdf_reprocess_endpoint_queues_single_source_upload(monkeypatch, workspa
     assert queued["previous_entry"]["status"] == "indexed"
 
 
+def test_pdf_reindex_endpoint_queues_index_only_job(monkeypatch, workspace_tmp):
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    markdown_path = processed_dir / "source.md"
+    markdown_path.write_text("# reindex only body", encoding="utf-8")
+    source_hash = "hash-reindex"
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=markdown_path,
+        source_hash=source_hash,
+        source_pdf_name="source.pdf",
+        source_pdf_path=workspace_tmp / "source.pdf",
+    )
+    registry_path = workspace_tmp / "registry.json"
+    web_app.PdfRegistry(registry_path).register_queued(
+        job_id="old-job",
+        files=[
+            {
+                "filename": "source.pdf",
+                "hash": source_hash,
+                "staging_path": "",
+                "upload_path": str(workspace_tmp / "source.pdf"),
+                "processed_markdown_path": str(markdown_path),
+            }
+        ],
+        options={"embedding_model": "old-embed", "summary_mode": "llm"},
+    )
+    captured = {}
+
+    class FakeQueue:
+        def enqueue_reindex_source(self, **kwargs):
+            captured.update(kwargs)
+            return web_app.QueueJob(
+                id="job-reindex",
+                kind="reindex_source",
+                source_hashes=list(kwargs["source_hashes"]),
+                options=dict(kwargs["options"]),
+            )
+
+        def enqueue_upload(self, **kwargs):
+            raise AssertionError("re-index must not re-run ingestion")
+
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", registry_path)
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    client = TestClient(web_app.app)
+    response = client.post(f"/api/pdfs/{source_hash}/reindex")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["kind"] == "reindex_source"
+    assert body["source_hashes"] == [source_hash]
+    assert captured["source_hashes"] == [source_hash]
+    assert captured["options"]["embedding_model"] == "old-embed"
+    assert captured["options"]["summary_mode"] == "llm"
+    # Ingestion is skipped: the processed Markdown is left untouched.
+    assert markdown_path.read_text(encoding="utf-8") == "# reindex only body"
+
+
+def test_pdf_reindex_404_when_no_processed_markdown(monkeypatch, workspace_tmp):
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+
+    class FakeQueue:
+        def enqueue_reindex_source(self, **kwargs):
+            raise AssertionError("should not enqueue when no markdown exists")
+
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    client = TestClient(web_app.app)
+    response = client.post("/api/pdfs/missing-hash/reindex")
+
+    assert response.status_code == 404
+
+
+def test_reindex_source_job_deletes_records_before_indexing(monkeypatch, workspace_tmp, lancedb_tmp):
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    markdown_path = processed_dir / "source.md"
+    markdown_path.write_text("reindex body", encoding="utf-8")
+    db_dir = lancedb_tmp / "db"
+    LanceDBVectorStore(db_dir).write_records(
+        [
+            {
+                "id": "target",
+                "doc_id": "doc-target",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": str(markdown_path),
+                "chunk_index": 0,
+                "content": "target content",
+                "source_hash": "hash-target",
+                "vector": [1.0, 0.0, 0.0],
+            },
+            {
+                "id": "kept",
+                "doc_id": "doc-kept",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": "kept.md",
+                "chunk_index": 0,
+                "content": "kept content",
+                "source_hash": "hash-other",
+                "vector": [0.0, 1.0, 0.0],
+            },
+        ],
+        embedding_model="fake-embed",
+        embedding_dim=3,
+    )
+    index_counts = []
+
+    def fake_index(md_dir, db_dir_arg, **kwargs):
+        # By the time indexing runs, the target source's vectors are gone.
+        index_counts.append(LanceDBVectorStore(db_dir).count())
+
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=processed_dir,
+        db_dir=db_dir,
+        registry_path=workspace_tmp / "registry.json",
+        run_indexing_func=fake_index,
+    )
+    job = queue.enqueue_reindex_source(source_hashes=["hash-target"])
+
+    _wait_for(lambda: queue.get_job(job.id)["status"] in {"done", "failed"})
+
+    assert queue.get_job(job.id)["status"] == "done"
+    assert queue.get_job(job.id)["kind"] == "reindex_source"
+    assert index_counts == [1]
+
+
 def test_pdf_documents_list_and_download_endpoint(monkeypatch, workspace_tmp):
     processed_dir = workspace_tmp / "processed"
     processed_dir.mkdir()
@@ -2286,6 +2724,21 @@ def test_frontend_jobs_polling_uses_active_count():
     assert "state.jobsActive = Number(data.active_count || 0) > 0" in script
     assert "wasActive && !state.jobsActive" in script
     assert "state.jobsActive ? JOBS_ACTIVE_POLL_INTERVAL_MS : state.jobsPollIntervalMs" in script
+    assert 'data-job-action="cancel"' in script
+    assert '/api/jobs/${encodeURIComponent(jobId)}/cancel' in script
+
+
+def test_frontend_pdf_rows_show_interrupted_warning():
+    markup = Path("web/index.html").read_text(encoding="utf-8")
+    script = Path("web/app.js").read_text(encoding="utf-8")
+    styles = Path("web/styles.css").read_text(encoding="utf-8")
+
+    assert "<th>Action</th>" in markup
+    assert "renderPdfInterruptedBadge" in script
+    assert "job_interrupted" in script
+    assert "pdf-warning-badge" in script
+    assert ".pdf-title-line" in styles
+    assert ".pdf-warning-badge" in styles
 
 
 def test_frontend_includes_new_user_guide_and_walkthrough():
@@ -2359,6 +2812,23 @@ def test_frontend_pdf_trust_actions_record_reviewer_name():
     assert ".pdf-untagged-row" in styles
     assert ".quality-untagged" in styles
     assert "#reviewerNameInput" in styles
+
+
+def test_frontend_delete_control_lives_in_documents_panel():
+    script = Path("web/app.js").read_text(encoding="utf-8")
+
+    pdf_actions_block = re.search(
+        r"function renderPdfActions\(item\) \{(?P<body>.*?)\n\}",
+        script,
+        flags=re.S,
+    )
+
+    assert 'data-action="delete"' not in script
+    assert pdf_actions_block is not None
+    assert 'data-pdf-action="delete"' in pdf_actions_block.group("body")
+    assert 'method: "DELETE"' in script
+    assert "/api/pdfs/${encodeURIComponent(sourceHash)}" in script
+    assert "/api/index/delete" not in script
 
 
 def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
