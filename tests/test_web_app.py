@@ -2315,12 +2315,21 @@ def test_frontend_includes_new_user_guide_and_walkthrough():
     assert "reloadAfterCacheClear" in script
     assert "caches.delete" in script
     assert "walkthroughSteps" in script
+    assert "fakePdf: true" in script
+    assert "ensureWalkthroughFakePdf" in script
+    assert "removeWalkthroughFakePdf" in script
+    assert "WALKTHROUGH_FAKE_PDF_HASH" in script
+    assert "Example untagged source.pdf" in script
     assert "activateTab(step.tab)" in script
     assert 'target.closest("details")' in script
     assert "details.open = true" in script
     assert "walkthrough-highlight" in script
+    assert "Tag source reliability" in script
+    assert "reliability group for each PDF" in markup
+    assert "Tag ungrouped PDFs" in markup
     assert ".guide-layout" in styles
     assert ".walkthrough-dialog" in styles
+    assert ".walkthrough-fake-pdf-row" in styles
     assert ".modal-dialog" in styles
 
 
@@ -2340,11 +2349,15 @@ def test_frontend_pdf_trust_actions_record_reviewer_name():
     assert "source_groups" in script
     assert "data-pdf-action=\"tag-group\"" in script
     assert "Group:" in script
+    assert "pdf-untagged-row" in script
+    assert "quality-untagged" in script
     assert "timeZoneName" in script
     assert "body.reviewed_by = reviewer" in script
     assert "Reviewed by:" in script
     assert "saveReviewerName(els.reviewerNameInput.value)" in script
     assert ".upload-groups-panel" in styles
+    assert ".pdf-untagged-row" in styles
+    assert ".quality-untagged" in styles
     assert "#reviewerNameInput" in styles
 
 

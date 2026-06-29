@@ -376,6 +376,19 @@ input[type="file"] {
   border-bottom: 0;
 }
 
+.pdf-untagged-row {
+  background: #fff8e8;
+}
+
+.pdf-untagged-row td:first-child {
+  border-left: 4px solid #d9a441;
+}
+
+.walkthrough-fake-pdf-row {
+  outline: 2px dashed #d9a441;
+  outline-offset: -4px;
+}
+
 .source-cell {
   width: 260px;
   color: var(--muted);
@@ -417,6 +430,12 @@ input[type="file"] {
 
 .index-vector-result-row {
   background: #fffdf5;
+}
+
+.quality-untagged {
+  border-color: #d9a441;
+  background: #fff3c4;
+  color: #6e4a0d;
 }
 
 .index-node-meta,

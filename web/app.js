@@ -31,6 +31,7 @@ const state = {
   indexLoadToken: 0,
   uploadDragDepth: 0,
   pendingForceUploadToken: "",
+  walkthroughFakePdfVisible: false,
   walkthroughIndex: -1,
   pendingSiteVersion: "",
   pendingVersionPrompt: false,
@@ -51,6 +52,7 @@ const TUTORIAL_SEEN_COOKIE = "rag_tutorial_seen";
 const SITE_VERSION_COOKIE = "rag_site_version";
 const REVIEWER_NAME_COOKIE = "rag_reviewer_name";
 const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
+const WALKTHROUGH_FAKE_PDF_HASH = "__walkthrough_fake_untagged_pdf__";
 const SOURCE_GROUP_LABELS = {
   official: "Official",
   student_research: "Student Research",
@@ -147,9 +149,10 @@ const walkthroughSteps = [
   },
   {
     tab: "upload",
-    target: "#pdfsTable",
-    title: "Review source readiness",
-    text: "Use the PDF table to check extraction quality, trust status, downloads, source approval, stale flags, and targeted re-runs for individual documents.",
+    target: "#walkthroughFakePdfRow [data-pdf-action='tag-group']",
+    title: "Tag source reliability",
+    text: "Untagged PDFs are highlighted at the top of the table. Use Tag group to mark each source as Official, Student Research, or Unofficial before relying on retrieval ranking.",
+    fakePdf: true,
   },
   {
     tab: "index",
@@ -1108,6 +1111,7 @@ function renderQualityCell(item) {
     : "";
   return `
     <span class="quality-badge quality-${escapeHtml(label)}">${escapeHtml(qualityTitle(label))}</span>
+    ${sourceGroup === "ungrouped" ? '<span class="quality-badge quality-untagged">Untagged</span>' : ""}
     <span class="quality-detail">${escapeHtml(metrics.join(" | "))}</span>
     <span class="quality-detail">Trust: ${escapeHtml(trustTitle(trust.review_status))} | ${escapeHtml(sourceTypeTitle(trust.source_type))}</span>
     <span class="quality-detail">Group: ${escapeHtml(sourceGroupTitle(sourceGroup))} | weight ${escapeHtml(reliabilityWeight.toFixed(2))}</span>
@@ -1121,6 +1125,30 @@ function renderQualityCell(item) {
       <button type="button" data-pdf-action="reprocess" data-source-hash="${escapeHtml(item.hash || "")}"${reprocessDisabled}>Re-run</button>
     </span>
   `;
+}
+
+function createPdfRow(item, options = {}) {
+  const row = document.createElement("tr");
+  const trust = item.trust && typeof item.trust === "object" ? item.trust : {};
+  const isUntagged = String(trust.source_group || "ungrouped") === "ungrouped";
+  row.classList.toggle("pdf-untagged-row", isUntagged);
+  if (options.fake) {
+    row.id = "walkthroughFakePdfRow";
+    row.classList.add("walkthrough-fake-pdf-row");
+  }
+  const download = item.download_url
+    ? `<a class="download-link" href="${escapeHtml(item.download_url)}">Download</a>`
+    : escapeHtml(item.path_error || "");
+  row.innerHTML = `
+    <td>
+      <strong>${escapeHtml(item.filename || item.hash)}</strong><br />
+      ${escapeHtml(item.hash || "")}
+    </td>
+    <td>${escapeHtml(item.status || "")}</td>
+    <td>${renderQualityCell(item)}</td>
+    <td>${download}</td>
+  `;
+  return row;
 }
 
 async function refreshJobs() {
@@ -1184,20 +1212,7 @@ async function refreshPdfs() {
     }
     els.pdfsBody.innerHTML = "";
     for (const item of data.pdfs || []) {
-      const row = document.createElement("tr");
-      const download = item.download_url
-        ? `<a class="download-link" href="${escapeHtml(item.download_url)}">Download</a>`
-        : escapeHtml(item.path_error || "");
-      row.innerHTML = `
-        <td>
-          <strong>${escapeHtml(item.filename || item.hash)}</strong><br />
-          ${escapeHtml(item.hash || "")}
-        </td>
-        <td>${escapeHtml(item.status || "")}</td>
-        <td>${renderQualityCell(item)}</td>
-        <td>${download}</td>
-      `;
-      els.pdfsBody.appendChild(row);
+      els.pdfsBody.appendChild(createPdfRow(item));
     }
     updatePageControls({
       total: state.pdfTotal,
@@ -1220,6 +1235,10 @@ async function handlePdfAction(event) {
   const sourceHash = button.dataset.sourceHash || "";
   const action = button.dataset.pdfAction || "";
   if (!sourceHash) {
+    return;
+  }
+  if (sourceHash === WALKTHROUGH_FAKE_PDF_HASH) {
+    setStatus(els.uploadStatus, "This walkthrough row is a local preview and is removed after the step.");
     return;
   }
   const body = {};
@@ -2706,6 +2725,45 @@ function activateTab(tabTarget) {
   }
 }
 
+function walkthroughFakePdfItem() {
+  return {
+    hash: WALKTHROUGH_FAKE_PDF_HASH,
+    filename: "Example untagged source.pdf",
+    status: "review",
+    path_error: "walkthrough preview",
+    trust: {
+      review_status: "unreviewed",
+      source_type: "unknown",
+      source_group: "ungrouped",
+      reliability_weight: 0.1,
+    },
+    quality: {
+      label: "review",
+      warnings: ["unreviewed_source"],
+      chunk_count: 12,
+      markdown_char_count: 18400,
+      enrichment_markers: 2,
+    },
+  };
+}
+
+function removeWalkthroughFakePdf() {
+  const row = document.getElementById("walkthroughFakePdfRow");
+  if (row) {
+    row.remove();
+  }
+  state.walkthroughFakePdfVisible = false;
+}
+
+function ensureWalkthroughFakePdf() {
+  if (state.walkthroughFakePdfVisible && document.getElementById("walkthroughFakePdfRow")) {
+    return;
+  }
+  const row = createPdfRow(walkthroughFakePdfItem(), { fake: true });
+  els.pdfsBody.prepend(row);
+  state.walkthroughFakePdfVisible = true;
+}
+
 function clearWalkthroughHighlight() {
   document.querySelectorAll(".walkthrough-highlight").forEach((element) => {
     element.classList.remove("walkthrough-highlight");
@@ -2731,7 +2789,13 @@ function renderWalkthroughStep() {
   if (!step) {
     return;
   }
+  if (!step.fakePdf) {
+    removeWalkthroughFakePdf();
+  }
   activateTab(step.tab);
+  if (step.fakePdf) {
+    ensureWalkthroughFakePdf();
+  }
   els.walkthroughOverlay.hidden = false;
   els.walkthroughStepLabel.textContent = `Step ${state.walkthroughIndex + 1} of ${walkthroughSteps.length}`;
   els.walkthroughTitle.textContent = step.title;
@@ -2753,6 +2817,7 @@ function closeWalkthrough() {
   state.walkthroughIndex = -1;
   els.walkthroughOverlay.hidden = true;
   clearWalkthroughHighlight();
+  removeWalkthroughFakePdf();
   if (state.pendingVersionPrompt) {
     showCachePrompt(state.pendingSiteVersion);
   }
