@@ -2281,6 +2281,13 @@ def test_update_document_trust_rejects_invalid_source_group(monkeypatch, workspa
         web_app.update_document_trust("hash-a", {"source_group": "bad-group"})
 
 
+def test_source_group_weights_match_review_policy():
+    assert web_app.source_group_weight("official") == 1.0
+    assert web_app.source_group_weight("student_research") == 0.9
+    assert web_app.source_group_weight("unofficial") == 0.8
+    assert web_app.source_group_weight("ungrouped") == 0.1
+
+
 def test_pdf_documents_sort_ungrouped_first(monkeypatch, workspace_tmp):
     registry_path = workspace_tmp / "registry.json"
     processed_dir = workspace_tmp / "processed"
@@ -2793,13 +2800,24 @@ def test_frontend_pdf_trust_actions_record_reviewer_name():
 
     assert 'id="reviewerNameInput"' in markup
     assert 'id="uploadGroupsPanel"' in markup
+    assert 'id="sourceGroupPromptOverlay"' in markup
+    assert 'data-source-group-choice="official"' in markup
+    assert 'data-source-group-choice="student_research"' in markup
+    assert 'data-source-group-choice="unofficial"' in markup
+    assert "Weight 0.90" in markup
+    assert "Weight 0.80" in markup
     assert "REVIEWER_NAME_COOKIE" in script
     assert "normalizeReviewerName" in script
     assert "ensureReviewerName" in script
     assert "formatBrowserTimestamp" in script
+    assert "chooseSourceGroup" in script
+    assert "closeSourceGroupPrompt" in script
+    assert "Set source group: official" not in script
     assert "renderUploadGroupSelectors" in script
     assert "selectedUploadSourceGroups" in script
     assert "source_groups" in script
+    assert "student_research: 0.9" in script
+    assert "unofficial: 0.8" in script
     assert "data-pdf-action=\"tag-group\"" in script
     assert "Group:" in script
     assert "pdf-untagged-row" in script
@@ -2811,6 +2829,9 @@ def test_frontend_pdf_trust_actions_record_reviewer_name():
     assert ".upload-groups-panel" in styles
     assert ".pdf-untagged-row" in styles
     assert ".quality-untagged" in styles
+    assert "border-left: 4px solid var(--danger)" in styles
+    assert "color: var(--danger)" in styles
+    assert ".source-group-actions" in styles
     assert "#reviewerNameInput" in styles
 
 

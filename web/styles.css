@@ -377,15 +377,15 @@ input[type="file"] {
 }
 
 .pdf-untagged-row {
-  background: #fff8e8;
+  background: #fff0f0;
 }
 
 .pdf-untagged-row td:first-child {
-  border-left: 4px solid #d9a441;
+  border-left: 4px solid var(--danger);
 }
 
 .walkthrough-fake-pdf-row {
-  outline: 2px dashed #d9a441;
+  outline: 2px dashed var(--danger);
   outline-offset: -4px;
 }
 
@@ -461,9 +461,9 @@ input[type="file"] {
 }
 
 .quality-untagged {
-  border-color: #d9a441;
-  background: #fff3c4;
-  color: #6e4a0d;
+  border-color: #e0baba;
+  background: #fff0f0;
+  color: var(--danger);
 }
 
 .index-node-meta,
@@ -667,6 +667,31 @@ input[type="file"] {
 
 .modal-dialog p {
   margin: 8px 0 14px;
+}
+
+.source-group-dialog {
+  max-width: 560px;
+}
+
+.source-group-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.source-group-actions button {
+  display: grid;
+  gap: 4px;
+  justify-items: start;
+  min-height: 76px;
+  padding: 12px;
+  text-align: left;
+}
+
+.source-group-actions span {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .modal-actions {
@@ -1140,6 +1165,10 @@ input[type="file"] {
 
   .update-button {
     flex: 0 0 auto;
+  }
+
+  .source-group-actions {
+    grid-template-columns: 1fr;
   }
 
   main {

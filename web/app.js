@@ -31,6 +31,7 @@ const state = {
   indexLoadToken: 0,
   uploadDragDepth: 0,
   pendingForceUploadToken: "",
+  sourceGroupPromptResolver: null,
   walkthroughFakePdfVisible: false,
   walkthroughIndex: -1,
   pendingSiteVersion: "",
@@ -61,8 +62,8 @@ const SOURCE_GROUP_LABELS = {
 };
 const SOURCE_GROUP_WEIGHTS = {
   official: 1.0,
-  student_research: 0.8,
-  unofficial: 0.5,
+  student_research: 0.9,
+  unofficial: 0.8,
   ungrouped: 0.1,
 };
 
@@ -132,6 +133,8 @@ const els = {
   cachePromptText: document.getElementById("cachePromptText"),
   cachePromptReloadButton: document.getElementById("cachePromptReloadButton"),
   cachePromptDoneButton: document.getElementById("cachePromptDoneButton"),
+  sourceGroupPromptOverlay: document.getElementById("sourceGroupPromptOverlay"),
+  sourceGroupPromptCancelButton: document.getElementById("sourceGroupPromptCancelButton"),
 };
 
 const walkthroughSteps = [
@@ -1070,6 +1073,30 @@ function parseSourceGroupInput(value) {
   return "";
 }
 
+function closeSourceGroupPrompt(value = "") {
+  if (els.sourceGroupPromptOverlay) {
+    els.sourceGroupPromptOverlay.hidden = true;
+  }
+  const resolve = state.sourceGroupPromptResolver;
+  state.sourceGroupPromptResolver = null;
+  if (resolve) {
+    resolve(value);
+  }
+}
+
+function chooseSourceGroup() {
+  if (!els.sourceGroupPromptOverlay) {
+    return Promise.resolve("");
+  }
+  if (state.sourceGroupPromptResolver) {
+    closeSourceGroupPrompt("");
+  }
+  els.sourceGroupPromptOverlay.hidden = false;
+  return new Promise((resolve) => {
+    state.sourceGroupPromptResolver = resolve;
+  });
+}
+
 function formatBrowserTimestamp(value) {
   const text = String(value || "").trim();
   if (!text) {
@@ -1307,16 +1334,8 @@ async function handlePdfAction(event) {
   if (action === "approve") {
     body.review_status = "approved";
   } else if (action === "tag-group") {
-    const prompted = window.prompt(
-      "Set source group: official, student_research, or unofficial",
-      "official",
-    );
-    if (prompted === null) {
-      return;
-    }
-    const sourceGroup = parseSourceGroupInput(prompted);
+    const sourceGroup = await chooseSourceGroup();
     if (!sourceGroup) {
-      setStatus(els.uploadStatus, "Choose one of: official, student_research, unofficial.", true);
       return;
     }
     body.source_group = sourceGroup;
@@ -3037,10 +3056,27 @@ document.addEventListener("keydown", (event) => {
   }
   if (event.key === "Escape" && !els.cachePromptOverlay.hidden) {
     closeCachePrompt();
+    return;
+  }
+  if (event.key === "Escape" && els.sourceGroupPromptOverlay && !els.sourceGroupPromptOverlay.hidden) {
+    closeSourceGroupPrompt("");
   }
 });
 els.cachePromptReloadButton.addEventListener("click", reloadAfterCacheClear);
 els.cachePromptDoneButton.addEventListener("click", () => closeCachePrompt());
+els.sourceGroupPromptOverlay.addEventListener("click", (event) => {
+  if (event.target === els.sourceGroupPromptOverlay) {
+    closeSourceGroupPrompt("");
+    return;
+  }
+  const button = event.target.closest("[data-source-group-choice]");
+  if (!button) {
+    return;
+  }
+  const sourceGroup = parseSourceGroupInput(button.dataset.sourceGroupChoice);
+  closeSourceGroupPrompt(sourceGroup);
+});
+els.sourceGroupPromptCancelButton.addEventListener("click", () => closeSourceGroupPrompt(""));
 
 els.updateButton.addEventListener("click", applyUpdate);
 els.fileInput.addEventListener("change", () => {

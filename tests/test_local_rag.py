@@ -578,7 +578,7 @@ def test_retrieval_applies_source_group_reliability_weight(monkeypatch):
         assert matches[0]["source_group"] == "official"
         assert matches[0]["reliability_modifier"] == 1.0
         assert matches[1]["source_group"] == "unofficial"
-        assert matches[1]["reliability_modifier"] == 0.5
+        assert matches[1]["reliability_modifier"] == 0.8
         assert matches[1]["vector_score"] > matches[0]["vector_score"]
         assert matches[1]["hybrid_score"] > matches[0]["hybrid_score"]
         assert matches[0]["score"] > matches[1]["score"]

@@ -289,6 +289,29 @@
       </div>
     </div>
 
+    <div id="sourceGroupPromptOverlay" class="modal-overlay" hidden>
+      <div class="modal-dialog source-group-dialog" role="dialog" aria-modal="true" aria-labelledby="sourceGroupPromptTitle">
+        <h2 id="sourceGroupPromptTitle">Choose Source Group</h2>
+        <div class="source-group-actions">
+          <button type="button" data-source-group-choice="official">
+            <strong>Official</strong>
+            <span>Weight 1.00</span>
+          </button>
+          <button type="button" data-source-group-choice="student_research">
+            <strong>Student Research</strong>
+            <span>Weight 0.90</span>
+          </button>
+          <button type="button" data-source-group-choice="unofficial">
+            <strong>Unofficial</strong>
+            <span>Weight 0.80</span>
+          </button>
+        </div>
+        <div class="modal-actions">
+          <button id="sourceGroupPromptCancelButton" type="button">Cancel</button>
+        </div>
+      </div>
+    </div>
+
     <script src="/static/app.js"></script>
   </body>
 </html>

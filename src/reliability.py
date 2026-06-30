@@ -20,13 +20,13 @@ SOURCE_GROUP_METADATA: dict[str, dict[str, Any]] = {
     SOURCE_GROUP_STUDENT_RESEARCH: {
         "key": SOURCE_GROUP_STUDENT_RESEARCH,
         "label": "Student Research",
-        "weight": 0.8,
+        "weight": 0.9,
         "assignable": True,
     },
     SOURCE_GROUP_UNOFFICIAL: {
         "key": SOURCE_GROUP_UNOFFICIAL,
         "label": "Unofficial",
-        "weight": 0.5,
+        "weight": 0.8,
         "assignable": True,
     },
     SOURCE_GROUP_UNGROUPED: {
