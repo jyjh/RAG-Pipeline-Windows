@@ -32,6 +32,7 @@ const state = {
   uploadDragDepth: 0,
   pendingForceUploadToken: "",
   sourceGroupPromptResolver: null,
+  walkthroughFakePdfPinned: false,
   walkthroughFakePdfVisible: false,
   walkthroughIndex: -1,
   pendingSiteVersion: "",
@@ -1299,10 +1300,7 @@ async function refreshPdfs() {
       state.pdfOffset = Math.max(0, Math.floor((state.pdfTotal - 1) / state.pdfLimit) * state.pdfLimit);
       return refreshPdfs();
     }
-    els.pdfsBody.innerHTML = "";
-    for (const item of data.pdfs || []) {
-      els.pdfsBody.appendChild(createPdfRow(item));
-    }
+    renderPdfRows(data.pdfs || []);
     updatePageControls({
       total: state.pdfTotal,
       offset: state.pdfOffset,
@@ -2796,7 +2794,7 @@ async function sendQuestion(event) {
   }
 }
 
-function activateTab(tabTarget) {
+function activateTab(tabTarget, options = {}) {
   const target = document.getElementById(tabTarget);
   const button = document.querySelector(`.tab[data-tab-target="${tabTarget}"]`);
   if (!target || !button) {
@@ -2811,7 +2809,7 @@ function activateTab(tabTarget) {
   } else {
     abortIndexLoad();
   }
-  if (tabTarget === "upload") {
+  if (tabTarget === "upload" && options.refreshUpload !== false) {
     refreshPdfs();
   }
 }
@@ -2839,6 +2837,7 @@ function walkthroughFakePdfItem() {
 }
 
 function removeWalkthroughFakePdf() {
+  state.walkthroughFakePdfPinned = false;
   const row = document.getElementById("walkthroughFakePdfRow");
   if (row) {
     row.remove();
@@ -2848,11 +2847,32 @@ function removeWalkthroughFakePdf() {
 
 function ensureWalkthroughFakePdf() {
   if (state.walkthroughFakePdfVisible && document.getElementById("walkthroughFakePdfRow")) {
-    return;
+    return false;
   }
   const row = createPdfRow(walkthroughFakePdfItem(), { fake: true });
   els.pdfsBody.prepend(row);
   state.walkthroughFakePdfVisible = true;
+  return true;
+}
+
+function renderPdfRows(items) {
+  const fragment = document.createDocumentFragment();
+  state.walkthroughFakePdfVisible = false;
+  if (state.walkthroughFakePdfPinned) {
+    fragment.appendChild(createPdfRow(walkthroughFakePdfItem(), { fake: true }));
+    state.walkthroughFakePdfVisible = true;
+  }
+  for (const item of items) {
+    fragment.appendChild(createPdfRow(item));
+  }
+  els.pdfsBody.innerHTML = "";
+  els.pdfsBody.appendChild(fragment);
+  if (state.walkthroughFakePdfPinned) {
+    const step = walkthroughSteps[state.walkthroughIndex];
+    if (step) {
+      window.requestAnimationFrame(() => highlightWalkthroughTarget(step.target));
+    }
+  }
 }
 
 function clearWalkthroughHighlight() {
@@ -2880,11 +2900,13 @@ function renderWalkthroughStep() {
   if (!step) {
     return;
   }
-  if (!step.fakePdf) {
+  const fakePdfStep = Boolean(step.fakePdf);
+  state.walkthroughFakePdfPinned = fakePdfStep;
+  if (!fakePdfStep) {
     removeWalkthroughFakePdf();
   }
-  activateTab(step.tab);
-  if (step.fakePdf) {
+  activateTab(step.tab, { refreshUpload: !fakePdfStep });
+  if (fakePdfStep) {
     ensureWalkthroughFakePdf();
   }
   els.walkthroughOverlay.hidden = false;

@@ -2752,6 +2752,15 @@ def test_frontend_includes_new_user_guide_and_walkthrough():
     markup = Path("web/index.html").read_text(encoding="utf-8")
     script = Path("web/app.js").read_text(encoding="utf-8")
     styles = Path("web/styles.css").read_text(encoding="utf-8")
+    refresh_pdfs = script[
+        script.index("async function refreshPdfs()") : script.index("async function handlePdfAction")
+    ]
+    render_pdf_rows = script[
+        script.index("function renderPdfRows(items)") : script.index("function clearWalkthroughHighlight")
+    ]
+    render_step = script[
+        script.index("function renderWalkthroughStep()") : script.index("function startWalkthrough")
+    ]
 
     assert 'data-tab-target="guide"' in markup
     assert 'id="guide"' in markup
@@ -2778,9 +2787,12 @@ def test_frontend_includes_new_user_guide_and_walkthrough():
     assert "fakePdf: true" in script
     assert "ensureWalkthroughFakePdf" in script
     assert "removeWalkthroughFakePdf" in script
+    assert "renderPdfRows(data.pdfs || []);" in refresh_pdfs
+    assert "state.walkthroughFakePdfPinned" in render_pdf_rows
+    assert "highlightWalkthroughTarget(step.target)" in render_pdf_rows
+    assert "activateTab(step.tab, { refreshUpload: !fakePdfStep })" in render_step
     assert "WALKTHROUGH_FAKE_PDF_HASH" in script
     assert "Example untagged source.pdf" in script
-    assert "activateTab(step.tab)" in script
     assert 'target.closest("details")' in script
     assert "details.open = true" in script
     assert "walkthrough-highlight" in script
