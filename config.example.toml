@@ -62,6 +62,9 @@ chat_max_lost_health_checks = 5
 [chat]
 context_window = 8192
 llm_num_predict = 4096
+planner_model = "qwen2.5:1.5b"
+planner_enabled = true
+planner_max_queries = 3
 system_prompt = """You are a retrieval-augmented assistant. Before answering, you must call search_local_context at least once. You may call search_local_context again with a narrower query when more evidence is needed. {web_instruction} Use only information returned by tools. In the final answer, cite every factual claim with source IDs exactly as provided, such as [S1] or [W1]. If the available sources are insufficient, say what is missing."""
 
 [server]

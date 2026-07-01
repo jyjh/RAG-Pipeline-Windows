@@ -47,6 +47,9 @@ class LocalQueryEngine:
         ollama_health_check_interval: float | None = None,
         ollama_max_lost_health_checks: int | None = None,
         system_prompt: str | None = None,
+        planner_model: str | None = None,
+        planner_enabled: bool = True,
+        planner_max_queries: int | None = None,
     ):
         from src.embeddings import EmbeddingEngine
         from src.asset_store import ImageAssetStore
@@ -137,6 +140,16 @@ class LocalQueryEngine:
         )
         self.tool_max_rounds = _positive_int(tool_max_rounds, DEFAULT_TOOL_MAX_ROUNDS)
         self.tool_max_calls = _positive_int(tool_max_calls, DEFAULT_TOOL_MAX_CALLS)
+        self.planner_enabled = bool(planner_enabled)
+        self.planner_model = str(
+            planner_model
+            if planner_model is not None
+            else os.environ.get("LOCAL_RAG_PLANNER_MODEL") or DEFAULT_PLANNER_MODEL
+        )
+        self.planner_max_queries = _positive_int(
+            planner_max_queries or os.environ.get("LOCAL_RAG_PLANNER_MAX_QUERIES"),
+            DEFAULT_PLANNER_MAX_QUERIES,
+        )
         self.engine = EmbeddingEngine(
             model_name=embedding_model,
             ollama_batch_size=embedding_batch_size,
@@ -425,6 +438,8 @@ class LocalQueryEngine:
         exclude_ids: set[str],
         citations: CitationRegistry,
         token_budget: int | None = None,
+        matches: list[dict[str, Any]] | None = None,
+        planner_queries: list[str] | None = None,
     ) -> dict[str, Any]:
         token_budget = self._context_token_budget() if token_budget is None else max(0, int(token_budget))
         result = {
@@ -437,13 +452,16 @@ class LocalQueryEngine:
                 "Use these source IDs for citations. Do not cite local context that is not listed here."
             ),
         }
+        if planner_queries:
+            result["planner_queries"] = list(planner_queries)
         base_tokens = estimate_json_tokens(result)
         if token_budget <= base_tokens:
             result["error"] = "Local context skipped because the prompt token budget is exhausted."
             return result
 
         result_budget = token_budget - base_tokens
-        matches = self._retrieve(query, exclude_ids=exclude_ids, token_budget=result_budget)
+        if matches is None:
+            matches = self._retrieve(query, exclude_ids=exclude_ids, token_budget=result_budget)
         context_blocks = []
         used_tokens = 0
         truncated = False
@@ -714,11 +732,111 @@ class LocalQueryEngine:
         self._append_tool_result(messages, tool_name=tool_name, result=result)
         return result, text
 
+    def _eager_local_tool_call(
+        self,
+        *,
+        question: str,
+        citations: CitationRegistry,
+        messages: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], str] | None:
+        """Pre-fetch local context before the main model is invoked.
+
+        Uses a small planner model to expand ``question`` into several diverse
+        retrieval queries, runs each through ``_retrieve`` (with an accumulating
+        exclude set so a chunk is returned at most once), merges the union, and
+        formats the result exactly like a model-issued ``search_local_context``
+        tool call. Returns ``None`` when eager retrieval is disabled or the
+        index is empty, so the caller falls back to the existing loop.
+        """
+        if not self.planner_enabled or not self.record_count:
+            return None
+        token_budget = self._tool_result_token_budget(messages)
+        planner_queries = generate_search_queries(
+            question,
+            model=self.planner_model,
+            max_queries=self.planner_max_queries,
+            timeout=DEFAULT_PLANNER_TIMEOUT,
+        )
+
+        # Shared exclude set across all expanded queries so a chunk is returned
+        # at most once even when several queries match it.
+        exclude_ids: set[str] = set()
+        seen_ids: set[str] = set()
+        merged: list[dict[str, Any]] = []
+        for query in planner_queries:
+            hits = self._retrieve(query, exclude_ids=exclude_ids, token_budget=token_budget)
+            if not hits:
+                continue
+            for hit in hits:
+                record_id = str(hit.get("id") or "")
+                if record_id and record_id in seen_ids:
+                    continue
+                if record_id:
+                    seen_ids.add(record_id)
+                    exclude_ids.add(record_id)
+                merged.append(hit)
+
+        if merged:
+            merged.sort(
+                key=lambda item: (
+                    float(item.get("score") or item.get("hybrid_score") or 0.0),
+                    float(item.get("vector_score") or 0.0),
+                ),
+                reverse=True,
+            )
+        result = self._local_tool_result(
+            query=question,
+            exclude_ids=set(),
+            citations=citations,
+            token_budget=token_budget,
+            matches=merged,
+            planner_queries=planner_queries,
+        )
+        call = {
+            "function": {
+                "name": "search_local_context",
+                "arguments": {"query": question, "exclude_ids": []},
+            }
+        }
+        messages.append({"role": "assistant", "content": "", "tool_calls": [call]})
+        self._append_tool_result(messages, tool_name="search_local_context", result=result)
+        text = f"Retrieved {result['result_count']} local source chunk(s) from {len(planner_queries)} query/queries."
+        if result.get("error"):
+            text = str(result["error"])
+        return result, text
+
     def _run_tool_rounds(self, question: str):
         citations = CitationRegistry(asset_store=self.asset_store)
         messages = self._tool_messages(question)
         local_search_used = False
         tool_calls_used = 0
+
+        # Eager multi-query pre-fetch: retrieve the most relevant local context
+        # before the main model is ever invoked, so the model starts its first
+        # round already seeing evidence instead of spending a round deciding to
+        # call search_local_context. Falls back to the loop's forced search if
+        # disabled or the index is empty.
+        if self.planner_enabled and self.record_count:
+            eager = self._eager_local_tool_call(
+                question=question,
+                citations=citations,
+                messages=messages,
+            )
+            if eager is not None:
+                result, text = eager
+                local_search_used = True
+                tool_calls_used += 1
+                yield {
+                    "type": "tool_call",
+                    "tool": "search_local_context",
+                    "text": "Searching local context...",
+                }
+                yield self._tool_result_event("search_local_context", result, text)
+                yield {"type": "sources", "sources": citations.all_sources()}
+                if not result.get("results"):
+                    # Eager retrieval found nothing; let the loop attempt web
+                    # search or fall through to the empty-context answer path.
+                    pass
 
         for _ in range(self.tool_max_rounds):
             tools = self._tool_definitions(include_web_search=self._web_search_allowed(messages))
@@ -820,7 +938,10 @@ class LocalQueryEngine:
                 yield event["text"]
 
     def ask_stream_events(self, question: str):
-        yield {"type": "notice", "text": "Planning retrieval tool calls..."}
+        if self.planner_enabled and self.record_count:
+            yield {"type": "notice", "text": "Searching local context..."}
+        else:
+            yield {"type": "notice", "text": "Planning retrieval tool calls..."}
         try:
             tool_state: dict[str, Any] | None = None
             for event in self._run_tool_rounds(question):

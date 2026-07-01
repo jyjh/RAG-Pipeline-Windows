@@ -229,6 +229,9 @@ DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 DEFAULT_SYSTEM_PROMPT = DEFAULT_QUERY_SYSTEM_PROMPT
 DEFAULT_OLLAMA_CHAT_HEALTH_CHECK_INTERVAL = DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL
 DEFAULT_OLLAMA_CHAT_MAX_LOST_HEALTH_CHECKS = DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS
+DEFAULT_PLANNER_MODEL = "qwen2.5:1.5b"
+DEFAULT_PLANNER_ENABLED = True
+DEFAULT_PLANNER_MAX_QUERIES = 3
 DEFAULT_INDEX_BACKEND = "lancedb"
 DEFAULT_SUMMARY_MODE = "hybrid"
 DEFAULT_CHUNK_TARGET_TOKENS = 900
@@ -461,6 +464,12 @@ def _load_chat_config(config_path: Path | None = None) -> dict[str, Any]:
         "ollama_max_lost_health_checks": _positive_int(
             ollama_config.get("chat_max_lost_health_checks"),
             DEFAULT_OLLAMA_CHAT_MAX_LOST_HEALTH_CHECKS,
+        ),
+        "planner_model": str(chat_config.get("planner_model") or DEFAULT_PLANNER_MODEL),
+        "planner_enabled": _bool_value(chat_config.get("planner_enabled"), DEFAULT_PLANNER_ENABLED),
+        "planner_max_queries": _positive_int(
+            chat_config.get("planner_max_queries"),
+            DEFAULT_PLANNER_MAX_QUERIES,
         ),
     }
 
@@ -3347,6 +3356,9 @@ def chat_stream(payload: ChatRequest):
                 ollama_health_check_interval=payload.ollama_health_check_interval,
                 ollama_max_lost_health_checks=payload.ollama_max_lost_health_checks,
                 system_prompt=payload.system_prompt,
+                planner_model=payload.planner_model,
+                planner_enabled=payload.planner_enabled,
+                planner_max_queries=payload.planner_max_queries,
                 progress_enabled=False,
             )
             if hasattr(engine, "ask_stream_events"):

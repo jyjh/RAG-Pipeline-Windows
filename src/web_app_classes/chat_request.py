@@ -31,6 +31,9 @@ class ChatRequest(BaseModel):
     ollama_health_check_interval: float | None = CHAT_CONFIG["ollama_health_check_interval"]
     ollama_max_lost_health_checks: int | None = CHAT_CONFIG["ollama_max_lost_health_checks"]
     system_prompt: str | None = CHAT_CONFIG["system_prompt"]
+    planner_model: str | None = CHAT_CONFIG["planner_model"]
+    planner_enabled: bool = CHAT_CONFIG["planner_enabled"]
+    planner_max_queries: int | None = CHAT_CONFIG["planner_max_queries"]
 
 ChatRequest.__module__ = _source_module.__name__
 finalize_split_class(_source_module, ChatRequest)

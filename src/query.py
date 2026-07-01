@@ -29,6 +29,9 @@ class QueryEngine:
         ollama_health_check_interval: float | None = None,
         ollama_max_lost_health_checks: int | None = None,
         system_prompt: str | None = None,
+        planner_model: str | None = None,
+        planner_enabled: bool = True,
+        planner_max_queries: int | None = None,
         progress_enabled: bool = True,
     ):
         from src.local_rag import LocalQueryEngine
@@ -56,6 +59,9 @@ class QueryEngine:
             ollama_health_check_interval=ollama_health_check_interval,
             ollama_max_lost_health_checks=ollama_max_lost_health_checks,
             system_prompt=system_prompt,
+            planner_model=planner_model,
+            planner_enabled=planner_enabled,
+            planner_max_queries=planner_max_queries,
             progress_enabled=progress_enabled,
         )
 

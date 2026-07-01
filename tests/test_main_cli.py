@@ -199,6 +199,9 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
             ollama_health_check_interval,
             ollama_max_lost_health_checks,
             system_prompt,
+            planner_model,
+            planner_enabled,
+            planner_max_queries,
             progress_enabled,
         ):
             calls["working_dir"] = working_dir
@@ -222,6 +225,9 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
             calls["ollama_health_check_interval"] = ollama_health_check_interval
             calls["ollama_max_lost_health_checks"] = ollama_max_lost_health_checks
             calls["system_prompt"] = system_prompt
+            calls["planner_model"] = planner_model
+            calls["planner_enabled"] = planner_enabled
+            calls["planner_max_queries"] = planner_max_queries
             calls["progress_enabled"] = progress_enabled
 
         def ask(self, question):
@@ -266,6 +272,9 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
         "ollama_health_check_interval": 5.0,
         "ollama_max_lost_health_checks": 5,
         "system_prompt": None,
+        "planner_model": "qwen2.5:1.5b",
+        "planner_enabled": True,
+        "planner_max_queries": 3,
         "progress_enabled": True,
         "question": "What is regularization?",
     }

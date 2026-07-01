@@ -49,6 +49,7 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_ollama_done_reason",
     "_ollama_response_message",
     "_ollama_tool_calls",
+    "generate_search_queries",
     "_split_think_tag_events",
     "chunk_markdown",
     "estimate_context_tokens",
@@ -93,6 +94,11 @@ DEFAULT_WEB_SEARCH_TIMEOUT = 8.0
 DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL = 5.0
 DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS = 5
+DEFAULT_PLANNER_MODEL = "qwen2.5:1.5b"
+DEFAULT_PLANNER_MAX_QUERIES = 3
+DEFAULT_PLANNER_TIMEOUT = 30.0
+DEFAULT_PLANNER_TEMPERATURE = 0.0
+DEFAULT_PLANNER_NUM_PREDICT = 256
 CONTEXT_METADATA_TOKEN_OVERHEAD = 64
 CONTEXT_TRUNCATION_NOTICE = "\n\n[Context truncated to fit prompt budget.]"
 MIN_CONTEXT_BLOCK_TOKENS = 96
@@ -419,6 +425,103 @@ def _split_think_tag_events(content: str, *, in_thinking: bool) -> tuple[list[di
         text = text[start + len("<think>") :]
         in_thinking = True
     return events, in_thinking
+
+
+def _parse_query_list(raw: str, *, max_queries: int) -> list[str]:
+    """Parse a planner response into a list of search queries.
+
+    Tries JSON first (handling ```json fences), then falls back to one
+    query per non-empty line. Empty results are dropped; the caller is
+    responsible for guaranteeing at least the original question is searched.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return []
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    candidate = fenced.group(1).strip() if fenced else text
+    queries: list[str] = []
+    try:
+        parsed = json.loads(candidate)
+        if isinstance(parsed, list):
+            queries = [str(item).strip() for item in parsed if str(item).strip()]
+        elif isinstance(parsed, str):
+            queries = [parsed.strip()] if parsed.strip() else []
+    except (json.JSONDecodeError, ValueError):
+        for line in candidate.splitlines():
+            line = line.strip().strip('"').strip("'").rstrip(",").strip()
+            if line:
+                queries.append(line)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for query in queries:
+        key = query.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(query)
+        if len(unique) >= max_queries:
+            break
+    return unique
+
+
+def generate_search_queries(
+    question: str,
+    *,
+    model: str,
+    max_queries: int,
+    timeout: float,
+    temperature: float = DEFAULT_PLANNER_TEMPERATURE,
+) -> list[str]:
+    """Expand a user question into several diverse retrieval queries.
+
+    Uses a small planner model (``model``) to emit paraphrases, synonyms, and
+    key terms. Always returns at least ``[question]`` and never raises: if the
+    planner model is unavailable or returns malformed output, the original
+    question is used so the flow degrades gracefully to single-query retrieval.
+    """
+    question = (question or "").strip()
+    if not question:
+        return []
+    if max_queries <= 0:
+        return [question]
+    system_prompt = (
+        "You are a search-query planner for a retrieval-augmented assistant. "
+        "Given a user question, produce alternative search queries that would "
+        "surface the most relevant source chunks. Use paraphrases, synonyms, "
+        "and the key technical terms from the question. Do not answer the "
+        'question. Reply with ONLY a JSON array of short query strings.'
+    )
+    user_prompt = (
+        f"Question: {question}\n\n"
+        f"Return up to {max_queries} diverse search queries as a JSON array of "
+        'strings, e.g. ["query one", "query two"]. No prose, no explanation.'
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    options = {"temperature": temperature, "num_predict": DEFAULT_PLANNER_NUM_PREDICT}
+    try:
+        response = _ollama_chat(
+            model=model,
+            messages=messages,
+            options=options,
+            stream=False,
+            timeout=timeout,
+        )
+        raw = _ollama_response_content(response)
+    except Exception as exc:  # planner is best-effort; never break the chat flow
+        _status(f"Planner model '{model}' failed; using original question only: {exc}")
+        return [question]
+    planned = _parse_query_list(raw, max_queries=max_queries)
+    if not planned:
+        _status(f"Planner model '{model}' returned no usable queries; using original question only.")
+        return [question]
+    # Guarantee the literal question is always searched, then keep it first.
+    planned_lower = {q.lower() for q in planned}
+    if question.lower() not in planned_lower:
+        return [question, *planned][: max_queries]
+    return [question] + [q for q in planned if q.lower() != question.lower()][: max_queries - 1]
 
 
 def chunk_markdown(text: str, *, max_chars: int = 3000, overlap: int = 400) -> list[str]:

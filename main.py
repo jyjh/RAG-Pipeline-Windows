@@ -39,6 +39,22 @@ def default_llm_model() -> str:
     return DEFAULT_LLM_MODEL
 
 
+def default_planner_model() -> str:
+    try:
+        from src.defaults import DEFAULT_PLANNER_MODEL
+    except Exception:
+        return "qwen2.5:1.5b"
+    return DEFAULT_PLANNER_MODEL
+
+
+def default_planner_max_queries() -> int:
+    try:
+        from src.defaults import DEFAULT_PLANNER_MAX_QUERIES
+    except Exception:
+        return 3
+    return DEFAULT_PLANNER_MAX_QUERIES
+
+
 def run_ingestion(*args, **kwargs):
     print("Importing ingestion module...", file=sys.stderr, flush=True)
     from src.ingestion import run_ingestion as _run_ingestion
@@ -311,6 +327,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum web-search results returned to the model per call.",
     )
     parser.add_argument(
+        "--planner_model",
+        default=default_planner_model(),
+        help="Small Ollama model used to expand the question into retrieval queries before the main model runs.",
+    )
+    parser.add_argument(
+        "--no_planner",
+        action="store_true",
+        help="Disable eager multi-query retrieval; let the main model decide when to search.",
+    )
+    parser.add_argument(
+        "--planner_max_queries",
+        type=int,
+        default=default_planner_max_queries(),
+        help="Number of diverse search queries the planner model should generate.",
+    )
+    parser.add_argument(
         "--ollama_health_check_interval",
         type=float,
         default=5.0,
@@ -469,6 +501,9 @@ def main(argv: list[str] | None = None) -> int:
                 ollama_health_check_interval=args.ollama_health_check_interval,
                 ollama_max_lost_health_checks=args.ollama_max_lost_health_checks,
                 system_prompt=args.system_prompt,
+                planner_model=args.planner_model,
+                planner_enabled=not args.no_planner,
+                planner_max_queries=args.planner_max_queries,
                 progress_enabled=not args.no_progress,
             ).ask(args.question)
             print(answer)

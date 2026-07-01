@@ -35,6 +35,9 @@ def test_query_engine_delegates_to_local_query_engine(monkeypatch):
         ollama_health_check_interval=2.5,
         ollama_max_lost_health_checks=7,
         system_prompt="Custom prompt {web_instruction}",
+        planner_model="qwen2.5:1.5b",
+        planner_enabled=False,
+        planner_max_queries=4,
         progress_enabled=False,
     )
 
@@ -63,6 +66,9 @@ def test_query_engine_delegates_to_local_query_engine(monkeypatch):
             "ollama_health_check_interval": 2.5,
             "ollama_max_lost_health_checks": 7,
             "system_prompt": "Custom prompt {web_instruction}",
+            "planner_model": "qwen2.5:1.5b",
+            "planner_enabled": False,
+            "planner_max_queries": 4,
             "progress_enabled": False,
         },
         "question": "What is aero balance?",

@@ -340,6 +340,7 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
             working_dir=str(tmp_path),
             progress_enabled=False,
             model="gemma4",
+            planner_enabled=False,
         )
         answer = engine.ask("alpha?")
 
@@ -404,6 +405,7 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
             working_dir=str(tmp_path),
             progress_enabled=False,
             model="gemma4",
+            planner_enabled=False,
         )
         chunks = list(engine.ask_stream("alpha?"))
 
@@ -1021,6 +1023,7 @@ def test_local_query_engine_reports_thinking_only_cutoff(monkeypatch):
             working_dir=str(tmp_path),
             progress_enabled=False,
             model="gemma4",
+            planner_enabled=False,
         )
         events = list(engine.ask_stream_events("alpha?"))
 
@@ -1093,6 +1096,7 @@ def test_local_query_engine_expands_lancedb_summary_hits(monkeypatch):
             working_dir=str(tmp_path),
             progress_enabled=False,
             model="gemma4",
+            planner_enabled=False,
         )
 
         assert engine.ask("alpha?") == "answer [S1]"
@@ -1325,5 +1329,247 @@ def test_local_indexer_fails_fast_when_ollama_preflight_fails(monkeypatch):
             assert "Ollama embedding preflight failed" in str(exc)
         else:
             raise AssertionError("Expected preflight failure")
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_parse_query_list_handles_json_array():
+    assert local_rag._parse_query_list('["alpha", "beta"]', max_queries=5) == ["alpha", "beta"]
+
+
+def test_parse_query_list_strips_json_fences():
+    assert local_rag._parse_query_list("```json\n[\"alpha\", \"beta\"]\n```", max_queries=5) == [
+        "alpha",
+        "beta",
+    ]
+
+
+def test_parse_query_list_falls_back_to_lines():
+    assert local_rag._parse_query_list("alpha\nbeta\n", max_queries=5) == ["alpha", "beta"]
+
+
+def test_parse_query_list_dedupes_and_caps():
+    parsed = local_rag._parse_query_list('["alpha", "alpha", "beta", "gamma"]', max_queries=2)
+    assert parsed == ["alpha", "beta"]
+
+
+def test_parse_query_list_empty_returns_empty():
+    assert local_rag._parse_query_list("", max_queries=5) == []
+
+
+def test_generate_search_queries_falls_back_to_question_on_error(monkeypatch):
+    def raise_chat(**kwargs):
+        raise RuntimeError("planner model unavailable")
+
+    monkeypatch.setattr(local_rag, "_ollama_chat", raise_chat)
+
+    queries = local_rag.generate_search_queries(
+        "What is ridge regression?",
+        model="qwen2.5:1.5b",
+        max_queries=3,
+        timeout=5.0,
+    )
+
+    assert queries == ["What is ridge regression?"]
+
+
+def test_generate_search_queries_prepends_original_question(monkeypatch):
+    def fake_chat(**kwargs):
+        return {"message": {"content": '["ridge regularization", "L2 penalty"]'}}
+
+    monkeypatch.setattr(local_rag, "_ollama_chat", fake_chat)
+
+    queries = local_rag.generate_search_queries(
+        "What is ridge regression?",
+        model="qwen2.5:1.5b",
+        max_queries=3,
+        timeout=5.0,
+    )
+
+    assert queries[0] == "What is ridge regression?"
+    assert "ridge regularization" in queries
+    assert "L2 penalty" in queries
+
+
+def test_generate_search_queries_returns_only_question_when_max_zero(monkeypatch):
+    queries = local_rag.generate_search_queries(
+        "What is ridge regression?",
+        model="qwen2.5:1.5b",
+        max_queries=0,
+        timeout=5.0,
+    )
+    assert queries == ["What is ridge regression?"]
+
+
+def test_eager_local_tool_call_merges_multi_query_results(monkeypatch):
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path.mkdir()
+    try:
+        _write_lancedb_records(
+            tmp_path,
+            [
+                {
+                    "id": "a:0",
+                    "doc_id": "a",
+                    "file_path": "a.md",
+                    "chunk_index": 0,
+                    "content": "alpha context",
+                    "vector": [1.0, 0.0, 0.0],
+                },
+                {
+                    "id": "b:0",
+                    "doc_id": "b",
+                    "file_path": "b.md",
+                    "chunk_index": 0,
+                    "content": "beta context",
+                    "vector": [0.0, 1.0, 0.0],
+                },
+            ],
+        )
+
+        class FakeEngine:
+            def __init__(self, **kwargs):
+                pass
+
+            def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+                # Both query embeddings point at the alpha chunk so retrieval
+                # is deterministic; the merge must still dedupe it.
+                return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+        monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+        # Force the planner to emit two queries; both resolve to the same chunk
+        # via the FakeEngine embedding, so we can assert dedup happens.
+        monkeypatch.setattr(
+            local_rag,
+            "generate_search_queries",
+            lambda *args, **kwargs: ["alpha?", "alpha variant"],
+        )
+
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            progress_enabled=False,
+            model="gemma4",
+            planner_model="qwen2.5:1.5b",
+            planner_max_queries=2,
+        )
+        citations = local_rag.CitationRegistry()
+        messages = engine._tool_messages("alpha?")
+
+        outcome = engine._eager_local_tool_call(
+            question="alpha?",
+            citations=citations,
+            messages=messages,
+        )
+
+        assert outcome is not None
+        result, text = outcome
+        assert result["tool"] == "search_local_context"
+        assert result["planner_queries"] == ["alpha?", "alpha variant"]
+        # The alpha chunk must appear at most once despite two queries.
+        chunk_ids = [block["chunk_id"] for block in result["results"]]
+        assert chunk_ids.count("a:0") == 1
+        assert result["result_count"] >= 1
+        # An assistant tool_calls message and a tool result are appended so the
+        # loop sees the search as already completed.
+        roles = [message.get("role") for message in messages]
+        assert "assistant" in roles
+        assert "tool" in roles
+        assert "Retrieved" in text
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_eager_local_tool_call_skipped_when_disabled():
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path.mkdir()
+    try:
+        _write_lancedb_records(
+            tmp_path,
+            [
+                {
+                    "id": "a:0",
+                    "doc_id": "a",
+                    "file_path": "a.md",
+                    "chunk_index": 0,
+                    "content": "alpha context",
+                    "vector": [1.0, 0.0, 0.0],
+                },
+            ],
+        )
+
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            progress_enabled=False,
+            planner_enabled=False,
+        )
+        citations = local_rag.CitationRegistry()
+        messages = engine._tool_messages("alpha?")
+
+        assert engine._eager_local_tool_call(
+            question="alpha?",
+            citations=citations,
+            messages=messages,
+        ) is None
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_eager_retrieval_runs_in_tool_rounds_and_prefetches_context(monkeypatch):
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path.mkdir()
+    try:
+        _write_lancedb_records(
+            tmp_path,
+            [
+                {
+                    "id": "a:0",
+                    "doc_id": "a",
+                    "file_path": "a.md",
+                    "chunk_index": 0,
+                    "content": "alpha context",
+                    "vector": [1.0, 0.0, 0.0],
+                },
+            ],
+        )
+
+        class FakeEngine:
+            def __init__(self, **kwargs):
+                pass
+
+            def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+                return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+        monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+        monkeypatch.setattr(
+            local_rag,
+            "generate_search_queries",
+            lambda *args, **kwargs: ["alpha?"],
+        )
+        # The model never calls tools itself; the eager pre-fetch must still
+        # supply context so the loop reaches the final-answer instruction.
+        monkeypatch.setattr(
+            local_rag,
+            "_ollama_chat",
+            _fake_local_tool_chat([], final_events=[{"message": {"content": "answer [S1]"}}]),
+        )
+
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            progress_enabled=False,
+            model="gemma4",
+            planner_enabled=True,
+            planner_max_queries=1,
+        )
+
+        events = list(engine.ask_stream_events("alpha?"))
+        # With the planner on and a populated index, the opening notice changes.
+        assert events[0] == {"type": "notice", "text": "Searching local context..."}
+        tool_call_events = [e for e in events if e.get("type") == "tool_call"]
+        assert tool_call_events
+        assert tool_call_events[0]["tool"] == "search_local_context"
+        tool_results = [e for e in events if e.get("type") == "tool_result"]
+        assert tool_results
+        assert tool_results[0]["result"]["planner_queries"] == ["alpha?"]
+        assert any(e.get("type") == "answer" and "answer [S1]" in e["text"] for e in events)
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
