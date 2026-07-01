@@ -655,16 +655,39 @@ def _record_text_for_lexical_score(record: dict[str, Any]) -> str:
     ) + f" {tag_text}"
 
 
-def _lexical_relevance(query_terms: set[str], record: dict[str, Any]) -> float:
+def _lexical_relevance(
+    query_terms: set[str],
+    record: dict[str, Any],
+    *,
+    keyword_cache: dict[str, tuple[set[str], set[str]]] | None = None,
+) -> float:
     if not query_terms:
         return 0.0
-    record_terms = _claim_keywords(_record_text_for_lexical_score(record))
+    # Per-record keyword sets are recomputed via regex on every call, but
+    # ``_retrieve`` ranks candidates and then re-ranks their children, so the
+    # same record can be scored twice. Memoize on the record id within one
+    # retrieval pass when a cache is supplied.
+    record_terms: set[str]
+    title_terms: set[str]
+    record_id = str(record.get("id") or "")
+    if keyword_cache is not None and record_id:
+        cached_terms = keyword_cache.get(record_id)
+        if cached_terms is not None:
+            record_terms, title_terms = cached_terms
+        else:
+            record_terms = _claim_keywords(_record_text_for_lexical_score(record))
+            title_terms = _claim_keywords(
+                " ".join(str(record.get(field) or "") for field in ("title", "section_path"))
+            )
+            keyword_cache[record_id] = (record_terms, title_terms)
+    else:
+        record_terms = _claim_keywords(_record_text_for_lexical_score(record))
+        title_terms = _claim_keywords(
+            " ".join(str(record.get(field) or "") for field in ("title", "section_path"))
+        )
     if not record_terms:
         return 0.0
     overlap = len(query_terms & record_terms) / max(len(query_terms), 1)
-    title_terms = _claim_keywords(
-        " ".join(str(record.get(field) or "") for field in ("title", "section_path"))
-    )
     title_overlap = len(query_terms & title_terms) / max(len(query_terms), 1) if title_terms else 0.0
     return min(1.0, overlap + (0.15 * title_overlap))
 

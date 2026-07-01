@@ -41,6 +41,8 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_pdf_components",
     "_default_pdf_reader",
     "_new_pdf_writer",
+    "_png_bytes_for_vision",
+    "VISION_IMAGE_MAX_EDGE",
     "_tqdm",
     "_docling_components",
     "_normalize_bool",
@@ -140,6 +142,35 @@ def _default_pdf_reader(file_path: str):
 def _new_pdf_writer():
     _, PdfWriter = _pdf_components()
     return PdfWriter()
+
+
+# Vision models downscale internally, so shipping multi-megabyte full-resolution
+# page/figure PNGs wastes encode time and IPC bandwidth. This cap (1568px on the
+# long edge, the common Qwen2.5-VL input) bounds the payload sent to the local
+# vision model without affecting what is stored as an asset.
+VISION_IMAGE_MAX_EDGE = 1568
+
+
+def _png_bytes_for_vision(image, fallback_bytes: bytes | None = None) -> bytes:
+    """Encode a PIL image to PNG, downscaling to ``VISION_IMAGE_MAX_EDGE`` on the
+    long edge. Returns ``fallback_bytes`` unchanged when ``image`` is not a real
+    PIL image (e.g. a test double), so callers can always pass the original
+    encoded bytes as a safe fallback. The caller owns ``image``."""
+    from PIL import Image
+
+    if not hasattr(image, "size") or not callable(getattr(image, "resize", None)):
+        return fallback_bytes if fallback_bytes is not None else b""
+    max_edge = max(image.size or (0, 0))
+    target = image
+    if max_edge > VISION_IMAGE_MAX_EDGE:
+        scale = VISION_IMAGE_MAX_EDGE / max_edge
+        target = image.resize(
+            (max(1, int(image.size[0] * scale)), max(1, int(image.size[1] * scale))),
+            Image.LANCZOS,
+        )
+    buffered = io.BytesIO()
+    target.save(buffered, format="PNG")
+    return buffered.getvalue()
 
 
 def _tqdm():

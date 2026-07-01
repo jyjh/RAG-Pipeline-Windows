@@ -14,8 +14,44 @@ class LanceDBVectorStore:
     def __init__(self, working_dir: str | Path):
         self.working_dir = Path(working_dir)
         self.db_path = lancedb_path(self.working_dir)
+        # Cached handles. LanceDB indexing runs in a subprocess, so the table can
+        # change on disk between requests. We detect that cheaply via the mtime of
+        # the version-hint file and drop the cached table/existence state when it
+        # changes. The DB connection itself is path-based and stateless, so it is
+        # reused for the lifetime of the instance.
+        self._db_conn = None
+        self._table_obj = None
+        self._table_signature: tuple[int, int] | None = None
+        self._exists_cache: tuple[tuple[int, int] | None, bool] | None = None
+
+    def _version_hint_path(self) -> Path:
+        return self.db_path / TABLE_NAME / "_versions" / "latest_version_hint.json"
+
+    def _read_table_signature(self):
+        try:
+            stat = self._version_hint_path().stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def _invalidate_table(self) -> None:
+        self._table_obj = None
+        self._table_signature = None
+        self._exists_cache = None
+
+    def table_version_hint_path(self) -> Path:
+        """Path to the LanceDB version-hint file; a cheap freshness signal for ETags."""
+        return self._version_hint_path()
 
     def exists(self) -> bool:
+        signature = self._read_table_signature()
+        if self._exists_cache is not None and self._exists_cache[0] == signature:
+            return self._exists_cache[1]
+        result = self._exists_fresh()
+        self._exists_cache = (signature, result)
+        return result
+
+    def _exists_fresh(self) -> bool:
         if not self.db_path.exists():
             return False
         try:
@@ -56,6 +92,7 @@ class LanceDBVectorStore:
             db.create_table(TABLE_NAME, data=rows, mode="overwrite")
         else:
             db.create_table(TABLE_NAME, schema=self._schema(embedding_dim), mode="overwrite")
+        self._invalidate_table()
 
     def list_records(
         self,
@@ -76,6 +113,7 @@ class LanceDBVectorStore:
                 offset=offset,
                 limit=limit,
                 columns=LIST_RECORD_COLUMNS,
+                total=total,
             )
         model, dim = self.metadata()
         return {
@@ -169,6 +207,7 @@ class LanceDBVectorStore:
                 "embedding_dim": embedding_dim,
             },
         )
+        self._invalidate_table()
         return record_row(record)
 
     def delete_records(self, *, record_ids: list[str]) -> dict[str, Any]:
@@ -183,6 +222,7 @@ class LanceDBVectorStore:
         if not existing:
             raise KeyError(", ".join(sorted(ids)))
         self._table().delete(" OR ".join(f"id = {sql_string(record_id)}" for record_id in ids))
+        self._invalidate_table()
         after = self.count()
         return {"deleted": before - after, "remaining": after}
 
@@ -207,6 +247,7 @@ class LanceDBVectorStore:
         if not self._where(where):
             return {"deleted": 0, "remaining": before}
         self._table().delete(where)
+        self._invalidate_table()
         after = self.count()
         return {"deleted": before - after, "remaining": after}
 
@@ -239,10 +280,18 @@ class LanceDBVectorStore:
     def _db(self):
         import lancedb
 
-        return lancedb.connect(str(self.db_path))
+        if self._db_conn is None:
+            self._db_conn = lancedb.connect(str(self.db_path))
+        return self._db_conn
 
     def _table(self):
-        return self._db().open_table(TABLE_NAME)
+        signature = self._read_table_signature()
+        if self._table_obj is not None and self._table_signature == signature:
+            return self._table_obj
+        table = self._db().open_table(TABLE_NAME)
+        self._table_obj = table
+        self._table_signature = signature
+        return table
 
     def _table_names(self, db=None) -> list[str]:
         db = db or self._db()
@@ -267,8 +316,9 @@ class LanceDBVectorStore:
         offset: int = 0,
         limit: int | None = None,
         columns: list[str] | None = None,
+        total: int | None = None,
     ) -> list[dict[str, Any]]:
-        count = self.count()
+        count = total if total is not None else self.count()
         if count <= 0:
             return []
         offset = max(0, int(offset))

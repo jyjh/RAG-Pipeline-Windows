@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
@@ -53,7 +53,7 @@ from src.local_rag import (
     INDEX_MANIFEST_FILENAME,
     write_index_manifest,
 )
-from src.pdf_registry import PdfRegistry, load_source_map, remove_source_entries_by_hash, sha256_file
+from src.pdf_registry import PdfRegistry, load_source_map, remove_source_entries_by_hash, sha256_file, source_map_path
 from src.reliability import (
     SOURCE_GROUP_UNGROUPED,
     normalize_source_group,
@@ -360,17 +360,28 @@ def _string_list(value: Any, default: tuple[str, ...]) -> list[str]:
     return list(default)
 
 
+_TOML_CONFIG_CACHE: dict[str, dict[str, Any]] = {}
+
+
 def _load_toml_config(config_path: Path) -> dict[str, Any]:
+    cache_key = str(config_path)
+    cached = _TOML_CONFIG_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     if not config_path.exists():
-        return {}
+        result: dict[str, Any] = {}
+        _TOML_CONFIG_CACHE[cache_key] = result
+        return result
     try:
         import tomllib
 
         with config_path.open("rb") as handle:
             payload = tomllib.load(handle)
-        return payload if isinstance(payload, dict) else {}
+        result = payload if isinstance(payload, dict) else {}
     except Exception:
-        return {}
+        result = {}
+    _TOML_CONFIG_CACHE[cache_key] = result
+    return result
 
 
 def _normalize_server_host(raw_host: Any, *, bind_all: bool) -> str:
@@ -491,8 +502,16 @@ INGESTION_CONFIG = _load_ingestion_config()
 ASSET_DIR = _resolve_root_path(INGESTION_CONFIG["asset_dir"], default=DEFAULT_ASSET_DIR)
 
 
+_INDEX_STORE_CACHE: dict = {}
+
+
 def _index_store(db_dir: Path | None = None):
-    return default_store(db_dir or DB_DIR)
+    resolved = str(db_dir or DB_DIR)
+    store = _INDEX_STORE_CACHE.get(resolved)
+    if store is None:
+        store = default_store(resolved)
+        _INDEX_STORE_CACHE[resolved] = store
+    return store
 
 
 def _background_worker_threads() -> int:
@@ -1430,14 +1449,7 @@ def _pdf_download_url(source_hash: str) -> str:
 
 def _load_trust_registry(path: Path | None = None) -> dict[str, Any]:
     trust_path = path or DOCUMENT_TRUST_PATH
-    if not trust_path.exists():
-        return {"version": 1, "documents": {}}
-    try:
-        payload = json.loads(trust_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"version": 1, "documents": {}}
-    if not isinstance(payload, dict):
-        return {"version": 1, "documents": {}}
+    payload = _cached_json_load(trust_path, default={"version": 1, "documents": {}})
     payload.setdefault("version", 1)
     payload.setdefault("documents", {})
     if not isinstance(payload["documents"], dict):
@@ -1589,16 +1601,83 @@ def _resolve_workspace_path(raw_path: str, *, root_dir: Path = ROOT_DIR) -> Path
         return None
 
 
+_UNSET_SENTINEL: Any = object()
+_JSON_CACHE: dict[str, tuple[tuple[int, int], Any]] = {}
+
+
+def _file_signature(*paths: Path) -> str:
+    """Cheap opaque ETag seed derived from the (mtime_ns, size) of the given files.
+
+    Used to short-circuit semi-static GET endpoints (PDF list, index rows) with a
+    conditional 304 so the expensive rebuild behind them only runs when the
+    underlying registry/manifest/source-map files actually changed.
+    """
+    parts: list[str] = []
+    for path in paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            parts.append(f"{path}:missing")
+            continue
+        parts.append(f"{path}:{stat.st_mtime_ns}:{stat.st_size}")
+    raw = "|".join(parts)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _not_modified_or_etag(request: Request, seed: str) -> Response | None:
+    """Return a 304 response if the client already holds this ETag, else None."""
+    etag = f'"{seed}"'
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
+    return None
+
+
+def _etagged_json(request: Request, payload: Any, seed: str) -> JSONResponse:
+    etag = f'"{seed}"'
+    return JSONResponse(content=payload, headers={"ETag": etag, "Cache-Control": "no-cache"})
+
+
+def _cached_json_load(
+    path: Path,
+    default: Any,
+    *,
+    on_decode_error: Any = _UNSET_SENTINEL,
+) -> Any:
+    """Load and JSON-parse ``path``, cached on its ``(mtime_ns, size)`` signature.
+
+    The PDF/trust/registry/manifest files are read on every PDF-listing request
+    but only change when ingestion/indexing writes them. Re-parsing the same
+    payload every request is pure waste, so we keep a small memo keyed on the
+    filesystem signature and only re-read when the file actually changes.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return default
+    signature = (stat.st_mtime_ns, stat.st_size)
+    cached = _JSON_CACHE.get(str(path))
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        value = on_decode_error if on_decode_error is not _UNSET_SENTINEL else default
+        _JSON_CACHE[str(path)] = (signature, value)
+        return value
+    value = payload if isinstance(payload, dict) else default
+    _JSON_CACHE[str(path)] = (signature, value)
+    return value
+
+
 def _load_index_manifest(db_dir: Path | None = None) -> dict[str, Any]:
     resolved_db_dir = Path(db_dir or DB_DIR)
     path = resolved_db_dir / INDEX_MANIFEST_FILENAME
     if not path.exists():
         return _derive_index_manifest(resolved_db_dir)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    payload = _cached_json_load(path, default=None)
+    if payload is None:
         return _derive_index_manifest(resolved_db_dir)
-    return payload if isinstance(payload, dict) else {}
+    return payload
 
 
 def _derive_index_manifest(db_dir: Path) -> dict[str, Any]:
@@ -1632,15 +1711,27 @@ def _index_manifest_stats(
     return {}
 
 
+_MARKDOWN_QUALITY_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+
+
 def _markdown_quality(processed_markdown_path: str, *, root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     path = _resolve_workspace_path(processed_markdown_path, root_dir=root_dir)
     if path is None:
         return {"markdown_exists": False, "markdown_char_count": 0, "page_markers": 0, "enrichment_markers": 0}
     try:
+        stat = path.stat()
+    except OSError:
+        return {"markdown_exists": False, "markdown_char_count": 0, "page_markers": 0, "enrichment_markers": 0}
+    signature = (stat.st_mtime_ns, stat.st_size)
+    cache_key = str(path)
+    cached = _MARKDOWN_QUALITY_CACHE.get(cache_key)
+    if cached is not None and cached[0] == signature:
+        return dict(cached[1])
+    try:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return {"markdown_exists": False, "markdown_char_count": 0, "page_markers": 0, "enrichment_markers": 0}
-    return {
+    result = {
         "markdown_exists": True,
         "markdown_char_count": len(text.strip()),
         "page_markers": len(re.findall(r"(?m)^##\s+Page\s+\d+", text)),
@@ -1648,6 +1739,8 @@ def _markdown_quality(processed_markdown_path: str, *, root_dir: Path = ROOT_DIR
         "table_markers": text.count("|"),
         "equation_markers": len(re.findall(r"(?<!\\)\$[^$\n]{1,160}(?<!\\)\$", text)),
     }
+    _MARKDOWN_QUALITY_CACHE[cache_key] = (signature, dict(result))
+    return result
 
 
 def _document_quality(
@@ -2268,9 +2361,28 @@ def _model_dump(model: BaseModel) -> dict[str, Any]:
     return model.dict()
 
 
+# Lazily constructed, module-level markdown renderer + LaTeX converter.
+# ``/api/render`` is hit ~10x/second during chat streaming, so constructing a fresh
+# ``MarkdownIt`` and re-resolving the converter import on every call is wasteful.
+_MARKDOWN_RENDERER: Any = None
+_LATEX_TO_MATHML: Any = None
+_MATH_PATTERN = re.compile(
+    r"(?s)\$\$(.+?)\$\$|\\\[(.+?)\\\]|\\\((.+?)\\\)|(?<!\\)\$(?!\s)(.+?)(?<!\s)(?<!\\)\$"
+)
+
+
+def _ensure_markdown_renderer() -> None:
+    global _MARKDOWN_RENDERER, _LATEX_TO_MATHML
+    if _MARKDOWN_RENDERER is None:
+        from latex2mathml.converter import convert as latex_to_mathml
+        from markdown_it import MarkdownIt
+
+        _LATEX_TO_MATHML = latex_to_mathml
+        _MARKDOWN_RENDERER = MarkdownIt("commonmark", {"html": False, "linkify": False})
+
+
 def render_markdown_text(text: str) -> str:
-    from latex2mathml.converter import convert as latex_to_mathml
-    from markdown_it import MarkdownIt
+    _ensure_markdown_renderer()
 
     math_blocks: list[str] = []
 
@@ -2279,18 +2391,13 @@ def render_markdown_text(text: str) -> str:
         display = "block" if match.group(1) is not None or match.group(2) is not None else "inline"
         placeholder = f"@@RAG_MATH_{len(math_blocks)}@@"
         try:
-            math_blocks.append(latex_to_mathml(latex.strip(), display=display))
+            math_blocks.append(_LATEX_TO_MATHML(latex.strip(), display=display))
         except Exception:
             math_blocks.append(html.escape(match.group(0)))
         return placeholder
 
-    protected = re.sub(
-        r"(?s)\$\$(.+?)\$\$|\\\[(.+?)\\\]|\\\((.+?)\\\)|(?<!\\)\$(?!\s)(.+?)(?<!\s)(?<!\\)\$",
-        replace_math,
-        text,
-    )
-    markdown = MarkdownIt("commonmark", {"html": False, "linkify": False})
-    rendered = markdown.render(protected)
+    protected = _MATH_PATTERN.sub(replace_math, text)
+    rendered = _MARKDOWN_RENDERER.render(protected)
     for index, math_html in enumerate(math_blocks):
         rendered = rendered.replace(f"@@RAG_MATH_{index}@@", math_html)
     return rendered
@@ -2937,8 +3044,22 @@ def cancel_job(job_id: str):
 
 
 @app.get("/api/pdfs")
-def pdf_documents(search: str = "", offset: int = 0, limit: int = 10):
-    return list_pdf_documents(search=search, offset=offset, limit=limit)
+def pdf_documents(request: Request, search: str = "", offset: int = 0, limit: int = 10):
+    # The PDF list only changes when ingestion/indexing writes the registry,
+    # source map, trust registry, or index manifest. Short-circuit unchanged
+    # polls with a conditional 304 instead of rebuilding the whole list.
+    seed = _file_signature(
+        PDF_REGISTRY_PATH,
+        source_map_path(PROCESSED_DIR),
+        DOCUMENT_TRUST_PATH,
+        DB_DIR / INDEX_MANIFEST_FILENAME,
+    )
+    if search == "" and (not_modified := _not_modified_or_etag(request, seed)):
+        return not_modified
+    payload = list_pdf_documents(search=search, offset=offset, limit=limit)
+    if search == "":
+        return _etagged_json(request, payload, seed)
+    return payload
 
 
 @app.get("/api/assets/{asset_id}")
@@ -3056,11 +3177,20 @@ def update_pdf_trust(source_hash: str, payload: DocumentTrustRequest):
 
 
 @app.get("/api/index")
-def index_rows(offset: int = 0, limit: int = 50, search: str = ""):
+def index_rows(request: Request, offset: int = 0, limit: int = 50, search: str = ""):
+    # Index rows only change when the LanceDB table is rewritten; key the ETag on
+    # the table version-hint file so unchanged polls short-circuit to a 304.
+    version_hint = _index_store().table_version_hint_path()
+    seed = _file_signature(version_hint, DB_DIR / INDEX_MANIFEST_FILENAME)
+    if search == "" and (not_modified := _not_modified_or_etag(request, seed)):
+        return not_modified
     try:
-        return list_index_rows(offset=offset, limit=limit, search=search)
+        payload = list_index_rows(offset=offset, limit=limit, search=search)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if search == "":
+        return _etagged_json(request, payload, seed)
+    return payload
 
 
 @app.get("/api/index/summaries")

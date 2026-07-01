@@ -85,6 +85,7 @@ class ScannedPageImageParser:
     @staticmethod
     def _image_to_png_bytes(image) -> bytes:
         source_image = getattr(image, "image", None)
+        opened = False
         if source_image is None:
             data = getattr(image, "data", None)
             if not data:
@@ -92,10 +93,22 @@ class ScannedPageImageParser:
             from PIL import Image
 
             source_image = Image.open(io.BytesIO(data))
-
-        buffered = io.BytesIO()
-        source_image.save(buffered, format="PNG")
-        return buffered.getvalue()
+            opened = True
+        try:
+            # Real PIL images get downscaled for the vision model; non-PIL image
+            # objects (e.g. docling wrappers or test doubles without .size) fall
+            # back to a plain PNG encode of whatever ``.save`` produces.
+            if hasattr(source_image, "size") and callable(getattr(source_image, "resize", None)):
+                return _png_bytes_for_vision(source_image)
+            buffered = io.BytesIO()
+            source_image.save(buffered, format="PNG")
+            return buffered.getvalue()
+        finally:
+            if opened:
+                try:
+                    source_image.close()
+                except Exception:
+                    pass
 
 ScannedPageImageParser.__module__ = _source_module.__name__
 finalize_split_class(_source_module, ScannedPageImageParser)

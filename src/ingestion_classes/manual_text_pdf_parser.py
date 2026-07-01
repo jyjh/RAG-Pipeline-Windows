@@ -58,6 +58,24 @@ class ManualTextPdfParser:
         self.min_alnum_ratio = min_alnum_ratio
         self.asset_triggers = self._normalize_asset_triggers(asset_triggers)
         self.progress_enabled = progress_enabled
+        # A single parse opens the same PDF up to three times (text extraction,
+        # image detection, page-asset isolation). Memoize the reader per file path
+        # so they share one parsed structure instead of re-reading it repeatedly.
+        self._reader_cache: dict[str, Any] = {}
+
+    def _get_reader(self, file_path: str):
+        reader = self._reader_cache.get(file_path)
+        if reader is None:
+            reader = self.reader_factory(file_path)
+            self._reader_cache[file_path] = reader
+        return reader
+
+    def clear_reader_cache(self, file_path: str | None = None) -> None:
+        """Drop cached PDF readers. Pass ``file_path`` to drop one, or nothing to drop all."""
+        if file_path is None:
+            self._reader_cache.clear()
+        else:
+            self._reader_cache.pop(file_path, None)
 
     def has_extractable_text(self, file_path: str) -> bool:
         return self.is_text_usable(self.extract_page_texts(file_path))
@@ -71,6 +89,9 @@ class ManualTextPdfParser:
         enriched_asset_pages: set[int] | None = None,
         page_texts: list[str] | None = None,
     ) -> str:
+        # Drop any readers cached from a previous document so this parse starts
+        # fresh (and so the cache cannot grow unbounded across a large batch).
+        self.clear_reader_cache()
         page_texts = page_texts if page_texts is not None else self.extract_page_texts(file_path)
         if not include_assets and asset_pages is None and self.asset_triggers != self.ASSET_TRIGGER_NONE:
             hints = self.asset_enrichment_page_hints(file_path, page_texts)
@@ -135,7 +156,7 @@ class ManualTextPdfParser:
         enriched_asset_pages: set[int] | None = None,
     ) -> dict[int, list[str]]:
         try:
-            reader = self.reader_factory(file_path)
+            reader = self._get_reader(file_path)
         except Exception as exc:
             logger.warning("Could not open PDF for page-level Docling assets: %s", exc)
             return {}
@@ -267,7 +288,7 @@ class ManualTextPdfParser:
 
     def image_pages(self, file_path: str) -> set[int]:
         try:
-            reader = self.reader_factory(file_path)
+            reader = self._get_reader(file_path)
         except Exception as exc:
             logger.warning("Could not inspect PDF images with pypdf: %s", exc)
             return set()
@@ -323,9 +344,9 @@ class ManualTextPdfParser:
                 continue
             if "|" in stripped or "\t" in stripped:
                 return True
-            if len(re.findall(r"\S+\s{2,}\S+", stripped)) >= 2:
+            if len(_TABLE_SPACED_RUN.findall(stripped)) >= 2:
                 table_like_lines += 1
-            elif len(re.findall(r"\d+(?:\.\d+)?", stripped)) >= 3 and re.search(r"\s{2,}", stripped):
+            elif len(_NUMBER_RUN.findall(stripped)) >= 3 and re.search(r"\s{2,}", stripped):
                 table_like_lines += 1
         return table_like_lines >= 3
 
@@ -336,11 +357,11 @@ class ManualTextPdfParser:
             if len(stripped) < 6:
                 continue
             marker_count = sum(stripped.count(marker) for marker in cls.EQUATION_MARKERS)
-            has_variable = bool(re.search(r"[A-Za-z]", stripped))
-            has_number = bool(re.search(r"\d", stripped))
+            has_variable = bool(_VARIABLE_RE.search(stripped))
+            has_number = bool(_NUMBER_ANYWHERE_RE.search(stripped))
             if marker_count >= 2 and (has_variable or has_number):
                 return True
-            if re.search(r"\b[A-Za-z]\s*=\s*[^=]+", stripped):
+            if _EQUATION_ASSIGN_RE.search(stripped):
                 return True
         return False
 
@@ -348,9 +369,9 @@ class ManualTextPdfParser:
     def text_suggests_formula(cls, text: str) -> bool:
         if any(marker in text for marker in cls.LATEX_MARKERS):
             return True
-        if re.search(r"(?<!\$)\$[^$\n]{2,}\$(?!\$)", text):
+        if _INLINE_FORMULA_RE.search(text):
             return True
-        if re.search(r"\\\[[\s\S]{2,}?\\\]|\\\([\s\S]{2,}?\\\)", text):
+        if _DISPLAY_FORMULA_RE.search(text):
             return True
         if cls.text_suggests_equation(text):
             return True
@@ -363,12 +384,12 @@ class ManualTextPdfParser:
             if len(stripped) < 6:
                 continue
             if "�" in stripped or "\ufffd" in stripped or "□" in stripped:
-                if re.search(r"[A-Za-z0-9=+\-*/^_<>()[\]{}]", stripped):
+                if _BROKEN_FORMULA_CHAR_RE.search(stripped):
                     return True
             compact = stripped.replace(" ", "")
             if len(compact) < 4:
                 continue
-            operator_count = len(re.findall(r"(?:<=|>=|!=|==|[=+\-*/^_<>])", compact))
+            operator_count = len(_OPERATOR_RUN_RE.findall(compact))
             symbol_count = sum(not char.isalnum() for char in compact)
             if operator_count >= 2 and symbol_count / max(len(compact), 1) >= 0.2:
                 return True
@@ -376,9 +397,9 @@ class ManualTextPdfParser:
 
     @classmethod
     def text_suggests_code(cls, text: str) -> bool:
-        if re.search(r"(?m)^\s*(```|~~~)", text):
+        if _CODE_FENCE_RE.search(text):
             return True
-        if re.search(r"(?m)^\s*(>>>|\.\.\.|In \[\d+\]:|\$ )", text):
+        if _CODE_PROMPT_RE.search(text):
             return True
 
         nonblank_lines = [line for line in text.splitlines() if line.strip()]
@@ -404,21 +425,21 @@ class ManualTextPdfParser:
     def _line_suggests_code(cls, stripped: str, *, allow_plain_assignment: bool = False) -> bool:
         if not stripped:
             return False
-        if any(re.search(pattern, stripped, flags=re.IGNORECASE) for pattern in cls.CODE_KEYWORD_PATTERNS):
+        if any(pattern.search(stripped) for pattern in _CODE_KEYWORD_RES):
             return True
-        if re.search(r"[{};]$", stripped) and re.search(r"[A-Za-z_]", stripped):
+        if _CODE_BRACE_TAIL_RE.search(stripped) and _CODE_HAS_IDENT_RE.search(stripped):
             return True
-        if re.search(r"(->|=>|::|:=|==|!=|&&|\|\|)", stripped):
+        if _CODE_OP_RE.search(stripped):
             return True
-        if re.search(r"^\s*</?[A-Za-z][A-Za-z0-9-]*(\s+[^>]*)?>", stripped):
+        if _CODE_TAG_RE.search(stripped):
             return True
-        if allow_plain_assignment and re.search(r"^[A-Za-z_][A-Za-z0-9_.$\[\]]*\s*=\s*[^=]", stripped):
+        if allow_plain_assignment and _CODE_ASSIGN_RE.search(stripped):
             return True
         return False
 
     def extract_page_texts(self, file_path: str) -> list[str]:
         _progress_status(f"Opening PDF with pypdf: {Path(file_path).name}", enabled=self.progress_enabled)
-        reader = self.reader_factory(file_path)
+        reader = self._get_reader(file_path)
         texts: list[str] = []
         page_iter = _iter_with_progress(
             enumerate(reader.pages, start=1),
@@ -450,6 +471,31 @@ class ManualTextPdfParser:
             normalized.append(line)
             previous_blank = blank
         return "\n".join(normalized).strip()
+
+
+# Precompiled regexes used by the per-page asset-hint heuristics above. These
+# functions run over every line of every page during ingestion, so compiling the
+# patterns once at import avoids recompiling them on every call (Python's regex
+# cache helps, but explicit module-level compiles are faster and clearer).
+_TABLE_SPACED_RUN = re.compile(r"\S+\s{2,}\S+")
+_NUMBER_RUN = re.compile(r"\d+(?:\.\d+)?")
+_VARIABLE_RE = re.compile(r"[A-Za-z]")
+_NUMBER_ANYWHERE_RE = re.compile(r"\d")
+_EQUATION_ASSIGN_RE = re.compile(r"\b[A-Za-z]\s*=\s*[^=]+")
+_INLINE_FORMULA_RE = re.compile(r"(?<!\$)\$[^$\n]{2,}\$(?!\$)")
+_DISPLAY_FORMULA_RE = re.compile(r"\\\[[\s\S]{2,}?\\\]|\\\([\s\S]{2,}?\\\)")
+_BROKEN_FORMULA_CHAR_RE = re.compile(r"[A-Za-z0-9=+\-*/^_<>()[\]{}]")
+_OPERATOR_RUN_RE = re.compile(r"(?:<=|>=|!=|==|[=+\-*/^_<>])")
+_CODE_FENCE_RE = re.compile(r"(?m)^\s*(```|~~~)")
+_CODE_PROMPT_RE = re.compile(r"(?m)^\s*(>>>|\.\.\.|In \[\d+\]:|\$ )")
+_CODE_KEYWORD_RES = tuple(
+    re.compile(pattern, flags=re.IGNORECASE) for pattern in ManualTextPdfParser.CODE_KEYWORD_PATTERNS
+)
+_CODE_BRACE_TAIL_RE = re.compile(r"[{};]$")
+_CODE_HAS_IDENT_RE = re.compile(r"[A-Za-z_]")
+_CODE_OP_RE = re.compile(r"(->|=>|::|:=|==|!=|&&|\|\|)")
+_CODE_TAG_RE = re.compile(r"^\s*</?[A-Za-z][A-Za-z0-9-]*(\s+[^>]*)?>")
+_CODE_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.$\[\]]*\s*=\s*[^=]")
 
 ManualTextPdfParser.__module__ = _source_module.__name__
 finalize_split_class(_source_module, ManualTextPdfParser)

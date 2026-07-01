@@ -59,8 +59,17 @@ class ImageAssetStore:
     def __init__(self, asset_dir: str | Path):
         self.asset_dir = Path(asset_dir)
         self.manifest_path = self.asset_dir / ASSET_MANIFEST_FILENAME
+        # Batch mode: while active, ``save_image`` mutates a single in-memory
+        # manifest and defers the (expensive, O(manifest size)) rewrite to
+        # ``commit_batch``. Without this, ingesting a document with K images does
+        # K full read+rewrite passes (O(K**2) in manifest size). The depth counter
+        # makes ``begin_batch``/``commit_batch`` safe to nest.
+        self._batch_manifest: dict[str, Any] | None = None
+        self._batch_depth = 0
 
     def load_manifest(self) -> dict[str, Any]:
+        if self._batch_manifest is not None:
+            return self._batch_manifest
         payload = _load_json(
             self.manifest_path,
             {"version": ASSET_MANIFEST_VERSION, "assets": {}},
@@ -70,6 +79,34 @@ class ImageAssetStore:
         if not isinstance(payload["assets"], dict):
             payload["assets"] = {}
         return payload
+
+    def begin_batch(self) -> None:
+        """Load the manifest once so subsequent ``save_image`` calls mutate it
+        in memory until ``commit_batch`` flushes a single rewrite. Reentrant."""
+        self._batch_depth += 1
+        if self._batch_manifest is None:
+            self._batch_manifest = self.load_manifest()
+
+    def commit_batch(self) -> None:
+        """Write the pending batched manifest (if any) to disk in a single pass.
+        Reentrant: only flushes when the outermost batch commits."""
+        if self._batch_depth <= 0:
+            return
+        self._batch_depth -= 1
+        if self._batch_depth == 0 and self._batch_manifest is not None:
+            _write_json(self.manifest_path, self._batch_manifest)
+            self._batch_manifest = None
+
+    def abort_batch(self) -> None:
+        """Discard any pending batched manifest without writing."""
+        self._batch_manifest = None
+        self._batch_depth = 0
+
+    def _persist_manifest(self, manifest: dict[str, Any]) -> None:
+        if self._batch_manifest is not None:
+            self._batch_manifest = manifest
+        else:
+            _write_json(self.manifest_path, manifest)
 
     def save_image(
         self,
@@ -106,7 +143,7 @@ class ImageAssetStore:
             "created_at": created_at,
         }
         assets[asset_id] = entry
-        _write_json(self.manifest_path, manifest)
+        self._persist_manifest(manifest)
         return dict(entry)
 
     def get_asset(self, asset_id: str) -> dict[str, Any] | None:
@@ -156,10 +193,26 @@ class ImageAssetStore:
         *,
         url_for: Callable[[str], str] | None = None,
     ) -> list[dict[str, Any]]:
+        # Load the manifest once rather than re-reading it twice per asset id
+        # (once via get_asset, once via asset_path -> get_asset).
+        manifest_assets = self.load_manifest().get("assets", {})
+        if not isinstance(manifest_assets, dict):
+            manifest_assets = {}
+        root = self.asset_dir.resolve()
         assets: list[dict[str, Any]] = []
         for asset_id in image_asset_ids(text):
-            entry = self.get_asset(asset_id)
-            if not entry or self.asset_path(asset_id) is None:
+            entry = manifest_assets.get(asset_id)
+            if not isinstance(entry, dict):
+                continue
+            relative_path = str(entry.get("relative_path") or "")
+            if not relative_path:
+                continue
+            candidate = (self.asset_dir / relative_path).resolve()
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                continue
+            if not (candidate.exists() and candidate.is_file()):
                 continue
             assets.append(self.public_metadata(entry, url_for=url_for))
         return assets
@@ -186,7 +239,7 @@ class ImageAssetStore:
             else:
                 kept[str(asset_id)] = entry
         manifest["assets"] = kept
-        _write_json(self.manifest_path, manifest)
+        self._persist_manifest(manifest)
 
         source_key = _safe_component(source_hash, "unknown-source")
         source_dir = self.asset_dir / source_key

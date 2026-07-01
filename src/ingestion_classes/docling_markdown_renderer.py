@@ -27,28 +27,48 @@ class DoclingMarkdownRenderer:
         self.source_pdf_name = str(source_pdf_name or "")
 
     def render_document(self, doc, *, page_no_override: int | None = None) -> str:
-        parts: list[str] = []
-        for item, _ in doc.iterate_items():
-            content = self.render_item(item, doc, page_no_override=page_no_override)
-            if content:
-                parts.append(content)
-        return "\n\n".join(parts)
+        self._begin_asset_batch()
+        try:
+            parts: list[str] = []
+            for item, _ in doc.iterate_items():
+                content = self.render_item(item, doc, page_no_override=page_no_override)
+                if content:
+                    parts.append(content)
+            return "\n\n".join(parts)
+        finally:
+            self._commit_asset_batch()
 
     def render_assets_by_page(self, doc, *, page_no_override: int | None = None) -> dict[int, list[str]]:
-        pages: dict[int, list[str]] = {}
-        for item, _ in doc.iterate_items():
-            if not self.is_asset_item(item):
-                continue
+        self._begin_asset_batch()
+        try:
+            pages: dict[int, list[str]] = {}
+            for item, _ in doc.iterate_items():
+                if not self.is_asset_item(item):
+                    continue
 
-            content = self.render_item(item, doc, page_no_override=page_no_override)
-            if not content:
-                continue
+                content = self.render_item(item, doc, page_no_override=page_no_override)
+                if not content:
+                    continue
 
-            page_no = page_no_override or self.item_page_no(item)
-            if page_no is None:
-                page_no = 1
-            pages.setdefault(page_no, []).append(content)
-        return pages
+                page_no = page_no_override or self.item_page_no(item)
+                if page_no is None:
+                    page_no = 1
+                pages.setdefault(page_no, []).append(content)
+            return pages
+        finally:
+            self._commit_asset_batch()
+
+    def _begin_asset_batch(self) -> None:
+        # Defer per-image manifest rewrites so a picture-heavy document does a
+        # single manifest flush instead of one growing rewrite per image.
+        store = self.image_asset_store
+        if store is not None and hasattr(store, "begin_batch"):
+            store.begin_batch()
+
+    def _commit_asset_batch(self) -> None:
+        store = self.image_asset_store
+        if store is not None and hasattr(store, "commit_batch"):
+            store.commit_batch()
 
     def render_item(self, item, doc, *, page_no_override: int | None = None) -> str:
         if self.is_picture_item(item):
@@ -133,7 +153,12 @@ class DoclingMarkdownRenderer:
             buffered = io.BytesIO()
             image.save(buffered, format="PNG")
             image_data = buffered.getvalue()
-            description = self.vision_describer.describe(image_data)
+            # Vision models downscale internally, so describe a downscaled copy
+            # rather than the full-resolution PNG when ``image`` is a real PIL
+            # image. The original ``image_data`` is still what gets stored as the
+            # asset for source fidelity, and is used as the fallback for non-PIL
+            # image objects (e.g. docling wrappers without PIL semantics).
+            description = self.vision_describer.describe(_png_bytes_for_vision(image, fallback_bytes=image_data))
             marker = ""
             if image_data and _usable_vision_description(description) and self.image_asset_store is not None:
                 from src.asset_store import image_asset_marker

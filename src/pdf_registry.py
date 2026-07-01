@@ -14,6 +14,7 @@ REGISTRY_VERSION = 1
 BLOCKING_STATUSES = {"queued", "saving_uploads", "ingesting", "ingested", "indexed"}
 
 _LOCK = threading.RLock()
+_JSON_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
 
 
 def utcnow() -> str:
@@ -29,19 +30,40 @@ def sha256_file(path: str | Path) -> str:
 
 
 def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
-    if not path.exists():
+    """Read and JSON-parse ``path``, cached on its ``(mtime_ns, size)`` signature.
+
+    The registry and source-map files are read on every PDF-listing request but
+    only change when ingestion/indexing writes them. Re-parsing the same payload
+    every request is pure waste, so we memoize on the filesystem signature and
+    only re-read when the file actually changes.
+    """
+    cache_key = str(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        _JSON_CACHE.pop(cache_key, None)
         return default
+    signature = (stat.st_mtime_ns, stat.st_size)
+    cached = _JSON_CACHE.get(cache_key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        _JSON_CACHE[cache_key] = (signature, default)
         return default
-    return payload if isinstance(payload, dict) else default
+    value = payload if isinstance(payload, dict) else default
+    _JSON_CACHE[cache_key] = (signature, value)
+    return value
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     data = json.dumps(payload, indent=2, sort_keys=True)
     path.write_text(data, encoding="utf-8")
+    # Invalidate the cached value so the next read sees the new file; the next
+    # _load_json will repopulate the cache under the fresh signature.
+    _JSON_CACHE.pop(str(path), None)
 
 
 class PdfRegistry:

@@ -325,10 +325,11 @@ class LocalQueryEngine:
         used_tokens = 0
         seen: set[str] = set()
         results: list[dict[str, Any]] = []
+        keyword_cache: dict[str, tuple[set[str], set[str]]] = {}
 
         def rank_record(record: dict[str, Any], *, inherited_score: float | None = None) -> dict[str, Any]:
             vector_score = float(record.get("score") or inherited_score or 0.0)
-            lexical_score = _lexical_relevance(query_terms, record)
+            lexical_score = _lexical_relevance(query_terms, record, keyword_cache=keyword_cache)
             hybrid_score = (
                 (1.0 - self.retrieval_lexical_weight) * vector_score
                 + self.retrieval_lexical_weight * lexical_score

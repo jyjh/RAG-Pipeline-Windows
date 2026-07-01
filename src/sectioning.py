@@ -8,6 +8,32 @@ from typing import Any
 
 from src._class_module_support import import_split_class
 
+# Precompiled regexes for the sectioning hot loops. Functions like
+# ``find_heading_line``, ``clean_title``, ``normalized_heading``, and
+# ``split_text`` run per section / per line during indexing, so compiling these
+# patterns once at import avoids recompiling them on every call.
+_RE_ONLY_DIGITS = re.compile(r"\d{1,4}")
+_RE_TOC_DOT_LEADER = re.compile(
+    r"^\s*(?P<num>(?:[A-Z]+|[A-Z]?\d+(?:\.\d+)*|[A-Z](?:\.\d+)*))\s+"
+    r"(?P<title>.+?)\s+(?:[.\u2026]\s*){2,}(?P<page>\d{1,4})\s*$"
+)
+_RE_TOC_PLAIN = re.compile(
+    r"^\s*(?P<num>[A-Z]|\d+(?:\.\d+)*)\s+"
+    r"(?P<title>[A-Za-z][^\n.]{2,}?)\s+(?P<page>\d{1,4})\s*$"
+)
+_RE_HASH_HEADING = re.compile(r"(?m)^(?P<hashes>#{1,6})\s+(?P<title>[^\n#][^\n]{2,160})\s*$")
+_RE_NUMBERED_HEADING = re.compile(
+    r"(?m)^(?P<title>(?P<num>\d+(?:\.\d+)*|[A-Z](?:\.\d+)*)\s+[^\n]{3,120})$"
+)
+_RE_FRONT_MATTER_NUMBER = re.compile(r"^(?:\[begin lecture [^\]]+\]\s*)?\(?\d+\)?$")
+_RE_FRONT_MATTER_NUMBERED = re.compile(r"^\d+(?:\.\d+)*\s+[A-Za-z][^\n.]{2,}$")
+_RE_SPLIT_PARAGRAPH = re.compile(r"\n\s*\n")
+_RE_TAG_WORD = re.compile(r"[A-Za-z][A-Za-z0-9-]{2,}")
+_RE_TITLE_WHITESPACE = re.compile(r"\s+")
+_RE_TITLE_TRAILING_NUM = re.compile(r"\s+\d{1,4}$")
+_RE_HEADING_LEADING_NUM = re.compile(r"^\d+(?:\.\d+)*\s+")
+_RE_HEADING_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
 _CLASS_MODULE_PROXY_FUNCTIONS = (
     "has_enriched_markdown",
     "build_section_records",
@@ -102,6 +128,7 @@ def build_section_records(
 
     doc_id = stable_id("doc", markdown_path.stem)
     records: list[SectionChunk] = []
+    chunk_counter = 0
     page_count = len(pages)
     all_titles = [section.title for section in flatten_sections(sections)]
     doc_tags = tags_for([doc_title, *all_titles])
@@ -135,25 +162,25 @@ def build_section_records(
     )
 
     for top_index, section in enumerate(sections):
-        records.extend(
-            records_for_section(
-                section,
-                pages=pages,
-                doc_id=doc_id,
-                doc_title=doc_title,
-                source_path=source_path,
-                path_titles=[],
-                summary_parent_id=doc_id,
-                chunk_counter_start=len([record for record in records if record.node_type == "chunk"]),
-                max_chars=max_chars,
-                overlap_chars=overlap_chars,
-                summary_mode=summary_mode,
-                top_index=top_index,
-                source_hash=source_hash,
-                source_pdf_name=source_pdf_name,
-                source_pdf_path=source_pdf_path,
-            )
+        section_records = records_for_section(
+            section,
+            pages=pages,
+            doc_id=doc_id,
+            doc_title=doc_title,
+            source_path=source_path,
+            path_titles=[],
+            summary_parent_id=doc_id,
+            chunk_counter_start=chunk_counter,
+            max_chars=max_chars,
+            overlap_chars=overlap_chars,
+            summary_mode=summary_mode,
+            top_index=top_index,
+            source_hash=source_hash,
+            source_pdf_name=source_pdf_name,
+            source_pdf_path=source_pdf_path,
         )
+        records.extend(section_records)
+        chunk_counter += sum(1 for record in section_records if record.node_type == "chunk")
 
     return [record.to_record() for record in records]
 
@@ -216,7 +243,7 @@ def records_for_section(
         active_summary_parent = section_summary_id
 
     if section.children:
-        chunk_counter = chunk_counter_start + len([record for record in records if record.node_type == "chunk"])
+        chunk_counter = chunk_counter_start
         for child_index, child in enumerate(section.children):
             child_records = records_for_section(
                 child,
@@ -235,14 +262,16 @@ def records_for_section(
                 source_pdf_name=source_pdf_name,
                 source_pdf_path=source_pdf_path,
             )
-            chunk_counter += len([record for record in child_records if record.node_type == "chunk"])
+            chunk_counter += sum(1 for record in child_records if record.node_type == "chunk")
             records.extend(child_records)
         return records
 
     raw_content = content_for_section(section, pages)
     chunks = split_text(raw_content, max_chars=max_chars, overlap_chars=overlap_chars)
+    chunk_counter = chunk_counter_start
     for offset, chunk in enumerate(chunks):
-        chunk_index = chunk_counter_start + len([record for record in records if record.node_type == "chunk"])
+        chunk_index = chunk_counter
+        chunk_counter += 1
         prefixed = (
             f"Section: {section_path}\n"
             f"Pages: {format_page_range(section.page_start, section.page_end)}\n\n"
@@ -400,19 +429,11 @@ def toc_sections_from_pages(pages: list[PageText], *, doc_id_seed: str) -> list[
 
 def parse_toc_entries(text: str) -> list[tuple[str, str, int]]:
     entries: list[tuple[str, str, int]] = []
-    dot_leader = re.compile(
-        r"^\s*(?P<num>(?:[A-Z]+|[A-Z]?\d+(?:\.\d+)*|[A-Z](?:\.\d+)*))\s+"
-        r"(?P<title>.+?)\s+(?:[.\u2026]\s*){2,}(?P<page>\d{1,4})\s*$"
-    )
-    plain = re.compile(
-        r"^\s*(?P<num>[A-Z]|\d+(?:\.\d+)*)\s+"
-        r"(?P<title>[A-Za-z][^\n.]{2,}?)\s+(?P<page>\d{1,4})\s*$"
-    )
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.lower() in {"contents", "table of contents"}:
             continue
-        match = dot_leader.match(stripped) or plain.match(stripped)
+        match = _RE_TOC_DOT_LEADER.match(stripped) or _RE_TOC_PLAIN.match(stripped)
         if not match:
             continue
         title = clean_title(match.group("title"))
@@ -473,19 +494,15 @@ def sections_from_markdown(doc_title: str, content: str) -> tuple[list[SectionNo
 
 def markdown_headings(content: str) -> list[tuple[int, int, str]]:
     headings: list[tuple[int, int, str]] = []
-    hash_pattern = re.compile(r"(?m)^(?P<hashes>#{1,6})\s+(?P<title>[^\n#][^\n]{2,160})\s*$")
-    numbered_pattern = re.compile(
-        r"(?m)^(?P<title>(?P<num>\d+(?:\.\d+)*|[A-Z](?:\.\d+)*)\s+[^\n]{3,120})$"
-    )
     seen_offsets: set[int] = set()
-    for match in hash_pattern.finditer(content):
+    for match in _RE_HASH_HEADING.finditer(content):
         title = clean_title(match.group("title"))
         if is_noise_line(title):
             continue
         level = len(match.group("hashes")) - 1
         headings.append((match.start(), level, title))
         seen_offsets.add(match.start())
-    for match in numbered_pattern.finditer(content):
+    for match in _RE_NUMBERED_HEADING.finditer(content):
         if match.start() in seen_offsets:
             continue
         title = clean_title(match.group("title"))
@@ -502,9 +519,9 @@ def strip_front_matter(content: str) -> str:
     content_markers = []
     for index, line in enumerate(lines):
         stripped = line.strip()
-        if re.match(r"^(?:\[begin lecture [^\]]+\]\s*)?\(?\d+\)?$", stripped.lower()):
+        if _RE_FRONT_MATTER_NUMBER.match(stripped.lower()):
             continue
-        if re.match(r"^\d+(?:\.\d+)*\s+[A-Za-z][^\n.]{2,}$", stripped):
+        if _RE_FRONT_MATTER_NUMBERED.match(stripped):
             content_markers.append(index)
             if len(content_markers) >= 2:
                 return "\n".join(lines[index:]).strip()
@@ -551,7 +568,7 @@ def find_heading_line(lines: list[str], title: str) -> int | None:
 
 
 def split_text(text: str, *, max_chars: int, overlap_chars: int) -> list[str]:
-    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+    paragraphs = [part.strip() for part in _RE_SPLIT_PARAGRAPH.split(text) if part.strip()]
     chunks: list[str] = []
     current: list[str] = []
     current_len = 0
@@ -604,7 +621,7 @@ def is_noise_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return False
-    if re.fullmatch(r"\d{1,4}", stripped):
+    if _RE_ONLY_DIGITS.fullmatch(stripped):
         return True
     if stripped.lower() in {"contents", "table of contents"}:
         return True
@@ -648,7 +665,7 @@ def tags_for(parts: list[str]) -> list[str]:
     }
     tags: list[str] = []
     for part in parts:
-        for word in re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", part.lower()):
+        for word in _RE_TAG_WORD.findall(part.lower()):
             if word in stop or word in tags:
                 continue
             tags.append(word)
@@ -676,15 +693,15 @@ def format_page_range(page_start: int | None, page_end: int | None) -> str:
 
 
 def clean_title(title: str) -> str:
-    title = re.sub(r"\s+", " ", title.replace("\ufb01", "fi").replace("\ufb02", "fl")).strip()
-    title = re.sub(r"\s+\d{1,4}$", "", title).strip()
+    title = _RE_TITLE_WHITESPACE.sub(" ", title.replace("\ufb01", "fi").replace("\ufb02", "fl")).strip()
+    title = _RE_TITLE_TRAILING_NUM.sub("", title).strip()
     return title
 
 
 def normalized_heading(value: str) -> str:
     value = clean_title(value)
-    value = re.sub(r"^\d+(?:\.\d+)*\s+", "", value)
-    return re.sub(r"[^a-z0-9]+", "", value.lower())
+    value = _RE_HEADING_LEADING_NUM.sub("", value)
+    return _RE_HEADING_NON_ALNUM.sub("", value.lower())
 
 
 def stable_id(*parts: str) -> str:
