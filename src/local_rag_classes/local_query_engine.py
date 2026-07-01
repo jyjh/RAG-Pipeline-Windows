@@ -94,11 +94,17 @@ class LocalQueryEngine:
             ollama_max_lost_health_checks or os.environ.get("LOCAL_RAG_OLLAMA_MAX_LOST_HEALTH_CHECKS"),
             DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
         )
-        self.system_prompt = str(
-            system_prompt
-            if system_prompt is not None
-            else os.environ.get("LOCAL_RAG_SYSTEM_PROMPT") or DEFAULT_QUERY_SYSTEM_PROMPT
-        ).strip()
+        explicit_system_prompt = system_prompt if system_prompt is not None else os.environ.get("LOCAL_RAG_SYSTEM_PROMPT")
+        self.system_prompt = str(explicit_system_prompt or DEFAULT_QUERY_SYSTEM_PROMPT).strip()
+        # A prompt counts as "custom" (user/config-supplied) only when it was
+        # explicitly provided AND differs from the built-in default templates.
+        # This lets the engine auto-select the eager vs. non-eager default even
+        # when a caller (e.g. the web app) materializes the default string.
+        stripped_prompt = self.system_prompt.strip()
+        self._custom_system_prompt = bool(explicit_system_prompt) and stripped_prompt not in (
+            DEFAULT_QUERY_SYSTEM_PROMPT.strip(),
+            DEFAULT_EAGER_QUERY_SYSTEM_PROMPT.strip(),
+        )
         self.retrieval_candidate_k = _positive_int(
             retrieval_candidate_k or os.environ.get("LOCAL_RAG_RETRIEVAL_CANDIDATE_K"),
             DEFAULT_RETRIEVAL_CANDIDATE_K,
@@ -179,6 +185,15 @@ class LocalQueryEngine:
             "num_predict": self.num_predict,
         }
 
+    def _eager_retrieval_active(self) -> bool:
+        """True when eager multi-query retrieval will run for this query.
+
+        Mirrors the guard in ``_run_tool_rounds``: the planner must be enabled
+        and the local index non-empty. Used to select the system prompt that
+        tells the model the context is already fetched.
+        """
+        return bool(self.planner_enabled and self.record_count)
+
     def _tool_messages(self, question: str) -> list[dict[str, Any]]:
         web_instruction = (
             "Use web_search only when local context is insufficient or the user asks for current/external facts, "
@@ -186,7 +201,18 @@ class LocalQueryEngine:
             if self.web_search_enabled
             else "Do not use web_search; it is disabled for this request."
         )
-        system_prompt = self.system_prompt or DEFAULT_QUERY_SYSTEM_PROMPT
+        eager = self._eager_retrieval_active()
+        if self._custom_system_prompt:
+            # User/config-supplied prompt: use verbatim, but in eager mode append
+            # the steering suffix so the model still treats pre-fetched context
+            # as already provided.
+            system_prompt = self.system_prompt
+            if eager:
+                system_prompt = f"{system_prompt}{EAGER_CONTEXT_SUFFIX}"
+        else:
+            system_prompt = (
+                DEFAULT_EAGER_QUERY_SYSTEM_PROMPT if eager else DEFAULT_QUERY_SYSTEM_PROMPT
+            )
         if "{web_instruction}" in system_prompt:
             system_prompt = system_prompt.replace("{web_instruction}", web_instruction)
         else:

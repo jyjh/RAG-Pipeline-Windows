@@ -110,6 +110,29 @@ DEFAULT_QUERY_SYSTEM_PROMPT = (
     "factual claim with source IDs exactly as provided, such as [S1] or [W1]. "
     "If the available sources are insufficient, say what is missing."
 )
+# Variant used when the eager planner has already retrieved local context and
+# injected it as a completed search_local_context tool call before the model's
+# first turn. The model should answer from that pre-fetched context and only
+# call tools again if the evidence is insufficient.
+DEFAULT_EAGER_QUERY_SYSTEM_PROMPT = (
+    "You are a retrieval-augmented assistant. Relevant local context has already "
+    "been retrieved for you and is provided in the search_local_context tool "
+    "result below; you do not need to call search_local_context before answering. "
+    "Answer directly from that pre-fetched context. You may call search_local_context "
+    "again with a narrower query, or web_search, only if the provided context is "
+    "insufficient to answer. {web_instruction} Use only information returned by "
+    "tools. In the final answer, cite every factual claim with source IDs exactly "
+    "as provided, such as [S1] or [W1]. If the available sources are insufficient, "
+    "say what is missing."
+)
+# Short directive appended to a user-supplied custom system_prompt when eager
+# retrieval is active, so a customized prompt still steers the model to treat the
+# pre-fetched tool result as already-provided context.
+EAGER_CONTEXT_SUFFIX = (
+    "\n\nNote: relevant local context has already been retrieved and is provided "
+    "in the search_local_context tool result. Answer directly from it; only call "
+    "search_local_context again (narrower query) or web_search if it is insufficient."
+)
 
 
 def _status(message: str, *, enabled: bool = True) -> None:

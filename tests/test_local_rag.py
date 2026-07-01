@@ -1573,3 +1573,173 @@ def test_eager_retrieval_runs_in_tool_rounds_and_prefetches_context(monkeypatch)
         assert any(e.get("type") == "answer" and "answer [S1]" in e["text"] for e in events)
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_eager_prompt_used_when_planner_active_and_index_populated(monkeypatch):
+    """With the planner on and a populated index, the eager system prompt is
+    selected automatically (no custom prompt configured)."""
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path.mkdir()
+    try:
+        _write_lancedb_records(
+            tmp_path,
+            [
+                {
+                    "id": "a:0",
+                    "doc_id": "a",
+                    "file_path": "a.md",
+                    "chunk_index": 0,
+                    "content": "alpha context",
+                    "vector": [1.0, 0.0, 0.0],
+                },
+            ],
+        )
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            progress_enabled=False,
+            planner_enabled=True,
+        )
+        assert engine._eager_retrieval_active() is True
+
+        system_content = engine._tool_messages("alpha?")[0]["content"]
+
+        assert "has already been retrieved" in system_content
+        assert "you do not need to call search_local_context before answering" in system_content
+        # The non-eager mandate must not appear.
+        assert "must call" not in system_content
+        # The {web_instruction} placeholder must have been filled.
+        assert "{web_instruction}" not in system_content
+        assert "web_search" in system_content
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_non_eager_prompt_used_when_planner_disabled(monkeypatch):
+    """With the planner off, the original mandate-to-search prompt is used."""
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path.mkdir()
+    try:
+        _write_lancedb_records(
+            tmp_path,
+            [
+                {
+                    "id": "a:0",
+                    "doc_id": "a",
+                    "file_path": "a.md",
+                    "chunk_index": 0,
+                    "content": "alpha context",
+                    "vector": [1.0, 0.0, 0.0],
+                },
+            ],
+        )
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            progress_enabled=False,
+            planner_enabled=False,
+        )
+        assert engine._eager_retrieval_active() is False
+
+        system_content = engine._tool_messages("alpha?")[0]["content"]
+
+        assert "must call" in system_content
+        assert "at least once" in system_content
+        assert "has already been retrieved" not in system_content
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_non_eager_prompt_used_when_index_empty():
+    """Eager retrieval can't run on an empty index, so the non-eager prompt
+    (mandating the model search itself) is selected even with the planner on."""
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path.mkdir()
+    try:
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            progress_enabled=False,
+            planner_enabled=True,
+        )
+        assert engine._eager_retrieval_active() is False
+
+        system_content = engine._tool_messages("alpha?")[0]["content"]
+
+        assert "must call" in system_content
+        assert "has already been retrieved" not in system_content
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_custom_prompt_gets_eager_suffix_when_planner_active():
+    """A user-supplied system_prompt is preserved verbatim, but in eager mode
+    the steering suffix is appended so the model still treats pre-fetched
+    context as already provided."""
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path.mkdir()
+    try:
+        _write_lancedb_records(
+            tmp_path,
+            [
+                {
+                    "id": "a:0",
+                    "doc_id": "a",
+                    "file_path": "a.md",
+                    "chunk_index": 0,
+                    "content": "alpha context",
+                    "vector": [1.0, 0.0, 0.0],
+                },
+            ],
+        )
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            progress_enabled=False,
+            planner_enabled=True,
+            system_prompt="You are a notes helper. {web_instruction}",
+        )
+
+        system_content = engine._tool_messages("alpha?")[0]["content"]
+
+        # The custom prompt text must be preserved at the start.
+        assert system_content.startswith("You are a notes helper.")
+        # The {web_instruction} placeholder must have been filled.
+        assert "{web_instruction}" not in system_content
+        # The eager steering suffix must be appended.
+        assert local_rag.EAGER_CONTEXT_SUFFIX.strip() in system_content
+        assert "has already been retrieved" in system_content
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_custom_prompt_used_verbatim_when_planner_disabled():
+    """With the planner off, a custom system_prompt is used verbatim with no
+    eager suffix appended."""
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    tmp_path.mkdir()
+    try:
+        _write_lancedb_records(
+            tmp_path,
+            [
+                {
+                    "id": "a:0",
+                    "doc_id": "a",
+                    "file_path": "a.md",
+                    "chunk_index": 0,
+                    "content": "alpha context",
+                    "vector": [1.0, 0.0, 0.0],
+                },
+            ],
+        )
+        engine = local_rag.LocalQueryEngine(
+            working_dir=str(tmp_path),
+            progress_enabled=False,
+            planner_enabled=False,
+            system_prompt="You are a notes helper. {web_instruction}",
+        )
+
+        system_content = engine._tool_messages("alpha?")[0]["content"]
+
+        assert system_content.startswith("You are a notes helper.")
+        assert local_rag.EAGER_CONTEXT_SUFFIX.strip() not in system_content
+        # web_instruction placeholder still filled.
+        assert "{web_instruction}" not in system_content
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
