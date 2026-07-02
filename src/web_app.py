@@ -1930,13 +1930,24 @@ def list_pdf_documents(
     }
 
 
-def list_job_rows(*, offset: int = 0, limit: int | None = 10) -> dict[str, Any]:
+def list_job_rows(*, offset: int = 0, limit: int | None = 10, search: str = "") -> dict[str, Any]:
     jobs = job_queue.list_jobs()
     active_count = sum(
         1
         for job in jobs
         if str(job.get("status") or "") in {"queued", "running", "paused_for_queries"}
     )
+    query = search.strip().lower()
+    if query:
+        jobs = [
+            job
+            for job in jobs
+            if query in str(job.get("id", "")).lower()
+            or query in str(job.get("status", "")).lower()
+            or query in str(job.get("phase", "")).lower()
+            or query in str(job.get("error", "")).lower()
+            or query in ", ".join(str(name) for name in (job.get("filenames") or [])).lower()
+        ]
     page = _page_slice(jobs, offset=offset, limit=limit)
     return {
         "jobs": page["rows"],
@@ -3030,8 +3041,8 @@ async def reindex(request: Request):
 
 
 @app.get("/api/jobs")
-def list_jobs(offset: int = 0, limit: int = 10):
-    return list_job_rows(offset=offset, limit=limit)
+def list_jobs(offset: int = 0, limit: int = 10, search: str = ""):
+    return list_job_rows(offset=offset, limit=(None if limit <= 0 else limit), search=search)
 
 
 @app.get("/api/jobs/{job_id}")
@@ -3065,7 +3076,7 @@ def pdf_documents(request: Request, search: str = "", offset: int = 0, limit: in
     )
     if search == "" and (not_modified := _not_modified_or_etag(request, seed)):
         return not_modified
-    payload = list_pdf_documents(search=search, offset=offset, limit=limit)
+    payload = list_pdf_documents(search=search, offset=offset, limit=(None if limit <= 0 else limit))
     if search == "":
         return _etagged_json(request, payload, seed)
     return payload

@@ -10,10 +10,13 @@ const state = {
   pdfSearch: "",
   pdfOffset: 0,
   pdfLimit: 10,
+  pdfPageSize: "10",
   pdfTotal: 0,
   jobsOffset: 0,
   jobsLimit: 10,
+  jobsPageSize: "10",
   jobsTotal: 0,
+  jobSearch: "",
   jobsActive: false,
   chats: [],
   activeChatId: null,
@@ -49,6 +52,7 @@ const RESTART_POLL_TIMEOUT_MS = 120000;
 const JOBS_ACTIVE_POLL_INTERVAL_MS = 2000;
 const INDEX_STREAM_BATCH_SIZE = 250;
 const INDEX_CHILD_BATCH_SIZE = 100;
+const CHAT_AUTO_SCROLL_THRESHOLD = 120;
 const CHAT_STORAGE_KEY = "rag.chatHistory.v1";
 const CHAT_UI_STORAGE_KEY = "rag.chatUi.v1";
 const TUTORIAL_SEEN_COOKIE = "rag_tutorial_seen";
@@ -88,10 +92,14 @@ const els = {
   prevPdfPageButton: document.getElementById("prevPdfPageButton"),
   pdfPageLabel: document.getElementById("pdfPageLabel"),
   nextPdfPageButton: document.getElementById("nextPdfPageButton"),
+  pdfPageSizeSelect: document.getElementById("pdfPageSizeSelect"),
   pdfsBody: document.getElementById("pdfsBody"),
   prevJobsPageButton: document.getElementById("prevJobsPageButton"),
   jobsPageLabel: document.getElementById("jobsPageLabel"),
   nextJobsPageButton: document.getElementById("nextJobsPageButton"),
+  jobsPageSizeSelect: document.getElementById("jobsPageSizeSelect"),
+  jobSearchInput: document.getElementById("jobSearchInput"),
+  jobSearchButton: document.getElementById("jobSearchButton"),
   jobsBody: document.getElementById("jobsBody"),
   searchInput: document.getElementById("searchInput"),
   searchButton: document.getElementById("searchButton"),
@@ -876,7 +884,7 @@ function renderActiveChat() {
       addMessage("You", message.text || "");
     }
   }
-  els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
+  scrollChatToBottom(true);
 }
 
 async function refreshHealth() {
@@ -1344,15 +1352,18 @@ function createPdfRow(item, options = {}) {
 
 async function refreshJobs() {
   try {
+    const isAll = state.jobsPageSize === "all";
+    state.jobsLimit = isAll ? 0 : (Number(state.jobsPageSize) || 10);
     const params = new URLSearchParams({
       offset: String(state.jobsOffset),
       limit: String(state.jobsLimit),
+      search: state.jobSearch,
     });
     const data = await requestJson(`/api/jobs?${params}`);
     state.jobsTotal = data.total || 0;
     const wasActive = state.jobsActive;
     state.jobsActive = Number(data.active_count || 0) > 0;
-    if (state.jobsOffset >= state.jobsTotal && state.jobsOffset > 0) {
+    if (!isAll && state.jobsOffset >= state.jobsTotal && state.jobsOffset > 0) {
       state.jobsOffset = Math.max(0, Math.floor((state.jobsTotal - 1) / state.jobsLimit) * state.jobsLimit);
       return refreshJobs();
     }
@@ -1374,14 +1385,20 @@ async function refreshJobs() {
       `;
       els.jobsBody.appendChild(row);
     }
-    updatePageControls({
-      total: state.jobsTotal,
-      offset: state.jobsOffset,
-      limit: state.jobsLimit,
-      label: els.jobsPageLabel,
-      prevButton: els.prevJobsPageButton,
-      nextButton: els.nextJobsPageButton,
-    });
+    if (isAll) {
+      els.jobsPageLabel.textContent = `All ${state.jobsTotal} jobs`;
+      els.prevJobsPageButton.disabled = true;
+      els.nextJobsPageButton.disabled = true;
+    } else {
+      updatePageControls({
+        total: state.jobsTotal,
+        offset: state.jobsOffset,
+        limit: state.jobsLimit,
+        label: els.jobsPageLabel,
+        prevButton: els.prevJobsPageButton,
+        nextButton: els.nextJobsPageButton,
+      });
+    }
     if (wasActive && !state.jobsActive) {
       await refreshPdfs();
       await refreshHealth();
@@ -1424,6 +1441,8 @@ async function handleJobAction(event) {
 
 async function refreshPdfs() {
   try {
+    const isAll = state.pdfPageSize === "all";
+    state.pdfLimit = isAll ? 0 : (Number(state.pdfPageSize) || 10);
     const params = new URLSearchParams({
       offset: String(state.pdfOffset),
       limit: String(state.pdfLimit),
@@ -1431,19 +1450,25 @@ async function refreshPdfs() {
     });
     const data = await requestJson(`/api/pdfs?${params}`);
     state.pdfTotal = data.total || 0;
-    if (state.pdfOffset >= state.pdfTotal && state.pdfOffset > 0) {
+    if (!isAll && state.pdfOffset >= state.pdfTotal && state.pdfOffset > 0) {
       state.pdfOffset = Math.max(0, Math.floor((state.pdfTotal - 1) / state.pdfLimit) * state.pdfLimit);
       return refreshPdfs();
     }
     renderPdfRows(data.pdfs || []);
-    updatePageControls({
-      total: state.pdfTotal,
-      offset: state.pdfOffset,
-      limit: state.pdfLimit,
-      label: els.pdfPageLabel,
-      prevButton: els.prevPdfPageButton,
-      nextButton: els.nextPdfPageButton,
-    });
+    if (isAll) {
+      els.pdfPageLabel.textContent = `All ${state.pdfTotal} PDFs`;
+      els.prevPdfPageButton.disabled = true;
+      els.nextPdfPageButton.disabled = true;
+    } else {
+      updatePageControls({
+        total: state.pdfTotal,
+        offset: state.pdfOffset,
+        limit: state.pdfLimit,
+        label: els.pdfPageLabel,
+        prevButton: els.prevPdfPageButton,
+        nextButton: els.nextPdfPageButton,
+      });
+    }
   } catch (error) {
     setStatus(els.uploadStatus, error.message, true);
   }
@@ -2264,6 +2289,14 @@ async function handleIndexAction(event) {
   }
 }
 
+function scrollChatToBottom(force = false) {
+  const el = els.chatMessages;
+  const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+  if (force || distanceFromBottom <= CHAT_AUTO_SCROLL_THRESHOLD) {
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
 function addMessage(role, text = "") {
   const message = document.createElement("div");
   message.className = "message";
@@ -2275,7 +2308,7 @@ function addMessage(role, text = "") {
   body.textContent = text;
   message.append(roleLabel, body);
   els.chatMessages.appendChild(message);
-  els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
+  scrollChatToBottom(true);
   return body;
 }
 
@@ -2339,7 +2372,7 @@ function addAssistantMessage() {
 
   message.append(roleLabel, thinking, sources, notice, body, toolResultsPanel);
   els.chatMessages.appendChild(message);
-  els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
+  scrollChatToBottom(true);
   return {
     body,
     answerStable,
@@ -2893,7 +2926,7 @@ async function sendQuestion(event) {
       } catch (_) {
         appendStreamEvent(assistantParts, { type: "answer", text: line });
       }
-      els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
+      scrollChatToBottom();
     };
 
     while (true) {
@@ -3311,19 +3344,53 @@ if (els.pdfBulkClearButton) {
   els.pdfBulkClearButton.addEventListener("click", clearPdfSelection);
 }
 els.jobsBody.addEventListener("click", handleJobAction);
+els.jobSearchButton.addEventListener("click", () => {
+  state.jobSearch = els.jobSearchInput.value.trim();
+  state.jobsOffset = 0;
+  refreshJobs();
+});
+els.jobSearchInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    state.jobSearch = els.jobSearchInput.value.trim();
+    state.jobsOffset = 0;
+    refreshJobs();
+  }
+});
+els.pdfPageSizeSelect.addEventListener("change", () => {
+  state.pdfPageSize = els.pdfPageSizeSelect.value;
+  state.pdfOffset = 0;
+  refreshPdfs();
+});
+els.jobsPageSizeSelect.addEventListener("change", () => {
+  state.jobsPageSize = els.jobsPageSizeSelect.value;
+  state.jobsOffset = 0;
+  refreshJobs();
+});
 els.prevPdfPageButton.addEventListener("click", () => {
+  if (state.pdfPageSize === "all") {
+    return;
+  }
   state.pdfOffset = Math.max(0, state.pdfOffset - state.pdfLimit);
   refreshPdfs();
 });
 els.nextPdfPageButton.addEventListener("click", () => {
+  if (state.pdfPageSize === "all") {
+    return;
+  }
   state.pdfOffset += state.pdfLimit;
   refreshPdfs();
 });
 els.prevJobsPageButton.addEventListener("click", () => {
+  if (state.jobsPageSize === "all") {
+    return;
+  }
   state.jobsOffset = Math.max(0, state.jobsOffset - state.jobsLimit);
   refreshJobs();
 });
 els.nextJobsPageButton.addEventListener("click", () => {
+  if (state.jobsPageSize === "all") {
+    return;
+  }
   state.jobsOffset += state.jobsLimit;
   refreshJobs();
 });

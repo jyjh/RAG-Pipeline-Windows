@@ -14,9 +14,9 @@
       </div>
       <div class="app-header-actions">
         <nav class="tabs" aria-label="Views">
-          <button class="tab active" data-tab-target="upload">Documents</button>
+          <button class="tab" data-tab-target="upload">Documents</button>
           <button class="tab" data-tab-target="index">Review</button>
-          <button class="tab" data-tab-target="chat">Ask</button>
+          <button class="tab active" data-tab-target="chat">Ask</button>
           <button class="tab" data-tab-target="guide">Guide</button>
         </nav>
         <button id="updateButton" class="update-button update-checking" type="button" title="Checking for updates">
@@ -26,7 +26,7 @@
     </header>
 
     <main>
-      <section id="upload" class="panel active">
+      <section id="upload" class="panel">
         <div id="uploadDropZone" class="upload-drop-zone">
           <div class="toolbar">
             <input id="fileInput" type="file" accept="application/pdf,.pdf" multiple />
@@ -51,6 +51,16 @@
         </div>
         <div class="toolbar table-pager">
           <strong>PDFs</strong>
+          <label class="inline-select-label">
+            Rows
+            <select id="pdfPageSizeSelect">
+              <option value="10" selected>10</option>
+              <option value="20">20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+              <option value="all">All</option>
+            </select>
+          </label>
           <button id="prevPdfPageButton" type="button">Prev</button>
           <span id="pdfPageLabel"></span>
           <button id="nextPdfPageButton" type="button">Next</button>
@@ -74,6 +84,18 @@
         </table>
         <div class="toolbar table-pager">
           <strong>Jobs</strong>
+          <input id="jobSearchInput" type="search" placeholder="Search jobs" />
+          <button id="jobSearchButton" type="button">Search</button>
+          <label class="inline-select-label">
+            Rows
+            <select id="jobsPageSizeSelect">
+              <option value="10" selected>10</option>
+              <option value="20">20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+              <option value="all">All</option>
+            </select>
+          </label>
           <button id="prevJobsPageButton" type="button">Prev</button>
           <span id="jobsPageLabel"></span>
           <button id="nextJobsPageButton" type="button">Next</button>
@@ -134,7 +156,7 @@
         </table>
       </section>
 
-      <section id="chat" class="panel chat-panel">
+      <section id="chat" class="panel chat-panel active">
         <div id="chatLayout" class="chat-layout">
           <aside id="chatSidebar" class="chat-sidebar" aria-label="Saved chats">
             <div class="chat-sidebar-header">
