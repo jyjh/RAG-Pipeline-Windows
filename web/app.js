@@ -32,6 +32,7 @@ const state = {
   uploadDragDepth: 0,
   pendingForceUploadToken: "",
   sourceGroupPromptResolver: null,
+  selectedPdfHashes: new Set(),
   walkthroughFakePdfPinned: false,
   walkthroughFakePdfVisible: false,
   walkthroughIndex: -1,
@@ -136,6 +137,11 @@ const els = {
   cachePromptDoneButton: document.getElementById("cachePromptDoneButton"),
   sourceGroupPromptOverlay: document.getElementById("sourceGroupPromptOverlay"),
   sourceGroupPromptCancelButton: document.getElementById("sourceGroupPromptCancelButton"),
+  pdfSelectAllCheckbox: document.getElementById("pdfSelectAllCheckbox"),
+  pdfBulkActionBar: document.getElementById("pdfBulkActionBar"),
+  pdfBulkCountLabel: document.getElementById("pdfBulkCountLabel"),
+  pdfBulkTagButton: document.getElementById("pdfBulkTagButton"),
+  pdfBulkClearButton: document.getElementById("pdfBulkClearButton"),
 };
 
 const walkthroughSteps = [
@@ -1098,6 +1104,126 @@ function chooseSourceGroup() {
   });
 }
 
+function togglePdfSelection(hash, checked) {
+  if (!hash) {
+    return;
+  }
+  if (checked) {
+    state.selectedPdfHashes.add(hash);
+  } else {
+    state.selectedPdfHashes.delete(hash);
+  }
+}
+
+function visibleUntaggedRowCheckboxes() {
+  if (!els.pdfsBody) {
+    return [];
+  }
+  return Array.from(els.pdfsBody.querySelectorAll("input.pdf-row-select[data-pdf-select]"));
+}
+
+function selectAllUntaggedPdfs(checked) {
+  const checkboxes = visibleUntaggedRowCheckboxes();
+  for (const checkbox of checkboxes) {
+    const hash = checkbox.dataset.pdfSelect || "";
+    checkbox.checked = checked;
+    togglePdfSelection(hash, checked);
+    const row = checkbox.closest("tr");
+    if (row) {
+      row.classList.toggle("pdf-row-selected", checked);
+    }
+  }
+  updatePdfBulkBar();
+  syncPdfSelectAllState();
+}
+
+function clearPdfSelection() {
+  state.selectedPdfHashes.clear();
+  visibleUntaggedRowCheckboxes().forEach((checkbox) => {
+    checkbox.checked = false;
+    const row = checkbox.closest("tr");
+    if (row) {
+      row.classList.remove("pdf-row-selected");
+    }
+  });
+  updatePdfBulkBar();
+  syncPdfSelectAllState();
+}
+
+function syncPdfSelectAllState() {
+  const headerCheckbox = els.pdfSelectAllCheckbox;
+  if (!headerCheckbox) {
+    return;
+  }
+  const checkboxes = visibleUntaggedRowCheckboxes();
+  const total = checkboxes.length;
+  const checked = checkboxes.filter((checkbox) => checkbox.checked).length;
+  headerCheckbox.checked = total > 0 && checked === total;
+  headerCheckbox.indeterminate = checked > 0 && checked < total;
+}
+
+function updatePdfBulkBar() {
+  const bar = els.pdfBulkActionBar;
+  const label = els.pdfBulkCountLabel;
+  const count = state.selectedPdfHashes.size;
+  if (bar) {
+    bar.hidden = count === 0;
+  }
+  if (label) {
+    label.textContent = `${count} selected`;
+  }
+  if (els.pdfBulkTagButton) {
+    els.pdfBulkTagButton.disabled = count === 0;
+  }
+}
+
+function syncPdfSelectionAfterRender() {
+  const liveHashes = new Set(
+    visibleUntaggedRowCheckboxes().map((checkbox) => checkbox.dataset.pdfSelect || "")
+  );
+  for (const hash of Array.from(state.selectedPdfHashes)) {
+    if (!liveHashes.has(hash)) {
+      state.selectedPdfHashes.delete(hash);
+    }
+  }
+  syncPdfSelectAllState();
+  updatePdfBulkBar();
+}
+
+async function applyBulkTagGroup() {
+  const hashes = Array.from(state.selectedPdfHashes);
+  if (!hashes.length) {
+    return;
+  }
+  const sourceGroup = await chooseSourceGroup();
+  if (!sourceGroup) {
+    return;
+  }
+  let successCount = 0;
+  const failures = [];
+  for (const hash of hashes) {
+    try {
+      await requestJson(`/api/pdfs/${encodeURIComponent(hash)}/trust`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source_group: sourceGroup }),
+      });
+      successCount += 1;
+    } catch (error) {
+      failures.push(`${hash.slice(0, 8)}: ${error.message}`);
+    }
+  }
+  clearPdfSelection();
+  const label = SOURCE_GROUP_LABELS[sourceGroup] || sourceGroup;
+  const summary = `Tagged ${successCount} PDF${successCount === 1 ? "" : "s"} as ${label}.`;
+  if (failures.length) {
+    setStatus(els.uploadStatus, `${summary} ${failures.length} failed: ${failures.join("; ")}`, true);
+  } else {
+    setStatus(els.uploadStatus, summary);
+  }
+  await refreshPdfs();
+}
+
 function formatBrowserTimestamp(value) {
   const text = String(value || "").trim();
   if (!text) {
@@ -1183,15 +1309,24 @@ function createPdfRow(item, options = {}) {
   const row = document.createElement("tr");
   const trust = item.trust && typeof item.trust === "object" ? item.trust : {};
   const isUntagged = String(trust.source_group || "ungrouped") === "ungrouped";
+  const isFakeRow = Boolean(options.fake);
+  const sourceHash = String(item.hash || "");
   row.classList.toggle("pdf-untagged-row", isUntagged);
-  if (options.fake) {
+  if (isFakeRow) {
     row.id = "walkthroughFakePdfRow";
     row.classList.add("walkthrough-fake-pdf-row");
   }
   const download = item.download_url
     ? `<a class="download-link" href="${escapeHtml(item.download_url)}">Download</a>`
     : escapeHtml(item.path_error || "");
+  const selectCell = isUntagged && sourceHash && sourceHash !== WALKTHROUGH_FAKE_PDF_HASH
+    ? `<td class="pdf-select-col"><input type="checkbox" class="pdf-row-select" data-pdf-select="${escapeHtml(sourceHash)}" title="Select this untagged PDF"${state.selectedPdfHashes.has(sourceHash) ? " checked" : ""} /></td>`
+    : `<td class="pdf-select-col"></td>`;
+  if (state.selectedPdfHashes.has(sourceHash) && isUntagged && !isFakeRow) {
+    row.classList.add("pdf-row-selected");
+  }
   row.innerHTML = `
+    ${selectCell}
     <td>
       <div class="pdf-title-line">
         <strong>${escapeHtml(item.filename || item.hash)}</strong>
@@ -2873,6 +3008,7 @@ function renderPdfRows(items) {
       window.requestAnimationFrame(() => highlightWalkthroughTarget(step.target));
     }
   }
+  syncPdfSelectionAfterRender();
 }
 
 function clearWalkthroughHighlight() {
@@ -3082,6 +3218,15 @@ document.addEventListener("keydown", (event) => {
   }
   if (event.key === "Escape" && els.sourceGroupPromptOverlay && !els.sourceGroupPromptOverlay.hidden) {
     closeSourceGroupPrompt("");
+    return;
+  }
+  if (els.sourceGroupPromptOverlay && !els.sourceGroupPromptOverlay.hidden && (event.ctrlKey || event.metaKey)) {
+    const HOTKEY_SOURCE_GROUPS = { "1": "official", "2": "student_research", "3": "unofficial" };
+    const choice = HOTKEY_SOURCE_GROUPS[event.key];
+    if (choice) {
+      event.preventDefault();
+      closeSourceGroupPrompt(parseSourceGroupInput(choice));
+    }
   }
 });
 els.cachePromptReloadButton.addEventListener("click", reloadAfterCacheClear);
@@ -3140,6 +3285,31 @@ els.reviewerNameInput.addEventListener("keydown", (event) => {
   }
 });
 els.pdfsBody.addEventListener("click", handlePdfAction);
+els.pdfsBody.addEventListener("change", (event) => {
+  const checkbox = event.target.closest("input.pdf-row-select[data-pdf-select]");
+  if (!checkbox) {
+    return;
+  }
+  const hash = checkbox.dataset.pdfSelect || "";
+  togglePdfSelection(hash, checkbox.checked);
+  const row = checkbox.closest("tr");
+  if (row) {
+    row.classList.toggle("pdf-row-selected", checkbox.checked);
+  }
+  updatePdfBulkBar();
+  syncPdfSelectAllState();
+});
+if (els.pdfSelectAllCheckbox) {
+  els.pdfSelectAllCheckbox.addEventListener("change", () => {
+    selectAllUntaggedPdfs(els.pdfSelectAllCheckbox.checked);
+  });
+}
+if (els.pdfBulkTagButton) {
+  els.pdfBulkTagButton.addEventListener("click", applyBulkTagGroup);
+}
+if (els.pdfBulkClearButton) {
+  els.pdfBulkClearButton.addEventListener("click", clearPdfSelection);
+}
 els.jobsBody.addEventListener("click", handleJobAction);
 els.prevPdfPageButton.addEventListener("click", () => {
   state.pdfOffset = Math.max(0, state.pdfOffset - state.pdfLimit);

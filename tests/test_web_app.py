@@ -2851,6 +2851,21 @@ def test_frontend_pdf_trust_actions_record_reviewer_name():
     assert "color: var(--danger)" in styles
     assert ".source-group-actions" in styles
     assert "#reviewerNameInput" in styles
+    # Source-group popup hotkeys (Ctrl+1/2/3) + multi-select bulk tagging.
+    assert 'source-group-hotkey">Ctrl+1' in markup
+    assert 'source-group-hotkey">Ctrl+2' in markup
+    assert 'source-group-hotkey">Ctrl+3' in markup
+    assert 'id="pdfSelectAllCheckbox"' in markup
+    assert 'id="pdfBulkActionBar"' in markup
+    assert 'id="pdfBulkTagButton"' in markup
+    assert ".source-group-hotkey" in styles
+    assert ".pdf-select-col" in styles
+    assert ".pdf-bulk-bar" in styles
+    assert "HOTKEY_SOURCE_GROUPS" in script
+    assert "selectedPdfHashes" in script
+    assert "applyBulkTagGroup" in script
+    assert "selectAllUntaggedPdfs" in script
+    assert "data-pdf-select=" in script
 
 
 def test_frontend_delete_control_lives_in_documents_panel():

@@ -384,6 +384,42 @@ input[type="file"] {
   border-left: 4px solid var(--danger);
 }
 
+.pdf-row-selected {
+  background: #fde8e8;
+}
+
+.pdf-row-selected.pdf-untagged-row td:first-child {
+  border-left-color: var(--accent);
+}
+
+.pdf-select-col {
+  width: 36px;
+  text-align: center;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.pdf-select-col input[type="checkbox"] {
+  cursor: pointer;
+}
+
+.pdf-bulk-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  background: #fdecec;
+  border: 1px solid #f0c8c8;
+}
+
+.pdf-bulk-bar[hidden] {
+  display: none;
+}
+
+.pdf-bulk-bar #pdfBulkCountLabel {
+  color: var(--danger);
+}
+
 .walkthrough-fake-pdf-row {
   outline: 2px dashed var(--danger);
   outline-offset: -4px;
@@ -692,6 +728,18 @@ input[type="file"] {
 .source-group-actions span {
   color: var(--muted);
   font-size: 12px;
+}
+
+.source-group-hotkey {
+  justify-self: start;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--muted);
+  font-family: "Consolas", "SF Mono", ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .modal-actions {

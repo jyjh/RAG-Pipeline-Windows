@@ -55,9 +55,15 @@
           <span id="pdfPageLabel"></span>
           <button id="nextPdfPageButton" type="button">Next</button>
         </div>
+        <div id="pdfBulkActionBar" class="toolbar pdf-bulk-bar" hidden>
+          <strong id="pdfBulkCountLabel">0 selected</strong>
+          <button id="pdfBulkTagButton" type="button">Tag selected</button>
+          <button id="pdfBulkClearButton" type="button">Clear</button>
+        </div>
         <table id="pdfsTable" class="data-table pdf-table">
           <thead>
             <tr>
+              <th class="pdf-select-col"><input id="pdfSelectAllCheckbox" type="checkbox" title="Select all untagged PDFs on this page" /></th>
               <th>PDF</th>
               <th>Status</th>
               <th>Quality</th>
@@ -296,14 +302,17 @@
           <button type="button" data-source-group-choice="official">
             <strong>Official</strong>
             <span>Weight 1.00</span>
+            <span class="source-group-hotkey">Ctrl+1</span>
           </button>
           <button type="button" data-source-group-choice="student_research">
             <strong>Student Research</strong>
             <span>Weight 0.90</span>
+            <span class="source-group-hotkey">Ctrl+2</span>
           </button>
           <button type="button" data-source-group-choice="unofficial">
             <strong>Unofficial</strong>
             <span>Weight 0.80</span>
+            <span class="source-group-hotkey">Ctrl+3</span>
           </button>
         </div>
         <div class="modal-actions">

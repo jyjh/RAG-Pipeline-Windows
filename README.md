@@ -107,6 +107,7 @@ Download the required local models:
 & $ollama pull gemma4
 & $ollama pull nomic-embed-text
 & $ollama pull qwen2.5vl:7b
+& $ollama pull qwen2.5:1.5b
 & $ollama list
 ```
 
