@@ -680,6 +680,11 @@ def test_run_ingestion_refuses_empty_markdown(monkeypatch, safe_tmp_path):
     assert not (output_dir / ".source_map.json").exists()
 
 
+def test_run_ingestion_fails_clearly_when_input_path_missing(safe_tmp_path):
+    with pytest.raises(RuntimeError, match="PDF input path does not exist"):
+        run_ingestion(str(safe_tmp_path / "missing.pdf"), str(safe_tmp_path / "processed"), progress_enabled=False)
+
+
 def test_run_ingestion_removes_stale_assets_before_processing(monkeypatch, safe_tmp_path):
     input_pdf = safe_tmp_path / "source.pdf"
     input_pdf.write_bytes(b"%PDF-1.4 source")

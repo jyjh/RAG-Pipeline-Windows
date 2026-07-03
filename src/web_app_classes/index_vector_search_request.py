@@ -11,11 +11,11 @@ bind_module_namespace(
 
 
 class IndexVectorSearchRequest(BaseModel):
-    query: str
-    relevance_floor: float = DEFAULT_INDEX_VECTOR_RELEVANCE_FLOOR
+    query: str = Field(min_length=1)
+    relevance_floor: float = Field(DEFAULT_INDEX_VECTOR_RELEVANCE_FLOOR, ge=0, le=1)
     embedding_model: str | None = DEFAULT_EMBEDDING_MODEL
-    embedding_batch_size: int | None = DEFAULT_EMBEDDING_BATCH_SIZE
-    embedding_timeout: float | None = DEFAULT_EMBEDDING_TIMEOUT
+    embedding_batch_size: int | None = Field(DEFAULT_EMBEDDING_BATCH_SIZE, ge=1, le=256)
+    embedding_timeout: float | None = Field(DEFAULT_EMBEDDING_TIMEOUT, gt=0)
 
 IndexVectorSearchRequest.__module__ = _source_module.__name__
 finalize_split_class(_source_module, IndexVectorSearchRequest)

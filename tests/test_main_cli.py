@@ -172,7 +172,7 @@ def test_main_index_dispatches_to_current_indexing(monkeypatch):
     }
 
 
-def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
+def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys, tmp_path):
     calls = {}
 
     class FakeQueryEngine:
@@ -235,6 +235,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
             return "answer text"
 
     monkeypatch.setattr(main, "QueryEngine", FakeQueryEngine)
+    monkeypatch.chdir(tmp_path)
 
     result = main.main(
         [
@@ -279,3 +280,101 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys):
         "question": "What is regularization?",
     }
     assert capsys.readouterr().out.strip() == "answer text"
+
+
+def test_main_query_reads_config_defaults_and_cli_flags_override(monkeypatch, capsys, tmp_path):
+    tmp_path.joinpath("config.toml").write_text(
+        "\n".join(
+            [
+                "[paths]",
+                'asset_dir = "configured-assets"',
+                "[models]",
+                'llm_model = "configured-llm"',
+                'embedding_model = "configured-embed"',
+                "[chat]",
+                "llm_num_predict = 123",
+                "llm_timeout = 77.5",
+                "temperature = 0.8",
+                "max_k = 12",
+                "context_window = 2048",
+                'planner_model = "configured-planner"',
+                "planner_enabled = true",
+                "planner_max_queries = 4",
+                'system_prompt = "configured prompt"',
+                "[retrieval]",
+                "candidate_top_k = 44",
+                "min_relevance_score = 0.25",
+                "relative_relevance_cutoff = 0.4",
+                "context_token_fraction = 0.5",
+                "[web_search]",
+                "enabled = true",
+                "timeout_seconds = 3.5",
+                "max_results = 9",
+                "[ollama]",
+                "chat_health_check_interval_seconds = 1.5",
+                "chat_max_lost_health_checks = 2",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    calls = {}
+
+    class FakeQueryEngine:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+        def ask(self, question):
+            calls["question"] = question
+            return "configured answer"
+
+    monkeypatch.setattr(main, "QueryEngine", FakeQueryEngine)
+    monkeypatch.chdir(tmp_path)
+
+    result = main.main(
+        [
+            "--mode",
+            "query",
+            "--db_dir",
+            "db-in",
+            "--question",
+            "Configured?",
+            "--llm_model",
+            "flag-llm",
+            "--embedding_model",
+            "flag-embed",
+            "--retrieval_min_score",
+            "0.7",
+            "--web_search_max_results",
+            "2",
+            "--no_web_search",
+            "--no_planner",
+            "--planner_max_queries",
+            "6",
+        ]
+    )
+
+    assert result == 0
+    assert calls["working_dir"] == "db-in"
+    assert calls["asset_dir"] == "configured-assets"
+    assert calls["model"] == "flag-llm"
+    assert calls["embedding_model"] == "flag-embed"
+    assert calls["llm_num_predict"] == 123
+    assert calls["llm_timeout"] == 77.5
+    assert calls["temperature"] == 0.8
+    assert calls["sampler_top_k"] == 12
+    assert calls["context_window"] == 2048
+    assert calls["retrieval_candidate_k"] == 44
+    assert calls["retrieval_min_score"] == 0.7
+    assert calls["retrieval_relative_cutoff"] == 0.4
+    assert calls["context_token_fraction"] == 0.5
+    assert calls["web_search_enabled"] is False
+    assert calls["web_search_timeout"] == 3.5
+    assert calls["web_search_max_results"] == 2
+    assert calls["ollama_health_check_interval"] == 1.5
+    assert calls["ollama_max_lost_health_checks"] == 2
+    assert calls["system_prompt"] == "configured prompt"
+    assert calls["planner_model"] == "configured-planner"
+    assert calls["planner_enabled"] is False
+    assert calls["planner_max_queries"] == 6
+    assert calls["question"] == "Configured?"
+    assert capsys.readouterr().out.strip() == "configured answer"

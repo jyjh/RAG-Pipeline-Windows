@@ -213,11 +213,13 @@ def _ollama_chat(
     if stream:
         return _ollama_chat_stream(
             payload,
+            timeout=timeout,
             health_check_interval=health_check_interval,
             max_lost_health_checks=max_lost_health_checks,
         )
     return _ollama_chat_once(
         payload,
+        timeout=timeout,
         health_check_interval=health_check_interval,
         max_lost_health_checks=max_lost_health_checks,
     )
@@ -270,13 +272,14 @@ def _connection_lost_error(kind: str, exc: BaseException, *, max_lost_health_che
 def _ollama_chat_once(
     payload: dict[str, Any],
     *,
+    timeout: float | None,
     health_check_interval: float,
     max_lost_health_checks: int,
 ) -> dict[str, Any]:
     retries_after_recovery = 0
     while True:
         try:
-            with urllib.request.urlopen(_ollama_chat_request(payload), timeout=None) as response:
+            with urllib.request.urlopen(_ollama_chat_request(payload), timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except (TimeoutError, socket.timeout, urllib.error.URLError, OSError) as exc:
             recovered = _wait_for_ollama_recovery(
@@ -296,6 +299,7 @@ def _ollama_chat_once(
 def _ollama_chat_stream(
     payload: dict[str, Any],
     *,
+    timeout: float | None,
     health_check_interval: float,
     max_lost_health_checks: int,
 ):
@@ -303,7 +307,7 @@ def _ollama_chat_stream(
         retries_after_recovery = 0
         while True:
             try:
-                with urllib.request.urlopen(_ollama_chat_request(payload), timeout=None) as response:
+                with urllib.request.urlopen(_ollama_chat_request(payload), timeout=timeout) as response:
                     for raw_line in response:
                         line = raw_line.decode("utf-8").strip()
                         if not line:

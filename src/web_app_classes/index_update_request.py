@@ -11,11 +11,11 @@ bind_module_namespace(
 
 
 class IndexUpdateRequest(BaseModel):
-    record_id: str
-    content: str
+    record_id: str = Field(min_length=1)
+    content: str = Field(min_length=1)
     embedding_model: str | None = None
-    embedding_batch_size: int | None = DEFAULT_EMBEDDING_BATCH_SIZE
-    embedding_timeout: float | None = DEFAULT_EMBEDDING_TIMEOUT
+    embedding_batch_size: int | None = Field(DEFAULT_EMBEDDING_BATCH_SIZE, ge=1, le=256)
+    embedding_timeout: float | None = Field(DEFAULT_EMBEDDING_TIMEOUT, gt=0)
 
 IndexUpdateRequest.__module__ = _source_module.__name__
 finalize_split_class(_source_module, IndexUpdateRequest)

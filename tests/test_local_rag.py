@@ -9,6 +9,7 @@ import numpy as np
 
 import src.local_rag as local_rag
 from src.asset_store import ImageAssetStore, image_asset_marker
+from src.index_overrides import load_index_overrides, persist_index_deletions, persist_index_edit
 from src.vector_store import LanceDBVectorStore
 
 
@@ -258,8 +259,8 @@ def test_ollama_chat_posts_directly_to_api_chat(monkeypatch):
         "http://127.0.0.1:11434/api/chat",
         "http://127.0.0.1:11434/api/chat",
     ]
-    assert calls[0]["timeout"] is None
-    assert calls[1]["timeout"] is None
+    assert calls[0]["timeout"] == 7.5
+    assert calls[1]["timeout"] == 8.5
     assert calls[0]["payload"]["model"] == "gemma4"
     assert calls[1]["payload"]["stream"] is True
 
@@ -291,11 +292,12 @@ def test_ollama_chat_cancels_after_lost_health_check_cycles(monkeypatch):
         raise AssertionError("Expected connection loss failure")
 
     assert calls[0]["url"] == "http://127.0.0.1:11434/api/chat"
-    assert calls[0]["timeout"] is None
+    assert calls[0]["timeout"] == 7.5
     assert [call["url"] for call in calls[1:]] == [
         "http://127.0.0.1:11434/api/version",
         "http://127.0.0.1:11434/api/version",
     ]
+    assert [call["timeout"] for call in calls[1:]] == [0.1, 0.1]
 
 
 def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
@@ -347,7 +349,9 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
         assert answer == "answer [S1]"
         assert calls[0]["model"] == "gemma4"
         assert calls[0]["tools"][0]["function"]["name"] == "search_local_context"
+        assert calls[0]["timeout"] is None
         assert calls[-1]["stream"] is True
+        assert calls[-1]["timeout"] is None
         assert calls[-1]["options"]["temperature"] == 0.3
         assert calls[-1]["options"]["top_k"] == 40
         assert calls[-1]["options"]["num_ctx"] == 8192
@@ -411,6 +415,7 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
 
         assert chunks == ["chunk ", "two [S1]"]
         assert calls[-1]["stream"] is True
+        assert calls[-1]["timeout"] is None
         assert calls[-1]["options"]["temperature"] == 0.3
         assert calls[-1]["options"]["top_k"] == 40
         assert calls[-1]["options"]["num_ctx"] == 8192
@@ -1302,6 +1307,125 @@ def test_local_indexer_reuses_unchanged_vectors(monkeypatch):
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
+def test_local_indexer_applies_persisted_overrides_when_reindexing(monkeypatch):
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
+    md_dir = tmp_path / "md"
+    live_db = tmp_path / "live-db"
+    staged_db = tmp_path / "staged-db"
+    md_dir.mkdir(parents=True)
+    try:
+        md_dir.joinpath("doc.md").write_text("content", encoding="utf-8")
+        keep_vector = [1.0] + [0.0] * 767
+        live_records = [
+            {
+                "id": "edited",
+                "doc_id": "doc",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": "doc.md",
+                "chunk_index": 0,
+                "content": "old content",
+                "title": "Edited",
+                "section_path": "Doc > Edited",
+                "page_start": 1,
+                "page_end": 1,
+                "summary": "summary",
+                "tags": [],
+                "source_hash": "hash-a",
+                "vector": [0.0, 1.0] + [0.0] * 766,
+            },
+            {
+                "id": "deleted",
+                "doc_id": "doc",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": "doc.md",
+                "chunk_index": 1,
+                "content": "delete content",
+                "title": "Deleted",
+                "section_path": "Doc > Deleted",
+                "page_start": 2,
+                "page_end": 2,
+                "summary": "summary",
+                "tags": [],
+                "source_hash": "hash-a",
+                "vector": [0.0, 0.0, 1.0] + [0.0] * 765,
+            },
+            {
+                "id": "kept",
+                "doc_id": "doc",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": "doc.md",
+                "chunk_index": 2,
+                "content": "keep content",
+                "title": "Kept",
+                "section_path": "Doc > Kept",
+                "page_start": 3,
+                "page_end": 3,
+                "summary": "summary",
+                "tags": [],
+                "source_hash": "hash-b",
+                "vector": keep_vector,
+            },
+        ]
+        LanceDBVectorStore(live_db).write_records(
+            live_records,
+            embedding_model="nomic-embed-text",
+            embedding_dim=768,
+        )
+        persist_index_edit(live_db, live_records[0], "edited content")
+        persist_index_deletions(live_db, [live_records[1]])
+        embedded_texts = []
+
+        class FakeEngine:
+            def __init__(self, **kwargs):
+                pass
+
+            def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+                if list(texts) == ["embedding health check"]:
+                    return np.asarray([[1.0] + [0.0] * 7], dtype=np.float32)
+                embedded_texts.extend(texts)
+                return np.asarray([[0.5] + [0.0] * 767 for _ in texts], dtype=np.float32)
+
+        def fake_build_section_records(*args, **kwargs):
+            records = []
+            for record in live_records:
+                item = dict(record)
+                item.pop("vector", None)
+                if item["id"] == "edited":
+                    item["content"] = "fresh source content"
+                records.append(item)
+            return records
+
+        monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+        monkeypatch.setattr(local_rag, "build_section_records", fake_build_section_records)
+
+        indexer = local_rag.LocalVectorIndexer(
+            working_dir=str(staged_db),
+            reuse_db_dir=str(live_db),
+            embedding_batch_size=8,
+            progress_enabled=False,
+        )
+        indexer.index_markdown(str(md_dir))
+
+        store = LanceDBVectorStore(staged_db)
+        assert store.get_record("edited")["content"] == "edited content"
+        assert store.get_record("kept")["vector"] == keep_vector
+        try:
+            store.get_record("deleted")
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("Deleted override should keep the record out of the rebuilt index")
+        assert embedded_texts == ["edited content"]
+        overrides = load_index_overrides(staged_db)
+        assert overrides["edits"]["edited"]["content"] == "edited content"
+        assert "deleted" in overrides["deletions"]
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def test_local_indexer_fails_fast_when_ollama_preflight_fails(monkeypatch):
     tmp_path = Path(tempfile.gettempdir()) / f"rag_test_local_rag_{uuid.uuid4().hex}"
     md_dir = tmp_path / "md"
@@ -1439,11 +1563,13 @@ def test_eager_local_tool_call_merges_multi_query_results(monkeypatch):
         monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
         # Force the planner to emit two queries; both resolve to the same chunk
         # via the FakeEngine embedding, so we can assert dedup happens.
-        monkeypatch.setattr(
-            local_rag,
-            "generate_search_queries",
-            lambda *args, **kwargs: ["alpha?", "alpha variant"],
-        )
+        planner_calls = []
+
+        def fake_generate_search_queries(*args, **kwargs):
+            planner_calls.append({"args": args, "kwargs": kwargs})
+            return ["alpha?", "alpha variant"]
+
+        monkeypatch.setattr(local_rag, "generate_search_queries", fake_generate_search_queries)
 
         engine = local_rag.LocalQueryEngine(
             working_dir=str(tmp_path),
@@ -1462,6 +1588,7 @@ def test_eager_local_tool_call_merges_multi_query_results(monkeypatch):
         )
 
         assert outcome is not None
+        assert planner_calls[0]["kwargs"]["timeout"] == local_rag.DEFAULT_PLANNER_TIMEOUT
         result, text = outcome
         assert result["tool"] == "search_local_context"
         assert result["planner_queries"] == ["alpha?", "alpha variant"]

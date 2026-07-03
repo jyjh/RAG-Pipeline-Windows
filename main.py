@@ -173,6 +173,37 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
     }
 
 
+def _load_query_config(config_path: Path | None = None) -> dict[str, Any]:
+    payload = _load_toml_config(config_path)
+    models = payload.get("models", {}) if isinstance(payload.get("models"), dict) else {}
+    chat = payload.get("chat", {}) if isinstance(payload.get("chat"), dict) else {}
+    retrieval = payload.get("retrieval", {}) if isinstance(payload.get("retrieval"), dict) else {}
+    web_search = payload.get("web_search", {}) if isinstance(payload.get("web_search"), dict) else {}
+    ollama = payload.get("ollama", {}) if isinstance(payload.get("ollama"), dict) else {}
+    return {
+        "llm_model": str(models.get("llm_model") or default_llm_model()),
+        "embedding_model": str(models.get("embedding_model") or "nomic-embed-text"),
+        "llm_num_predict": _as_positive_int(chat.get("llm_num_predict"), 4096),
+        "llm_timeout": _as_float(chat.get("llm_timeout"), 120.0),
+        "temperature": _as_float(chat.get("temperature"), 0.3),
+        "max_k": _as_positive_int(chat.get("max_k"), 40),
+        "context_window": _as_positive_int(chat.get("context_window"), 8192),
+        "retrieval_candidate_k": _as_positive_int(retrieval.get("candidate_top_k"), 80),
+        "retrieval_min_score": _as_float(retrieval.get("min_relevance_score"), 0.50),
+        "retrieval_relative_cutoff": _as_float(retrieval.get("relative_relevance_cutoff"), 0.72),
+        "context_token_fraction": _as_float(retrieval.get("context_token_fraction"), 0.60),
+        "web_search_enabled": _as_bool(web_search.get("enabled"), True),
+        "web_search_timeout": _as_float(web_search.get("timeout_seconds"), 8.0),
+        "web_search_max_results": _as_positive_int(web_search.get("max_results"), 5),
+        "ollama_health_check_interval": _as_float(ollama.get("chat_health_check_interval_seconds"), 5.0),
+        "ollama_max_lost_health_checks": _as_positive_int(ollama.get("chat_max_lost_health_checks"), 5),
+        "system_prompt": str(chat.get("system_prompt") or "") or None,
+        "planner_model": str(chat.get("planner_model") or default_planner_model()),
+        "planner_enabled": _as_bool(chat.get("planner_enabled"), True),
+        "planner_max_queries": _as_positive_int(chat.get("planner_max_queries"), default_planner_max_queries()),
+    }
+
+
 def _ingestion_args(args: argparse.Namespace) -> dict[str, Any]:
     config = _load_ingestion_config()
     return {
@@ -207,22 +238,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--md_dir", default="processed_docs", help="Generated Markdown directory")
     parser.add_argument("--db_dir", default="db", help="Local vector index directory")
     parser.add_argument("--asset_dir", default=None, help="Directory for stored image assets.")
-    parser.add_argument("--llm_model", default=default_llm_model(), help="Ollama LLM model")
+    parser.add_argument("--llm_model", default=None, help="Ollama LLM model")
     parser.add_argument(
         "--embedding_model",
-        default="nomic-embed-text",
+        default=None,
         help="Ollama embedding model name",
     )
     parser.add_argument(
         "--embedding_batch_size",
         type=int,
-        default=8,
+        default=None,
         help="Texts/chunks per Ollama embedding request.",
     )
     parser.add_argument(
         "--embedding_timeout",
         type=float,
-        default=30.0,
+        default=None,
         help="Seconds before one Ollama embedding HTTP request fails.",
     )
     parser.add_argument(
@@ -258,55 +289,55 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm_num_predict",
         type=int,
-        default=4096,
+        default=None,
         help="Maximum answer tokens to request from Ollama in query mode.",
     )
     parser.add_argument(
         "--llm_timeout",
         type=float,
-        default=120.0,
+        default=None,
         help="Deprecated compatibility option; Ollama chat generation no longer uses a request timeout.",
     )
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.3,
+        default=None,
         help="Ollama sampling temperature in query mode.",
     )
     parser.add_argument(
         "--max_k",
         type=int,
-        default=40,
+        default=None,
         help="Ollama top_k sampler setting in query mode.",
     )
     parser.add_argument(
         "--context_window",
         type=int,
-        default=8192,
+        default=None,
         help="Ollama num_ctx context window in query mode.",
     )
     parser.add_argument(
         "--retrieval_candidate_k",
         type=int,
-        default=80,
+        default=None,
         help="Candidate pool size for local vector retrieval before relevance cutoffs.",
     )
     parser.add_argument(
         "--retrieval_min_score",
         type=float,
-        default=0.50,
+        default=None,
         help="Minimum normalized relevance score for local context chunks.",
     )
     parser.add_argument(
         "--retrieval_relative_cutoff",
         type=float,
-        default=0.72,
+        default=None,
         help="Keep chunks with score at least this fraction of the best hit.",
     )
     parser.add_argument(
         "--context_token_fraction",
         type=float,
-        default=0.60,
+        default=None,
         help="Fraction of the model context window allowed for input prompt context, capped at 0.60.",
     )
     parser.add_argument(
@@ -317,18 +348,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--web_search_timeout",
         type=float,
-        default=8.0,
+        default=None,
         help="Seconds before a keyless web-search request fails.",
     )
     parser.add_argument(
         "--web_search_max_results",
         type=int,
-        default=5,
+        default=None,
         help="Maximum web-search results returned to the model per call.",
     )
     parser.add_argument(
         "--planner_model",
-        default=default_planner_model(),
+        default=None,
         help="Small Ollama model used to expand the question into retrieval queries before the main model runs.",
     )
     parser.add_argument(
@@ -339,19 +370,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--planner_max_queries",
         type=int,
-        default=default_planner_max_queries(),
+        default=None,
         help="Number of diverse search queries the planner model should generate.",
     )
     parser.add_argument(
         "--ollama_health_check_interval",
         type=float,
-        default=5.0,
+        default=None,
         help="Seconds between Ollama health checks after chat connection loss.",
     )
     parser.add_argument(
         "--ollama_max_lost_health_checks",
         type=int,
-        default=5,
+        default=None,
         help="Cancel chat only after this many failed Ollama health checks after connection loss.",
     )
     parser.add_argument(
@@ -465,9 +496,9 @@ def main(argv: list[str] | None = None) -> int:
                 args.md_dir,
                 args.db_dir,
                 progress_enabled=not args.no_progress,
-                embedding_model=args.embedding_model,
-                embedding_batch_size=args.embedding_batch_size,
-                embedding_timeout=args.embedding_timeout,
+                embedding_model=args.embedding_model or "nomic-embed-text",
+                embedding_batch_size=args.embedding_batch_size or 8,
+                embedding_timeout=args.embedding_timeout or 30.0,
                 index_backend=args.index_backend,
                 reuse_db_dir=args.reuse_db_dir,
                 summary_mode=args.summary_mode,
@@ -479,31 +510,56 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode == "query":
             if not args.question:
                 parser.error("--question is required when --mode query")
+            query_config = _load_query_config()
             answer = QueryEngine(
                 working_dir=args.db_dir,
                 asset_dir=args.asset_dir or _load_ingestion_config()["asset_dir"],
-                model=args.llm_model,
-                embedding_model=args.embedding_model,
-                embedding_batch_size=args.embedding_batch_size,
-                embedding_timeout=args.embedding_timeout,
-                llm_num_predict=args.llm_num_predict,
-                llm_timeout=args.llm_timeout,
-                temperature=args.temperature,
-                sampler_top_k=args.max_k,
-                context_window=args.context_window,
-                retrieval_candidate_k=args.retrieval_candidate_k,
-                retrieval_min_score=args.retrieval_min_score,
-                retrieval_relative_cutoff=args.retrieval_relative_cutoff,
-                context_token_fraction=args.context_token_fraction,
-                web_search_enabled=not args.no_web_search,
-                web_search_timeout=args.web_search_timeout,
-                web_search_max_results=args.web_search_max_results,
-                ollama_health_check_interval=args.ollama_health_check_interval,
-                ollama_max_lost_health_checks=args.ollama_max_lost_health_checks,
-                system_prompt=args.system_prompt,
-                planner_model=args.planner_model,
-                planner_enabled=not args.no_planner,
-                planner_max_queries=args.planner_max_queries,
+                model=args.llm_model or query_config["llm_model"],
+                embedding_model=args.embedding_model or query_config["embedding_model"],
+                embedding_batch_size=args.embedding_batch_size or 8,
+                embedding_timeout=args.embedding_timeout or 30.0,
+                llm_num_predict=args.llm_num_predict or query_config["llm_num_predict"],
+                llm_timeout=args.llm_timeout if args.llm_timeout is not None else query_config["llm_timeout"],
+                temperature=args.temperature if args.temperature is not None else query_config["temperature"],
+                sampler_top_k=args.max_k or query_config["max_k"],
+                context_window=args.context_window or query_config["context_window"],
+                retrieval_candidate_k=args.retrieval_candidate_k or query_config["retrieval_candidate_k"],
+                retrieval_min_score=(
+                    args.retrieval_min_score
+                    if args.retrieval_min_score is not None
+                    else query_config["retrieval_min_score"]
+                ),
+                retrieval_relative_cutoff=(
+                    args.retrieval_relative_cutoff
+                    if args.retrieval_relative_cutoff is not None
+                    else query_config["retrieval_relative_cutoff"]
+                ),
+                context_token_fraction=(
+                    args.context_token_fraction
+                    if args.context_token_fraction is not None
+                    else query_config["context_token_fraction"]
+                ),
+                web_search_enabled=query_config["web_search_enabled"] and not args.no_web_search,
+                web_search_timeout=(
+                    args.web_search_timeout
+                    if args.web_search_timeout is not None
+                    else query_config["web_search_timeout"]
+                ),
+                web_search_max_results=args.web_search_max_results or query_config["web_search_max_results"],
+                ollama_health_check_interval=(
+                    args.ollama_health_check_interval
+                    if args.ollama_health_check_interval is not None
+                    else query_config["ollama_health_check_interval"]
+                ),
+                ollama_max_lost_health_checks=(
+                    args.ollama_max_lost_health_checks
+                    if args.ollama_max_lost_health_checks is not None
+                    else query_config["ollama_max_lost_health_checks"]
+                ),
+                system_prompt=args.system_prompt if args.system_prompt is not None else query_config["system_prompt"],
+                planner_model=args.planner_model or query_config["planner_model"],
+                planner_enabled=query_config["planner_enabled"] and not args.no_planner,
+                planner_max_queries=args.planner_max_queries or query_config["planner_max_queries"],
                 progress_enabled=not args.no_progress,
             ).ask(args.question)
             print(answer)

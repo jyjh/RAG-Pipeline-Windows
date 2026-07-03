@@ -27,6 +27,8 @@ class QueueJob:
     options: dict[str, Any] = field(default_factory=dict)
     cancel_requested: bool = False
     error: str | None = None
+    log_tail: list[str] = field(default_factory=list)
+    log_line_count: int = 0
     created_at: str = field(default_factory=_utcnow)
     started_at: str | None = None
     finished_at: str | None = None
@@ -49,6 +51,8 @@ class QueueJob:
             "options": dict(self.options),
             "cancel_requested": self.cancel_requested,
             "error": self.error,
+            "log_tail": "\n".join(self.log_tail),
+            "log_line_count": self.log_line_count,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,

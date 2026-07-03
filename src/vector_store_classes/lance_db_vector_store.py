@@ -251,6 +251,13 @@ class LanceDBVectorStore:
         after = self.count()
         return {"deleted": before - after, "remaining": after}
 
+    def records_by_source_hash(self, source_hashes: list[str]) -> list[dict[str, Any]]:
+        hashes = sorted({str(value) for value in source_hashes if value})
+        if not hashes or not self.exists():
+            return []
+        rows = self._where(" OR ".join(f"source_hash = {sql_string(source_hash)}" for source_hash in hashes))
+        return [record_row(row) for row in rows]
+
     def search(self, vector: list[float], *, top_k: int) -> list[dict[str, Any]]:
         if not self.exists():
             return []

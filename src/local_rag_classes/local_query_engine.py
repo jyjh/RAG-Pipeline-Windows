@@ -871,7 +871,7 @@ class LocalQueryEngine:
                 messages=messages,
                 options=self._ollama_options(),
                 stream=False,
-                timeout=self.llm_timeout,
+                timeout=None,
                 health_check_interval=self.ollama_health_check_interval,
                 max_lost_health_checks=self.ollama_max_lost_health_checks,
                 tools=tools,
@@ -992,7 +992,7 @@ class LocalQueryEngine:
                 messages=messages,
                 options=self._ollama_options(),
                 stream=True,
-                timeout=self.llm_timeout,
+                timeout=None,
                 health_check_interval=self.ollama_health_check_interval,
                 max_lost_health_checks=self.ollama_max_lost_health_checks,
             )

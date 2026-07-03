@@ -29,13 +29,13 @@ def run_indexing(
     if not os.path.isdir(md_dir):
         logger.warning("Markdown directory does not exist: %s", md_dir)
         _progress_status(f"Markdown directory does not exist: {md_dir}", enabled=progress_enabled)
-        return
+        raise RuntimeError(f"Markdown directory does not exist: {md_dir}")
 
     md_files = sorted(f for f in os.listdir(md_dir) if f.endswith(".md"))
     _progress_status(f"Found {len(md_files)} Markdown file(s).", enabled=progress_enabled)
     if not md_files:
         logger.warning("No markdown files found in %s", md_dir)
-        return
+        raise RuntimeError(f"No Markdown files found in {md_dir}")
 
     from src.local_rag import LocalVectorIndexer
 

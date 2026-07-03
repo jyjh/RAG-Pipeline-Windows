@@ -980,6 +980,50 @@ input[type="file"] {
   color: var(--accent-strong);
 }
 
+/* Inline citations in the answer (e.g. [S1], [W1]) link to the Sources panel. */
+.citation-link {
+  color: var(--accent-strong);
+  text-decoration: none;
+  font-weight: 650;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.citation-link:hover {
+  text-decoration: underline;
+}
+
+.job-log {
+  margin-top: 6px;
+}
+
+.job-log summary {
+  color: var(--accent-strong);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.job-log pre {
+  max-height: 180px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #f8fafc;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Briefly highlight a source when jumped to via a citation click. */
+.source-item.source-highlight {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 2px;
+  border-radius: 4px;
+  background: #fbfcfd;
+  transition: outline 0.2s ease, background 0.2s ease;
+}
+
 .source-assets {
   display: flex;
   gap: 8px;

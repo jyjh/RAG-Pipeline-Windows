@@ -410,6 +410,8 @@ DocumentProcessor.__module__ = __name__
 
 def _iter_pdf_paths(input_path: str) -> list[Path]:
     path = Path(input_path)
+    if not path.exists():
+        raise RuntimeError(f"PDF input path does not exist: {input_path}")
     if path.is_file():
         return [path] if path.suffix.lower() == ".pdf" else []
     return sorted(p for p in path.iterdir() if p.is_file() and p.suffix.lower() == ".pdf")

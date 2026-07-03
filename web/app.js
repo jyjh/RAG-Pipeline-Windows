@@ -55,10 +55,16 @@ const INDEX_CHILD_BATCH_SIZE = 100;
 const CHAT_AUTO_SCROLL_THRESHOLD = 120;
 const CHAT_STORAGE_KEY = "rag.chatHistory.v1";
 const CHAT_UI_STORAGE_KEY = "rag.chatUi.v1";
+const CHAT_HISTORY_LIMIT = 30;
+const CHAT_MESSAGE_LIMIT = 120;
 const TUTORIAL_SEEN_COOKIE = "rag_tutorial_seen";
 const SITE_VERSION_COOKIE = "rag_site_version";
 const REVIEWER_NAME_COOKIE = "rag_reviewer_name";
+const DEBUG_MODE_COOKIE = "debug_mode";
 const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
+// Maps each assistant message DOM node to its streaming parts object, so
+// citation clicks can resolve the matching source panel.
+const assistantMessageParts = new WeakMap();
 const WALKTHROUGH_FAKE_PDF_HASH = "__walkthrough_fake_untagged_pdf__";
 const SOURCE_GROUP_LABELS = {
   official: "Official",
@@ -324,6 +330,11 @@ function getCookie(name) {
     }
   }
   return "";
+}
+
+function isDebugMode() {
+  const value = getCookie(DEBUG_MODE_COOKIE).trim().toLowerCase();
+  return value === "1" || value === "true";
 }
 
 function setCookie(name, value, maxAgeSeconds = COOKIE_MAX_AGE_SECONDS) {
@@ -694,11 +705,22 @@ function loadChatState() {
 }
 
 function persistChatState() {
+  const active = activeChat();
+  let chats = state.chats;
+  if (active && !chats.slice(0, CHAT_HISTORY_LIMIT).some((chat) => chat.id === active.id)) {
+    chats = [active, ...chats.filter((chat) => chat.id !== active.id)];
+  }
+  state.chats = chats.slice(0, CHAT_HISTORY_LIMIT);
   localStorage.setItem(
     CHAT_STORAGE_KEY,
     JSON.stringify({
       activeChatId: state.activeChatId,
-      chats: state.chats,
+      chats: state.chats.map((chat) => ({
+        ...chat,
+        messages: Array.isArray(chat.messages)
+          ? chat.messages.slice(-CHAT_MESSAGE_LIMIT)
+          : [],
+      })),
     }),
   );
 }
@@ -862,7 +884,9 @@ function addAssistantMessageToChat(chat, parts) {
     answerHtml: parts.answerStable.innerHTML,
     thinkingHtml: parts.rawThinking ? parts.thinkingStable.innerHTML : "",
     sources: parts.sources,
-    toolResults: parts.toolResults,
+    // Tool results are debug-only; skip persistence entirely when debug mode
+    // is off so they don't accumulate in chat history.
+    toolResults: isDebugMode() ? parts.toolResults : [],
     notice: parts.notice.textContent || "",
     createdAt: nowIso(),
   });
@@ -1375,12 +1399,16 @@ async function refreshJobs() {
       const cancelButton = canCancel
         ? `<button type="button" class="danger" data-job-action="cancel" data-job-id="${escapeHtml(job.id || "")}">Cancel</button>`
         : "";
+      const logTail = String(job.log_tail || "").trim();
+      const logBlock = logTail
+        ? `<details class="job-log"><summary>Log (${Number(job.log_line_count || 0)} lines)</summary><pre>${escapeHtml(logTail)}</pre></details>`
+        : "";
       row.innerHTML = `
         <td>${escapeHtml(job.id.slice(0, 8))}</td>
         <td>${escapeHtml(job.status)}</td>
         <td>${escapeHtml(job.phase)}</td>
         <td>${escapeHtml((job.filenames || []).join(", "))}</td>
-        <td>${escapeHtml(job.error || "")}</td>
+        <td>${escapeHtml(job.error || "")}${logBlock}</td>
         <td><div class="job-actions">${cancelButton}</div></td>
       `;
       els.jobsBody.appendChild(row);
@@ -1997,7 +2025,8 @@ function createIndexRow(item, options = {}) {
   const sourceName = item.source_pdf_name || item.file_path || item.title || item.id;
   const pageRange = indexPageRange(item);
   const childCount = indexChildCountLabel(item);
-  const meta = [indexNodeLabel(item), indexScoreLabel(item), indexReliabilityLabel(item), pageRange, childCount]
+  const editedLabel = item.edited ? "Edited" : "";
+  const meta = [indexNodeLabel(item), editedLabel, indexScoreLabel(item), indexReliabilityLabel(item), pageRange, childCount]
     .filter(Boolean)
     .join(" | ");
   row.innerHTML = `
@@ -2370,10 +2399,17 @@ function addAssistantMessage() {
   toolResultsBody.className = "tool-results-body";
   toolResultsPanel.append(toolResultsSummary, toolResultsBody);
 
-  message.append(roleLabel, thinking, sources, notice, body, toolResultsPanel);
+  // Sources and tool results sit below the answer body. The tool-results panel
+  // is only attached (and populated) when debug mode is enabled via the
+  // `debug_mode` cookie; it stays a detached stub otherwise so existing code
+  // can still assign to it without error.
+  message.append(roleLabel, thinking, notice, body, sources);
+  if (isDebugMode()) {
+    message.appendChild(toolResultsPanel);
+  }
   els.chatMessages.appendChild(message);
   scrollChatToBottom(true);
-  return {
+  const parts = {
     body,
     answerStable,
     answerTail,
@@ -2412,6 +2448,8 @@ function addAssistantMessage() {
     thinkingRenderInFlight: false,
     thinkingLastRenderAt: 0,
   };
+  assistantMessageParts.set(message, parts);
+  return parts;
 }
 
 function sourceTitle(source) {
@@ -2471,12 +2509,15 @@ function appendAssetPreviewGrid(container, assets, options = {}) {
 
 function renderSourcePanel(parts) {
   const sources = Array.isArray(parts.sources) ? parts.sources : [];
+  const wasOpen = parts.sourcesPanel.open;
   parts.sourcesPanel.hidden = sources.length === 0;
-  parts.sourcesPanel.open = sources.length > 0;
+  // Sources are collapsed by default; preserve an explicit user expand.
+  parts.sourcesPanel.open = wasOpen && sources.length > 0;
   parts.sourcesBody.innerHTML = "";
   for (const source of sources) {
     const item = document.createElement("div");
     item.className = "source-item";
+    item.dataset.citation = String(source.label || source.id || "").trim();
     const links = [];
     if (source.kind === "web" && source.url) {
       links.push(`<a href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">Open</a>`);
@@ -2502,6 +2543,90 @@ function renderSourcePanel(parts) {
     const assets = Array.isArray(source.assets) ? source.assets : [];
     appendAssetPreviewGrid(item, assets);
     parts.sourcesBody.appendChild(item);
+  }
+}
+
+const CITATION_PATTERN = /\[([SW]\d+)\]/g;
+
+// Walks the rendered answer and turns [S1]/[W1] tokens into clickable links
+// pointing at the matching source in the Sources panel. Markdown is rendered
+// server-side with HTML disabled, so the tokens always arrive as plain text
+// inside text nodes; this post-process links them without touching the HTML.
+function linkAnswerCitations(parts) {
+  const root = parts.answerStable;
+  if (!root) {
+    return;
+  }
+  const validLabels = new Set(
+    (Array.isArray(parts.sources) ? parts.sources : [])
+      .map((source) => String(source.label || source.id || "").trim())
+      .filter(Boolean),
+  );
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue || !/\[[SW]\d+\]/.test(node.nodeValue)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const targets = [];
+  let current = walker.nextNode();
+  while (current) {
+    targets.push(current);
+    current = walker.nextNode();
+  }
+  for (const textNode of targets) {
+    const text = textNode.nodeValue;
+    CITATION_PATTERN.lastIndex = 0;
+    if (!CITATION_PATTERN.test(text)) {
+      continue;
+    }
+    const fragment = document.createDocumentFragment();
+    let lastIndex = 0;
+    CITATION_PATTERN.lastIndex = 0;
+    let match = CITATION_PATTERN.exec(text);
+    while (match) {
+      if (match.index > lastIndex) {
+        fragment.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+      }
+      const label = match[0];
+      const isValid = validLabels.size === 0 || validLabels.has(label);
+      if (isValid) {
+        const link = document.createElement("a");
+        link.className = "citation-link";
+        link.href = "#";
+        link.dataset.citation = label;
+        link.textContent = label;
+        link.title = `Jump to source ${label}`;
+        fragment.appendChild(link);
+      } else {
+        fragment.appendChild(document.createTextNode(label));
+      }
+      lastIndex = CITATION_PATTERN.lastIndex;
+      match = CITATION_PATTERN.exec(text);
+    }
+    if (lastIndex < text.length) {
+      fragment.appendChild(document.createTextNode(text.slice(lastIndex)));
+    }
+    textNode.parentNode.replaceChild(fragment, textNode);
+  }
+}
+
+function focusSourceForCitation(parts, label) {
+  const panel = parts.sourcesPanel;
+  if (!panel || panel.hidden) {
+    return;
+  }
+  panel.open = true;
+  const selector = `.source-item[data-citation="${CSS.escape(label)}"]`;
+  const target = parts.sourcesBody.querySelector(selector);
+  if (target) {
+    target.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    target.classList.add("source-highlight");
+    setTimeout(() => target.classList.remove("source-highlight"), 2000);
+  } else {
+    panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 }
 
@@ -2616,6 +2741,12 @@ function fallbackToolResultEntries(parts) {
 }
 
 function renderToolResultsPanel(parts) {
+  if (!isDebugMode()) {
+    parts.toolResultsPanel.hidden = true;
+    parts.toolResultsPanel.open = false;
+    parts.toolResultsBody.innerHTML = "";
+    return;
+  }
   const entries = fallbackToolResultEntries(parts);
   parts.toolResultsPanel.hidden = entries.length === 0;
   parts.toolResultsPanel.open = entries.length > 0;
@@ -2716,6 +2847,7 @@ function addSavedAssistantMessage(saved) {
     parts.answerStable.textContent = parts.rawAnswer;
     parts.answerCommittedLength = parts.rawAnswer.length;
   }
+  linkAnswerCitations(parts);
   renderToolResultsPanel(parts);
   return parts;
 }
@@ -2771,7 +2903,6 @@ function appendStreamEvent(parts, event) {
     }
     markGemmaResponseStarted(parts);
     parts.thinking.hidden = false;
-    parts.thinking.open = true;
     parts.rawThinking += text;
     updateStreamTailRaw(parts, "thinking");
     queueMarkdownRender(parts, "thinking");
@@ -2868,6 +2999,10 @@ async function formatAssistantMessage(parts) {
   } catch (error) {
     addFormattingNotice(parts, error);
   } finally {
+    if (Array.isArray(parts.sources) && parts.sources.length) {
+      renderSourcePanel(parts);
+    }
+    linkAnswerCitations(parts);
     renderToolResultsPanel(parts);
   }
 }
@@ -3448,6 +3583,23 @@ els.newChatButton.addEventListener("click", () => {
 });
 els.collapseChatSidebarButton.addEventListener("click", () => setChatSidebarCollapsed(true));
 els.expandChatSidebarButton.addEventListener("click", () => setChatSidebarCollapsed(false));
+// Citation links ([S1]/[W1]) in the answer jump to the matching source.
+els.chatMessages.addEventListener("click", (event) => {
+  const link = event.target.closest("a.citation-link");
+  if (!link) {
+    return;
+  }
+  event.preventDefault();
+  const message = link.closest(".assistant-message");
+  if (!message) {
+    return;
+  }
+  const parts = assistantMessageParts.get(message);
+  if (!parts) {
+    return;
+  }
+  focusSourceForCitation(parts, link.dataset.citation || "");
+});
 
 loadReviewerName();
 loadChatState();

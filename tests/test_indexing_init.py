@@ -2,6 +2,8 @@ import shutil
 import uuid
 from pathlib import Path
 
+import pytest
+
 from src.indexing import run_indexing
 
 
@@ -49,3 +51,18 @@ def test_run_indexing_uses_local_vector_indexer(monkeypatch):
         }
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_run_indexing_fails_clearly_when_markdown_directory_missing(safe_tmp_path):
+    missing_dir = safe_tmp_path / "missing"
+
+    with pytest.raises(RuntimeError, match="Markdown directory does not exist"):
+        run_indexing(str(missing_dir), str(safe_tmp_path / "db"), progress_enabled=False)
+
+
+def test_run_indexing_fails_clearly_when_markdown_directory_empty(safe_tmp_path):
+    md_dir = safe_tmp_path / "md"
+    md_dir.mkdir()
+
+    with pytest.raises(RuntimeError, match="No Markdown files found"):
+        run_indexing(str(md_dir), str(safe_tmp_path / "db"), progress_enabled=False)

@@ -91,6 +91,17 @@ class RagJobQueue:
         if job is not None and (job.cancel_requested or job._cancel_event.is_set()):
             raise JobCancelled("Job cancelled by user.")
 
+    def _append_job_log(self, job: QueueJob, text: str) -> None:
+        line = str(text or "").rstrip()
+        if not line:
+            return
+        with self._condition:
+            job.log_line_count += 1
+            job.log_tail.append(line)
+            if len(job.log_tail) > JOB_LOG_TAIL_LINES:
+                del job.log_tail[: len(job.log_tail) - JOB_LOG_TAIL_LINES]
+            self._condition.notify_all()
+
     def enqueue_upload(
         self,
         *,
@@ -390,6 +401,7 @@ class RagJobQueue:
         asset_store = ImageAssetStore(_resolve_root_path(job.options.get("asset_dir") or _source_module.ASSET_DIR))
         for source_hash in hashes:
             asset_store.remove_source_assets(source_hash)
+        clear_overrides_for_sources(self.db_dir, hashes)
         removed_entries = remove_source_entries_by_hash(self.processed_dir, hashes)
         legacy_paths: list[str] = []
         legacy_doc_ids: list[str] = []
@@ -446,9 +458,14 @@ class RagJobQueue:
             return
         self._raise_if_cancelled(job)
         try:
-            _source_module._run_job_subprocess(command, worker_threads=worker_threads, cancel_event=job._cancel_event)
+            _source_module._run_job_subprocess(
+                command,
+                worker_threads=worker_threads,
+                cancel_event=job._cancel_event,
+                log_callback=lambda line: self._append_job_log(job, line),
+            )
         except TypeError as exc:
-            if "cancel_event" not in str(exc):
+            if "cancel_event" not in str(exc) and "log_callback" not in str(exc):
                 raise
             self._raise_if_cancelled(job)
             _source_module._run_job_subprocess(command, worker_threads=worker_threads)

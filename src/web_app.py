@@ -19,12 +19,12 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from src.defaults import (
@@ -52,6 +52,13 @@ from src.local_rag import (
     DEFAULT_QUERY_SYSTEM_PROMPT,
     INDEX_MANIFEST_FILENAME,
     write_index_manifest,
+)
+from src.index_overrides import (
+    clear_overrides_for_sources,
+    edited_record_ids,
+    index_overrides_path,
+    persist_index_deletions,
+    persist_index_edit,
 )
 from src.pdf_registry import PdfRegistry, load_source_map, remove_source_entries_by_hash, sha256_file, source_map_path
 from src.reliability import (
@@ -244,6 +251,7 @@ DEFAULT_SERVER_PORT = 8000
 DEFAULT_BACKGROUND_WORKER_THREADS = min(4, max(1, (os.cpu_count() or 2) // 2))
 DEFAULT_UPDATE_REMOTE = "origin"
 DEFAULT_UPDATE_BRANCH = "main"
+JOB_LOG_TAIL_LINES = 200
 GIT_TIMEOUT_SECONDS = 30.0
 GIT_PULL_TIMEOUT_SECONDS = 300.0
 INDEX_STREAM_DEFAULT_BATCH_SIZE = 250
@@ -307,6 +315,14 @@ def _positive_float(value: Any, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _nonnegative_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
 
 
 def _nonempty_str(value: Any, default: str) -> str:
@@ -512,6 +528,7 @@ ASSET_DIR = _resolve_root_path(INGESTION_CONFIG["asset_dir"], default=DEFAULT_AS
 
 
 _INDEX_STORE_CACHE: dict = {}
+_INDEX_RECORDS_SNAPSHOT_CACHE: dict[str, tuple[str, tuple[list[dict[str, Any]], str, int]]] = {}
 
 
 def _index_store(db_dir: Path | None = None):
@@ -587,6 +604,7 @@ def _run_job_subprocess(
     *,
     worker_threads: int | None = None,
     cancel_event: threading.Event | None = None,
+    log_callback: Callable[[str], None] | None = None,
 ) -> None:
     kwargs: dict[str, Any] = {
         "cwd": ROOT_DIR,
@@ -612,25 +630,48 @@ def _run_job_subprocess(
     if cancel_event.is_set():
         raise JobCancelled("Job cancelled by user.")
 
+    kwargs["stderr"] = subprocess.STDOUT
+
     process = subprocess.Popen(command, **kwargs)
-    stdout = ""
-    stderr = ""
-    while True:
+    output_lines: list[str] = []
+    reader_done = threading.Event()
+
+    def read_output() -> None:
         try:
-            stdout, stderr = process.communicate(timeout=0.2)
+            stream = process.stdout
+            if stream is None:
+                return
+            for line in stream:
+                text = str(line).rstrip()
+                if text:
+                    output_lines.append(text)
+                    if len(output_lines) > JOB_LOG_TAIL_LINES:
+                        del output_lines[: len(output_lines) - JOB_LOG_TAIL_LINES]
+                    if log_callback is not None:
+                        log_callback(text)
+        finally:
+            reader_done.set()
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    while True:
+        returncode = process.poll()
+        if returncode is not None:
+            reader_done.wait(timeout=5)
             break
-        except subprocess.TimeoutExpired:
-            if not cancel_event.is_set():
-                continue
+        if cancel_event.is_set():
             process.terminate()
             try:
-                stdout, stderr = process.communicate(timeout=5)
+                process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
-                stdout, stderr = process.communicate()
+                process.wait()
+            reader_done.wait(timeout=5)
             raise JobCancelled("Job cancelled by user.")
+        reader_done.wait(timeout=0.2)
 
-    result = subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr=stderr)
+    stdout = "\n".join(output_lines)
+    result = subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr="")
     if result.returncode == 0:
         return
     detail = _process_output_tail(result)
@@ -660,8 +701,10 @@ def _publish_staged_index(staged_db_dir: str | Path, live_db_dir: str | Path) ->
     live_db = Path(live_db_dir)
     staged_lancedb = lancedb_path(staged_db)
     staged_manifest = staged_db / INDEX_MANIFEST_FILENAME
+    staged_overrides = index_overrides_path(staged_db)
     live_lancedb = lancedb_path(live_db)
     live_manifest = live_db / INDEX_MANIFEST_FILENAME
+    live_overrides = index_overrides_path(live_db)
 
     if not staged_lancedb.exists():
         raise RuntimeError(f"Indexing did not create a LanceDB directory at {staged_lancedb}")
@@ -673,21 +716,31 @@ def _publish_staged_index(staged_db_dir: str | Path, live_db_dir: str | Path) ->
     backup_dir.mkdir(parents=True, exist_ok=False)
     backup_lancedb = backup_dir / LANCEDB_DIRNAME
     backup_manifest = backup_dir / INDEX_MANIFEST_FILENAME
+    backup_overrides = backup_dir / index_overrides_path(live_db).name
 
     try:
         if live_lancedb.exists():
             shutil.move(str(live_lancedb), str(backup_lancedb))
         if live_manifest.exists():
             shutil.move(str(live_manifest), str(backup_manifest))
+        if live_overrides.exists():
+            shutil.move(str(live_overrides), str(backup_overrides))
         shutil.move(str(staged_lancedb), str(live_lancedb))
         shutil.move(str(staged_manifest), str(live_manifest))
+        if staged_overrides.exists():
+            shutil.move(str(staged_overrides), str(live_overrides))
+        elif backup_overrides.exists():
+            shutil.move(str(backup_overrides), str(live_overrides))
     except Exception:
         _remove_path(live_lancedb)
         _remove_path(live_manifest)
+        _remove_path(live_overrides)
         if backup_lancedb.exists():
             shutil.move(str(backup_lancedb), str(live_lancedb))
         if backup_manifest.exists():
             shutil.move(str(backup_manifest), str(live_manifest))
+        if backup_overrides.exists():
+            shutil.move(str(backup_overrides), str(live_overrides))
         raise
     finally:
         shutil.rmtree(backup_dir, ignore_errors=True)
@@ -728,6 +781,28 @@ def _with_index_assets_for_rows(rows: list[dict[str, Any]]) -> list[dict[str, An
 
     asset_store = ImageAssetStore(ASSET_DIR)
     return [_with_index_assets(row, asset_store=asset_store) for row in rows]
+
+
+def _with_index_override_metadata_for_rows(
+    rows: list[dict[str, Any]],
+    *,
+    db_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    if not rows:
+        return rows
+    try:
+        edited_ids = edited_record_ids(Path(db_dir or DB_DIR))
+    except Exception:
+        edited_ids = set()
+    if not edited_ids:
+        return rows
+    marked: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        if str(item.get("id") or "") in edited_ids:
+            item["edited"] = True
+        marked.append(item)
+    return marked
 
 
 def _git_target_valid(value: str) -> bool:
@@ -1051,24 +1126,40 @@ def list_index_rows(
     limit = min(max(1, int(limit)), 200)
     with INDEX_LOCK:
         payload = _index_store(db_dir).list_records(offset=offset, limit=limit, search=search)
-    payload["rows"] = _with_index_assets_for_rows(list(payload.get("rows") or []))
+    rows = _with_index_override_metadata_for_rows(list(payload.get("rows") or []), db_dir=db_dir)
+    payload["rows"] = _with_index_assets_for_rows(rows)
     return payload
 
 
 def _index_records_snapshot(db_dir: Path | None = None) -> tuple[list[dict[str, Any]], str, int]:
-    store = _index_store(db_dir)
+    resolved_db_dir = Path(db_dir or DB_DIR)
+    store = _index_store(resolved_db_dir)
     if not store.exists():
-        raise FileNotFoundError(f"LanceDB table not found at {lancedb_path(db_dir or DB_DIR) / 'chunks'}")
+        raise FileNotFoundError(f"LanceDB table not found at {lancedb_path(resolved_db_dir) / 'chunks'}")
+    cache_key = str(resolved_db_dir.resolve())
+    signature = _file_signature(
+        store.table_version_hint_path(),
+        resolved_db_dir / INDEX_MANIFEST_FILENAME,
+        index_overrides_path(resolved_db_dir),
+    )
+    cached = _INDEX_RECORDS_SNAPSHOT_CACHE.get(cache_key)
+    if cached is not None and cached[0] == signature:
+        rows, model, dim = cached[1]
+        return [dict(row) for row in rows], model, dim
     count = store.count()
     if count <= 0:
         model, dim = store.metadata()
-        return [], model, dim
+        result = ([], model, dim)
+        _INDEX_RECORDS_SNAPSHOT_CACHE[cache_key] = (signature, result)
+        return result
     payload = store.list_records(offset=0, limit=count, search="")
-    return (
+    result = (
         list(payload.get("rows") or []),
         str(payload.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
         int(payload.get("embedding_dim") or 768),
     )
+    _INDEX_RECORDS_SNAPSHOT_CACHE[cache_key] = (signature, result)
+    return [dict(row) for row in result[0]], result[1], result[2]
 
 
 def _is_index_summary(row: dict[str, Any]) -> bool:
@@ -1205,6 +1296,7 @@ def list_index_summary_rows(
         )
         for row in page["rows"]
     ]
+    page_rows = _with_index_override_metadata_for_rows(page_rows, db_dir=db_dir)
     page_rows = _with_index_assets_for_rows(page_rows)
     return {
         "offset": page["offset"],
@@ -1250,10 +1342,10 @@ def list_index_child_rows(
         "offset": page["offset"],
         "limit": page["limit"],
         "total": page["total"],
-        "rows": _with_index_assets_for_rows([
+        "rows": _with_index_assets_for_rows(_with_index_override_metadata_for_rows([
             _with_index_hierarchy_metadata(row, children=[], parent=parent)
             for row in page["rows"]
-        ]),
+        ], db_dir=db_dir)),
         "embedding_model": embedding_model,
         "embedding_dim": embedding_dim,
         "view": "hierarchy_children",
@@ -1295,7 +1387,7 @@ def iter_index_row_events(
         received += len(rows)
         yield {
             "type": "rows",
-            "rows": _with_index_assets_for_rows(rows),
+            "rows": _with_index_assets_for_rows(_with_index_override_metadata_for_rows(rows, db_dir=db_dir)),
             "received": received,
         }
 
@@ -1320,32 +1412,45 @@ def update_index_record(
     if not content.strip():
         raise ValueError("Record content cannot be empty.")
 
+    resolved_db_dir = Path(db_dir or DB_DIR)
     with INDEX_LOCK:
-        store = _index_store(db_dir)
+        store = _index_store(resolved_db_dir)
         record = store.get_record(record_id)
-        model = embedding_model or record.get("embedding_model") or DEFAULT_EMBEDDING_MODEL
-        embedding_dim = int(record.get("embedding_dim") or len(record.get("vector") or []) or 768)
+    model = embedding_model or record.get("embedding_model") or DEFAULT_EMBEDDING_MODEL
+    embedding_dim = int(record.get("embedding_dim") or len(record.get("vector") or []) or 768)
 
-        from src.embeddings import EmbeddingEngine
+    from src.embeddings import EmbeddingEngine
 
-        engine = EmbeddingEngine(
-            model_name=model,
-            ollama_batch_size=embedding_batch_size,
-            ollama_timeout=embedding_timeout,
-        )
-        vector = engine.get_mrl_embeddings(
-            [content],
-            truncate_dim=embedding_dim,
-            prefix="search_document: ",
-        )[0]
+    engine = EmbeddingEngine(
+        model_name=model,
+        ollama_batch_size=embedding_batch_size,
+        ollama_timeout=embedding_timeout,
+    )
+    vector = engine.get_mrl_embeddings(
+        [content],
+        truncate_dim=embedding_dim,
+        prefix="search_document: ",
+    )[0]
 
-        return store.update_record(
+    with INDEX_LOCK:
+        store = _index_store(resolved_db_dir)
+        row = store.update_record(
             record_id=record_id,
             content=content,
             vector=vector.tolist(),
             embedding_model=model,
             embedding_dim=embedding_dim,
         )
+        persist_index_edit(resolved_db_dir, record, content)
+        manifest_model, manifest_dim = store.metadata()
+        write_index_manifest(
+            resolved_db_dir,
+            store.all_records(),
+            embedding_model=manifest_model,
+            embedding_dim=manifest_dim,
+        )
+        row["edited"] = True
+        return row
 
 
 def delete_index_records(*, record_ids: list[str], db_dir: Path | None = None) -> dict[str, Any]:
@@ -1356,7 +1461,14 @@ def delete_index_records(*, record_ids: list[str], db_dir: Path | None = None) -
     with INDEX_LOCK:
         resolved_db_dir = Path(db_dir or DB_DIR)
         store = _index_store(resolved_db_dir)
+        records_to_tombstone: list[dict[str, Any]] = []
+        for record_id in sorted(ids):
+            try:
+                records_to_tombstone.append(store.get_record(record_id))
+            except KeyError:
+                continue
         result = store.delete_records(record_ids=list(ids))
+        persist_index_deletions(resolved_db_dir, records_to_tombstone)
         model, dim = store.metadata()
         write_index_manifest(
             resolved_db_dir,
@@ -1425,7 +1537,10 @@ def vector_search_index_rows(
         row["source_id"] = str(item.get("source_id") or "")
         row["location"] = str(item.get("location") or "")
         row["vector_query"] = query
-        rows.append(_with_index_assets(row, asset_store=getattr(engine, "asset_store", None)))
+        rows.append(row)
+
+    rows = _with_index_override_metadata_for_rows(rows, db_dir=db_dir)
+    rows = [_with_index_assets(row, asset_store=getattr(engine, "asset_store", None)) for row in rows]
 
     return {
         "query": query,
@@ -2203,6 +2318,7 @@ def delete_pdf_document(
         source_entries=source_entries,
         db_dir=db_dir,
     )
+    clear_overrides_for_sources(Path(db_dir or DB_DIR), {source_hash})
     markdown_deleted = _delete_processed_markdown_files(
         source_entries,
         processed_dir=processed_dir,
@@ -2516,20 +2632,21 @@ def _upload_options_from_form(form: Any) -> dict[str, Any]:
             form.get("ocr_force_full_page"),
             INGESTION_CONFIG["ocr_force_full_page"],
         ),
-        "ocr_bitmap_area_threshold": float(
-            form.get("ocr_bitmap_area_threshold") or INGESTION_CONFIG["ocr_bitmap_area_threshold"]
+        "ocr_bitmap_area_threshold": _positive_float(
+            form.get("ocr_bitmap_area_threshold"),
+            INGESTION_CONFIG["ocr_bitmap_area_threshold"],
         ),
         "rapidocr_backend": str(form.get("rapidocr_backend") or INGESTION_CONFIG["rapidocr_backend"]),
         "tesseract_cmd": str(form.get("tesseract_cmd") or INGESTION_CONFIG["tesseract_cmd"]),
         "tesseract_data_path": str(form.get("tesseract_data_path") or INGESTION_CONFIG["tesseract_data_path"]),
         "tesseract_psm": _optional_int(form.get("tesseract_psm"), INGESTION_CONFIG["tesseract_psm"]),
         "embedding_model": str(form.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
-        "embedding_batch_size": int(form.get("embedding_batch_size") or DEFAULT_EMBEDDING_BATCH_SIZE),
-        "embedding_timeout": float(form.get("embedding_timeout") or DEFAULT_EMBEDDING_TIMEOUT),
+        "embedding_batch_size": _positive_int(form.get("embedding_batch_size"), DEFAULT_EMBEDDING_BATCH_SIZE),
+        "embedding_timeout": _positive_float(form.get("embedding_timeout"), DEFAULT_EMBEDDING_TIMEOUT),
         "index_backend": str(form.get("index_backend") or DEFAULT_INDEX_BACKEND),
         "summary_mode": str(form.get("summary_mode") or DEFAULT_SUMMARY_MODE),
-        "chunk_target_tokens": int(form.get("chunk_target_tokens") or DEFAULT_CHUNK_TARGET_TOKENS),
-        "chunk_overlap_tokens": int(form.get("chunk_overlap_tokens") or DEFAULT_CHUNK_OVERLAP_TOKENS),
+        "chunk_target_tokens": _positive_int(form.get("chunk_target_tokens"), DEFAULT_CHUNK_TARGET_TOKENS),
+        "chunk_overlap_tokens": _nonnegative_int(form.get("chunk_overlap_tokens"), DEFAULT_CHUNK_OVERLAP_TOKENS),
         "progress_enabled": False,
     }
 
@@ -2708,7 +2825,7 @@ def _vector_store_duplicate_entries(
         return []
 
     try:
-        rows = store.list_records(offset=0, limit=store.count(), search="").get("rows") or []
+        rows = store.records_by_source_hash(sorted(target_hashes))
     except Exception:
         return []
 
@@ -2753,6 +2870,21 @@ def _path_is_relative_to(path: Path, root: Path) -> bool:
         return False
 
 
+_PDF_HASH_CACHE: dict[str, tuple[tuple[int, int], str]] = {}
+
+
+def _cached_pdf_hash(path: Path) -> str:
+    stat = path.stat()
+    signature = (stat.st_mtime_ns, stat.st_size)
+    key = str(path.resolve())
+    cached = _PDF_HASH_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    digest = sha256_file(path)
+    _PDF_HASH_CACHE[key] = (signature, digest)
+    return digest
+
+
 def _data_pdf_duplicate_entries(
     files: list[dict[str, Any]],
     *,
@@ -2787,7 +2919,7 @@ def _data_pdf_duplicate_entries(
         if staging_dir.exists() and _path_is_relative_to(resolved, staging_dir):
             continue
         try:
-            digest = sha256_file(resolved)
+            digest = _cached_pdf_hash(resolved)
         except OSError:
             continue
         if digest in target_hashes and digest not in existing_by_hash:
@@ -2848,6 +2980,10 @@ async def _handle_upload_request(request: Request, *, require_source_groups: boo
     try:
         form = await request.form()
         force_duplicates = str(form.get("force_duplicates") or "").lower() in {"1", "true", "yes", "on"}
+        job_id = uuid.uuid4().hex
+        staging_dir = STAGING_DIR / job_id
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        staging_dirs[job_id] = staging_dir
         raw_source_groups = [
             str(value or "")
             for key, value in form.multi_items()
@@ -2869,10 +3005,6 @@ async def _handle_upload_request(request: Request, *, require_source_groups: boo
                 counter += 1
             used_names.add(filename.lower())
 
-            job_id = uuid.uuid4().hex
-            staging_dir = STAGING_DIR / job_id
-            staging_dir.mkdir(parents=True, exist_ok=True)
-            staging_dirs[job_id] = staging_dir
             destination = staging_dir / filename
             digest = hashlib.sha256()
             with destination.open("wb") as handle:
@@ -2951,35 +3083,33 @@ async def _handle_upload_request(request: Request, *, require_source_groups: boo
         forced_hashes = {entry["hash"] for entry in duplicate_entries} if force_token_valid else set()
         options = _upload_options_from_form(form)
         _apply_upload_source_groups(uploads)
-        jobs: list[QueueJob] = []
-        for upload in uploads:
-            job_id = str(upload["job_id"])
-            file_upload = {
+        file_uploads = [
+            {
                 "filename": str(upload["filename"]),
                 "hash": str(upload["hash"]),
                 "staging_path": str(upload["staging_path"]),
                 "source_group": normalize_source_group(upload.get("source_group")),
             }
-            file_forced_hashes = {file_upload["hash"]} if file_upload["hash"] in forced_hashes else set()
-            registry.register_queued(
-                job_id=job_id,
-                files=[file_upload],
-                forced_hashes=file_forced_hashes,
-                options=options,
-            )
-            registered_jobs.append((job_id, [file_upload]))
-            job = job_queue.enqueue_upload(
-                staging_dir=Path(str(upload["staging_dir"])),
-                filenames=[file_upload["filename"]],
-                uploads=[file_upload],
-                force_duplicate_hashes=sorted(file_forced_hashes),
-                job_id=job_id,
-                options=options,
-            )
-            queued_job_ids.add(job_id)
-            jobs.append(job)
+            for upload in uploads
+        ]
+        registry.register_queued(
+            job_id=job_id,
+            files=file_uploads,
+            forced_hashes=forced_hashes,
+            options=options,
+        )
+        registered_jobs.append((job_id, file_uploads))
+        job = job_queue.enqueue_upload(
+            staging_dir=staging_dir,
+            filenames=filenames,
+            uploads=file_uploads,
+            force_duplicate_hashes=sorted(forced_hashes),
+            job_id=job_id,
+            options=options,
+        )
+        queued_job_ids.add(job_id)
 
-        job_payloads = [job.to_dict() for job in jobs]
+        job_payloads = [job.to_dict()]
         response = dict(job_payloads[0]) if job_payloads else {}
         response["jobs"] = job_payloads
         response["job_count"] = len(job_payloads)
@@ -3033,9 +3163,16 @@ async def _optional_json(request: Request) -> dict[str, Any]:
     return value
 
 
+def _request_validation_error(exc: ValidationError) -> HTTPException:
+    return HTTPException(status_code=422, detail=exc.errors())
+
+
 @app.post("/api/reindex")
 async def reindex(request: Request):
-    payload = ReindexRequest(**await _optional_json(request))
+    try:
+        payload = ReindexRequest(**await _optional_json(request))
+    except ValidationError as exc:
+        raise _request_validation_error(exc) from exc
     job = job_queue.enqueue_reindex(options=_model_dump(payload))
     return job.to_dict()
 

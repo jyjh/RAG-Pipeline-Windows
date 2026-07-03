@@ -17,6 +17,7 @@ import src.local_rag as local_rag
 import src.query as query
 import src.web_app as web_app
 from src.asset_store import ImageAssetStore, image_asset_marker
+from src.index_overrides import load_index_overrides, persist_index_deletions, persist_index_edit
 from src.pdf_registry import load_source_map, write_source_entry
 from src.vector_store import LanceDBVectorStore
 
@@ -519,6 +520,16 @@ def test_update_index_record_reembeds_and_saves(monkeypatch, lancedb_tmp):
     assert record["content"] == "edited context"
     assert record["vector"] == [0.0, 0.0, 1.0]
     assert calls["embed"] == (["edited context"], 3, "search_document: ")
+    manifest = json.loads(db_dir.joinpath(local_rag.INDEX_MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    document = manifest["documents"]["processed_docs/doc.md"]
+    assert manifest["total_records"] == 2
+    assert document["content_hashes"]["doc.md:0"] == local_rag.index_record_content_hash(record)
+    assert load_index_overrides(db_dir)["edits"]["doc.md:0"]["content"] == "edited context"
+    edited_rows = {
+        item["id"]: item
+        for item in web_app.list_index_rows(db_dir=db_dir)["rows"]
+    }
+    assert edited_rows["doc.md:0"]["edited"] is True
 
 
 def test_delete_index_records_persists_remaining_records(lancedb_tmp):
@@ -529,6 +540,7 @@ def test_delete_index_records_persists_remaining_records(lancedb_tmp):
 
     assert result == {"deleted": 1, "remaining": 1}
     assert [row["id"] for row in LanceDBVectorStore(db_dir).list_records()["rows"]] == ["doc.md:0"]
+    assert "doc.md:1" in load_index_overrides(db_dir)["deletions"]
 
 
 def test_delete_index_records_updates_pdf_status_when_source_removed(monkeypatch, workspace_tmp, lancedb_tmp):
@@ -667,6 +679,18 @@ def test_delete_pdf_document_removes_source_artifacts(monkeypatch, workspace_tmp
         embedding_model="fake-embed",
         embedding_dim=3,
     )
+    persist_index_edit(db_dir, LanceDBVectorStore(db_dir).get_record("target"), "edited target content")
+    persist_index_deletions(
+        db_dir,
+        [
+            {
+                "id": "removed-target",
+                "doc_id": "doc-target",
+                "file_path": str(markdown_path),
+                "source_hash": source_hash,
+            }
+        ],
+    )
     monkeypatch.setattr(web_app, "DB_DIR", db_dir)
 
     result = web_app.delete_pdf_document(
@@ -696,6 +720,8 @@ def test_delete_pdf_document_removes_source_artifacts(monkeypatch, workspace_tmp
     manifest = json.loads(db_dir.joinpath(local_rag.INDEX_MANIFEST_FILENAME).read_text(encoding="utf-8"))
     assert source_hash not in manifest["documents"]
     assert "hash-other" in manifest["documents"]
+    assert load_index_overrides(db_dir)["edits"] == {}
+    assert load_index_overrides(db_dir)["deletions"] == {}
 
 
 def test_web_index_helpers_work_with_lancedb(monkeypatch):
@@ -1153,6 +1179,45 @@ def test_queue_pauses_new_work_while_query_is_active(workspace_tmp):
     assert (workspace_tmp / "uploads" / job.id / "doc.pdf").exists()
 
 
+def test_queue_upload_batch_runs_one_final_index(workspace_tmp):
+    calls = []
+
+    def fake_ingest(input_dir, output_dir, **kwargs):
+        calls.append(("ingest", sorted(path.name for path in Path(input_dir).glob("*.pdf"))))
+
+    def fake_index(md_dir, db_dir, **kwargs):
+        calls.append(("index", Path(md_dir).name, Path(db_dir).name))
+
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=workspace_tmp / "db",
+        registry_path=workspace_tmp / "registry.json",
+        run_ingestion_func=fake_ingest,
+        run_indexing_func=fake_index,
+    )
+    staging = workspace_tmp / "staging"
+    staging.mkdir()
+    staging.joinpath("one.pdf").write_bytes(b"%PDF-1.4 one")
+    staging.joinpath("two.pdf").write_bytes(b"%PDF-1.4 two")
+
+    job = queue.enqueue_upload(
+        staging_dir=staging,
+        filenames=["one.pdf", "two.pdf"],
+        uploads=[
+            {"filename": "one.pdf", "hash": "hash-one", "staging_path": str(staging / "one.pdf")},
+            {"filename": "two.pdf", "hash": "hash-two", "staging_path": str(staging / "two.pdf")},
+        ],
+    )
+
+    _wait_for(lambda: queue.get_job(job.id)["status"] == "done")
+
+    assert calls == [
+        ("ingest", ["one.pdf", "two.pdf"]),
+        ("index", "processed", "db"),
+    ]
+
+
 def test_queue_cancel_paused_upload_marks_document_interrupted(workspace_tmp):
     calls = []
     registry_path = workspace_tmp / "registry.json"
@@ -1317,6 +1382,93 @@ def test_queue_subprocess_failure_reports_tail(monkeypatch, workspace_tmp):
     message = str(exc_info.value)
     assert "exit code 5" in message
     assert "failure detail" in message
+
+
+def test_reindex_request_rejects_invalid_numeric_settings(monkeypatch):
+    class FakeQueue:
+        def enqueue_reindex(self, **kwargs):
+            raise AssertionError("invalid request should not enqueue")
+
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    response = TestClient(web_app.app).post("/api/reindex", json={"embedding_batch_size": 0})
+
+    assert response.status_code == 422
+
+
+def test_job_subprocess_streams_bounded_log_tail(workspace_tmp):
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=workspace_tmp / "db",
+        registry_path=workspace_tmp / "registry.json",
+    )
+    job = web_app.QueueJob(id="job-logs", kind="reindex")
+
+    web_app._run_job_subprocess(
+        [
+            web_app.sys.executable,
+            "-c",
+            "for i in range(205): print(f'line {i}', flush=True)",
+        ],
+        cancel_event=job._cancel_event,
+        log_callback=lambda line: queue._append_job_log(job, line),
+    )
+
+    payload = job.to_dict()
+    assert payload["log_line_count"] == 205
+    assert len(job.log_tail) == web_app.JOB_LOG_TAIL_LINES
+    assert job.log_tail[0] == "line 5"
+    assert "line 204" in payload["log_tail"]
+
+
+def test_job_subprocess_failure_and_cancellation_keep_log_tail(workspace_tmp):
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=workspace_tmp / "db",
+        registry_path=workspace_tmp / "registry.json",
+    )
+    failed_job = web_app.QueueJob(id="job-failed", kind="reindex")
+
+    with pytest.raises(RuntimeError, match="before fail"):
+        web_app._run_job_subprocess(
+            [
+                web_app.sys.executable,
+                "-c",
+                "print('before fail', flush=True); raise SystemExit(3)",
+            ],
+            cancel_event=failed_job._cancel_event,
+            log_callback=lambda line: queue._append_job_log(failed_job, line),
+        )
+    assert failed_job.log_tail == ["before fail"]
+
+    cancelled_job = web_app.QueueJob(id="job-cancel-run", kind="reindex")
+    errors = []
+
+    def run_cancellable():
+        try:
+            web_app._run_job_subprocess(
+                [
+                    web_app.sys.executable,
+                    "-c",
+                    "import time; print('started', flush=True); time.sleep(30)",
+                ],
+                cancel_event=cancelled_job._cancel_event,
+                log_callback=lambda line: queue._append_job_log(cancelled_job, line),
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_cancellable)
+    thread.start()
+    _wait_for(lambda: cancelled_job.log_line_count == 1)
+    cancelled_job._cancel_event.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert isinstance(errors[0], web_app.JobCancelled)
+    assert cancelled_job.log_tail == ["started"]
 
 
 def test_queue_staged_index_publish_swaps_live_index(monkeypatch, workspace_tmp, lancedb_tmp):
@@ -1497,6 +1649,11 @@ def test_force_duplicate_cleanup_waits_until_ingestion_phase(monkeypatch, worksp
         embedding_model="fake-embed",
         embedding_dim=3,
     )
+    persist_index_edit(db_dir, LanceDBVectorStore(db_dir).get_record("old"), "edited old content")
+    persist_index_deletions(
+        db_dir,
+        [{"id": "old-deleted", "doc_id": "old-doc", "file_path": str(old_markdown), "source_hash": "hash-a"}],
+    )
     asset_store = ImageAssetStore(asset_dir)
     stale_asset = asset_store.save_image(
         image_data=b"old-graph",
@@ -1551,6 +1708,8 @@ def test_force_duplicate_cleanup_waits_until_ingestion_phase(monkeypatch, worksp
     assert calls[0] == ("ingest", False, 1, False)
     assert load_source_map(processed_dir)["documents"] == {}
     assert asset_store.load_manifest()["assets"] == {}
+    assert load_index_overrides(db_dir)["edits"] == {}
+    assert load_index_overrides(db_dir)["deletions"] == {}
 
 
 def test_startup_recovery_resumes_saved_upload(workspace_tmp):
@@ -1697,7 +1856,7 @@ def test_upload_endpoint_enqueues_pdf_batch(monkeypatch, workspace_tmp):
     assert Path(captured["staging_dir"]).joinpath("notes.pdf").exists()
 
 
-def test_upload_endpoint_splits_multiple_pdfs_into_jobs(monkeypatch, workspace_tmp):
+def test_upload_endpoint_batches_multiple_pdfs_into_one_job(monkeypatch, workspace_tmp):
     captured = []
 
     class FakeQueue:
@@ -1729,16 +1888,16 @@ def test_upload_endpoint_splits_multiple_pdfs_into_jobs(monkeypatch, workspace_t
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["job_count"] == 2
+    assert payload["job_count"] == 1
     assert payload["filenames"] == ["one.pdf", "two.pdf"]
-    assert [job["filenames"] for job in payload["jobs"]] == [["one.pdf"], ["two.pdf"]]
-    assert [item["filenames"] for item in captured] == [["one.pdf"], ["two.pdf"]]
-    assert captured[0]["job_id"] != captured[1]["job_id"]
-    assert captured[0]["staging_dir"] != captured[1]["staging_dir"]
+    assert [job["filenames"] for job in payload["jobs"]] == [["one.pdf", "two.pdf"]]
+    assert [item["filenames"] for item in captured] == [["one.pdf", "two.pdf"]]
+    assert len(captured) == 1
+    assert len(captured[0]["uploads"]) == 2
     assert captured[0]["uploads"][0]["source_group"] == "official"
-    assert captured[1]["uploads"][0]["source_group"] == "unofficial"
+    assert captured[0]["uploads"][1]["source_group"] == "unofficial"
     assert Path(captured[0]["staging_dir"]).joinpath("one.pdf").exists()
-    assert Path(captured[1]["staging_dir"]).joinpath("two.pdf").exists()
+    assert Path(captured[0]["staging_dir"]).joinpath("two.pdf").exists()
 
 
 def test_upload_endpoint_requires_source_groups(monkeypatch, workspace_tmp):
@@ -1919,6 +2078,46 @@ def test_upload_endpoint_rejects_duplicate_from_vector_store(monkeypatch, worksp
     assert detail["duplicates"][0]["record_id"] == "chunk-duplicate"
 
 
+def test_vector_duplicate_lookup_filters_by_source_hash(monkeypatch):
+    calls = []
+
+    class FakeStore:
+        def exists(self):
+            return True
+
+        def records_by_source_hash(self, source_hashes):
+            calls.append(list(source_hashes))
+            return [
+                {
+                    "id": "chunk-target",
+                    "source_hash": "hash-target",
+                    "source_pdf_name": "target.pdf",
+                }
+            ]
+
+        def list_records(self, **kwargs):
+            raise AssertionError("duplicate lookup should not scan the full index")
+
+    monkeypatch.setattr(web_app, "_index_store", lambda db_dir=None: FakeStore())
+
+    duplicates = web_app._vector_store_duplicate_entries(
+        [{"filename": "copy.pdf", "hash": "hash-target"}],
+        known_hashes=set(),
+    )
+
+    assert calls == [["hash-target"]]
+    assert duplicates == [
+        {
+            "filename": "copy.pdf",
+            "hash": "hash-target",
+            "existing_filename": "target.pdf",
+            "status": "indexed",
+            "job_id": "",
+            "record_id": "chunk-target",
+        }
+    ]
+
+
 def test_upload_endpoint_rejects_duplicate_from_existing_data_pdf(monkeypatch, workspace_tmp):
     class FakeQueue:
         def enqueue_upload(self, **kwargs):
@@ -1950,6 +2149,30 @@ def test_upload_endpoint_rejects_duplicate_from_existing_data_pdf(monkeypatch, w
     assert detail["force_token"]
     assert detail["duplicates"][0]["existing_filename"] == "notes.pdf"
     assert detail["duplicates"][0]["status"] == "uploaded"
+
+
+def test_data_pdf_duplicate_scan_reuses_hash_cache(monkeypatch, workspace_tmp):
+    data_dir = workspace_tmp / "data"
+    uploads_dir = data_dir / "uploads" / "existing-job"
+    uploads_dir.mkdir(parents=True)
+    pdf_path = uploads_dir / "notes.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 existing uploaded pdf")
+    calls = []
+
+    def fake_sha256_file(path):
+        calls.append(Path(path))
+        return "hash-target"
+
+    web_app._PDF_HASH_CACHE.clear()
+    monkeypatch.setattr(web_app, "sha256_file", fake_sha256_file)
+
+    files = [{"filename": "copy.pdf", "hash": "hash-target"}]
+    first = web_app._data_pdf_duplicate_entries(files, known_hashes=set(), data_dir=data_dir)
+    second = web_app._data_pdf_duplicate_entries(files, known_hashes=set(), data_dir=data_dir)
+
+    assert [item["existing_filename"] for item in first] == ["notes.pdf"]
+    assert [item["existing_filename"] for item in second] == ["notes.pdf"]
+    assert calls == [pdf_path]
 
 
 def test_upload_endpoint_allows_forced_duplicate(monkeypatch, workspace_tmp):

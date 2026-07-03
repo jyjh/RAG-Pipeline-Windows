@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from src._class_module_support import bind_module_namespace, finalize_split_class
 import src.local_rag as _source_module
+from src.index_overrides import apply_index_overrides, copy_index_overrides
 
 bind_module_namespace(
     _source_module,
@@ -207,6 +208,16 @@ class LocalVectorIndexer:
             )
             records.extend(file_records)
 
+        override_db_dir = self.reuse_db_dir or self.working_dir
+        before_overrides = len(records)
+        records = apply_index_overrides(records, override_db_dir)
+        removed_by_overrides = before_overrides - len(records)
+        if removed_by_overrides:
+            _status(
+                f"Local index: skipped {removed_by_overrides} record(s) hidden by persisted index overrides.",
+                enabled=self.progress_enabled,
+            )
+
         backend = (self.index_backend or "lancedb").lower()
         if backend != "lancedb":
             raise ValueError("index_backend must be lancedb; JSON chunk storage has been removed.")
@@ -226,6 +237,8 @@ class LocalVectorIndexer:
             embedding_model=self.embedding_model,
             embedding_dim=768,
         )
+        if self.reuse_db_dir:
+            copy_index_overrides(self.reuse_db_dir, self.working_dir)
         _status(
             f"Local index: wrote {len(records)} structured record(s) to {output_target} "
             f"({embedded} embedded, {reused} reused)",
