@@ -1749,6 +1749,21 @@ def _file_signature(*paths: Path) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
+def _signature_from_parts(*parts: Any) -> str:
+    raw = "|".join(str(part) for part in parts)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _scoped_signature(seed: str, **params: Any) -> str:
+    param_parts = [f"{key}={params[key]}" for key in sorted(params)]
+    return _signature_from_parts(seed, *param_parts)
+
+
+def _payload_signature(payload: Any, *parts: Any) -> str:
+    serialized = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+    return _signature_from_parts(*parts, serialized)
+
+
 def _not_modified_or_etag(request: Request, seed: str) -> Response | None:
     """Return a 304 response if the client already holds this ETag, else None."""
     etag = f'"{seed}"'
@@ -1760,6 +1775,12 @@ def _not_modified_or_etag(request: Request, seed: str) -> Response | None:
 def _etagged_json(request: Request, payload: Any, seed: str) -> JSONResponse:
     etag = f'"{seed}"'
     return JSONResponse(content=payload, headers={"ETag": etag, "Cache-Control": "no-cache"})
+
+
+def _conditional_json(request: Request, payload: Any, seed: str) -> Response:
+    if not_modified := _not_modified_or_etag(request, seed):
+        return not_modified
+    return _etagged_json(request, payload, seed)
 
 
 def _cached_json_load(
@@ -2487,6 +2508,12 @@ DocumentTrustRequest = import_split_class("src.web_app_classes.document_trust_re
 DocumentTrustRequest.__module__ = __name__
 
 
+class BulkDocumentTrustRequest(BaseModel):
+    source_hashes: list[str] = Field(default_factory=list)
+    source_group: str
+    reviewed_by: str | None = None
+
+
 RenderRequest = import_split_class("src.web_app_classes.render_request", "RenderRequest")
 RenderRequest.__module__ = __name__
 
@@ -2559,11 +2586,20 @@ app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 @app.get("/")
 def root():
-    return FileResponse(WEB_DIR / "index.html")
+    index_path = WEB_DIR / "index.html"
+    try:
+        text = index_path.read_text(encoding="utf-8")
+    except OSError:
+        return FileResponse(index_path)
+    version = _file_signature(WEB_DIR / "styles.css", WEB_DIR / "app.js", WEB_DIR / "vendor" / "fflate.min.js")
+    text = text.replace('/static/styles.css"', f'/static/styles.css?v={version}"')
+    text = text.replace('/static/vendor/fflate.min.js"', f'/static/vendor/fflate.min.js?v={version}"')
+    text = text.replace('/static/app.js"', f'/static/app.js?v={version}"')
+    return Response(content=text, media_type="text/html; charset=utf-8")
 
 
 @app.get("/api/health")
-def health():
+def health(request: Request):
     path = lancedb_path(DB_DIR)
     store = _index_store()
     record_count = 0
@@ -2574,7 +2610,7 @@ def health():
                 record_count = store.count()
         except Exception:
             record_count = 0
-    return {
+    payload = {
         "ok": True,
         "paths": {
             "data_dir": str(DATA_DIR),
@@ -2594,6 +2630,8 @@ def health():
         },
         "queue": job_queue.summary(),
     }
+    seed = _payload_signature(payload, _file_signature(_index_store().table_version_hint_path(), DB_DIR / INDEX_MANIFEST_FILENAME))
+    return _conditional_json(request, payload, seed)
 
 
 @app.get("/api/update/status")
@@ -3225,8 +3263,10 @@ async def reindex(request: Request):
 
 
 @app.get("/api/jobs")
-def list_jobs(offset: int = 0, limit: int = 10, search: str = ""):
-    return list_job_rows(offset=offset, limit=(None if limit <= 0 else limit), search=search)
+def list_jobs(request: Request, offset: int = 0, limit: int = 10, search: str = ""):
+    payload = list_job_rows(offset=offset, limit=(None if limit <= 0 else limit), search=search)
+    seed = _payload_signature(payload, "jobs", offset, limit, search)
+    return _conditional_json(request, payload, seed)
 
 
 @app.get("/api/jobs/{job_id}")
@@ -3252,18 +3292,26 @@ def pdf_documents(request: Request, search: str = "", offset: int = 0, limit: in
     # The PDF list only changes when ingestion/indexing writes the registry,
     # source map, trust registry, or index manifest. Short-circuit unchanged
     # polls with a conditional 304 instead of rebuilding the whole list.
-    seed = _file_signature(
-        PDF_REGISTRY_PATH,
-        source_map_path(PROCESSED_DIR),
-        DOCUMENT_TRUST_PATH,
-        DB_DIR / INDEX_MANIFEST_FILENAME,
+    seed = _scoped_signature(
+        _file_signature(
+            PDF_REGISTRY_PATH,
+            source_map_path(PROCESSED_DIR),
+            DOCUMENT_TRUST_PATH,
+            DB_DIR / INDEX_MANIFEST_FILENAME,
+        ),
+        search=search,
+        offset=offset,
+        limit=limit,
     )
-    if search == "" and (not_modified := _not_modified_or_etag(request, seed)):
+    if not_modified := _not_modified_or_etag(request, seed):
         return not_modified
     payload = list_pdf_documents(search=search, offset=offset, limit=(None if limit <= 0 else limit))
-    if search == "":
-        return _etagged_json(request, payload, seed)
-    return payload
+    return _etagged_json(request, payload, seed)
+
+
+def _pdf_row_for_hash(source_hash: str) -> dict[str, Any] | None:
+    documents = list_pdf_documents(search=source_hash, offset=0, limit=None)["pdfs"]
+    return next((item for item in documents if item.get("hash") == source_hash), None)
 
 
 @app.get("/api/assets/{asset_id}")
@@ -3375,9 +3423,45 @@ def update_pdf_trust(source_hash: str, payload: DocumentTrustRequest):
             source_hash,
             {key: value for key, value in _model_dump(payload).items() if value is not None},
         )
-        return {"trust": entry}
+        return {"trust": entry, "pdf": _pdf_row_for_hash(source_hash)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/pdfs/trust/bulk")
+def update_pdf_trust_bulk(payload: BulkDocumentTrustRequest):
+    source_group = normalize_source_group(payload.source_group)
+    if source_group not in TRUST_SOURCE_GROUPS or source_group == SOURCE_GROUP_UNGROUPED:
+        choices = ", ".join(sorted(group for group in TRUST_SOURCE_GROUPS if group != SOURCE_GROUP_UNGROUPED))
+        raise HTTPException(status_code=400, detail=f"source_group must be one of: {choices}")
+
+    hashes = []
+    seen = set()
+    failed = []
+    for raw_hash in payload.source_hashes:
+        source_hash = str(raw_hash or "").strip()
+        if not source_hash:
+            failed.append({"source_hash": source_hash, "error": "source_hash cannot be empty"})
+            continue
+        if source_hash in seen:
+            continue
+        seen.add(source_hash)
+        hashes.append(source_hash)
+    if not hashes and not failed:
+        raise HTTPException(status_code=400, detail="At least one source hash is required.")
+
+    updated = []
+    updates: dict[str, Any] = {"source_group": source_group}
+    reviewed_by = str(payload.reviewed_by or "").strip()
+    if reviewed_by:
+        updates["reviewed_by"] = reviewed_by
+    for source_hash in hashes:
+        try:
+            trust = update_document_trust(source_hash, updates)
+            updated.append({"source_hash": source_hash, "trust": trust, "pdf": _pdf_row_for_hash(source_hash)})
+        except ValueError as exc:
+            failed.append({"source_hash": source_hash, "error": str(exc)})
+    return {"updated": updated, "failed": failed}
 
 
 @app.get("/api/index")
@@ -3385,35 +3469,65 @@ def index_rows(request: Request, offset: int = 0, limit: int = 50, search: str =
     # Index rows only change when the LanceDB table is rewritten; key the ETag on
     # the table version-hint file so unchanged polls short-circuit to a 304.
     version_hint = _index_store().table_version_hint_path()
-    seed = _file_signature(version_hint, DB_DIR / INDEX_MANIFEST_FILENAME)
-    if search == "" and (not_modified := _not_modified_or_etag(request, seed)):
+    seed = _scoped_signature(
+        _file_signature(version_hint, DB_DIR / INDEX_MANIFEST_FILENAME, index_overrides_path(DB_DIR)),
+        offset=offset,
+        limit=limit,
+        search=search,
+    )
+    if not_modified := _not_modified_or_etag(request, seed):
         return not_modified
     try:
         payload = list_index_rows(offset=offset, limit=limit, search=search)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    if search == "":
-        return _etagged_json(request, payload, seed)
-    return payload
+    return _etagged_json(request, payload, seed)
 
 
 @app.get("/api/index/summaries")
-def index_summary_rows(offset: int = 0, limit: int = 20, search: str = ""):
+def index_summary_rows(request: Request, offset: int = 0, limit: int = 20, search: str = ""):
+    seed = _scoped_signature(
+        _file_signature(
+            _index_store().table_version_hint_path(),
+            DB_DIR / INDEX_MANIFEST_FILENAME,
+            index_overrides_path(DB_DIR),
+        ),
+        offset=offset,
+        limit=limit,
+        search=search,
+    )
+    if not_modified := _not_modified_or_etag(request, seed):
+        return not_modified
     try:
-        return list_index_summary_rows(offset=offset, limit=limit, search=search)
+        payload = list_index_summary_rows(offset=offset, limit=limit, search=search)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _etagged_json(request, payload, seed)
 
 
 @app.get("/api/index/children")
 def index_child_rows(
+    request: Request,
     parent_id: str,
     offset: int = 0,
     limit: int = INDEX_CHILD_DEFAULT_LIMIT,
     search: str = "",
 ):
+    seed = _scoped_signature(
+        _file_signature(
+            _index_store().table_version_hint_path(),
+            DB_DIR / INDEX_MANIFEST_FILENAME,
+            index_overrides_path(DB_DIR),
+        ),
+        parent_id=parent_id,
+        offset=offset,
+        limit=limit,
+        search=search,
+    )
+    if not_modified := _not_modified_or_etag(request, seed):
+        return not_modified
     try:
-        return list_index_child_rows(
+        payload = list_index_child_rows(
             parent_id=parent_id,
             offset=offset,
             limit=limit,
@@ -3423,6 +3537,7 @@ def index_child_rows(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Record not found: {exc}") from exc
+    return _etagged_json(request, payload, seed)
 
 
 @app.get("/api/index/stream")

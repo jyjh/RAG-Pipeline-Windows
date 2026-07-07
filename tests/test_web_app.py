@@ -329,6 +329,46 @@ def test_index_children_endpoint_pages_descendants(monkeypatch, lancedb_tmp):
     assert payload["rows"][1]["node_level"] == 2
 
 
+def test_index_hierarchy_endpoints_use_conditional_etags(monkeypatch, lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    _write_hierarchical_index(db_dir)
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+
+    client = TestClient(web_app.app)
+    summaries = client.get("/api/index/summaries")
+    summaries_unchanged = client.get(
+        "/api/index/summaries",
+        headers={"If-None-Match": summaries.headers["etag"]},
+    )
+    children = client.get("/api/index/children", params={"parent_id": "doc-summary"})
+    children_unchanged = client.get(
+        "/api/index/children",
+        params={"parent_id": "doc-summary"},
+        headers={"If-None-Match": children.headers["etag"]},
+    )
+
+    store = LanceDBVectorStore(db_dir)
+    persist_index_edit(db_dir, store.get_record("chunk-1"), "edited child context")
+    summaries_changed = client.get(
+        "/api/index/summaries",
+        headers={"If-None-Match": summaries.headers["etag"]},
+    )
+    children_changed = client.get(
+        "/api/index/children",
+        params={"parent_id": "doc-summary"},
+        headers={"If-None-Match": children.headers["etag"]},
+    )
+
+    assert summaries.status_code == 200
+    assert summaries_unchanged.status_code == 304
+    assert children.status_code == 200
+    assert children_unchanged.status_code == 304
+    assert summaries_changed.status_code == 200
+    assert summaries_changed.headers["etag"] != summaries.headers["etag"]
+    assert children_changed.status_code == 200
+    assert children_changed.headers["etag"] != children.headers["etag"]
+
+
 def test_index_review_rows_include_image_asset_metadata(monkeypatch, workspace_tmp, lancedb_tmp):
     asset_dir = workspace_tmp / "assets"
     store = ImageAssetStore(asset_dir)
@@ -2399,6 +2439,61 @@ def test_jobs_endpoint_reports_active_job_count(monkeypatch):
     assert response.json()["active_count"] == 2
 
 
+def test_jobs_endpoint_uses_conditional_etag(monkeypatch):
+    class FakeQueue:
+        def __init__(self):
+            self.jobs = [{"id": "job-a", "status": "queued", "phase": "queued", "filenames": ["a.pdf"]}]
+
+        def list_jobs(self):
+            return list(self.jobs)
+
+    queue = FakeQueue()
+    monkeypatch.setattr(web_app, "job_queue", queue)
+
+    client = TestClient(web_app.app)
+    first = client.get("/api/jobs")
+    second = client.get("/api/jobs", headers={"If-None-Match": first.headers["etag"]})
+    queue.jobs.append({"id": "job-b", "status": "done", "phase": "done", "filenames": ["b.pdf"]})
+    changed = client.get("/api/jobs", headers={"If-None-Match": first.headers["etag"]})
+
+    assert first.status_code == 200
+    assert second.status_code == 304
+    assert changed.status_code == 200
+    assert changed.headers["etag"] != first.headers["etag"]
+    assert changed.json()["total"] == 2
+
+
+def test_health_endpoint_uses_conditional_etag(monkeypatch, workspace_tmp):
+    class FakeQueue:
+        def __init__(self):
+            self.queued_count = 0
+
+        def summary(self):
+            return {
+                "active_query_count": 0,
+                "queued_count": self.queued_count,
+                "running_job_ids": [],
+                "indexing_job_ids": [],
+                "job_count": self.queued_count,
+            }
+
+    queue = FakeQueue()
+    monkeypatch.setattr(web_app, "job_queue", queue)
+    monkeypatch.setattr(web_app, "DB_DIR", workspace_tmp / "db")
+
+    client = TestClient(web_app.app)
+    first = client.get("/api/health")
+    second = client.get("/api/health", headers={"If-None-Match": first.headers["etag"]})
+    queue.queued_count = 1
+    changed = client.get("/api/health", headers={"If-None-Match": first.headers["etag"]})
+
+    assert first.status_code == 200
+    assert second.status_code == 304
+    assert changed.status_code == 200
+    assert changed.headers["etag"] != first.headers["etag"]
+    assert changed.json()["queue"]["queued_count"] == 1
+
+
 def test_index_mutation_endpoints_reject_active_indexing(monkeypatch):
     class IndexingQueue:
         def summary(self):
@@ -2485,6 +2580,35 @@ def test_pdf_documents_endpoint_paginates(monkeypatch, workspace_tmp):
     assert payload["offset"] == 10
     assert payload["limit"] == 10
     assert [pdf["filename"] for pdf in payload["pdfs"]] == ["doc-10.pdf", "doc-11.pdf"]
+
+
+def test_pdf_documents_endpoint_uses_conditional_etag_after_trust_update(monkeypatch, workspace_tmp):
+    registry_path = workspace_tmp / "registry.json"
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    trust_path = workspace_tmp / "trust.json"
+    web_app.PdfRegistry(registry_path).register_queued(
+        job_id="job",
+        files=[{"filename": "doc.pdf", "hash": "hash-doc", "staging_path": ""}],
+    )
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", registry_path)
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", trust_path)
+    monkeypatch.setattr(web_app, "DB_DIR", workspace_tmp / "db")
+
+    client = TestClient(web_app.app)
+    first = client.get("/api/pdfs")
+    second = client.get("/api/pdfs", headers={"If-None-Match": first.headers["etag"]})
+    update = client.post("/api/pdfs/hash-doc/trust", json={"source_group": "official"})
+    changed = client.get("/api/pdfs", headers={"If-None-Match": first.headers["etag"]})
+
+    assert first.status_code == 200
+    assert second.status_code == 304
+    assert update.status_code == 200
+    assert update.json()["pdf"]["trust"]["source_group"] == "official"
+    assert changed.status_code == 200
+    assert changed.headers["etag"] != first.headers["etag"]
+    assert changed.json()["pdfs"][0]["trust"]["source_group"] == "official"
 
 
 def test_pdf_documents_include_quality_payload(monkeypatch, workspace_tmp):
@@ -2694,6 +2818,62 @@ def test_pdf_trust_endpoint_marks_stale_source(monkeypatch, workspace_tmp):
     assert document["trust"]["notes"] == "old design rules"
     assert "marked_stale" in document["quality"]["warnings"]
     assert document["quality"]["label"] == "review"
+
+
+def test_pdf_bulk_trust_endpoint_updates_multiple_sources(monkeypatch, workspace_tmp):
+    registry_path = workspace_tmp / "registry.json"
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    trust_path = workspace_tmp / "trust.json"
+    web_app.PdfRegistry(registry_path).register_queued(
+        job_id="job",
+        files=[
+            {"filename": "a.pdf", "hash": "hash-a", "staging_path": ""},
+            {"filename": "b.pdf", "hash": "hash-b", "staging_path": ""},
+        ],
+    )
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", registry_path)
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", trust_path)
+    monkeypatch.setattr(web_app, "DB_DIR", workspace_tmp / "db")
+
+    response = TestClient(web_app.app).post(
+        "/api/pdfs/trust/bulk",
+        json={"source_hashes": ["hash-a", "hash-b"], "source_group": "official"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["failed"] == []
+    assert [item["source_hash"] for item in payload["updated"]] == ["hash-a", "hash-b"]
+    assert {item["pdf"]["trust"]["source_group"] for item in payload["updated"]} == {"official"}
+
+
+def test_pdf_bulk_trust_endpoint_reports_partial_failures(monkeypatch, workspace_tmp):
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", workspace_tmp / "processed")
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+    monkeypatch.setattr(web_app, "DB_DIR", workspace_tmp / "db")
+    (workspace_tmp / "processed").mkdir()
+
+    response = TestClient(web_app.app).post(
+        "/api/pdfs/trust/bulk",
+        json={"source_hashes": ["hash-a", ""], "source_group": "official"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["updated"][0]["source_hash"] == "hash-a"
+    assert response.json()["failed"][0]["error"] == "source_hash cannot be empty"
+
+
+def test_pdf_bulk_trust_endpoint_rejects_invalid_source_group():
+    response = TestClient(web_app.app).post(
+        "/api/pdfs/trust/bulk",
+        json={"source_hashes": ["hash-a"], "source_group": "bad-group"},
+    )
+
+    assert response.status_code == 400
+    assert "source_group must be one of" in response.json()["detail"]
 
 
 def test_pdf_reprocess_endpoint_queues_single_source_upload(monkeypatch, workspace_tmp):
@@ -3074,6 +3254,47 @@ def test_frontend_jobs_polling_uses_active_count():
     assert 'data-job-id="${escapeHtml(jobId)}"${logOpen}' in script
 
 
+def test_frontend_uses_etag_cache_lazy_panels_and_keyed_row_patching():
+    script = Path("web/app.js").read_text(encoding="utf-8")
+    startup = script[script.index("loadReviewerName();") :]
+
+    assert "const getJsonCache = new Map();" in script
+    assert 'headers.set("If-None-Match", cached.etag)' in script
+    assert "response.status === 304" in script
+    assert "notModified: true" in script
+    assert "state.uploadDataDirty" in script
+    assert "!state.indexLoaded || state.indexDirty" in script
+    assert "refreshJobs();" not in startup
+    assert "refreshPdfs();" not in startup
+    assert "function patchTableRows(tbody, items, options)" in script
+    assert "row.dataset.patchKey" in script
+    assert "row.dataset.renderKey" in script
+    assert "tbody.replaceChildren(fragment)" in script
+    assert "function patchPdfRow(item, options = {})" in script
+    assert "function renderJobRows(jobs)" in script
+    assert "existingChildRows" in script
+
+
+def test_frontend_reduces_chat_render_churn():
+    script = Path("web/app.js").read_text(encoding="utf-8")
+
+    assert "function scheduleChatScroll(force = false)" in script
+    assert "window.requestAnimationFrame" in script
+    assert "scheduleChatScroll();" in script
+    assert "const stableHtml = stableDelta ? await renderMarkdown(stableDelta) : \"\";" in script
+    assert "setStreamTailRaw(parts, keys, tailText)" in script
+    assert "sourcesSignature" in script
+    assert "toolResultsSignature" in script
+
+
+def test_root_injects_static_asset_cache_busting():
+    response = TestClient(web_app.app).get("/")
+
+    assert response.status_code == 200
+    assert "/static/styles.css?v=" in response.text
+    assert "/static/app.js?v=" in response.text
+
+
 def test_frontend_pdf_rows_show_interrupted_warning():
     markup = Path("web/index.html").read_text(encoding="utf-8")
     script = Path("web/app.js").read_text(encoding="utf-8")
@@ -3092,7 +3313,7 @@ def test_frontend_includes_new_user_guide_and_walkthrough():
     script = Path("web/app.js").read_text(encoding="utf-8")
     styles = Path("web/styles.css").read_text(encoding="utf-8")
     refresh_pdfs = script[
-        script.index("async function refreshPdfs()") : script.index("async function handlePdfAction")
+        script.index("async function refreshPdfs(options = {})") : script.index("async function handlePdfAction")
     ]
     render_pdf_rows = script[
         script.index("function renderPdfRows(items)") : script.index("function clearWalkthroughHighlight")
@@ -3197,6 +3418,7 @@ def test_frontend_pdf_trust_actions_record_reviewer_name():
     assert "HOTKEY_SOURCE_GROUPS" in script
     assert "selectedPdfHashes" in script
     assert "applyBulkTagGroup" in script
+    assert 'requestJson("/api/pdfs/trust/bulk"' in script
     assert "selectAllUntaggedPdfs" in script
     assert "data-pdf-select=" in script
 

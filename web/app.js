@@ -18,10 +18,21 @@ const state = {
   jobsTotal: 0,
   jobSearch: "",
   jobsActive: false,
+  activeTab: "chat",
+  pdfsLoaded: false,
+  jobsLoaded: false,
+  uploadDataDirty: true,
+  pdfsRenderedUrl: "",
+  jobsRenderedUrl: "",
+  indexLoaded: false,
+  indexDirty: true,
+  indexRenderedUrl: "",
   chats: [],
   activeChatId: null,
   streamingChatId: null,
   chatAbortController: null,
+  chatScrollFrame: 0,
+  chatScrollForce: false,
   chatSidebarCollapsed: false,
   healthPollIntervalMs: 60000,
   jobsPollIntervalMs: 60000,
@@ -66,6 +77,7 @@ const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
 // Maps each assistant message DOM node to its streaming parts object, so
 // citation clicks can resolve the matching source panel.
 const assistantMessageParts = new WeakMap();
+const getJsonCache = new Map();
 const WALKTHROUGH_FAKE_PDF_HASH = "__walkthrough_fake_untagged_pdf__";
 const SOURCE_GROUP_LABELS = {
   official: "Official",
@@ -218,6 +230,14 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+function stableJson(value) {
+  try {
+    return JSON.stringify(value);
+  } catch (_) {
+    return String(value);
+  }
+}
+
 async function errorFromResponse(response) {
   let detail = await response.text();
   return errorFromText(response.status, response.statusText, detail);
@@ -242,11 +262,31 @@ function errorFromText(status, statusText, text) {
 }
 
 async function requestJson(path, options = {}) {
-  const response = await fetch(path, options);
+  const method = String(options.method || "GET").toUpperCase();
+  const cacheable = method === "GET" && !options.body;
+  const headers = new Headers(options.headers || {});
+  if (cacheable) {
+    const cached = getJsonCache.get(path);
+    if (cached && cached.etag) {
+      headers.set("If-None-Match", cached.etag);
+    }
+  }
+  const response = await fetch(path, { ...options, headers });
+  if (response.status === 304 && cacheable) {
+    const cached = getJsonCache.get(path);
+    if (cached) {
+      return { ...cached.data, notModified: true };
+    }
+  }
   if (!response.ok) {
     throw await errorFromResponse(response);
   }
-  return response.json();
+  const data = await response.json();
+  const etag = response.headers.get("ETag");
+  if (cacheable && etag) {
+    getJsonCache.set(path, { etag, data });
+  }
+  return data;
 }
 
 function uploadFormData(path, body, options = {}) {
@@ -653,10 +693,7 @@ async function runMarkdownRender(parts, kind) {
 
   parts[keys.inFlight] = true;
   try {
-    const [stableHtml, tailHtml] = await Promise.all([
-      stableDelta ? renderMarkdown(stableDelta) : "",
-      tailText ? renderMarkdown(tailText) : "",
-    ]);
+    const stableHtml = stableDelta ? await renderMarkdown(stableDelta) : "";
     if (parts.finalized) {
       return;
     }
@@ -672,7 +709,7 @@ async function runMarkdownRender(parts, kind) {
     }
 
     if (parts[keys.version] === version && parts[keys.raw] === text) {
-      setStreamTailHtml(parts, keys, tailHtml);
+      setStreamTailRaw(parts, keys, tailText);
     } else {
       updateStreamTailRaw(parts, kind);
     }
@@ -957,6 +994,9 @@ function renderActiveChat() {
 async function refreshHealth() {
   try {
     const data = await requestJson("/api/health");
+    if (data.notModified) {
+      return;
+    }
     applyServerConfig(data.server || {});
     applyChatConfig(data.chat || {});
     const queue = data.queue || {};
@@ -1091,6 +1131,57 @@ function updatePageControls({ total, offset, limit, label, prevButton, nextButto
   label.textContent = `${start}-${end} of ${total}`;
   prevButton.disabled = offset <= 0;
   nextButton.disabled = offset + limit >= total;
+}
+
+function patchTableRows(tbody, items, options) {
+  const keyFor = options.keyFor;
+  const createRow = options.createRow;
+  const renderKeyFor = options.renderKeyFor || ((item) => stableJson(item));
+  const existing = new Map();
+  Array.from(tbody.children).forEach((row) => {
+    const key = row.dataset.patchKey;
+    if (key) {
+      existing.set(key, row);
+    }
+  });
+
+  const currentRows = Array.from(tbody.children);
+  const fragment = document.createDocumentFragment();
+  const seen = new Set();
+  let changed = currentRows.length !== items.length;
+  items.forEach((item, index) => {
+    const key = String(keyFor(item));
+    const renderKey = renderKeyFor(item);
+    let row = existing.get(key);
+    if (!row || row.dataset.renderKey !== renderKey) {
+      row = createRow(item);
+      row.dataset.patchKey = key;
+      row.dataset.renderKey = renderKey;
+      changed = true;
+    }
+    if (row !== currentRows[index]) {
+      changed = true;
+    }
+    seen.add(key);
+    fragment.appendChild(row);
+  });
+  for (const key of existing.keys()) {
+    if (!seen.has(key)) {
+      changed = true;
+    }
+  }
+  tbody.replaceChildren(fragment);
+  return changed;
+}
+
+function markUploadDataDirty() {
+  state.uploadDataDirty = true;
+  state.pdfsLoaded = false;
+  state.jobsLoaded = false;
+}
+
+function markIndexDirty() {
+  state.indexDirty = true;
 }
 
 function qualityTitle(value) {
@@ -1253,12 +1344,20 @@ function updatePdfBulkBar() {
 }
 
 function syncPdfSelectionAfterRender() {
-  const liveHashes = new Set(
-    visibleUntaggedRowCheckboxes().map((checkbox) => checkbox.dataset.pdfSelect || "")
-  );
+  const checkboxes = visibleUntaggedRowCheckboxes();
+  const liveHashes = new Set(checkboxes.map((checkbox) => checkbox.dataset.pdfSelect || ""));
   for (const hash of Array.from(state.selectedPdfHashes)) {
     if (!liveHashes.has(hash)) {
       state.selectedPdfHashes.delete(hash);
+    }
+  }
+  for (const checkbox of checkboxes) {
+    const hash = checkbox.dataset.pdfSelect || "";
+    const checked = state.selectedPdfHashes.has(hash);
+    checkbox.checked = checked;
+    const row = checkbox.closest("tr");
+    if (row) {
+      row.classList.toggle("pdf-row-selected", checked);
     }
   }
   syncPdfSelectAllState();
@@ -1274,29 +1373,31 @@ async function applyBulkTagGroup() {
   if (!sourceGroup) {
     return;
   }
-  let successCount = 0;
-  const failures = [];
-  for (const hash of hashes) {
-    try {
-      await requestJson(`/api/pdfs/${encodeURIComponent(hash)}/trust`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source_group: sourceGroup }),
-      });
-      successCount += 1;
-    } catch (error) {
-      failures.push(`${hash.slice(0, 8)}: ${error.message}`);
+  try {
+    const result = await requestJson("/api/pdfs/trust/bulk", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_hashes: hashes, source_group: sourceGroup }),
+    });
+    for (const item of result.updated || []) {
+      if (item.pdf) {
+        patchPdfRow(item.pdf);
+      }
     }
+    clearPdfSelection();
+    const label = SOURCE_GROUP_LABELS[sourceGroup] || sourceGroup;
+    const successCount = (result.updated || []).length;
+    const failures = (result.failed || []).map((item) => `${String(item.source_hash || "").slice(0, 8)}: ${item.error}`);
+    const summary = `Tagged ${successCount} PDF${successCount === 1 ? "" : "s"} as ${label}.`;
+    if (failures.length) {
+      setStatus(els.uploadStatus, `${summary} ${failures.length} failed: ${failures.join("; ")}`, true);
+    } else {
+      setStatus(els.uploadStatus, summary);
+    }
+  } catch (error) {
+    setStatus(els.uploadStatus, error.message, true);
   }
-  clearPdfSelection();
-  const label = SOURCE_GROUP_LABELS[sourceGroup] || sourceGroup;
-  const summary = `Tagged ${successCount} PDF${successCount === 1 ? "" : "s"} as ${label}.`;
-  if (failures.length) {
-    setStatus(els.uploadStatus, `${summary} ${failures.length} failed: ${failures.join("; ")}`, true);
-  } else {
-    setStatus(els.uploadStatus, summary);
-  }
-  await refreshPdfs();
+  await refreshPdfs({ force: true });
 }
 
 function formatBrowserTimestamp(value) {
@@ -1417,6 +1518,28 @@ function createPdfRow(item, options = {}) {
   return row;
 }
 
+function pdfRowPatchKey(item) {
+  return `pdf:${String(item.hash || "")}`;
+}
+
+function pdfRowRenderKey(item, options = {}) {
+  return stableJson({ item, fake: Boolean(options.fake) });
+}
+
+function patchPdfRow(item, options = {}) {
+  const key = pdfRowPatchKey(item);
+  const existing = els.pdfsBody.querySelector(`tr[data-patch-key="${CSS.escape(key)}"]`);
+  if (!existing) {
+    return false;
+  }
+  const row = createPdfRow(item, options);
+  row.dataset.patchKey = key;
+  row.dataset.renderKey = pdfRowRenderKey(item, options);
+  existing.replaceWith(row);
+  syncPdfSelectionAfterRender();
+  return true;
+}
+
 function rememberJobLogOpenState() {
   const liveIds = new Set();
   els.jobsBody.querySelectorAll("details.job-log[data-job-id]").forEach((details) => {
@@ -1438,7 +1561,45 @@ function rememberJobLogOpenState() {
   }
 }
 
-async function refreshJobs() {
+function createJobRow(job) {
+  const row = document.createElement("tr");
+  const jobId = String(job.id || "");
+  const canCancel = ["queued", "running", "paused_for_queries"].includes(String(job.status || ""))
+    && !job.cancel_requested;
+  const cancelButton = canCancel
+    ? `<button type="button" class="danger" data-job-action="cancel" data-job-id="${escapeHtml(jobId)}">Cancel</button>`
+    : "";
+  const logTail = String(job.log_tail || "").trim();
+  const logOpen = state.openJobLogIds.has(jobId) ? " open" : "";
+  const logBlock = logTail
+    ? `<details class="job-log" data-job-id="${escapeHtml(jobId)}"${logOpen}><summary>Log (${Number(job.log_line_count || 0)} lines)</summary><pre>${escapeHtml(logTail)}</pre></details>`
+    : "";
+  row.innerHTML = `
+    <td>${escapeHtml(jobId.slice(0, 8))}</td>
+    <td>${escapeHtml(job.status)}</td>
+    <td>${escapeHtml(job.phase)}</td>
+    <td>${escapeHtml((job.filenames || []).join(", "))}</td>
+    <td>${escapeHtml(job.error || "")}${logBlock}</td>
+    <td><div class="job-actions">${cancelButton}</div></td>
+  `;
+  return row;
+}
+
+function renderJobRows(jobs) {
+  rememberJobLogOpenState();
+  patchTableRows(els.jobsBody, jobs, {
+    keyFor(job) {
+      return `job:${String(job.id || "")}`;
+    },
+    createRow: createJobRow,
+  });
+}
+
+async function refreshJobs(options = {}) {
+  if (state.activeTab !== "upload" && !options.force) {
+    state.uploadDataDirty = true;
+    return;
+  }
   try {
     const isAll = state.jobsPageSize === "all";
     state.jobsLimit = isAll ? 0 : (Number(state.jobsPageSize) || 10);
@@ -1447,39 +1608,21 @@ async function refreshJobs() {
       limit: String(state.jobsLimit),
       search: state.jobSearch,
     });
-    const data = await requestJson(`/api/jobs?${params}`);
+    const url = `/api/jobs?${params}`;
+    const data = await requestJson(url);
+    state.jobsLoaded = true;
+    if (data.notModified && state.jobsRenderedUrl === url) {
+      return;
+    }
     state.jobsTotal = data.total || 0;
     const wasActive = state.jobsActive;
     state.jobsActive = Number(data.active_count || 0) > 0;
     if (!isAll && state.jobsOffset >= state.jobsTotal && state.jobsOffset > 0) {
       state.jobsOffset = Math.max(0, Math.floor((state.jobsTotal - 1) / state.jobsLimit) * state.jobsLimit);
-      return refreshJobs();
+      return refreshJobs({ force: true });
     }
-    rememberJobLogOpenState();
-    els.jobsBody.innerHTML = "";
-    for (const job of data.jobs || []) {
-      const row = document.createElement("tr");
-      const jobId = String(job.id || "");
-      const canCancel = ["queued", "running", "paused_for_queries"].includes(String(job.status || ""))
-        && !job.cancel_requested;
-      const cancelButton = canCancel
-        ? `<button type="button" class="danger" data-job-action="cancel" data-job-id="${escapeHtml(jobId)}">Cancel</button>`
-        : "";
-      const logTail = String(job.log_tail || "").trim();
-      const logOpen = state.openJobLogIds.has(jobId) ? " open" : "";
-      const logBlock = logTail
-        ? `<details class="job-log" data-job-id="${escapeHtml(jobId)}"${logOpen}><summary>Log (${Number(job.log_line_count || 0)} lines)</summary><pre>${escapeHtml(logTail)}</pre></details>`
-        : "";
-      row.innerHTML = `
-        <td>${escapeHtml(jobId.slice(0, 8))}</td>
-        <td>${escapeHtml(job.status)}</td>
-        <td>${escapeHtml(job.phase)}</td>
-        <td>${escapeHtml((job.filenames || []).join(", "))}</td>
-        <td>${escapeHtml(job.error || "")}${logBlock}</td>
-        <td><div class="job-actions">${cancelButton}</div></td>
-      `;
-      els.jobsBody.appendChild(row);
-    }
+    renderJobRows(data.jobs || []);
+    state.jobsRenderedUrl = url;
     if (isAll) {
       els.jobsPageLabel.textContent = `All ${state.jobsTotal} jobs`;
       els.prevJobsPageButton.disabled = true;
@@ -1495,7 +1638,8 @@ async function refreshJobs() {
       });
     }
     if (wasActive && !state.jobsActive) {
-      await refreshPdfs();
+      markIndexDirty();
+      await refreshPdfs({ force: true });
       await refreshHealth();
     }
     if (wasActive !== state.jobsActive) {
@@ -1525,8 +1669,9 @@ async function handleJobAction(event) {
       method: "POST",
     });
     setStatus(els.uploadStatus, `Cancelled job ${String(job.id || jobId).slice(0, 8)}.`);
-    await refreshJobs();
-    await refreshPdfs();
+    markIndexDirty();
+    await refreshJobs({ force: true });
+    await refreshPdfs({ force: true });
   } catch (error) {
     setStatus(els.uploadStatus, error.message, true);
   } finally {
@@ -1534,7 +1679,11 @@ async function handleJobAction(event) {
   }
 }
 
-async function refreshPdfs() {
+async function refreshPdfs(options = {}) {
+  if (state.activeTab !== "upload" && !options.force) {
+    state.uploadDataDirty = true;
+    return;
+  }
   try {
     const isAll = state.pdfPageSize === "all";
     state.pdfLimit = isAll ? 0 : (Number(state.pdfPageSize) || 10);
@@ -1543,13 +1692,19 @@ async function refreshPdfs() {
       limit: String(state.pdfLimit),
       search: state.pdfSearch,
     });
-    const data = await requestJson(`/api/pdfs?${params}`);
+    const url = `/api/pdfs?${params}`;
+    const data = await requestJson(url);
+    state.pdfsLoaded = true;
+    if (data.notModified && state.pdfsRenderedUrl === url) {
+      return;
+    }
     state.pdfTotal = data.total || 0;
     if (!isAll && state.pdfOffset >= state.pdfTotal && state.pdfOffset > 0) {
       state.pdfOffset = Math.max(0, Math.floor((state.pdfTotal - 1) / state.pdfLimit) * state.pdfLimit);
-      return refreshPdfs();
+      return refreshPdfs({ force: true });
     }
     renderPdfRows(data.pdfs || []);
+    state.pdfsRenderedUrl = url;
     if (isAll) {
       els.pdfPageLabel.textContent = `All ${state.pdfTotal} PDFs`;
       els.prevPdfPageButton.disabled = true;
@@ -1624,28 +1779,39 @@ async function handlePdfAction(event) {
         method: "POST",
       });
       setStatus(els.uploadStatus, `Queued re-run job ${String(job.id || "").slice(0, 8)}.`);
-      await refreshJobs();
+      markIndexDirty();
+      await refreshJobs({ force: true });
+      await refreshPdfs({ force: true });
     } else if (action === "reindex") {
       const job = await requestJson(`/api/pdfs/${encodeURIComponent(sourceHash)}/reindex`, {
         method: "POST",
       });
       setStatus(els.uploadStatus, `Queued re-index job ${String(job.id || "").slice(0, 8)}.`);
-      await refreshJobs();
+      markIndexDirty();
+      await refreshJobs({ force: true });
+      await refreshPdfs({ force: true });
     } else if (action === "delete") {
       const result = await requestJson(`/api/pdfs/${encodeURIComponent(sourceHash)}`, {
         method: "DELETE",
       });
       const deletedVectors = Number(result.vectors?.deleted || 0);
       setStatus(els.uploadStatus, `Deleted source ${sourceHash.slice(0, 8)} and ${deletedVectors} index record${deletedVectors === 1 ? "" : "s"}.`);
-      await refreshJobs();
+      markIndexDirty();
+      await refreshJobs({ force: true });
+      await refreshPdfs({ force: true });
     } else {
-      await requestJson(`/api/pdfs/${encodeURIComponent(sourceHash)}/trust`, {
+      const result = await requestJson(`/api/pdfs/${encodeURIComponent(sourceHash)}/trust`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
+      if (result.pdf) {
+        patchPdfRow(result.pdf);
+      }
+      if (action === "tag-group") {
+        await refreshPdfs({ force: true });
+      }
     }
-    await refreshPdfs();
   } catch (error) {
     setStatus(els.uploadStatus, error.message, true);
   } finally {
@@ -1992,8 +2158,9 @@ async function uploadFiles(forceDuplicates = false, forceToken = "") {
     } else {
       setStatus(els.uploadStatus, `Queued ${jobs.length} jobs.`);
     }
-    await refreshJobs();
-    await refreshPdfs();
+    markIndexDirty();
+    await refreshJobs({ force: true });
+    await refreshPdfs({ force: true });
   } catch (error) {
     if (
       error.status === 409 &&
@@ -2029,8 +2196,9 @@ async function enqueueReindex() {
     const job = await requestJson("/api/reindex", { method: "POST" });
     setStatus(els.uploadStatus, `Queued reindex job ${job.id.slice(0, 8)}.`);
     state.jobsOffset = 0;
-    await refreshJobs();
-    await refreshPdfs();
+    markIndexDirty();
+    await refreshJobs({ force: true });
+    await refreshPdfs({ force: true });
   } catch (error) {
     setStatus(els.uploadStatus, error.message, true);
   } finally {
@@ -2050,15 +2218,22 @@ async function loadIndex() {
     limit: String(state.limit),
     search: state.search,
   });
+  const url = `/api/index/summaries?${params}`;
   try {
-    const data = await requestJson(`/api/index/summaries?${params}`, {
+    const data = await requestJson(url, {
       signal: load.abortController.signal,
     });
     if (!isActiveIndexLoad(load)) {
       return;
     }
+    state.indexLoaded = true;
+    state.indexDirty = false;
+    if (data.notModified && state.indexRenderedUrl === url) {
+      return;
+    }
     state.total = data.total || 0;
     renderIndexRows(data.rows || []);
+    state.indexRenderedUrl = url;
     const start = state.total ? state.offset + 1 : 0;
     const end = Math.min(state.offset + state.limit, state.total);
     els.pageLabel.textContent = `${start}-${end} of ${state.total} summaries`;
@@ -2083,6 +2258,7 @@ async function loadAllIndexSummaries(load) {
     limit: "0",
     search: state.search,
   });
+  const url = `/api/index/summaries?${params}`;
 
   els.indexBody.innerHTML = "";
   els.pageLabel.textContent = "Loading summaries...";
@@ -2091,15 +2267,21 @@ async function loadAllIndexSummaries(load) {
   setStatus(els.indexStatus, "Loading summary chunks...");
 
   try {
-    const data = await requestJson(`/api/index/summaries?${params}`, {
+    const data = await requestJson(url, {
       signal: load.abortController.signal,
     });
     if (!isActiveIndexLoad(load)) {
       return;
     }
+    state.indexLoaded = true;
+    state.indexDirty = false;
+    if (data.notModified && state.indexRenderedUrl === url) {
+      return;
+    }
     const rows = data.rows || [];
     state.total = data.total || rows.length;
     renderIndexRows(rows);
+    state.indexRenderedUrl = url;
     els.pageLabel.textContent = `All ${rows.length} of ${state.total} summaries`;
     els.prevPageButton.disabled = true;
     els.nextPageButton.disabled = true;
@@ -2256,28 +2438,63 @@ function createIndexEmptyChildRow(parentId) {
   return row;
 }
 
-function appendIndexRows(rows) {
-  const fragment = document.createDocumentFragment();
-  for (const item of rows) {
-    fragment.appendChild(createIndexRow(item, { allowToggle: true }));
-  }
-  els.indexBody.appendChild(fragment);
-}
-
 function renderIndexRows(rows) {
-  els.indexBody.innerHTML = "";
-  appendIndexRows(rows);
+  const existingTopRows = new Map();
+  const existingChildRows = new Map();
+  Array.from(els.indexBody.children).forEach((row) => {
+    const parentId = row.dataset.parentId;
+    if (parentId) {
+      const group = existingChildRows.get(parentId) || [];
+      group.push(row);
+      existingChildRows.set(parentId, group);
+      return;
+    }
+    const recordId = row.dataset.recordId;
+    if (recordId) {
+      existingTopRows.set(recordId, row);
+    }
+  });
+
+  const fragment = document.createDocumentFragment();
+  rows.forEach((item) => {
+    const recordId = String(item.id || "");
+    const renderKey = stableJson(item);
+    let row = existingTopRows.get(recordId);
+    let rowReused = Boolean(row && row.dataset.renderKey === renderKey);
+    if (!row || row.dataset.renderKey !== renderKey) {
+      row = createIndexRow(item, { allowToggle: true });
+      row.dataset.renderKey = renderKey;
+      rowReused = false;
+    }
+    row.dataset.patchKey = `index:${recordId}`;
+    fragment.appendChild(row);
+
+    const childRows = rowReused ? existingChildRows.get(recordId) || [] : [];
+    if (childRows.length) {
+      const firstVisible = !childRows[0].hidden;
+      const toggle = row.querySelector("[data-action='toggle-children']");
+      if (toggle) {
+        setIndexToggle(toggle, firstVisible);
+      }
+      for (const childRow of childRows) {
+        fragment.appendChild(childRow);
+      }
+    }
+  });
+  els.indexBody.replaceChildren(fragment);
 }
 
 function renderVectorIndexRows(rows) {
-  els.indexBody.innerHTML = "";
-  const fragment = document.createDocumentFragment();
-  for (const item of rows) {
-    const row = createIndexRow(item, { allowToggle: false });
-    row.classList.add("index-vector-result-row");
-    fragment.appendChild(row);
-  }
-  els.indexBody.appendChild(fragment);
+  patchTableRows(els.indexBody, rows, {
+    keyFor(item) {
+      return `vector:${String(item.id || "")}`;
+    },
+    createRow(item) {
+      const row = createIndexRow(item, { allowToggle: false });
+      row.classList.add("index-vector-result-row");
+      return row;
+    },
+  });
 }
 
 async function runIndexVectorSearch() {
@@ -2499,6 +2716,19 @@ function scrollChatToBottom(force = false) {
   }
 }
 
+function scheduleChatScroll(force = false) {
+  state.chatScrollForce = state.chatScrollForce || force;
+  if (state.chatScrollFrame) {
+    return;
+  }
+  state.chatScrollFrame = window.requestAnimationFrame(() => {
+    const shouldForce = state.chatScrollForce;
+    state.chatScrollFrame = 0;
+    state.chatScrollForce = false;
+    scrollChatToBottom(shouldForce);
+  });
+}
+
 function addMessage(role, text = "") {
   const message = document.createElement("div");
   message.className = "message";
@@ -2510,7 +2740,7 @@ function addMessage(role, text = "") {
   body.textContent = text;
   message.append(roleLabel, body);
   els.chatMessages.appendChild(message);
-  scrollChatToBottom(true);
+  scheduleChatScroll(true);
   return body;
 }
 
@@ -2581,7 +2811,7 @@ function addAssistantMessage() {
     message.appendChild(toolResultsPanel);
   }
   els.chatMessages.appendChild(message);
-  scrollChatToBottom(true);
+  scheduleChatScroll(true);
   const parts = {
     body,
     answerStable,
@@ -2600,7 +2830,9 @@ function addAssistantMessage() {
     answerCommittedLength: 0,
     thinkingCommittedLength: 0,
     sourcesData: [],
+    sourcesSignature: "",
     toolResults: [],
+    toolResultsSignature: "",
     get sources() {
       return this.sourcesData;
     },
@@ -2682,6 +2914,11 @@ function appendAssetPreviewGrid(container, assets, options = {}) {
 
 function renderSourcePanel(parts) {
   const sources = Array.isArray(parts.sources) ? parts.sources : [];
+  const signature = stableJson(sources);
+  if (parts.sourcesSignature === signature) {
+    return;
+  }
+  parts.sourcesSignature = signature;
   const wasOpen = parts.sourcesPanel.open;
   parts.sourcesPanel.hidden = sources.length === 0;
   // Sources are collapsed by default; preserve an explicit user expand.
@@ -2918,9 +3155,15 @@ function renderToolResultsPanel(parts) {
     parts.toolResultsPanel.hidden = true;
     parts.toolResultsPanel.open = false;
     parts.toolResultsBody.innerHTML = "";
+    parts.toolResultsSignature = "";
     return;
   }
   const entries = fallbackToolResultEntries(parts);
+  const signature = stableJson(entries);
+  if (parts.toolResultsSignature === signature) {
+    return;
+  }
+  parts.toolResultsSignature = signature;
   parts.toolResultsPanel.hidden = entries.length === 0;
   parts.toolResultsPanel.open = entries.length > 0;
   parts.toolResultsBody.innerHTML = "";
@@ -3234,7 +3477,7 @@ async function sendQuestion(event) {
       } catch (_) {
         appendStreamEvent(assistantParts, { type: "answer", text: line });
       }
-      scrollChatToBottom();
+      scheduleChatScroll();
     };
 
     while (true) {
@@ -3276,17 +3519,26 @@ function activateTab(tabTarget, options = {}) {
   if (!target || !button) {
     return;
   }
+  state.activeTab = tabTarget;
   document.querySelectorAll(".tab").forEach((tab) => tab.classList.remove("active"));
   document.querySelectorAll(".panel").forEach((panel) => panel.classList.remove("active"));
   button.classList.add("active");
   target.classList.add("active");
   if (tabTarget === "index") {
-    loadIndex();
+    if (options.forceRefresh || !state.indexLoaded || state.indexDirty) {
+      loadIndex();
+    }
   } else {
     abortIndexLoad();
   }
   if (tabTarget === "upload" && options.refreshUpload !== false) {
-    refreshPdfs();
+    if (options.forceRefresh || state.uploadDataDirty || !state.pdfsLoaded) {
+      refreshPdfs({ force: true });
+    }
+    if (options.forceRefresh || state.uploadDataDirty || !state.jobsLoaded) {
+      refreshJobs({ force: true });
+    }
+    state.uploadDataDirty = false;
   }
 }
 
@@ -3332,17 +3584,26 @@ function ensureWalkthroughFakePdf() {
 }
 
 function renderPdfRows(items) {
-  const fragment = document.createDocumentFragment();
+  const rows = [];
   state.walkthroughFakePdfVisible = false;
   if (state.walkthroughFakePdfPinned) {
-    fragment.appendChild(createPdfRow(walkthroughFakePdfItem(), { fake: true }));
+    rows.push({ item: walkthroughFakePdfItem(), fake: true });
     state.walkthroughFakePdfVisible = true;
   }
   for (const item of items) {
-    fragment.appendChild(createPdfRow(item));
+    rows.push({ item, fake: false });
   }
-  els.pdfsBody.innerHTML = "";
-  els.pdfsBody.appendChild(fragment);
+  patchTableRows(els.pdfsBody, rows, {
+    keyFor(entry) {
+      return pdfRowPatchKey(entry.item);
+    },
+    renderKeyFor(entry) {
+      return pdfRowRenderKey(entry.item, { fake: entry.fake });
+    },
+    createRow(entry) {
+      return createPdfRow(entry.item, { fake: entry.fake });
+    },
+  });
   if (state.walkthroughFakePdfPinned) {
     const step = walkthroughSteps[state.walkthroughIndex];
     if (step) {
@@ -3605,13 +3866,13 @@ els.reindexButton.addEventListener("click", enqueueReindex);
 els.pdfSearchButton.addEventListener("click", () => {
   state.pdfSearch = els.pdfSearchInput.value.trim();
   state.pdfOffset = 0;
-  refreshPdfs();
+  refreshPdfs({ force: true });
 });
 els.pdfSearchInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     state.pdfSearch = els.pdfSearchInput.value.trim();
     state.pdfOffset = 0;
-    refreshPdfs();
+    refreshPdfs({ force: true });
   }
 });
 els.reviewerNameInput.addEventListener("change", () => saveReviewerName(els.reviewerNameInput.value));
@@ -3653,52 +3914,52 @@ els.jobsBody.addEventListener("click", handleJobAction);
 els.jobSearchButton.addEventListener("click", () => {
   state.jobSearch = els.jobSearchInput.value.trim();
   state.jobsOffset = 0;
-  refreshJobs();
+  refreshJobs({ force: true });
 });
 els.jobSearchInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     state.jobSearch = els.jobSearchInput.value.trim();
     state.jobsOffset = 0;
-    refreshJobs();
+    refreshJobs({ force: true });
   }
 });
 els.pdfPageSizeSelect.addEventListener("change", () => {
   state.pdfPageSize = els.pdfPageSizeSelect.value;
   state.pdfOffset = 0;
-  refreshPdfs();
+  refreshPdfs({ force: true });
 });
 els.jobsPageSizeSelect.addEventListener("change", () => {
   state.jobsPageSize = els.jobsPageSizeSelect.value;
   state.jobsOffset = 0;
-  refreshJobs();
+  refreshJobs({ force: true });
 });
 els.prevPdfPageButton.addEventListener("click", () => {
   if (state.pdfPageSize === "all") {
     return;
   }
   state.pdfOffset = Math.max(0, state.pdfOffset - state.pdfLimit);
-  refreshPdfs();
+  refreshPdfs({ force: true });
 });
 els.nextPdfPageButton.addEventListener("click", () => {
   if (state.pdfPageSize === "all") {
     return;
   }
   state.pdfOffset += state.pdfLimit;
-  refreshPdfs();
+  refreshPdfs({ force: true });
 });
 els.prevJobsPageButton.addEventListener("click", () => {
   if (state.jobsPageSize === "all") {
     return;
   }
   state.jobsOffset = Math.max(0, state.jobsOffset - state.jobsLimit);
-  refreshJobs();
+  refreshJobs({ force: true });
 });
 els.nextJobsPageButton.addEventListener("click", () => {
   if (state.jobsPageSize === "all") {
     return;
   }
   state.jobsOffset += state.jobsLimit;
-  refreshJobs();
+  refreshJobs({ force: true });
 });
 els.searchButton.addEventListener("click", () => {
   state.offset = 0;
@@ -3781,8 +4042,6 @@ persistChatState();
 maybeStartFirstVisitWalkthrough();
 refreshHealth();
 refreshUpdateStatus();
-refreshJobs();
-refreshPdfs();
 scheduleHealthPolling();
 scheduleUpdatePolling();
 scheduleJobsPolling();
