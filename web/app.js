@@ -1881,6 +1881,17 @@ function showDuplicatePrompt(detail) {
 const ZIP_IGNORED_PREFIXES = ["__macosx/"];
 const ZIP_IGNORED_NAMES = new Set([".ds_store"]);
 
+// Tracks which zip File each extracted PDF came from, so the source-group UI
+// can render a zip-level "group for all" selector above its member PDFs.
+// Files picked directly as PDFs are absent from this map (standalone rows).
+const fileZipOrigin = new WeakMap();
+// Per-File selects, keyed by File identity (not name). Survives basename
+// collisions (e.g. two zips each containing report.pdf) and decouples DOM
+// render order from the staged FileList order consumed at submit time.
+const fileToGroupSelect = new WeakMap();
+const zipToDefaultSelect = new WeakMap();
+const selectZipOrigin = new WeakMap();
+
 function isIgnoredZipEntry(path) {
   const lower = String(path || "").toLowerCase();
   if (ZIP_IGNORED_NAMES.has(lower)) return true;
@@ -1946,6 +1957,7 @@ async function extractPdfsFromZip(file) {
       continue;
     }
     accepted.push(new File([bytes], base, { type: "application/pdf" }));
+    fileZipOrigin.set(accepted[accepted.length - 1], file);
   }
   return { accepted, rejected, errors };
 }
@@ -1985,41 +1997,139 @@ function updateSelectedFilesLabel() {
   els.selectedFilesLabel.textContent = `${names.length} selected: ${shown}${extra}`;
 }
 
+// Option list used by both standalone-PDF and zip-level selectors.
+const SOURCE_GROUP_OPTIONS_HTML = `
+  <option value="">Choose group</option>
+  <option value="official">Official</option>
+  <option value="student_research">Student Research</option>
+  <option value="unofficial">Unofficial</option>
+`;
+
+function buildGroupSelect({ inheritDefault = false } = {}) {
+  const select = document.createElement("select");
+  select.className = "upload-group-select";
+  if (inheritDefault) {
+    // First option = "inherit from zip". Its concrete value is resolved at
+    // submit time via the zip-level selector, so it stays empty here.
+    select.innerHTML = `
+      <option value="" data-inherit="true">Use group default</option>
+      <option value="official" data-override="official">Official</option>
+      <option value="student_research" data-override="student_research">Student Research</option>
+      <option value="unofficial" data-override="unofficial">Unofficial</option>
+    `;
+  } else {
+    select.innerHTML = SOURCE_GROUP_OPTIONS_HTML;
+  }
+  return select;
+}
+
 function renderUploadGroupSelectors() {
   const files = Array.from(els.fileInput.files || []);
   els.uploadGroupsPanel.innerHTML = "";
   els.uploadGroupsPanel.hidden = files.length === 0;
+  if (!files.length) return;
+
+  // Group members by their source zip (preserve selection order). Standalone
+  // PDFs land in the `standalone` bucket in input order.
+  const standalone = [];
+  const zipGroups = new Map(); // zip File -> File[]
   for (const file of files) {
+    const zip = fileZipOrigin.get(file);
+    if (zip) {
+      if (!zipGroups.has(zip)) zipGroups.set(zip, []);
+      zipGroups.get(zip).push(file);
+    } else {
+      standalone.push(file);
+    }
+  }
+
+  // Render standalone PDFs first (unchanged layout).
+  for (const file of standalone) {
     const row = document.createElement("label");
     row.className = "upload-group-row";
     const name = document.createElement("span");
     name.className = "upload-group-name";
     name.textContent = file.name || "unnamed.pdf";
-    const select = document.createElement("select");
-    select.className = "upload-group-select";
+    const select = buildGroupSelect();
     select.dataset.uploadGroup = "true";
-    select.innerHTML = `
-      <option value="">Choose group</option>
-      <option value="official">Official</option>
-      <option value="student_research">Student Research</option>
-      <option value="unofficial">Unofficial</option>
-    `;
+    fileToGroupSelect.set(file, select);
     row.append(name, select);
     els.uploadGroupsPanel.appendChild(row);
+  }
+
+  // Then one section per zip: a header row ("group for all PDFs in <zip>") and
+  // indented member rows whose default option inherits the zip-level choice.
+  for (const [zip, members] of zipGroups) {
+    const header = document.createElement("div");
+    header.className = "upload-zip-header";
+    const label = document.createElement("span");
+    label.className = "upload-zip-label";
+    const count = members.length;
+    label.textContent = `${zip.name || "archive.zip"} · ${count} PDF${count === 1 ? "" : "s"}`;
+    const defaultSelect = buildGroupSelect();
+    defaultSelect.dataset.zipGroupDefault = "true";
+    defaultSelect.dataset.zipName = zip.name || "archive.zip";
+    zipToDefaultSelect.set(zip, defaultSelect);
+    const defaultLabel = document.createElement("span");
+    defaultLabel.className = "upload-zip-default-label";
+    defaultLabel.textContent = "Group for all:";
+    header.append(label, defaultLabel, defaultSelect);
+    els.uploadGroupsPanel.appendChild(header);
+
+    for (const file of members) {
+      const row = document.createElement("label");
+      row.className = "upload-group-row upload-group-row--member";
+      const name = document.createElement("span");
+      name.className = "upload-group-name";
+      name.textContent = file.name || "unnamed.pdf";
+      const select = buildGroupSelect({ inheritDefault: true });
+      select.dataset.uploadGroup = "true";
+      select.dataset.inheritFrom = "zip";
+      fileToGroupSelect.set(file, select);
+      // Remember which zip this member inherits from, by identity.
+      selectZipOrigin.set(select, zip);
+      row.append(name, select);
+      header.after(row); // keep header immediately above its members
+    }
   }
 }
 
 function selectedUploadSourceGroups() {
-  const selects = Array.from(els.uploadGroupsPanel.querySelectorAll("[data-upload-group='true']"));
-  if (!selects.length) {
+  const files = Array.from(els.fileInput.files || []);
+  if (!files.length || !fileToGroupSelect.has(files[0])) {
     return [];
   }
+
+  // Resolve in the exact order files are appended to FormData. Each file maps
+  // to its own select by identity; member rows whose value is the "inherit"
+  // option resolve their group from the owning zip's header select.
   const groups = [];
-  for (const select of selects) {
-    const value = parseSourceGroupInput(select.value);
+  for (const file of files) {
+    const select = fileToGroupSelect.get(file);
+    if (!select) {
+      setStatus(els.uploadStatus, `No source-group selector for ${file.name || "file"}.`, true);
+      return null;
+    }
+    let value = parseSourceGroupInput(select.value);
+    let labelSelect = select;
+    if (!value && select.dataset.inheritFrom === "zip") {
+      const zip = selectZipOrigin.get(select);
+      const zipSelect = zip ? zipToDefaultSelect.get(zip) : null;
+      if (zipSelect) {
+        value = parseSourceGroupInput(zipSelect.value);
+        labelSelect = zipSelect;
+      }
+    }
     if (!value) {
-      select.focus();
-      setStatus(els.uploadStatus, "Choose a source group for each selected PDF.", true);
+      labelSelect.focus();
+      const isMember = select.dataset.inheritFrom === "zip";
+      setStatus(
+        els.uploadStatus,
+        isMember
+          ? `Choose a group for ${file.name || "this PDF"}'s archive (or override it individually).`
+          : `Choose a source group for ${file.name || "this PDF"}.`,
+        true,
+      );
       return null;
     }
     groups.push(value);
