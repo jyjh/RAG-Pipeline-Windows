@@ -36,6 +36,7 @@ const state = {
   pendingForceUploadToken: "",
   sourceGroupPromptResolver: null,
   selectedPdfHashes: new Set(),
+  openJobLogIds: new Set(),
   walkthroughFakePdfPinned: false,
   walkthroughFakePdfVisible: false,
   walkthroughIndex: -1,
@@ -1416,6 +1417,27 @@ function createPdfRow(item, options = {}) {
   return row;
 }
 
+function rememberJobLogOpenState() {
+  const liveIds = new Set();
+  els.jobsBody.querySelectorAll("details.job-log[data-job-id]").forEach((details) => {
+    const jobId = details.dataset.jobId || "";
+    if (!jobId) {
+      return;
+    }
+    liveIds.add(jobId);
+    if (details.open) {
+      state.openJobLogIds.add(jobId);
+    } else {
+      state.openJobLogIds.delete(jobId);
+    }
+  });
+  for (const jobId of Array.from(state.openJobLogIds)) {
+    if (!liveIds.has(jobId)) {
+      state.openJobLogIds.delete(jobId);
+    }
+  }
+}
+
 async function refreshJobs() {
   try {
     const isAll = state.jobsPageSize === "all";
@@ -1433,20 +1455,23 @@ async function refreshJobs() {
       state.jobsOffset = Math.max(0, Math.floor((state.jobsTotal - 1) / state.jobsLimit) * state.jobsLimit);
       return refreshJobs();
     }
+    rememberJobLogOpenState();
     els.jobsBody.innerHTML = "";
     for (const job of data.jobs || []) {
       const row = document.createElement("tr");
+      const jobId = String(job.id || "");
       const canCancel = ["queued", "running", "paused_for_queries"].includes(String(job.status || ""))
         && !job.cancel_requested;
       const cancelButton = canCancel
-        ? `<button type="button" class="danger" data-job-action="cancel" data-job-id="${escapeHtml(job.id || "")}">Cancel</button>`
+        ? `<button type="button" class="danger" data-job-action="cancel" data-job-id="${escapeHtml(jobId)}">Cancel</button>`
         : "";
       const logTail = String(job.log_tail || "").trim();
+      const logOpen = state.openJobLogIds.has(jobId) ? " open" : "";
       const logBlock = logTail
-        ? `<details class="job-log"><summary>Log (${Number(job.log_line_count || 0)} lines)</summary><pre>${escapeHtml(logTail)}</pre></details>`
+        ? `<details class="job-log" data-job-id="${escapeHtml(jobId)}"${logOpen}><summary>Log (${Number(job.log_line_count || 0)} lines)</summary><pre>${escapeHtml(logTail)}</pre></details>`
         : "";
       row.innerHTML = `
-        <td>${escapeHtml(job.id.slice(0, 8))}</td>
+        <td>${escapeHtml(jobId.slice(0, 8))}</td>
         <td>${escapeHtml(job.status)}</td>
         <td>${escapeHtml(job.phase)}</td>
         <td>${escapeHtml((job.filenames || []).join(", "))}</td>

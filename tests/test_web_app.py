@@ -3068,6 +3068,10 @@ def test_frontend_jobs_polling_uses_active_count():
     assert "state.jobsActive ? JOBS_ACTIVE_POLL_INTERVAL_MS : state.jobsPollIntervalMs" in script
     assert 'data-job-action="cancel"' in script
     assert '/api/jobs/${encodeURIComponent(jobId)}/cancel' in script
+    assert "openJobLogIds: new Set()" in script
+    assert "function rememberJobLogOpenState()" in script
+    assert 'details.job-log[data-job-id]' in script
+    assert 'data-job-id="${escapeHtml(jobId)}"${logOpen}' in script
 
 
 def test_frontend_pdf_rows_show_interrupted_warning():
