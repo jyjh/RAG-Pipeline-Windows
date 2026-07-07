@@ -29,11 +29,11 @@
       <section id="upload" class="panel">
         <div id="uploadDropZone" class="upload-drop-zone">
           <div class="toolbar">
-            <input id="fileInput" type="file" accept="application/pdf,.pdf" multiple />
+            <input id="fileInput" type="file" accept="application/pdf,.pdf,.zip,application/zip,application/x-zip-compressed" multiple />
             <button id="uploadButton" type="button">Upload + index</button>
             <button id="reindexButton" type="button">Reindex</button>
           </div>
-          <div id="selectedFilesLabel" class="selected-files-label">Drop PDFs</div>
+          <div id="selectedFilesLabel" class="selected-files-label">Drop PDFs or a .zip of PDFs</div>
           <div id="uploadGroupsPanel" class="upload-groups-panel" hidden></div>
         </div>
         <div id="uploadStatus" class="status"></div>
@@ -226,7 +226,7 @@
             <ol class="guide-steps">
               <li>
                 <strong>Add PDFs</strong>
-                <span>Upload team reports, textbooks, notes, papers, or standards and choose a reliability group for each PDF.</span>
+                <span>Upload team reports, textbooks, notes, papers, or standards and choose a reliability group for each PDF. You can also drop a <code>.zip</code> of PDFs — subfolders are flattened automatically.</span>
               </li>
               <li>
                 <strong>Wait for jobs</strong>
@@ -343,6 +343,7 @@
       </div>
     </div>
 
+    <script src="/static/vendor/fflate.min.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

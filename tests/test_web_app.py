@@ -2175,6 +2175,99 @@ def test_data_pdf_duplicate_scan_reuses_hash_cache(monkeypatch, workspace_tmp):
     assert calls == [pdf_path]
 
 
+def test_data_pdf_duplicate_scan_skips_metadata_known_paths(monkeypatch, workspace_tmp):
+    data_dir = workspace_tmp / "data"
+    uploads_dir = data_dir / "uploads" / "existing-job"
+    uploads_dir.mkdir(parents=True)
+    registry_pdf = uploads_dir / "known-registry.pdf"
+    source_map_pdf = data_dir / "known-source-map.pdf"
+    orphan_pdf = data_dir / "orphan.pdf"
+    for path in (registry_pdf, source_map_pdf, orphan_pdf):
+        path.write_bytes(b"%PDF-1.4 known")
+
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    markdown_path = processed_dir / "known.md"
+    markdown_path.write_text("# Known", encoding="utf-8")
+    registry_path = data_dir / "registry.json"
+    web_app.PdfRegistry(registry_path).register_queued(
+        job_id="known-job",
+        files=[
+            {
+                "filename": registry_pdf.name,
+                "hash": "1" * 64,
+                "upload_path": str(registry_pdf),
+            }
+        ],
+    )
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=markdown_path,
+        source_hash="2" * 64,
+        source_pdf_name=source_map_pdf.name,
+        source_pdf_path=source_map_pdf,
+    )
+    calls = []
+
+    def fake_sha256_file(path):
+        calls.append(Path(path))
+        return "hash-target"
+
+    web_app._PDF_HASH_CACHE.clear()
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", registry_path)
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "sha256_file", fake_sha256_file)
+
+    duplicates = web_app._data_pdf_duplicate_entries(
+        [{"filename": "copy.pdf", "hash": "hash-target"}],
+        known_hashes=set(),
+        data_dir=data_dir,
+    )
+
+    assert calls == [orphan_pdf]
+    assert [item["existing_filename"] for item in duplicates] == [orphan_pdf.name]
+
+
+def test_upload_endpoint_accepts_large_pdf_response_shape(monkeypatch, workspace_tmp):
+    captured = {}
+
+    class FakeQueue:
+        def enqueue_upload(self, **kwargs):
+            captured.update(kwargs)
+            return web_app.QueueJob(
+                id=kwargs["job_id"],
+                kind="upload",
+                filenames=kwargs["filenames"],
+                uploads=kwargs["uploads"],
+                staging_dir=str(kwargs["staging_dir"]),
+            )
+
+    data_dir = workspace_tmp / "data"
+    monkeypatch.setattr(web_app, "DATA_DIR", data_dir)
+    monkeypatch.setattr(web_app, "STAGING_DIR", data_dir / ".upload_queue")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", data_dir / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", workspace_tmp / "processed")
+    monkeypatch.setattr(web_app, "DB_DIR", workspace_tmp / "db")
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    content = b"%PDF-1.4\n" + (b"0" * (8 * 1024 * 1024))
+    expected_hash = hashlib.sha256(content).hexdigest()
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/uploads",
+        data={"source_groups": "official"},
+        files=[("files", ("large.pdf", content, "application/pdf"))],
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job_count"] == 1
+    assert payload["filenames"] == ["large.pdf"]
+    assert captured["uploads"][0]["hash"] == expected_hash
+    assert Path(captured["uploads"][0]["staging_path"]).exists()
+
+
 def test_upload_endpoint_allows_forced_duplicate(monkeypatch, workspace_tmp):
     captured = {}
 
@@ -2951,6 +3044,19 @@ def test_sources_panel_frontend_includes_image_asset_preview():
     assert ".source-assets" in styles
     assert ".source-asset img" in styles
     assert ".index-assets .source-asset img" in styles
+
+
+def test_frontend_upload_uses_xhr_progress_and_keeps_duplicate_prompt():
+    script = Path("web/app.js").read_text(encoding="utf-8")
+
+    assert "function uploadFormData(path, body, options = {})" in script
+    assert "new XMLHttpRequest()" in script
+    assert 'request.upload.addEventListener("progress"' in script
+    assert 'uploadFormData("/api/uploads", body' in script
+    assert 'requestJson("/api/uploads"' not in script
+    assert "Upload received. Processing upload..." in script
+    assert "Duplicate upload blocked." in script
+    assert "showDuplicatePrompt(error.detail)" in script
 
 
 def test_frontend_jobs_polling_uses_active_count():

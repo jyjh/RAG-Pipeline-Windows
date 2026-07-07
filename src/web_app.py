@@ -25,6 +25,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from src.defaults import (
@@ -2885,6 +2886,54 @@ def _cached_pdf_hash(path: Path) -> str:
     return digest
 
 
+def _copy_upload_file_to_path(upload: StarletteUploadFile, destination: Path) -> str:
+    digest = hashlib.sha256()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    upload.file.seek(0)
+    with destination.open("wb") as handle:
+        for chunk in iter(lambda: upload.file.read(1024 * 1024), b""):
+            digest.update(chunk)
+            handle.write(chunk)
+    upload.file.seek(0)
+    return digest.hexdigest()
+
+
+def _known_data_pdf_paths(
+    *,
+    data_dir: Path | None = None,
+    registry_path: Path | None = None,
+    processed_dir: Path | None = None,
+) -> set[Path]:
+    data_dir = data_dir or DATA_DIR
+    registry_path = registry_path or PDF_REGISTRY_PATH
+    processed_dir = processed_dir or PROCESSED_DIR
+    known_paths: set[Path] = set()
+
+    def add_path(raw_path: Any) -> None:
+        text = str(raw_path or "")
+        if not text:
+            return
+        try:
+            known_paths.add(_resolve_pdf_path(text, data_dir=data_dir).resolve())
+        except (OSError, PermissionError, FileNotFoundError):
+            return
+
+    registry_payload = PdfRegistry(registry_path).load()
+    for source_hash, entry in registry_payload.get("pdfs", {}).items():
+        if not source_hash or not isinstance(entry, dict):
+            continue
+        add_path(entry.get("upload_path"))
+        add_path(entry.get("source_pdf_path"))
+
+    source_map = load_source_map(processed_dir)
+    for entry in source_map.get("documents", {}).values():
+        if not isinstance(entry, dict) or not entry.get("source_hash"):
+            continue
+        add_path(entry.get("source_pdf_path"))
+
+    return known_paths
+
+
 def _data_pdf_duplicate_entries(
     files: list[dict[str, Any]],
     *,
@@ -2908,6 +2957,7 @@ def _data_pdf_duplicate_entries(
             except OSError:
                 pass
 
+    known_pdf_paths = _known_data_pdf_paths(data_dir=data_dir)
     existing_by_hash: dict[str, Path] = {}
     for candidate in data_dir.rglob("*.pdf"):
         try:
@@ -2915,6 +2965,8 @@ def _data_pdf_duplicate_entries(
         except OSError:
             continue
         if resolved in current_paths:
+            continue
+        if resolved in known_pdf_paths:
             continue
         if staging_dir.exists() and _path_is_relative_to(resolved, staging_dir):
             continue
@@ -3006,20 +3058,15 @@ async def _handle_upload_request(request: Request, *, require_source_groups: boo
             used_names.add(filename.lower())
 
             destination = staging_dir / filename
-            digest = hashlib.sha256()
-            with destination.open("wb") as handle:
-                while True:
-                    chunk = await value.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    digest.update(chunk)
-                    handle.write(chunk)
-            await value.close()
+            try:
+                digest = await run_in_threadpool(_copy_upload_file_to_path, value, destination)
+            finally:
+                await value.close()
             filenames.append(filename)
             uploads.append(
                 {
                     "filename": filename,
-                    "hash": digest.hexdigest(),
+                    "hash": digest,
                     "staging_path": str(destination),
                     "staging_dir": str(staging_dir),
                     "job_id": job_id,
@@ -3059,7 +3106,7 @@ async def _handle_upload_request(request: Request, *, require_source_groups: boo
             )
 
         registry = PdfRegistry(PDF_REGISTRY_PATH)
-        duplicate_entries = _blocking_duplicate_entries(uploads)
+        duplicate_entries = await run_in_threadpool(_blocking_duplicate_entries, uploads)
         force_token = str(form.get("force_token") or "")
         force_token_valid = (
             force_duplicates

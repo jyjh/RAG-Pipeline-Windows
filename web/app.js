@@ -219,6 +219,11 @@ function escapeHtml(value) {
 
 async function errorFromResponse(response) {
   let detail = await response.text();
+  return errorFromText(response.status, response.statusText, detail);
+}
+
+function errorFromText(status, statusText, text) {
+  let detail = text;
   try {
     const parsed = JSON.parse(detail);
     detail = parsed.detail || detail;
@@ -228,9 +233,9 @@ async function errorFromResponse(response) {
   const message =
     typeof detail === "string"
       ? detail
-      : detail.message || `${response.status} ${response.statusText}`;
+      : detail.message || `${status} ${statusText}`;
   const error = new Error(message);
-  error.status = response.status;
+  error.status = status;
   error.detail = detail;
   return error;
 }
@@ -241,6 +246,43 @@ async function requestJson(path, options = {}) {
     throw await errorFromResponse(response);
   }
   return response.json();
+}
+
+function uploadFormData(path, body, options = {}) {
+  const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", path);
+    request.addEventListener("load", () => {
+      const text = request.responseText || "";
+      if (request.status >= 200 && request.status < 300) {
+        try {
+          resolve(JSON.parse(text || "{}"));
+        } catch (_) {
+          reject(new Error("Upload response was not valid JSON."));
+        }
+        return;
+      }
+      reject(errorFromText(request.status, request.statusText, text));
+    });
+    request.addEventListener("error", () => {
+      reject(new Error("Upload failed. Check the server connection."));
+    });
+    request.addEventListener("abort", () => {
+      const error = new Error("Upload cancelled.");
+      error.name = "AbortError";
+      reject(error);
+    });
+    if (onProgress) {
+      request.upload.addEventListener("progress", (event) => {
+        const total = Number(event.total || 0);
+        const loaded = Number(event.loaded || 0);
+        const percent = event.lengthComputable && total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : null;
+        onProgress({ loaded, total, percent });
+      });
+    }
+    request.send(body);
+  });
 }
 
 function isAbortError(error) {
@@ -1644,19 +1686,100 @@ function showDuplicatePrompt(detail) {
   els.forceUploadButton.disabled = !forceToken;
 }
 
-function pdfFilesFromList(files) {
+// Zip-entry prefixes/names that are never useful PDFs (macOS metadata, etc.).
+const ZIP_IGNORED_PREFIXES = ["__macosx/"];
+const ZIP_IGNORED_NAMES = new Set([".ds_store"]);
+
+function isIgnoredZipEntry(path) {
+  const lower = String(path || "").toLowerCase();
+  if (ZIP_IGNORED_NAMES.has(lower)) return true;
+  return ZIP_IGNORED_PREFIXES.some((prefix) => lower.startsWith(prefix));
+}
+
+function isZipFile(file) {
+  const name = (file.name || "").toLowerCase();
+  return (
+    name.endsWith(".zip") ||
+    file.type === "application/zip" ||
+    file.type === "application/x-zip-compressed"
+  );
+}
+
+// Expand a single .zip File into PDF File objects. Subfolders are flattened to
+// basenames; the server's existing batch dedupe handles same-name collisions.
+// Returns { accepted: File[], rejected: string[], errors: string[] }.
+async function extractPdfsFromZip(file) {
   const accepted = [];
   const rejected = [];
+  const errors = [];
+  const displayName = file.name || "archive.zip";
+
+  if (typeof fflate === "undefined" || !fflate.unzipSync) {
+    errors.push(`Zip support failed to load — pick PDFs directly instead of ${displayName}.`);
+    return { accepted, rejected, errors };
+  }
+
+  let buffer;
+  try {
+    buffer = await file.arrayBuffer();
+  } catch (err) {
+    errors.push(`Could not read ${displayName}: ${err && err.message ? err.message : err}.`);
+    return { accepted, rejected, errors };
+  }
+
+  let entries;
+  try {
+    entries = fflate.unzipSync(new Uint8Array(buffer));
+  } catch (err) {
+    errors.push(`Could not unzip ${displayName}: ${err && err.message ? err.message : err}.`);
+    return { accepted, rejected, errors };
+  }
+
+  const names = Object.keys(entries);
+  if (!names.length) {
+    errors.push(`${displayName} contains no files.`);
+    return { accepted, rejected, errors };
+  }
+
+  for (const entryName of names) {
+    if (!entryName || entryName.endsWith("/")) continue; // directory entry
+    if (isIgnoredZipEntry(entryName)) continue;
+    const base = entryName.split("/").pop() || entryName;
+    if (!base.toLowerCase().endsWith(".pdf")) {
+      rejected.push(entryName);
+      continue;
+    }
+    const bytes = entries[entryName];
+    if (!(bytes instanceof Uint8Array) || bytes.length === 0) {
+      rejected.push(entryName);
+      continue;
+    }
+    accepted.push(new File([bytes], base, { type: "application/pdf" }));
+  }
+  return { accepted, rejected, errors };
+}
+
+// Split a selection into PDFs + zip-expanded PDFs. Non-PDF, non-zip files fall
+// through to `rejected` exactly as the legacy path did.
+async function pdfFilesFromList(files) {
+  const accepted = [];
+  const rejected = [];
+  const errors = [];
   for (const file of Array.from(files || [])) {
     const name = file.name || "";
     const isPdf = file.type === "application/pdf" || name.toLowerCase().endsWith(".pdf");
     if (isPdf) {
       accepted.push(file);
+    } else if (isZipFile(file)) {
+      const result = await extractPdfsFromZip(file);
+      accepted.push(...result.accepted);
+      rejected.push(...result.rejected);
+      errors.push(...result.errors);
     } else {
       rejected.push(name || "unnamed file");
     }
   }
-  return { accepted, rejected };
+  return { accepted, rejected, errors };
 }
 
 function updateSelectedFilesLabel() {
@@ -1713,11 +1836,19 @@ function selectedUploadSourceGroups() {
   return groups;
 }
 
-function setSelectedUploadFiles(files) {
+async function setSelectedUploadFiles(files) {
   clearDuplicatePrompt();
-  const { accepted, rejected } = pdfFilesFromList(files);
+  const { accepted, rejected, errors } = await pdfFilesFromList(files);
   if (!accepted.length) {
-    setStatus(els.uploadStatus, "Drop one or more PDF files.", true);
+    const messages = errors.slice();
+    if (rejected.length) {
+      messages.push(`Skipped non-PDF file(s): ${rejected.join(", ")}`);
+    }
+    setStatus(
+      els.uploadStatus,
+      messages.length ? messages.join("\n") : "Drop one or more PDF files.",
+      true,
+    );
     updateSelectedFilesLabel();
     renderUploadGroupSelectors();
     return;
@@ -1730,8 +1861,12 @@ function setSelectedUploadFiles(files) {
   els.fileInput.files = transfer.files;
   updateSelectedFilesLabel();
   renderUploadGroupSelectors();
+  const messages = errors.slice();
   if (rejected.length) {
-    setStatus(els.uploadStatus, `Skipped non-PDF file(s): ${rejected.join(", ")}`, true);
+    messages.push(`Skipped non-PDF file(s): ${rejected.join(", ")}`);
+  }
+  if (messages.length) {
+    setStatus(els.uploadStatus, messages.join("\n"), true);
   } else {
     setStatus(els.uploadStatus, "");
   }
@@ -1804,9 +1939,22 @@ async function uploadFiles(forceDuplicates = false, forceToken = "") {
 
   els.uploadButton.disabled = true;
   els.forceUploadButton.disabled = true;
-  setStatus(els.uploadStatus, isForced ? "Queueing forced upload..." : "Queueing upload...");
+  setStatus(els.uploadStatus, isForced ? "Uploading forced upload..." : "Uploading...");
   try {
-    const result = await requestJson("/api/uploads", { method: "POST", body });
+    const result = await uploadFormData("/api/uploads", body, {
+      onProgress(progress) {
+        if (progress.percent === null) {
+          setStatus(els.uploadStatus, isForced ? "Uploading forced upload..." : "Uploading...");
+          return;
+        }
+        if (progress.percent >= 100) {
+          setStatus(els.uploadStatus, "Upload received. Processing upload...");
+          return;
+        }
+        const prefix = isForced ? "Uploading forced upload" : "Uploading";
+        setStatus(els.uploadStatus, `${prefix} ${progress.percent}%...`);
+      },
+    });
     const jobs = Array.isArray(result.jobs) && result.jobs.length ? result.jobs : [result];
     els.fileInput.value = "";
     updateSelectedFilesLabel();
@@ -3415,9 +3563,7 @@ els.sourceGroupPromptCancelButton.addEventListener("click", () => closeSourceGro
 
 els.updateButton.addEventListener("click", applyUpdate);
 els.fileInput.addEventListener("change", () => {
-  clearDuplicatePrompt();
-  updateSelectedFilesLabel();
-  renderUploadGroupSelectors();
+  setSelectedUploadFiles(els.fileInput.files);
 });
 els.uploadDropZone.addEventListener("dragenter", handleUploadDrag);
 els.uploadDropZone.addEventListener("dragover", handleUploadDrag);
