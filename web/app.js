@@ -101,6 +101,15 @@ const els = {
   uploadGroupsPanel: document.getElementById("uploadGroupsPanel"),
   uploadButton: document.getElementById("uploadButton"),
   reindexButton: document.getElementById("reindexButton"),
+  reingestButton: document.getElementById("reingestButton"),
+  backupIndexButton: document.getElementById("backupIndexButton"),
+  rebuildIndexButton: document.getElementById("rebuildIndexButton"),
+  toggleRestorePanelButton: document.getElementById("toggleRestorePanelButton"),
+  restoreIndexPanel: document.getElementById("restoreIndexPanel"),
+  restoreBackupsList: document.getElementById("restoreBackupsList"),
+  refreshBackupsButton: document.getElementById("refreshBackupsButton"),
+  closeRestorePanelButton: document.getElementById("closeRestorePanelButton"),
+  maintenanceStatus: document.getElementById("maintenanceStatus"),
   uploadStatus: document.getElementById("uploadStatus"),
   duplicatePrompt: document.getElementById("duplicatePrompt"),
   duplicatePromptText: document.getElementById("duplicatePromptText"),
@@ -2316,6 +2325,285 @@ async function enqueueReindex() {
   }
 }
 
+async function enqueueReingest() {
+  if (els.reingestButton) {
+    els.reingestButton.disabled = true;
+  }
+  const confirmed = await confirmAction(
+    "Re-ingest all PDFs?",
+    "This re-runs PDF extraction (ingestion) and indexing for every registered PDF. " +
+      "Use it after changing OCR/parser/vision settings or when extracted text looks wrong across many documents. " +
+      "It runs as a background job and may take a while.",
+    "Re-ingest all",
+  );
+  if (!confirmed) {
+    if (els.reingestButton) {
+      els.reingestButton.disabled = false;
+    }
+    return;
+  }
+  setMaintenanceStatus("Queueing full re-ingest...");
+  try {
+    const job = await requestJson("/api/reingest", { method: "POST" });
+    setMaintenanceStatus(`Queued re-ingest job ${job.id.slice(0, 8)}.`);
+    state.jobsOffset = 0;
+    markIndexDirty();
+    await refreshJobs({ force: true });
+    await refreshPdfs({ force: true });
+  } catch (error) {
+    setMaintenanceStatus(error.message, true);
+  } finally {
+    if (els.reingestButton) {
+      els.reingestButton.disabled = false;
+    }
+  }
+}
+
+function confirmAction(title, body, confirmLabel = "Confirm") {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.hidden = false;
+    const dialog = document.createElement("div");
+    dialog.className = "modal-dialog";
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    const heading = document.createElement("h2");
+    heading.textContent = title;
+    dialog.appendChild(heading);
+    if (body) {
+      const paragraph = document.createElement("p");
+      paragraph.textContent = body;
+      dialog.appendChild(paragraph);
+    }
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const confirmButton = document.createElement("button");
+    confirmButton.type = "button";
+    confirmButton.textContent = confirmLabel;
+    if (confirmLabel.toLowerCase().includes("rebuild") || confirmLabel.toLowerCase().includes("restore")) {
+      confirmButton.className = "danger";
+    }
+    const cancelButton = document.createElement("button");
+    cancelButton.type = "button";
+    cancelButton.textContent = "Cancel";
+    actions.appendChild(cancelButton);
+    actions.appendChild(confirmButton);
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    const close = (result) => {
+      overlay.remove();
+      document.removeEventListener("keydown", onKey);
+      resolve(result);
+    };
+    const onKey = (event) => {
+      if (event.key === "Escape") {
+        close(false);
+      } else if (event.key === "Enter") {
+        close(true);
+      }
+    };
+    confirmButton.addEventListener("click", () => close(true));
+    cancelButton.addEventListener("click", () => close(false));
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) {
+        close(false);
+      }
+    });
+    document.addEventListener("keydown", onKey);
+    setTimeout(() => confirmButton.focus(), 0);
+  });
+}
+
+function setMaintenanceStatus(text, isError = false) {
+  if (els.maintenanceStatus) {
+    setStatus(els.maintenanceStatus, text, isError);
+  }
+}
+
+async function enqueueBackup() {
+  if (els.backupIndexButton) {
+    els.backupIndexButton.disabled = true;
+  }
+  setMaintenanceStatus("Queueing index backup...");
+  try {
+    const job = await requestJson("/api/index/backup", { method: "POST" });
+    setMaintenanceStatus(`Queued index backup job ${job.id.slice(0, 8)}.`);
+    state.jobsOffset = 0;
+    await refreshJobs({ force: true });
+    await loadIndexBackups();
+  } catch (error) {
+    setMaintenanceStatus(error.message, true);
+  } finally {
+    if (els.backupIndexButton) {
+      els.backupIndexButton.disabled = false;
+    }
+  }
+}
+
+async function enqueueRebuild() {
+  if (els.rebuildIndexButton) {
+    els.rebuildIndexButton.disabled = true;
+  }
+  const confirmed = await confirmAction(
+    "Re-build the LanceDB index?",
+    "This drops the current index and rebuilds it from the processed Markdown. " +
+      "It runs as a background job and the index stays queryable until the rebuild publishes. " +
+      "Use this if the index is corrupted.",
+    "Re-build index",
+  );
+  if (!confirmed) {
+    if (els.rebuildIndexButton) {
+      els.rebuildIndexButton.disabled = false;
+    }
+    return;
+  }
+  setMaintenanceStatus("Queueing index rebuild...");
+  try {
+    const job = await requestJson("/api/index/rebuild", { method: "POST" });
+    setMaintenanceStatus(`Queued index rebuild job ${job.id.slice(0, 8)}.`);
+    state.jobsOffset = 0;
+    markIndexDirty();
+    await refreshJobs({ force: true });
+    await refreshPdfs({ force: true });
+  } catch (error) {
+    setMaintenanceStatus(error.message, true);
+  } finally {
+    if (els.rebuildIndexButton) {
+      els.rebuildIndexButton.disabled = false;
+    }
+  }
+}
+
+function toggleRestorePanel(forceOpen = null) {
+  if (!els.restoreIndexPanel) {
+    return;
+  }
+  const willOpen = forceOpen === null ? els.restoreIndexPanel.hidden : forceOpen;
+  els.restoreIndexPanel.hidden = !willOpen;
+  if (willOpen) {
+    loadIndexBackups();
+  }
+}
+
+function formatBackupSize(bytes) {
+  const value = Number(bytes || 0);
+  if (value >= 1024 * 1024) {
+    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (value >= 1024) {
+    return `${(value / 1024).toFixed(0)} KB`;
+  }
+  return `${value} B`;
+}
+
+function formatBackupTimestamp(value) {
+  if (!value) {
+    return "Unknown date";
+  }
+  try {
+    const date = new Date(String(value).replace(" ", "T"));
+    if (Number.isNaN(date.getTime())) {
+      return String(value);
+    }
+    return date.toLocaleString();
+  } catch (_) {
+    return String(value);
+  }
+}
+
+async function loadIndexBackups() {
+  if (!els.restoreBackupsList) {
+    return;
+  }
+  els.restoreBackupsList.innerHTML = '<p class="restore-empty">Loading backups…</p>';
+  try {
+    const data = await requestJson("/api/index/backups");
+    renderIndexBackups(data.backups || [], data.keep);
+  } catch (error) {
+    els.restoreBackupsList.innerHTML = `<p class="restore-empty error">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderIndexBackups(backups, keep) {
+  if (!els.restoreBackupsList) {
+    return;
+  }
+  if (!backups.length) {
+    els.restoreBackupsList.innerHTML =
+      '<p class="restore-empty">No index backups yet. Use “Backup index” to create one.</p>';
+    return;
+  }
+  const rows = backups
+    .map((backup) => {
+      const name = escapeHtml(backup.name || "");
+      const date = escapeHtml(formatBackupTimestamp(backup.created_at));
+      const recordCount =
+        backup.record_count === null || backup.record_count === undefined
+          ? "—"
+          : `${backup.record_count} records`;
+      const size = escapeHtml(formatBackupSize(backup.size_bytes));
+      const corrupt = backup.lancedb_present === false;
+      const note = corrupt
+        ? '<span class="restore-tag danger">missing LanceDB</span>'
+        : "";
+      const restoreDisabled = corrupt ? " disabled" : "";
+      return (
+        `<div class="backup-row" data-backup-name="${name}">` +
+          `<div class="backup-row-main">` +
+            `<div class="backup-row-title">${name}</div>` +
+            `<div class="backup-row-meta">${date} · ${escapeHtml(recordCount)} · ${size} ${note}</div>` +
+          `</div>` +
+          `<div class="backup-row-actions">` +
+            `<button type="button" class="danger" data-backup-action="restore" data-backup-name="${name}"${restoreDisabled}>Restore</button>` +
+          `</div>` +
+        `</div>`
+      );
+    })
+    .join("");
+  const footer = keep
+    ? `<p class="restore-footnote">The ${keep} most recent backups are kept automatically.</p>`
+    : "";
+  els.restoreBackupsList.innerHTML = rows + footer;
+}
+
+async function handleBackupAction(event) {
+  const button = event.target.closest("button[data-backup-action]");
+  if (!button) {
+    return;
+  }
+  const action = button.dataset.backupAction;
+  const backupName = button.dataset.backupName || "";
+  if (action !== "restore" || !backupName) {
+    return;
+  }
+  const confirmed = await confirmAction(
+    "Restore this index backup?",
+    `The current live index will be swapped out for “${backupName}”. A safety backup of the current index is taken first so this is reversible.`,
+    "Restore index",
+  );
+  if (!confirmed) {
+    return;
+  }
+  setMaintenanceStatus("Queueing index restore...");
+  try {
+    const job = await requestJson("/api/index/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ backup_name: backupName }),
+    });
+    setMaintenanceStatus(`Queued index restore job ${job.id.slice(0, 8)}.`);
+    state.jobsOffset = 0;
+    markIndexDirty();
+    await refreshJobs({ force: true });
+    await refreshPdfs({ force: true });
+  } catch (error) {
+    setMaintenanceStatus(error.message, true);
+  }
+}
+
 async function loadIndex() {
   const load = startIndexLoad();
   state.indexMode = "standard";
@@ -3973,6 +4261,27 @@ els.forceUploadButton.addEventListener("click", () => {
   uploadFiles(true, state.pendingForceUploadToken);
 });
 els.reindexButton.addEventListener("click", enqueueReindex);
+if (els.reingestButton) {
+  els.reingestButton.addEventListener("click", enqueueReingest);
+}
+if (els.backupIndexButton) {
+  els.backupIndexButton.addEventListener("click", enqueueBackup);
+}
+if (els.rebuildIndexButton) {
+  els.rebuildIndexButton.addEventListener("click", enqueueRebuild);
+}
+if (els.toggleRestorePanelButton) {
+  els.toggleRestorePanelButton.addEventListener("click", () => toggleRestorePanel());
+}
+if (els.closeRestorePanelButton) {
+  els.closeRestorePanelButton.addEventListener("click", () => toggleRestorePanel(false));
+}
+if (els.refreshBackupsButton) {
+  els.refreshBackupsButton.addEventListener("click", loadIndexBackups);
+}
+if (els.restoreBackupsList) {
+  els.restoreBackupsList.addEventListener("click", handleBackupAction);
+}
 els.pdfSearchButton.addEventListener("click", () => {
   state.pdfSearch = els.pdfSearchInput.value.trim();
   state.pdfOffset = 0;

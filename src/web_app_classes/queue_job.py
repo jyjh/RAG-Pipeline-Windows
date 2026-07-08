@@ -20,6 +20,7 @@ class QueueJob:
     uploads: list[dict[str, Any]] = field(default_factory=list)
     force_duplicate_hashes: list[str] = field(default_factory=list)
     source_hashes: list[str] = field(default_factory=list)
+    backup_name: str | None = None
     staging_dir: str | None = None
     upload_dir: str | None = None
     resume_status: str | None = None
@@ -44,6 +45,7 @@ class QueueJob:
             "uploads": [dict(item) for item in self.uploads],
             "force_duplicate_hashes": list(self.force_duplicate_hashes),
             "source_hashes": list(self.source_hashes),
+            "backup_name": self.backup_name,
             "staging_dir": self.staging_dir,
             "upload_dir": self.upload_dir,
             "resume_status": self.resume_status,

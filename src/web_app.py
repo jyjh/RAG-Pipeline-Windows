@@ -135,6 +135,10 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "update_index_record",
     "delete_index_records",
     "vector_search_index_rows",
+    "index_backup_root",
+    "list_index_backups",
+    "create_index_backup",
+    "restore_index_from_backup",
     "_resolve_pdf_path",
     "_pdf_download_url",
     "delete_pdf_document",
@@ -157,6 +161,7 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "resolve_pdf_download_path",
     "_reprocess_options_for_source",
     "enqueue_source_reprocess",
+    "enqueue_full_reingest",
     "_model_dump",
     "render_markdown_text",
     "recover_pending_upload_jobs_on_startup",
@@ -274,6 +279,9 @@ UPLOAD_RESUME_STATUS_ORDER = {
 
 INDEX_LOCK = threading.RLock()
 TRUST_LOCK = threading.RLock()
+LANCEDB_BACKUP_DIRNAME = "backups"
+LANCEDB_BACKUP_KEEP = 5
+INDEX_BACKUP_COMPONENTS = (LANCEDB_DIRNAME, INDEX_MANIFEST_FILENAME, "index_overrides.json")
 TRUST_REVIEW_STATUSES = {"unreviewed", "approved", "rejected", "stale"}
 TRUST_SOURCE_TYPES = {
     "unknown",
@@ -745,6 +753,243 @@ def _publish_staged_index(staged_db_dir: str | Path, live_db_dir: str | Path) ->
         raise
     finally:
         shutil.rmtree(backup_dir, ignore_errors=True)
+
+
+def index_backup_root(db_dir: str | Path) -> Path:
+    return Path(db_dir) / LANCEDB_BACKUP_DIRNAME
+
+
+def _index_backup_component_paths(db_dir: str | Path) -> list[Path]:
+    base = Path(db_dir)
+    overrides = index_overrides_path(base)
+    return [lancedb_path(base), base / INDEX_MANIFEST_FILENAME, overrides]
+
+
+def _backup_created_at_from_name(name: str) -> str:
+    # Snapshot dir names are ``YYYYMMDD-HHMMSS-<hex>``. Parse the leading
+    # timestamp back into an ISO-8601 string for display; fall back to the
+    # raw name when the prefix does not match (manual/imported backups).
+    match = re.match(r"^(\d{8})-(\d{6})", name)
+    if not match:
+        return name
+    date_part, time_part = match.groups()
+    try:
+        parsed = datetime.strptime(f"{date_part}{time_part}", "%Y%m%d%H%M%S")
+    except ValueError:
+        return name
+    return parsed.replace(tzinfo=timezone.utc).isoformat(timespec="seconds")
+
+
+def _backup_size_bytes(backup_dir: Path) -> int:
+    total = 0
+    for entry in backup_dir.rglob("*"):
+        try:
+            if entry.is_file():
+                total += entry.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _invalidate_index_caches(db_dir: str | Path) -> None:
+    resolved = str(Path(db_dir).resolve())
+    _INDEX_RECORDS_SNAPSHOT_CACHE.pop(resolved, None)
+    store = _INDEX_STORE_CACHE.get(resolved)
+    if store is not None:
+        store._invalidate_table()
+
+
+def _snapshot_sort_key(path: Path) -> tuple[int, str]:
+    """Sort snapshots newest-first by creation mtime, then name as a tiebreaker.
+
+    Two backups created within the same wall-clock second share the timestamp
+    prefix in their directory name, so lexicographic name ordering alone is not
+    enough to recover creation order. The directory mtime is monotonic across
+    freshly-created snapshots and disambiguates them.
+    """
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        mtime = 0
+    return (mtime, path.name)
+
+
+def list_index_backups(db_dir: str | Path) -> list[dict[str, Any]]:
+    """List LanceDB index backup snapshots under ``db/backups/`` (newest first)."""
+    backup_root = index_backup_root(db_dir)
+    if not backup_root.exists():
+        return []
+    children = sorted(
+        (child for child in backup_root.iterdir() if child.is_dir()),
+        key=_snapshot_sort_key,
+        reverse=True,
+    )
+    entries: list[dict[str, Any]] = []
+    for child in children:
+        lancedb_dir = child / LANCEDB_DIRNAME
+        manifest = child / INDEX_MANIFEST_FILENAME
+        record_count: int | None
+        try:
+            store = default_store(child)
+            record_count = store.count() if lancedb_dir.exists() else None
+        except Exception:
+            record_count = None
+        entries.append(
+            {
+                "name": child.name,
+                "created_at": _backup_created_at_from_name(child.name),
+                "path": str(child),
+                "lancedb_present": lancedb_dir.exists(),
+                "manifest_present": manifest.exists(),
+                "record_count": record_count,
+                "size_bytes": _backup_size_bytes(child),
+            }
+        )
+    return entries
+
+
+def create_index_backup(db_dir: str | Path) -> dict[str, Any]:
+    """Snapshot the live LanceDB index, manifest, and overrides under ``db/backups/``.
+
+    Backups older than ``LANCEDB_BACKUP_KEEP`` are pruned so disk usage stays
+    bounded. Callers must hold the index-mutation guard (no active indexing) so
+    the live table is not mid-write while it is copied.
+    """
+    resolved_db_dir = Path(db_dir)
+    live_lancedb = lancedb_path(resolved_db_dir)
+    if not live_lancedb.exists():
+        raise FileNotFoundError(
+            f"Nothing to back up: LanceDB directory not found at {live_lancedb}"
+        )
+    backup_root = index_backup_root(resolved_db_dir)
+    backup_root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    snapshot_dir = backup_root / f"{stamp}-{uuid.uuid4().hex[:6]}"
+    snapshot_dir.mkdir(parents=True, exist_ok=False)
+
+    components = _index_backup_component_paths(resolved_db_dir)
+    try:
+        for source in components:
+            if not source.exists():
+                continue
+            destination = snapshot_dir / source.name
+            if source.is_dir():
+                shutil.copytree(source, destination)
+            else:
+                shutil.copy2(source, destination)
+    except Exception:
+        _remove_path(snapshot_dir)
+        raise
+
+    _prune_index_backups(backup_root)
+    _invalidate_index_caches(resolved_db_dir)
+    snapshot_entries = list_index_backups(resolved_db_dir)
+    return next(
+        (entry for entry in snapshot_entries if entry["name"] == snapshot_dir.name),
+        {
+            "name": snapshot_dir.name,
+            "created_at": _backup_created_at_from_name(snapshot_dir.name),
+            "path": str(snapshot_dir),
+            "lancedb_present": True,
+            "manifest_present": (snapshot_dir / INDEX_MANIFEST_FILENAME).exists(),
+            "record_count": None,
+            "size_bytes": _backup_size_bytes(snapshot_dir),
+        },
+    )
+
+
+def _prune_index_backups(backup_root: Path) -> None:
+    if LANCEDB_BACKUP_KEEP <= 0:
+        return
+    snapshots = sorted(
+        (child for child in backup_root.iterdir() if child.is_dir()),
+        key=_snapshot_sort_key,
+        reverse=True,
+    )
+    for stale in snapshots[LANCEDB_BACKUP_KEEP:]:
+        _remove_path(stale)
+
+
+def _swap_index_into(source_db_dir: str | Path, live_db_dir: str | Path) -> None:
+    """Atomically swap the LanceDB/manifest/overrides from ``source`` into ``live``.
+
+    The current live components are moved aside into a ``.index_rollover_<hex>``
+    directory first so a failed swap can roll back, mirroring the safe-swap logic
+    already used by ``_publish_staged_index``.
+    """
+    source_db = Path(source_db_dir)
+    live_db = Path(live_db_dir)
+    source_components = _index_backup_component_paths(source_db)
+    live_components = _index_backup_component_paths(live_db)
+
+    live_db.mkdir(parents=True, exist_ok=True)
+    rollover = live_db.parent / f".index_rollover_{uuid.uuid4().hex}"
+    rollover.mkdir(parents=True, exist_ok=False)
+    rollover_targets = [rollover / component.name for component in live_components]
+    try:
+        for live_component, rollover_target in zip(live_components, rollover_targets):
+            if live_component.exists():
+                shutil.move(str(live_component), str(rollover_target))
+        for source_component, live_component in zip(source_components, live_components):
+            if source_component.exists():
+                shutil.move(str(source_component), str(live_component))
+    except Exception:
+        for live_component, rollover_target in zip(live_components, rollover_targets):
+            _remove_path(live_component)
+            if rollover_target.exists():
+                shutil.move(str(rollover_target), str(live_component))
+        _remove_path(rollover)
+        raise
+    finally:
+        _remove_path(rollover)
+
+    _invalidate_index_caches(live_db)
+
+
+def restore_index_from_backup(db_dir: str | Path, backup_name: str) -> dict[str, Any]:
+    """Restore a named backup snapshot over the live LanceDB index.
+
+    A one-shot backup of the current live index is taken first into
+    ``db/backups/`` so a bad restore is itself recoverable. ``backup_name`` is
+    validated to be a bare directory name under the backup root to prevent path
+    traversal.
+    """
+    resolved_db_dir = Path(db_dir)
+    raw_name = str(backup_name or "").strip()
+    # Reject anything that is not a bare directory name. Path separators (in
+    # either direction), drive letters, parent traversal, and absolute paths are
+    # all blocked so ``backup_root / name`` cannot escape the backup directory.
+    if (
+        not raw_name
+        or raw_name in {".", ".."}
+        or "/" in raw_name
+        or "\\" in raw_name
+        or ":" in raw_name
+        or Path(raw_name).is_absolute()
+    ):
+        raise ValueError("Invalid backup name.")
+    name = raw_name
+    backup_root = index_backup_root(resolved_db_dir)
+    snapshot_dir = backup_root / name
+    if not snapshot_dir.is_dir():
+        raise FileNotFoundError(f"Backup not found: {name}")
+    backup_lancedb = snapshot_dir / LANCEDB_DIRNAME
+    if not backup_lancedb.exists():
+        raise FileNotFoundError(f"Backup is missing its LanceDB directory: {name}")
+
+    safety_backup = None
+    if lancedb_path(resolved_db_dir).exists():
+        try:
+            safety_backup = create_index_backup(resolved_db_dir)
+        except Exception:
+            safety_backup = None
+
+    _swap_index_into(snapshot_dir, resolved_db_dir)
+    return {
+        "restored": True,
+        "backup_name": name,
+        "safety_backup": safety_backup,
+    }
 
 
 def _index_mutation_blocker() -> str:
@@ -2433,6 +2678,128 @@ def enqueue_source_reprocess(
     )
 
 
+def _known_source_hashes(
+    *,
+    registry_path: Path = PDF_REGISTRY_PATH,
+    processed_dir: Path = PROCESSED_DIR,
+) -> list[str]:
+    """All distinct source hashes known from the upload registry and source map."""
+    hashes: list[str] = []
+    seen: set[str] = set()
+    registry_payload = PdfRegistry(registry_path).load()
+    for source_hash, entry in registry_payload.get("pdfs", {}).items():
+        source_hash = str(source_hash or "")
+        if source_hash and source_hash not in seen and isinstance(entry, dict):
+            seen.add(source_hash)
+            hashes.append(source_hash)
+    for entry in load_source_map(processed_dir).get("documents", {}).values():
+        if not isinstance(entry, dict):
+            continue
+        source_hash = str(entry.get("source_hash", ""))
+        if source_hash and source_hash not in seen:
+            seen.add(source_hash)
+            hashes.append(source_hash)
+    return hashes
+
+
+def enqueue_full_reingest(
+    *,
+    registry_path: Path | None = None,
+    processed_dir: Path | None = None,
+    staging_root: Path | None = None,
+    root_dir: Path = ROOT_DIR,
+    data_dir: Path = DATA_DIR,
+) -> QueueJob:
+    """Queue a full PDF -> Markdown -> index re-run for every known source.
+
+    Re-runs ingestion (PDF extraction) and indexing for all registered PDFs in a
+    single upload job. Useful after changing OCR/parser/vision settings or when
+    extracted Markdown looks wrong across the board. Existing per-source vectors,
+    assets, overrides, and source-map entries for each hash are dropped by the
+    upload job's forced-duplicate handling before the fresh extraction runs.
+    """
+    registry_path = registry_path or PDF_REGISTRY_PATH
+    processed_dir = processed_dir or PROCESSED_DIR
+    staging_root = staging_root or STAGING_DIR
+
+    source_hashes = _known_source_hashes(
+        registry_path=registry_path,
+        processed_dir=processed_dir,
+    )
+    if not source_hashes:
+        raise FileNotFoundError("No PDFs are registered to re-ingest.")
+
+    job_id = uuid.uuid4().hex
+    staging_dir = staging_root / job_id
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    filenames: list[str] = []
+    uploads: list[dict[str, Any]] = []
+    used_names: set[str] = set()
+
+    try:
+        for source_hash in source_hashes:
+            try:
+                path, filename = resolve_pdf_download_path(
+                    source_hash,
+                    registry_path=registry_path,
+                    processed_dir=processed_dir,
+                    root_dir=root_dir,
+                    data_dir=data_dir,
+                )
+            except FileNotFoundError:
+                continue
+            staged_name = _safe_filename(filename or path.name)
+            base = staged_name
+            counter = 1
+            while staged_name.lower() in used_names:
+                stem = Path(base).stem
+                staged_name = f"{stem}-{counter}.pdf"
+                counter += 1
+            used_names.add(staged_name.lower())
+            staged_path = staging_dir / staged_name
+            shutil.copy2(path, staged_path)
+            filenames.append(staged_name)
+            uploads.append(
+                {
+                    "filename": staged_name,
+                    "hash": source_hash,
+                    "staging_path": str(staged_path),
+                }
+            )
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+    if not uploads:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise FileNotFoundError("No source PDF files could be located to re-ingest.")
+
+    options = _upload_options_from_form({})
+    file_uploads = [
+        {
+            "filename": str(upload["filename"]),
+            "hash": str(upload["hash"]),
+            "staging_path": str(upload["staging_path"]),
+            "source_group": SOURCE_GROUP_UNGROUPED,
+        }
+        for upload in uploads
+    ]
+    PdfRegistry(registry_path).register_queued(
+        job_id=job_id,
+        files=file_uploads,
+        forced_hashes=set(source_hashes),
+        options=options,
+    )
+    return job_queue.enqueue_upload(
+        staging_dir=staging_dir,
+        filenames=filenames,
+        uploads=file_uploads,
+        force_duplicate_hashes=sorted(source_hashes),
+        job_id=job_id,
+        options=options,
+    )
+
+
 def _source_markdown_path(
     source_hash: str,
     *,
@@ -2502,6 +2869,10 @@ IndexVectorSearchRequest.__module__ = __name__
 
 ReindexRequest = import_split_class("src.web_app_classes.reindex_request", "ReindexRequest")
 ReindexRequest.__module__ = __name__
+
+
+RestoreBackupRequest = import_split_class("src.web_app_classes.restore_backup_request", "RestoreBackupRequest")
+RestoreBackupRequest.__module__ = __name__
 
 
 DocumentTrustRequest = import_split_class("src.web_app_classes.document_trust_request", "DocumentTrustRequest")
@@ -3259,6 +3630,69 @@ async def reindex(request: Request):
     except ValidationError as exc:
         raise _request_validation_error(exc) from exc
     job = job_queue.enqueue_reindex(options=_model_dump(payload))
+    return job.to_dict()
+
+
+@app.post("/api/reingest")
+def reingest():
+    blocker = _index_mutation_blocker()
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
+    try:
+        job = enqueue_full_reingest(
+            registry_path=PDF_REGISTRY_PATH,
+            processed_dir=PROCESSED_DIR,
+            staging_root=STAGING_DIR,
+            root_dir=ROOT_DIR,
+            data_dir=DATA_DIR,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    response = job.to_dict()
+    response["reingest"] = True
+    return response
+
+
+@app.get("/api/index/backups")
+def index_backups(request: Request):
+    payload = {"backups": list_index_backups(DB_DIR), "keep": LANCEDB_BACKUP_KEEP}
+    seed = _file_signature(index_backup_root(DB_DIR))
+    return _conditional_json(request, payload, seed)
+
+
+@app.post("/api/index/backup")
+def backup_index():
+    blocker = _index_mutation_blocker()
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
+    job = job_queue.enqueue_backup()
+    return job.to_dict()
+
+
+@app.post("/api/index/rebuild")
+def rebuild_index(request: Request):
+    blocker = _index_mutation_blocker()
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
+    job = job_queue.enqueue_rebuild()
+    return job.to_dict()
+
+
+@app.post("/api/index/restore")
+async def restore_index(request: Request):
+    try:
+        payload = RestoreBackupRequest(**await _optional_json(request))
+    except ValidationError as exc:
+        raise _request_validation_error(exc) from exc
+    blocker = _index_mutation_blocker()
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
+    try:
+        job = job_queue.enqueue_restore(backup_name=payload.backup_name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return job.to_dict()
 
 

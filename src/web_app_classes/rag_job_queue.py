@@ -160,6 +160,50 @@ class RagJobQueue:
         )
         return self._enqueue(job, auto_start=auto_start)
 
+    def enqueue_backup(
+        self,
+        *,
+        job_id: str | None = None,
+        options: dict[str, Any] | None = None,
+        auto_start: bool = True,
+    ) -> QueueJob:
+        job = QueueJob(
+            id=job_id or uuid.uuid4().hex,
+            kind="backup",
+            options=options or {},
+        )
+        return self._enqueue(job, auto_start=auto_start)
+
+    def enqueue_rebuild(
+        self,
+        *,
+        job_id: str | None = None,
+        options: dict[str, Any] | None = None,
+        auto_start: bool = True,
+    ) -> QueueJob:
+        job = QueueJob(
+            id=job_id or uuid.uuid4().hex,
+            kind="rebuild",
+            options=options or {},
+        )
+        return self._enqueue(job, auto_start=auto_start)
+
+    def enqueue_restore(
+        self,
+        *,
+        backup_name: str,
+        job_id: str | None = None,
+        options: dict[str, Any] | None = None,
+        auto_start: bool = True,
+    ) -> QueueJob:
+        job = QueueJob(
+            id=job_id or uuid.uuid4().hex,
+            kind="restore",
+            backup_name=str(backup_name),
+            options=options or {},
+        )
+        return self._enqueue(job, auto_start=auto_start)
+
     def _enqueue(self, job: QueueJob, *, auto_start: bool) -> QueueJob:
         with self._condition:
             self._jobs[job.id] = job
@@ -258,6 +302,45 @@ class RagJobQueue:
             self._delete_source_index_records(job.source_hashes)
             self._raise_if_cancelled(job)
             self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
+            return
+
+        if job.kind == "backup":
+            self._wait_for_no_queries(job, "backing_up")
+            self._raise_if_cancelled(job)
+            snapshot = _source_module.create_index_backup(self.db_dir)
+            self._append_job_log(
+                job,
+                f"Backed up LanceDB index to {snapshot.get('name')} ({snapshot.get('record_count')} records).",
+            )
+            return
+
+        if job.kind == "rebuild":
+            self._wait_for_no_queries(job, "indexing")
+            self._raise_if_cancelled(job)
+            self._drop_live_index()
+            self._raise_if_cancelled(job)
+            rebuild_options = dict(job.options or {})
+            # Fresh rebuild: never reuse vectors from the (possibly corrupt)
+            # live index we just dropped.
+            rebuild_options["reuse_db_dir"] = None
+            self._run_indexing(str(self.processed_dir), str(self.db_dir), rebuild_options, job=job)
+            return
+
+        if job.kind == "restore":
+            self._wait_for_no_queries(job, "restoring")
+            self._raise_if_cancelled(job)
+            if not job.backup_name:
+                raise ValueError("Restore job is missing a backup name.")
+            result = _source_module.restore_index_from_backup(self.db_dir, job.backup_name)
+            self._append_job_log(
+                job,
+                f"Restored LanceDB index from backup {job.backup_name}.",
+            )
+            if result.get("safety_backup"):
+                self._append_job_log(
+                    job,
+                    f"Pre-restore index rolled back to backup {result['safety_backup'].get('name')}.",
+                )
             return
 
         raise ValueError(f"Unknown job kind: {job.kind}")
@@ -609,6 +692,20 @@ class RagJobQueue:
             store = _index_store(self.db_dir)
             if store.exists():
                 store.delete_records_by_source_hash(source_hashes=sorted(hashes))
+
+    def _drop_live_index(self) -> None:
+        """Remove the live LanceDB directory so a rebuild starts from scratch.
+
+        Used when the index is corrupted: the staged rebuild that follows cannot
+        reuse vectors that are not there, so the next ``_run_indexing`` builds a
+        clean table from the processed Markdown in ``processed_dir``.
+        """
+        with INDEX_LOCK:
+            live_lancedb = lancedb_path(self.db_dir)
+            if live_lancedb.exists():
+                _source_module._remove_path(live_lancedb)
+            store = _index_store(self.db_dir)
+            store._invalidate_table()
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._condition:

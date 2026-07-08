@@ -36,6 +36,22 @@
           <div id="selectedFilesLabel" class="selected-files-label">Drop PDFs or a .zip of PDFs</div>
           <div id="uploadGroupsPanel" class="upload-groups-panel" hidden></div>
         </div>
+        <div class="toolbar maintenance-bar">
+          <strong>Index maintenance</strong>
+          <button id="reingestButton" class="danger" type="button" title="Re-run PDF extraction (ingestion) and indexing for every registered PDF">Re-ingest all</button>
+          <button id="backupIndexButton" type="button" title="Snapshot the current LanceDB index into db/backups">Backup index</button>
+          <button id="rebuildIndexButton" class="danger" type="button" title="Drop the current index and rebuild it from processed Markdown">Re-build index</button>
+          <button id="toggleRestorePanelButton" type="button" title="Show saved index backups">Restore…</button>
+          <span id="maintenanceStatus" class="status"></span>
+        </div>
+        <div id="restoreIndexPanel" class="restore-panel" hidden>
+          <div class="restore-panel-header">
+            <strong>Saved index backups</strong>
+            <button id="refreshBackupsButton" type="button">Refresh</button>
+            <button id="closeRestorePanelButton" type="button">Close</button>
+          </div>
+          <div id="restoreBackupsList" class="restore-backups-list"></div>
+        </div>
         <div id="uploadStatus" class="status"></div>
         <div id="duplicatePrompt" class="duplicate-prompt" hidden>
           <div id="duplicatePromptText"></div>

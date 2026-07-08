@@ -3546,3 +3546,348 @@ def test_render_endpoint_formats_markdown_and_latex():
     assert "Synthesize the Explanation" in html
     assert "<math" in html
     assert "sigma" not in html
+
+
+def test_create_index_backup_snapshots_lancedb_and_prunes(lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    _write_index(db_dir)
+
+    snapshots = [web_app.create_index_backup(db_dir) for _ in range(web_app.LANCEDB_BACKUP_KEEP + 2)]
+
+    listed = web_app.list_index_backups(db_dir)
+    assert len(listed) == web_app.LANCEDB_BACKUP_KEEP
+    # Newest snapshot (last created) must be retained at the top.
+    assert listed[0]["name"] == snapshots[-1]["name"]
+    # Each retained snapshot has the LanceDB dir and a nonzero record count.
+    for entry in listed:
+        assert entry["lancedb_present"] is True
+        assert entry["record_count"] == 2
+    backup_root = web_app.index_backup_root(db_dir)
+    assert len([child for child in backup_root.iterdir() if child.is_dir()]) == web_app.LANCEDB_BACKUP_KEEP
+
+
+def test_list_index_backups_reports_record_count_and_detects_corruption(lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    _write_index(db_dir)
+    backup = web_app.create_index_backup(db_dir)
+
+    listed = web_app.list_index_backups(db_dir)
+    assert listed[0]["name"] == backup["name"]
+    assert listed[0]["record_count"] == 2
+    assert listed[0]["lancedb_present"] is True
+
+    # Simulate a corrupted/incomplete backup with no LanceDB directory.
+    bad_dir = web_app.index_backup_root(db_dir) / "20240101-000000-deadbeef"
+    bad_dir.mkdir(parents=True)
+    listed = web_app.list_index_backups(db_dir)
+    bad_entry = next(entry for entry in listed if entry["name"] == bad_dir.name)
+    assert bad_entry["lancedb_present"] is False
+    assert bad_entry["record_count"] is None
+
+
+def test_backup_endpoint_enqueues_job(monkeypatch):
+    captured = {}
+
+    class FakeQueue:
+        def summary(self):
+            return {"indexing_job_ids": []}
+
+        def enqueue_backup(self, **kwargs):
+            job = web_app.QueueJob(id="backup-job", kind="backup")
+            captured["called"] = True
+            return job
+
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+    response = TestClient(web_app.app).post("/api/index/backup")
+
+    assert response.status_code == 200
+    assert response.json()["kind"] == "backup"
+    assert captured["called"] is True
+
+
+def test_backup_endpoint_blocks_during_indexing(monkeypatch):
+    class ActiveIndexingQueue:
+        def summary(self):
+            return {"indexing_job_ids": ["job-1"]}
+        def enqueue_backup(self, **kwargs):
+            raise AssertionError("backup should not enqueue while indexing")
+
+    monkeypatch.setattr(web_app, "job_queue", ActiveIndexingQueue())
+    response = TestClient(web_app.app).post("/api/index/backup")
+
+    assert response.status_code == 409
+
+
+def test_rebuild_endpoint_enqueues_job_and_blocks_during_indexing(monkeypatch):
+    captured = {}
+
+    class IdleQueue:
+        def summary(self):
+            return {"indexing_job_ids": []}
+        def enqueue_rebuild(self, **kwargs):
+            job = web_app.QueueJob(id="rebuild-job", kind="rebuild")
+            captured["called"] = True
+            return job
+
+    monkeypatch.setattr(web_app, "job_queue", IdleQueue())
+    response = TestClient(web_app.app).post("/api/index/rebuild")
+    assert response.status_code == 200
+    assert response.json()["kind"] == "rebuild"
+    assert captured["called"] is True
+
+    class ActiveIndexingQueue:
+        def summary(self):
+            return {"indexing_job_ids": ["job-1"]}
+        def enqueue_rebuild(self, **kwargs):
+            raise AssertionError("rebuild should not enqueue while indexing")
+
+    monkeypatch.setattr(web_app, "job_queue", ActiveIndexingQueue())
+    blocked = TestClient(web_app.app).post("/api/index/rebuild")
+    assert blocked.status_code == 409
+
+
+def test_restore_endpoint_requires_backup_name():
+    response = TestClient(web_app.app).post("/api/index/restore", json={})
+    assert response.status_code == 422
+
+
+def test_restore_endpoint_enqueues_job(monkeypatch, lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    _write_index(db_dir)
+    backup = web_app.create_index_backup(db_dir)
+    captured = {}
+
+    class IdleQueue:
+        def summary(self):
+            return {"indexing_job_ids": []}
+        def enqueue_restore(self, *, backup_name, **kwargs):
+            captured["backup_name"] = backup_name
+            return web_app.QueueJob(id="restore-job", kind="restore", backup_name=backup_name)
+
+    monkeypatch.setattr(web_app, "job_queue", IdleQueue())
+    response = TestClient(web_app.app).post(
+        "/api/index/restore",
+        json={"backup_name": backup["name"]},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["kind"] == "restore"
+    assert payload["backup_name"] == backup["name"]
+    assert captured["backup_name"] == backup["name"]
+
+
+def test_index_backups_endpoint_lists_snapshots(monkeypatch, lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    _write_index(db_dir)
+    backup = web_app.create_index_backup(db_dir)
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+
+    response = TestClient(web_app.app).get("/api/index/backups")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["keep"] == web_app.LANCEDB_BACKUP_KEEP
+    assert payload["backups"][0]["name"] == backup["name"]
+    assert payload["backups"][0]["record_count"] == 2
+
+
+def test_restore_index_swaps_live_table_and_keeps_safety_backup(lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    _write_index(db_dir)  # 2 records: doc.md:0, doc.md:1
+
+    # Capture an early backup, then mutate the live index.
+    early_backup = web_app.create_index_backup(db_dir)
+    web_app.delete_index_records(record_ids=["doc.md:1"], db_dir=db_dir)
+    assert LanceDBVectorStore(db_dir).count() == 1
+
+    result = web_app.restore_index_from_backup(db_dir, early_backup["name"])
+
+    assert result["restored"] is True
+    assert result["backup_name"] == early_backup["name"]
+    # Live index reflects the restored (2-record) snapshot.
+    assert LanceDBVectorStore(db_dir).count() == 2
+    # A safety backup of the pre-restore (1-record) index was kept.
+    safety = result["safety_backup"]
+    assert safety is not None
+    safety_store = LanceDBVectorStore(
+        web_app.index_backup_root(db_dir) / safety["name"]
+    )
+    assert safety_store.count() == 1
+
+
+def test_restore_index_rejects_unknown_backup(lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    _write_index(db_dir)
+    with pytest.raises(FileNotFoundError):
+        web_app.restore_index_from_backup(db_dir, "does-not-exist")
+
+
+def test_restore_index_rejects_traversal_name(lancedb_tmp):
+    db_dir = lancedb_tmp / "db"
+    _write_index(db_dir)
+    with pytest.raises(ValueError):
+        web_app.restore_index_from_backup(db_dir, "../escape")
+
+
+def _write_minimal_pdf(path: Path, payload: bytes = b"%PDF-1.4 reingest sample"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+
+
+def test_known_source_hashes_collects_from_registry_and_source_map(workspace_tmp):
+    registry_path = workspace_tmp / "registry.json"
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+
+    web_app.PdfRegistry(registry_path).register_queued(
+        job_id="job-a",
+        files=[{"filename": "a.pdf", "hash": "hash-a"}],
+    )
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=processed_dir / "b.md",
+        source_hash="hash-b",
+        source_pdf_name="b.pdf",
+        source_pdf_path=workspace_tmp / "b.pdf",
+    )
+
+    hashes = web_app._known_source_hashes(
+        registry_path=registry_path,
+        processed_dir=processed_dir,
+    )
+    assert hashes == ["hash-a", "hash-b"]
+
+
+def test_enqueue_full_reingest_stages_all_sources_and_forces_duplicates(monkeypatch, workspace_tmp):
+    registry_path = workspace_tmp / "registry.json"
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    data_dir = workspace_tmp / "data"
+    staging_root = workspace_tmp / "staging"
+
+    _write_minimal_pdf(data_dir / "a.pdf", b"%PDF-1.4 alpha")
+    _write_minimal_pdf(data_dir / "b.pdf", b"%PDF-1.4 beta")
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=processed_dir / "a.md",
+        source_hash="hash-a",
+        source_pdf_name="a.pdf",
+        source_pdf_path=data_dir / "a.pdf",
+    )
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=processed_dir / "b.md",
+        source_hash="hash-b",
+        source_pdf_name="b.pdf",
+        source_pdf_path=data_dir / "b.pdf",
+    )
+
+    captured = {}
+
+    class FakeQueue:
+        def enqueue_upload(self, **kwargs):
+            captured.update(kwargs)
+            return web_app.QueueJob(
+                id=str(kwargs.get("job_id")),
+                kind="upload",
+                filenames=list(kwargs.get("filenames", [])),
+                force_duplicate_hashes=list(kwargs.get("force_duplicate_hashes", [])),
+            )
+
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+
+    job = web_app.enqueue_full_reingest(
+        registry_path=registry_path,
+        processed_dir=processed_dir,
+        staging_root=staging_root,
+        root_dir=workspace_tmp,
+        data_dir=data_dir,
+    )
+
+    assert job.kind == "upload"
+    assert sorted(captured["filenames"]) == ["a.pdf", "b.pdf"]
+    assert sorted(captured["force_duplicate_hashes"]) == ["hash-a", "hash-b"]
+    upload_hashes = {upload["hash"] for upload in captured["uploads"]}
+    assert upload_hashes == {"hash-a", "hash-b"}
+    # Each staged file actually exists in the staging directory.
+    staging_dir = captured["staging_dir"]
+    for upload in captured["uploads"]:
+        assert Path(upload["staging_path"]).exists()
+    assert str(staging_dir).startswith(str(staging_root))
+
+
+def test_enqueue_full_reingest_raises_when_no_sources(workspace_tmp):
+    with pytest.raises(FileNotFoundError):
+        web_app.enqueue_full_reingest(
+            registry_path=workspace_tmp / "empty-registry.json",
+            processed_dir=workspace_tmp / "empty-processed",
+            staging_root=workspace_tmp / "staging",
+            root_dir=workspace_tmp,
+            data_dir=workspace_tmp / "data",
+        )
+
+
+def test_reingest_endpoint_enqueues_job(monkeypatch, workspace_tmp):
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    data_dir = workspace_tmp / "data"
+    _write_minimal_pdf(data_dir / "a.pdf")
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=processed_dir / "a.md",
+        source_hash="hash-a",
+        source_pdf_name="a.pdf",
+        source_pdf_path=data_dir / "a.pdf",
+    )
+
+    captured = {}
+
+    class IdleQueue:
+        def summary(self):
+            return {"indexing_job_ids": []}
+
+        def enqueue_upload(self, **kwargs):
+            captured.update(kwargs)
+            return web_app.QueueJob(
+                id=str(kwargs.get("job_id")),
+                kind="upload",
+                filenames=list(kwargs.get("filenames", [])),
+            )
+
+    monkeypatch.setattr(web_app, "job_queue", IdleQueue())
+    monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "DATA_DIR", data_dir)
+
+    response = TestClient(web_app.app).post("/api/reingest")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["reingest"] is True
+    assert payload["kind"] == "upload"
+    assert captured["filenames"] == ["a.pdf"]
+
+
+def test_reingest_endpoint_returns_404_with_no_sources(monkeypatch, workspace_tmp):
+    class IdleQueue:
+        def summary(self):
+            return {"indexing_job_ids": []}
+
+    monkeypatch.setattr(web_app, "job_queue", IdleQueue())
+    monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", workspace_tmp / "processed")
+    monkeypatch.setattr(web_app, "DATA_DIR", workspace_tmp / "data")
+
+    response = TestClient(web_app.app).post("/api/reingest")
+    assert response.status_code == 404
+
+
+def test_reingest_endpoint_blocks_during_indexing(monkeypatch):
+    class ActiveIndexingQueue:
+        def summary(self):
+            return {"indexing_job_ids": ["job-1"]}
+
+    monkeypatch.setattr(web_app, "job_queue", ActiveIndexingQueue())
+    response = TestClient(web_app.app).post("/api/reingest")
+    assert response.status_code == 409
