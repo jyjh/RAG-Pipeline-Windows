@@ -1,0 +1,52 @@
+{
+  "fixtures": [
+    {
+      "name": "born_digital.pdf",
+      "type": "digital",
+      "expected": {
+        "min_pages": 1,
+        "contains_text": "Golden FSAE RAG fixture document"
+      }
+    },
+    {
+      "name": "scanned_page.pdf",
+      "type": "scanned",
+      "status": "todo",
+      "expected": {
+        "requires_full_page_ocr": true
+      }
+    },
+    {
+      "name": "mixed_page.pdf",
+      "type": "mixed",
+      "status": "todo",
+      "expected": {
+        "has_text_and_images": true
+      }
+    },
+    {
+      "name": "table_heavy.pdf",
+      "type": "table",
+      "status": "todo",
+      "expected": {
+        "min_table_blocks": 1
+      }
+    },
+    {
+      "name": "equation_heavy.pdf",
+      "type": "equation",
+      "status": "todo",
+      "expected": {
+        "min_equation_blocks": 1
+      }
+    },
+    {
+      "name": "figure_chart.pdf",
+      "type": "figure",
+      "status": "todo",
+      "expected": {
+        "min_asset_crops": 1
+      }
+    }
+  ]
+}

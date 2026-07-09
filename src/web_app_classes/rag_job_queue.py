@@ -392,6 +392,11 @@ class RagJobQueue:
         staging_dir = Path(job.staging_dir)
         upload_dir = self.upload_root / job.id
         upload_dir.mkdir(parents=True, exist_ok=True)
+        # Saving uploads copies the staged PDFs into the upload dir, doubling
+        # their footprint. Refuse before copying if the volume is too full.
+        required = _source_module.estimate_dir_bytes(staging_dir)
+        if required > 0:
+            _source_module.check_disk_space(upload_dir, required)
         if not staging_dir.exists():
             self._populate_existing_upload_paths(job, upload_dir)
             self._require_upload_files(job, upload_dir)
@@ -590,6 +595,7 @@ class RagJobQueue:
             self._raise_if_cancelled(job)
             run_ingestion_func(input_dir, output_dir, **resolved)
             self._raise_if_cancelled(job)
+            self._summarize_ingest_result(job, output_dir)
             return
 
         command = [
@@ -621,6 +627,80 @@ class RagJobQueue:
         _append_cli_option(command, "--tesseract_psm", resolved["tesseract_psm"])
         command.append("--no_progress")
         self._run_pipeline_subprocess(command, job=job)
+        self._summarize_ingest_result(job, output_dir)
+
+    def _summarize_ingest_result(self, job: QueueJob | None, output_dir: str) -> None:
+        """Attach the per-file ingest breakdown to the job log.
+
+        ``run_ingestion`` writes ``.ingest_result.json`` with processed/skipped/
+        failed lists. The subprocess boundary means the registry can't see per-
+        file outcomes, so we surface them here in the job log the API returns.
+        """
+        if job is None:
+            return
+        from src.ingestion import INGEST_RESULT_FILENAME
+
+        result_path = Path(output_dir) / INGEST_RESULT_FILENAME
+        if not result_path.exists():
+            return
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        processed = payload.get("processed") or []
+        skipped = payload.get("skipped") or []
+        failed = payload.get("failed") or []
+        if not isinstance(processed, list):
+            processed = []
+        if not isinstance(skipped, list):
+            skipped = []
+        if not isinstance(failed, list):
+            failed = []
+        self._append_job_log(
+            job,
+            f"Ingest summary: {len(processed)} processed, {len(skipped)} skipped, "
+            f"{len(failed)} failed.",
+        )
+        for entry in failed:
+            if isinstance(entry, dict):
+                self._append_job_log(
+                    job,
+                    f"  failed: {entry.get('file', '?')} - {entry.get('error', '')}",
+                )
+
+    def _summarize_index_result(self, job: QueueJob | None, staged_db_dir: str) -> None:
+        """Attach the index run-summary to the job log.
+
+        The indexer writes ``.index_result.json`` into the staged dir with
+        processed/failed counts and disk usage. Read it before the staged dir
+        is removed so a partial-failure indexing run still reports which files
+        failed in the job log the API returns.
+        """
+        if job is None:
+            return
+        result_path = Path(staged_db_dir) / ".index_result.json"
+        if not result_path.exists():
+            return
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        processed = int(payload.get("files_processed") or 0)
+        failed_entries = payload.get("errors") or []
+        if not isinstance(failed_entries, list):
+            failed_entries = []
+        disk_used = payload.get("disk_used_bytes")
+        self._append_job_log(
+            job,
+            f"Index summary: {processed} file(s) indexed, {len(failed_entries)} failed"
+            + (f", {disk_used} bytes on disk." if disk_used is not None else "."),
+        )
+        for entry in failed_entries:
+            if isinstance(entry, dict):
+                self._append_job_log(
+                    job,
+                    f"  failed: {entry.get('file', '?')} - {entry.get('error', '')}",
+                )
 
     def _run_indexing(
         self,
@@ -648,6 +728,12 @@ class RagJobQueue:
             return
 
         staged_db_dir = _source_module._staged_index_dir(db_dir)
+        # The staged build writes a second full copy of the index alongside the
+        # live one; refuse to start if the volume can't hold both. Budget for
+        # the existing index plus the processed Markdown corpus it rebuilds from.
+        existing_index = _source_module.estimate_dir_bytes(_source_module.lancedb_path(db_dir))
+        corpus_bytes = _source_module.estimate_dir_bytes(md_dir)
+        _source_module.check_disk_space(db_dir, existing_index + corpus_bytes)
         command = [
             sys.executable,
             str(ROOT_DIR / "main.py"),
@@ -671,6 +757,9 @@ class RagJobQueue:
 
         try:
             self._run_pipeline_subprocess(command, job=job)
+            # Read the staged index run-summary before publish deletes the dir,
+            # so per-file failures and disk usage can be surfaced in the job log.
+            self._summarize_index_result(job, staged_db_dir)
             if job is not None:
                 self._wait_for_no_queries(job, "publishing_index")
             with INDEX_LOCK:
@@ -701,11 +790,12 @@ class RagJobQueue:
         clean table from the processed Markdown in ``processed_dir``.
         """
         with INDEX_LOCK:
-            live_lancedb = lancedb_path(self.db_dir)
-            if live_lancedb.exists():
-                _source_module._remove_path(live_lancedb)
-            store = _index_store(self.db_dir)
-            store._invalidate_table()
+            with _source_module.acquire_index_lock(self.db_dir):
+                live_lancedb = lancedb_path(self.db_dir)
+                if live_lancedb.exists():
+                    _source_module._remove_path(live_lancedb)
+                store = _index_store(self.db_dir)
+                store._invalidate_table()
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._condition:

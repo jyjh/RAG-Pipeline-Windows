@@ -23,6 +23,23 @@ class VectorStore(Protocol):
         embedding_dim: int,
     ) -> None: ...
 
+    def append_records(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        embedding_model: str,
+        embedding_dim: int,
+    ) -> None: ...
+
+    def replace_records_by_source_hash(
+        self,
+        *,
+        source_hash: str,
+        records: list[dict[str, Any]],
+        embedding_model: str,
+        embedding_dim: int,
+    ) -> dict[str, Any]: ...
+
     def list_records(
         self,
         *,
@@ -66,6 +83,8 @@ class VectorStore(Protocol):
     ) -> dict[str, Any]: ...
 
     def records_by_source_hash(self, source_hashes: list[str]) -> list[dict[str, Any]]: ...
+
+    def vectors_by_source_hash(self, source_hashes: list[str]) -> list[dict[str, Any]]: ...
 
     def search(self, vector: list[float], *, top_k: int) -> list[dict[str, Any]]: ...
 

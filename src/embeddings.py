@@ -7,6 +7,7 @@ import os
 import shutil
 import socket
 import sys
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -77,6 +78,7 @@ class EmbeddingEngine:
         *,
         ollama_batch_size: int | None = None,
         ollama_timeout: float | None = None,
+        ollama_retries: int | None = None,
     ):
         self.model_name = model_name
         self.ollama_batch_size = _positive_int(
@@ -86,6 +88,15 @@ class EmbeddingEngine:
         self.ollama_timeout = _positive_float(
             ollama_timeout or os.environ.get("OLLAMA_EMBED_TIMEOUT"),
             30.0,
+        )
+        # Bounded retry with exponential backoff for transient Ollama hiccups
+        # (timeouts, brief connection resets). A single blip otherwise aborts an
+        # entire multi-hour ingestion; the retry lets it ride out a transient
+        # failure. Final-attempt failure still raises so callers can skip the
+        # file (per-file isolation) rather than the whole corpus.
+        self.ollama_retries = _positive_int(
+            ollama_retries if ollama_retries is not None else os.environ.get("OLLAMA_EMBED_RETRIES"),
+            3,
         )
         self._cache: dict[tuple[int, int, str], Any] = {}
 
@@ -162,7 +173,7 @@ class EmbeddingEngine:
                     f"({len(batch)} text(s), {total_chars} chars, timeout={self.ollama_timeout:g}s)"
                 )
                 payload_input = batch[0] if len(batch) == 1 else batch
-                response = self._ollama_api(
+                response = self._ollama_api_with_retry(
                     "/api/embed",
                     {"model": self.model_name, "input": payload_input},
                 )
@@ -183,7 +194,7 @@ class EmbeddingEngine:
                         f"{self.model_name} batch {batch_number}/{total_batches} "
                         f"text {text_index}/{len(batch)} ({len(text)} chars, timeout={self.ollama_timeout:g}s)"
                     )
-                    response = self._ollama_api(
+                    response = self._ollama_api_with_retry(
                         "/api/embeddings",
                         {"model": self.model_name, "prompt": text},
                     )
@@ -232,4 +243,33 @@ class EmbeddingEngine:
             ) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Ollama request failed at {url}: {exc}") from exc
+
+    def _ollama_api_with_retry(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Call :meth:`_ollama_api` with bounded exponential-backoff retry.
+
+        Retries on the transient errors ``_ollama_api`` raises (RuntimeError
+        wrapping timeouts/URL errors). The last attempt's exception propagates
+        so a genuinely broken endpoint still fails the batch -- but only after
+        a few rides through a transient blip.
+        """
+        import random
+
+        attempts = max(1, int(self.ollama_retries))
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._ollama_api(path, payload)
+            except RuntimeError as exc:
+                last_exc = exc
+                if attempt >= attempts:
+                    break
+                # Exponential backoff: 0.5s, 1s, 2s, ... plus up to 25% jitter.
+                backoff = (0.5 * (2 ** (attempt - 1))) * (1 + random.random() * 0.25)
+                _status(
+                    f"Ollama request failed (attempt {attempt}/{attempts}); "
+                    f"retrying in {backoff:.2f}s. Error: {exc}"
+                )
+                time.sleep(backoff)
+        assert last_exc is not None
+        raise last_exc
 

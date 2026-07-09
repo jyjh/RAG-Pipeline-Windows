@@ -28,6 +28,10 @@ from pydantic import BaseModel, Field, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from src.atomic_io import write_json_atomic
+from src.disk_space import DiskSpaceError, check_disk_space, estimate_dir_bytes
+from src.file_lock import acquire_index_lock
+from src.job_logging import log_event, setup_job_logging
 from src.defaults import (
     DEFAULT_ASSET_DIR,
     DEFAULT_ASSET_TRIGGERS,
@@ -99,6 +103,12 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_remove_path",
     "_publish_staged_index",
     "_index_mutation_blocker",
+    "check_disk_space",
+    "estimate_dir_bytes",
+    "DiskSpaceError",
+    "acquire_index_lock",
+    "log_event",
+    "setup_job_logging",
     "_git_target_valid",
     "_run_git",
     "_git_failure_message",
@@ -721,38 +731,48 @@ def _publish_staged_index(staged_db_dir: str | Path, live_db_dir: str | Path) ->
         raise RuntimeError(f"Indexing did not create an index manifest at {staged_manifest}")
 
     live_db.mkdir(parents=True, exist_ok=True)
-    backup_dir = live_db.parent / f".index_backup_{uuid.uuid4().hex}"
-    backup_dir.mkdir(parents=True, exist_ok=False)
-    backup_lancedb = backup_dir / LANCEDB_DIRNAME
-    backup_manifest = backup_dir / INDEX_MANIFEST_FILENAME
-    backup_overrides = backup_dir / index_overrides_path(live_db).name
+    # The publish is a same-filesystem rename, so it needs little free space,
+    # but refuse outright if the target volume is critically full to avoid a
+    # half-swapped live index on a tight disk.
+    check_disk_space(live_db, 1)
+    # Cross-process lock: a direct CLI ``main.py --mode index`` run or a second
+    # server must not swap/backup the live index out from under this publish.
+    with acquire_index_lock(live_db):
+        backup_dir = live_db.parent / f".index_backup_{uuid.uuid4().hex}"
+        backup_dir.mkdir(parents=True, exist_ok=False)
+        backup_lancedb = backup_dir / LANCEDB_DIRNAME
+        backup_manifest = backup_dir / INDEX_MANIFEST_FILENAME
+        backup_overrides = backup_dir / index_overrides_path(live_db).name
 
-    try:
-        if live_lancedb.exists():
-            shutil.move(str(live_lancedb), str(backup_lancedb))
-        if live_manifest.exists():
-            shutil.move(str(live_manifest), str(backup_manifest))
-        if live_overrides.exists():
-            shutil.move(str(live_overrides), str(backup_overrides))
-        shutil.move(str(staged_lancedb), str(live_lancedb))
-        shutil.move(str(staged_manifest), str(live_manifest))
-        if staged_overrides.exists():
-            shutil.move(str(staged_overrides), str(live_overrides))
-        elif backup_overrides.exists():
-            shutil.move(str(backup_overrides), str(live_overrides))
-    except Exception:
-        _remove_path(live_lancedb)
-        _remove_path(live_manifest)
-        _remove_path(live_overrides)
-        if backup_lancedb.exists():
-            shutil.move(str(backup_lancedb), str(live_lancedb))
-        if backup_manifest.exists():
-            shutil.move(str(backup_manifest), str(live_manifest))
-        if backup_overrides.exists():
-            shutil.move(str(backup_overrides), str(live_overrides))
-        raise
-    finally:
-        shutil.rmtree(backup_dir, ignore_errors=True)
+        try:
+            if live_lancedb.exists():
+                shutil.move(str(live_lancedb), str(backup_lancedb))
+            if live_manifest.exists():
+                shutil.move(str(live_manifest), str(backup_manifest))
+            if live_overrides.exists():
+                shutil.move(str(live_overrides), str(backup_overrides))
+            shutil.move(str(staged_lancedb), str(live_lancedb))
+            shutil.move(str(staged_manifest), str(live_manifest))
+            if staged_overrides.exists():
+                shutil.move(str(staged_overrides), str(live_overrides))
+            elif backup_overrides.exists():
+                shutil.move(str(backup_overrides), str(live_overrides))
+        except Exception:
+            _remove_path(live_lancedb)
+            _remove_path(live_manifest)
+            _remove_path(live_overrides)
+            if backup_lancedb.exists():
+                shutil.move(str(backup_lancedb), str(live_lancedb))
+            if backup_manifest.exists():
+                shutil.move(str(backup_manifest), str(live_manifest))
+            if backup_overrides.exists():
+                shutil.move(str(backup_overrides), str(live_overrides))
+            raise
+        finally:
+            shutil.rmtree(backup_dir, ignore_errors=True)
+        # Invalidate in-process store/record caches so the next read sees the
+        # freshly published table (mirrors _swap_index_into; previously missing).
+        _invalidate_index_caches(live_db)
 
 
 def index_backup_root(db_dir: str | Path) -> Path:
@@ -863,27 +883,34 @@ def create_index_backup(db_dir: str | Path) -> dict[str, Any]:
         )
     backup_root = index_backup_root(resolved_db_dir)
     backup_root.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    snapshot_dir = backup_root / f"{stamp}-{uuid.uuid4().hex[:6]}"
-    snapshot_dir.mkdir(parents=True, exist_ok=False)
+    # copytree duplicates the whole index on disk; refuse before touching it if
+    # free space can't cover the copy (a mid-copy exhaustion corrupts the
+    # snapshot and can cascade into publish/restore failures).
+    required = estimate_dir_bytes(live_lancedb)
+    if required > 0:
+        check_disk_space(backup_root, required)
+    with acquire_index_lock(resolved_db_dir):
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        snapshot_dir = backup_root / f"{stamp}-{uuid.uuid4().hex[:6]}"
+        snapshot_dir.mkdir(parents=True, exist_ok=False)
 
-    components = _index_backup_component_paths(resolved_db_dir)
-    try:
-        for source in components:
-            if not source.exists():
-                continue
-            destination = snapshot_dir / source.name
-            if source.is_dir():
-                shutil.copytree(source, destination)
-            else:
-                shutil.copy2(source, destination)
-    except Exception:
-        _remove_path(snapshot_dir)
-        raise
+        components = _index_backup_component_paths(resolved_db_dir)
+        try:
+            for source in components:
+                if not source.exists():
+                    continue
+                destination = snapshot_dir / source.name
+                if source.is_dir():
+                    shutil.copytree(source, destination)
+                else:
+                    shutil.copy2(source, destination)
+        except Exception:
+            _remove_path(snapshot_dir)
+            raise
 
-    _prune_index_backups(backup_root)
-    _invalidate_index_caches(resolved_db_dir)
-    snapshot_entries = list_index_backups(resolved_db_dir)
+        _prune_index_backups(backup_root)
+        _invalidate_index_caches(resolved_db_dir)
+        snapshot_entries = list_index_backups(resolved_db_dir)
     return next(
         (entry for entry in snapshot_entries if entry["name"] == snapshot_dir.name),
         {
@@ -923,27 +950,28 @@ def _swap_index_into(source_db_dir: str | Path, live_db_dir: str | Path) -> None
     live_components = _index_backup_component_paths(live_db)
 
     live_db.mkdir(parents=True, exist_ok=True)
-    rollover = live_db.parent / f".index_rollover_{uuid.uuid4().hex}"
-    rollover.mkdir(parents=True, exist_ok=False)
-    rollover_targets = [rollover / component.name for component in live_components]
-    try:
-        for live_component, rollover_target in zip(live_components, rollover_targets):
-            if live_component.exists():
-                shutil.move(str(live_component), str(rollover_target))
-        for source_component, live_component in zip(source_components, live_components):
-            if source_component.exists():
-                shutil.move(str(source_component), str(live_component))
-    except Exception:
-        for live_component, rollover_target in zip(live_components, rollover_targets):
-            _remove_path(live_component)
-            if rollover_target.exists():
-                shutil.move(str(rollover_target), str(live_component))
-        _remove_path(rollover)
-        raise
-    finally:
-        _remove_path(rollover)
+    with acquire_index_lock(live_db):
+        rollover = live_db.parent / f".index_rollover_{uuid.uuid4().hex}"
+        rollover.mkdir(parents=True, exist_ok=False)
+        rollover_targets = [rollover / component.name for component in live_components]
+        try:
+            for live_component, rollover_target in zip(live_components, rollover_targets):
+                if live_component.exists():
+                    shutil.move(str(live_component), str(rollover_target))
+            for source_component, live_component in zip(source_components, live_components):
+                if source_component.exists():
+                    shutil.move(str(source_component), str(live_component))
+        except Exception:
+            for live_component, rollover_target in zip(live_components, rollover_targets):
+                _remove_path(live_component)
+                if rollover_target.exists():
+                    shutil.move(str(rollover_target), str(live_component))
+            _remove_path(rollover)
+            raise
+        finally:
+            _remove_path(rollover)
 
-    _invalidate_index_caches(live_db)
+        _invalidate_index_caches(live_db)
 
 
 def restore_index_from_backup(db_dir: str | Path, backup_name: str) -> dict[str, Any]:
@@ -1829,8 +1857,7 @@ def _load_trust_registry(path: Path | None = None) -> dict[str, Any]:
 
 def _write_trust_registry(payload: dict[str, Any], path: Path | None = None) -> None:
     trust_path = path or DOCUMENT_TRUST_PATH
-    trust_path.parent.mkdir(parents=True, exist_ok=True)
-    trust_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    write_json_atomic(trust_path, payload)
 
 
 def _default_trust_entry(source_hash: str) -> dict[str, Any]:
@@ -2040,6 +2067,14 @@ def _cached_json_load(
     but only change when ingestion/indexing writes them. Re-parsing the same
     payload every request is pure waste, so we keep a small memo keyed on the
     filesystem signature and only re-read when the file actually changes.
+
+    Metadata writes are now atomic (``write_json_atomic``), so a
+    :class:`json.JSONDecodeError` is real corruption, not a torn write. We do
+    NOT cache the corrupt fallback value: pinning the swallowed default against
+    the corrupt file's signature would mask a later repair. Callers that have a
+    legitimate rebuild-from-source recovery (e.g. the index manifest, which can
+    be re-derived from LanceDB) still get their fallback; they just re-attempt
+    the parse on every call until the file is fixed.
     """
     try:
         stat = path.stat()
@@ -2051,10 +2086,13 @@ def _cached_json_load(
         return cached[1]
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        value = on_decode_error if on_decode_error is not _UNSET_SENTINEL else default
-        _JSON_CACHE[str(path)] = (signature, value)
-        return value
+    except json.JSONDecodeError:
+        # Real corruption: return the fallback but do NOT cache it, so a repair
+        # (rewriting the file, even with the same mtime/size edge case) is
+        # observed on the next read instead of masked by a stale cache entry.
+        return on_decode_error if on_decode_error is not _UNSET_SENTINEL else default
+    except OSError:
+        return default
     value = payload if isinstance(payload, dict) else default
     _JSON_CACHE[str(path)] = (signature, value)
     return value
@@ -2947,6 +2985,13 @@ def recover_pending_upload_jobs_on_startup() -> dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Configure a persistent server log so background-worker errors and
+    # startup recovery are diagnosable after a crash (the in-memory job-log
+    # tail is lost on restart). Best-effort: a read-only workspace won't fail.
+    try:
+        setup_job_logging(Path("logs") / "server.log")
+    except OSError:
+        pass
     recover_pending_upload_jobs_on_startup()
     yield
 

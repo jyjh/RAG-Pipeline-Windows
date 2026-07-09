@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from src.atomic_io import write_bytes_atomic, write_json_atomic
+
 
 ASSET_MANIFEST_FILENAME = "assets_manifest.json"
 IMAGE_ASSET_MARKER_RE = re.compile(r"\[Image Asset:\s*([A-Za-z0-9_.-]+)\]")
@@ -38,16 +40,14 @@ def image_asset_ids(text: str) -> list[str]:
 def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
     if not path.exists():
         return default
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return default
+    # A JSON decode failure now indicates real corruption (writes are atomic),
+    # so surface it rather than silently returning an empty manifest.
+    payload = json.loads(path.read_text(encoding="utf-8"))
     return payload if isinstance(payload, dict) else default
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    write_json_atomic(path, payload)
 
 
 def _safe_component(value: str, fallback: str) -> str:
@@ -124,8 +124,7 @@ class ImageAssetStore:
         asset_id = f"img_{source_key[:12]}_p{page_key}_{image_sha[:16]}"
         relative_path = Path(source_key) / f"{asset_id}.png"
         image_path = self.asset_dir / relative_path
-        image_path.parent.mkdir(parents=True, exist_ok=True)
-        image_path.write_bytes(image_data)
+        write_bytes_atomic(image_path, image_data)
 
         manifest = self.load_manifest()
         assets = manifest.setdefault("assets", {})

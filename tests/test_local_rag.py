@@ -1150,6 +1150,9 @@ def test_local_indexer_batches_chunk_embeddings(monkeypatch):
                     "page_end": i + 1,
                     "summary": f"summary {i}",
                     "tags": ["chunk"],
+                    "source_hash": "hash-doc",
+                    "source_pdf_name": "doc.pdf",
+                    "source_pdf_path": "uploads/doc.pdf",
                 }
                 for i in range(5)
             ]
@@ -1203,6 +1206,9 @@ def test_local_indexer_reuses_unchanged_vectors(monkeypatch):
                     "page_end": 1,
                     "summary": "summary",
                     "tags": [],
+                    "source_hash": "hash-doc",
+                    "source_pdf_name": "doc.pdf",
+                    "source_pdf_path": "uploads/doc.pdf",
                     "vector": reused_vector,
                 },
                 {
@@ -1219,6 +1225,9 @@ def test_local_indexer_reuses_unchanged_vectors(monkeypatch):
                     "page_end": 2,
                     "summary": "summary",
                     "tags": [],
+                    "source_hash": "hash-doc",
+                    "source_pdf_name": "doc.pdf",
+                    "source_pdf_path": "uploads/doc.pdf",
                     "vector": [0.5] + [0.0] * 767,
                 },
             ],
@@ -1256,6 +1265,9 @@ def test_local_indexer_reuses_unchanged_vectors(monkeypatch):
                 "file_path": "doc.md",
                 "summary": "summary",
                 "tags": [],
+                "source_hash": "hash-doc",
+                "source_pdf_name": "doc.pdf",
+                "source_pdf_path": "uploads/doc.pdf",
             }
             return [
                 {

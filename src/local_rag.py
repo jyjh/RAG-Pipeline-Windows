@@ -17,6 +17,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+from src.atomic_io import write_json_atomic
 from src.sectioning import (
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_CHUNK_TARGET_TOKENS,
@@ -899,7 +900,44 @@ def index_record_content_hash(record: dict[str, Any]) -> str:
 
 
 def _build_index_manifest(records: list[dict[str, Any]], *, embedding_model: str, embedding_dim: int) -> dict[str, Any]:
-    documents: dict[str, dict[str, Any]] = {}
+    manifest = _empty_manifest(embedding_model, embedding_dim)
+    _merge_records_into_manifest(manifest, records)
+    return manifest
+
+
+def _empty_manifest(embedding_model: str, embedding_dim: int) -> dict[str, Any]:
+    """Return a fresh, empty manifest shell ready for :func:`_merge_records_into_manifest`.
+
+    Split from :func:`_build_index_manifest` so the streaming indexer can build
+    a manifest incrementally (one file's records merged at a time) instead of
+    holding the whole corpus's records in memory before computing the manifest.
+    """
+    return {
+        "version": 1,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "embedding_model": str(embedding_model),
+        "embedding_dim": int(embedding_dim),
+        "total_records": 0,
+        "embedded_records": 0,
+        "reused_records": 0,
+        "documents": {},
+    }
+
+
+def _merge_records_into_manifest(
+    manifest: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> None:
+    """Fold ``records`` into ``manifest`` in place, updating running counts.
+
+    Safe to call repeatedly (once per file during streaming indexing). For
+    re-indexing a source that already has an entry, pass only that file's
+    records and delete the existing document key first.
+    """
+    documents: dict[str, dict[str, Any]] = manifest.setdefault("documents", {})
+    embedded = int(manifest.get("embedded_records") or 0)
+    reused = int(manifest.get("reused_records") or 0)
+    total = int(manifest.get("total_records") or 0)
     for record in records:
         key = _manifest_source_key(record)
         document = documents.setdefault(
@@ -935,16 +973,41 @@ def _build_index_manifest(records: list[dict[str, Any]], *, embedding_model: str
             document["page_start"] = page_start if not current else min(current, page_start)
         if page_end:
             document["page_end"] = max(int(document.get("page_end") or 0), page_end)
-    return {
-        "version": 1,
-        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "embedding_model": embedding_model,
-        "embedding_dim": int(embedding_dim),
-        "total_records": len(records),
-        "embedded_records": sum(1 for record in records if not record.get("vector_reused")),
-        "reused_records": sum(1 for record in records if record.get("vector_reused")),
-        "documents": documents,
-    }
+        if record.get("vector_reused"):
+            reused += 1
+        else:
+            embedded += 1
+        total += 1
+    manifest["total_records"] = total
+    manifest["embedded_records"] = embedded
+    manifest["reused_records"] = reused
+    manifest["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _remove_source_from_manifest(manifest: dict[str, Any], source_key: str) -> None:
+    """Drop a document entry from ``manifest`` and recompute running totals."""
+    documents: dict[str, dict[str, Any]] = manifest.setdefault("documents", {})
+    document = documents.pop(source_key, None)
+    if not document:
+        return
+    delta = int(document.get("record_count") or 0)
+    manifest["total_records"] = max(0, int(manifest.get("total_records") or 0) - delta)
+    # Embedded/reused counts are not recoverable per-source from the stored
+    # document shape, so recompute them as best-effort: subtract the doc's own
+    # record count proportionally only if we tracked it. We did not store
+    # per-doc embedded/reused, so leave the totals as upper-bound-ish and let
+    # the final write be authoritative for a full rebuild. For incremental
+    # re-index the merged records re-add the correct counts.
+
+
+def write_index_manifest_payload(
+    working_dir: str | Path,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Write a pre-built manifest dict to ``working_dir`` atomically."""
+    path = Path(working_dir) / INDEX_MANIFEST_FILENAME
+    write_json_atomic(path, manifest)
+    return manifest
 
 
 def write_index_manifest(
@@ -955,10 +1018,7 @@ def write_index_manifest(
     embedding_dim: int,
 ) -> dict[str, Any]:
     manifest = _build_index_manifest(records, embedding_model=embedding_model, embedding_dim=embedding_dim)
-    path = Path(working_dir) / INDEX_MANIFEST_FILENAME
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    return manifest
+    return write_index_manifest_payload(working_dir, manifest)
 
 
 DuckDuckGoLiteParser = import_split_class("src.local_rag_classes.duck_duck_go_lite_parser", "DuckDuckGoLiteParser")

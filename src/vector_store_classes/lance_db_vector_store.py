@@ -94,6 +94,63 @@ class LanceDBVectorStore:
             db.create_table(TABLE_NAME, schema=self._schema(embedding_dim), mode="overwrite")
         self._invalidate_table()
 
+    def append_records(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        embedding_model: str,
+        embedding_dim: int,
+    ) -> None:
+        """Add ``records`` without touching existing rows.
+
+        Used by the streaming indexer to write one file's records at a time so
+        peak RAM is ~one file instead of the whole corpus. On the first call
+        (table missing) the table is created with ``mode="overwrite"`` -- this
+        is a brand-new staged directory, so there is nothing to preserve. On
+        subsequent calls the rows are appended via ``table.add``.
+        """
+        self.db_path.mkdir(parents=True, exist_ok=True)
+        rows = [
+            self._row_for_lance(record, embedding_model=embedding_model, embedding_dim=embedding_dim)
+            for record in records
+        ]
+        db = self._db()
+        if TABLE_NAME not in self._table_names(db):
+            # First write into a fresh (staged) directory: create the table.
+            if rows:
+                db.create_table(TABLE_NAME, data=rows, mode="overwrite")
+            else:
+                db.create_table(TABLE_NAME, schema=self._schema(embedding_dim), mode="overwrite")
+        elif rows:
+            self._table().add(rows)
+        self._invalidate_table()
+
+    def replace_records_by_source_hash(
+        self,
+        *,
+        source_hash: str,
+        records: list[dict[str, Any]],
+        embedding_model: str,
+        embedding_dim: int,
+    ) -> dict[str, Any]:
+        """Atomically replace one source's rows with ``records``.
+
+        A delete-then-add of a single source within one logical operation, so
+        re-indexing one file is idempotent and never touches other files' rows.
+        Uses the existing :meth:`delete_records_by_source_hash`, which is a
+        no-op when the table is absent or no rows match. Returns the delete
+        summary for diagnostics.
+        """
+        source_hash = str(source_hash or "")
+        deleted = self.delete_records_by_source_hash(source_hashes=[source_hash] if source_hash else [])
+        if records:
+            self.append_records(
+                records,
+                embedding_model=embedding_model,
+                embedding_dim=embedding_dim,
+            )
+        return deleted
+
     def list_records(
         self,
         *,
@@ -257,6 +314,19 @@ class LanceDBVectorStore:
             return []
         rows = self._where(" OR ".join(f"source_hash = {sql_string(source_hash)}" for source_hash in hashes))
         return [record_row(row) for row in rows]
+
+    def vectors_by_source_hash(self, source_hashes: list[str]) -> list[dict[str, Any]]:
+        """Raw rows (including ``vector``) for the given sources.
+
+        :meth:`records_by_source_hash` strips the vector column (via
+        ``record_row``) for API/listing use. Vector reuse needs the vector, so
+        this returns the raw LanceDB rows -- one read per source, keeping the
+        streaming indexer's memory bounded to ~one file.
+        """
+        hashes = sorted({str(value) for value in source_hashes if value})
+        if not hashes or not self.exists():
+            return []
+        return self._where(" OR ".join(f"source_hash = {sql_string(source_hash)}" for source_hash in hashes))
 
     def search(self, vector: list[float], *, top_k: int) -> list[dict[str, Any]]:
         if not self.exists():

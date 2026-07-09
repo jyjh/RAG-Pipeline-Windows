@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.atomic_io import write_json_atomic
+
 
 INDEX_OVERRIDES_FILENAME = "index_overrides.json"
 INDEX_OVERRIDES_VERSION = 1
@@ -45,7 +47,6 @@ def load_index_overrides(db_dir: str | Path) -> dict[str, Any]:
 
 def write_index_overrides(db_dir: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
     path = index_overrides_path(db_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
     normalized = _empty_payload()
     normalized["edits"] = {
         str(record_id): dict(entry)
@@ -57,7 +58,7 @@ def write_index_overrides(db_dir: str | Path, payload: dict[str, Any]) -> dict[s
         for record_id, entry in (payload.get("deletions") or {}).items()
         if record_id and isinstance(entry, dict)
     }
-    path.write_text(json.dumps(normalized, indent=2, sort_keys=True), encoding="utf-8")
+    write_json_atomic(path, normalized)
     return normalized
 
 
@@ -96,8 +97,13 @@ def persist_index_deletions(db_dir: str | Path, records: list[dict[str, Any]]) -
     return write_index_overrides(db_dir, payload)
 
 
-def apply_index_overrides(records: list[dict[str, Any]], db_dir: str | Path) -> list[dict[str, Any]]:
-    payload = load_index_overrides(db_dir)
+def apply_overrides_to_records(records: list[dict[str, Any]], payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Apply a loaded overrides payload to a batch of records.
+
+    Split from :func:`apply_index_overrides` so the streaming indexer can load
+    overrides once and apply them per-file without re-reading disk for every
+    Markdown file.
+    """
     edits = payload.get("edits") or {}
     deletions = set(str(record_id) for record_id in (payload.get("deletions") or {}).keys())
     if not edits and not deletions:
@@ -117,6 +123,11 @@ def apply_index_overrides(records: list[dict[str, Any]], db_dir: str | Path) -> 
         else:
             applied.append(record)
     return applied
+
+
+def apply_index_overrides(records: list[dict[str, Any]], db_dir: str | Path) -> list[dict[str, Any]]:
+    payload = load_index_overrides(db_dir)
+    return apply_overrides_to_records(records, payload)
 
 
 def clear_overrides_for_sources(db_dir: str | Path, source_hashes: set[str]) -> dict[str, Any]:

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+from src.atomic_io import write_json_atomic
+from src.file_lock import acquire_registry_lock
 
 
 REGISTRY_FILENAME = ".pdf_upload_registry.json"
@@ -36,6 +40,12 @@ def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
     only change when ingestion/indexing writes them. Re-parsing the same payload
     every request is pure waste, so we memoize on the filesystem signature and
     only re-read when the file actually changes.
+
+    Metadata writes are now atomic (``write_json_atomic``), so a
+    :class:`json.JSONDecodeError` is real corruption rather than a torn write.
+    We let it propagate so the damage is surfaced instead of silently masking
+    it with an empty registry that would lose all upload/ingest state. A missing
+    file (``OSError``) and a non-dict payload still fall back to ``default``.
     """
     cache_key = str(path)
     try:
@@ -47,23 +57,36 @@ def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
     cached = _JSON_CACHE.get(cache_key)
     if cached is not None and cached[0] == signature:
         return cached[1]
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        _JSON_CACHE[cache_key] = (signature, default)
-        return default
+    # Note: json.JSONDecodeError is intentionally NOT caught -- see docstring.
+    payload = json.loads(path.read_text(encoding="utf-8"))
     value = payload if isinstance(payload, dict) else default
     _JSON_CACHE[cache_key] = (signature, value)
     return value
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = json.dumps(payload, indent=2, sort_keys=True)
-    path.write_text(data, encoding="utf-8")
+    write_json_atomic(path, payload)
     # Invalidate the cached value so the next read sees the new file; the next
     # _load_json will repopulate the cache under the fresh signature.
     _JSON_CACHE.pop(str(path), None)
+
+
+@contextlib.contextmanager
+def _registry_lock_for(path: str | Path) -> Iterator[None]:
+    """Acquire the in-process registry lock plus a cross-process file lock.
+
+    The in-process ``_LOCK`` serializes registry mutations within one server.
+    The cross-process lock (portalocker) additionally serializes against a
+    second server instance or a concurrent CLI run. The cross-process lock is
+    best-effort: if it cannot be acquired (e.g. read-only filesystem), we fall
+    back to the in-process lock alone rather than failing the mutation.
+    """
+    with _LOCK:
+        try:
+            with acquire_registry_lock(Path(path).parent, timeout=30.0):
+                yield
+        except (TimeoutError, OSError):
+            yield
 
 
 class PdfRegistry:
@@ -109,7 +132,7 @@ class PdfRegistry:
     ) -> None:
         forced_hashes = forced_hashes or set()
         options = dict(options or {})
-        with _LOCK:
+        with _registry_lock_for(self.path):
             payload = self.load()
             pdfs = payload.setdefault("pdfs", {})
             now = utcnow()
@@ -142,7 +165,7 @@ class PdfRegistry:
         status: str,
         error: str | None = None,
     ) -> None:
-        with _LOCK:
+        with _registry_lock_for(self.path):
             payload = self.load()
             pdfs = payload.setdefault("pdfs", {})
             now = utcnow()
@@ -207,7 +230,7 @@ class PdfRegistry:
         hashes = [str(value) for value in source_hashes if value]
         if not hashes:
             return
-        with _LOCK:
+        with _registry_lock_for(self.path):
             payload = self.load()
             pdfs = payload.setdefault("pdfs", {})
             now = utcnow()
@@ -232,7 +255,7 @@ class PdfRegistry:
         source_hash = str(source_hash or "")
         if not source_hash:
             return None
-        with _LOCK:
+        with _registry_lock_for(self.path):
             payload = self.load()
             pdfs = payload.setdefault("pdfs", {})
             entry = pdfs.pop(source_hash, None)
@@ -289,7 +312,7 @@ def write_source_entry(
         "processed_markdown_path": str(markdown),
         "updated_at": utcnow(),
     }
-    with _LOCK:
+    with _registry_lock_for(source_map_path(processed_dir)):
         payload = load_source_map(processed_dir)
         payload["documents"][markdown.name] = entry
         _write_json(source_map_path(processed_dir), payload)
@@ -310,7 +333,7 @@ def remove_source_entries_by_hash(
     hashes = {str(value) for value in source_hashes if value}
     if not hashes:
         return []
-    with _LOCK:
+    with _registry_lock_for(source_map_path(processed_dir)):
         payload = load_source_map(processed_dir)
         documents = payload.get("documents", {})
         removed: list[dict[str, Any]] = []

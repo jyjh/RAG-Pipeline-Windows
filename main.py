@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -469,7 +470,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable ingestion progress bars",
     )
+    parser.add_argument(
+        "--job_log_dir",
+        default=None,
+        help="Directory for per-job structured log files (ingest/index runs). "
+        "Defaults to <workspace>/logs.",
+    )
     return parser
+
+
+def _setup_job_logger(mode: str, job_log_dir: str | None) -> logging.Logger | None:
+    """Attach a per-run structured file handler for ingest/index modes.
+
+    Returns the configured logger (or None if setup failed). The log file is
+    ``logs/job_<mode>_<pid>.log`` under ``job_log_dir`` (defaulting to a
+    ``logs`` dir next to the workspace root). Structured events written via
+    ``log_event`` land here and survive a subprocess crash, unlike the
+    in-memory job-log tail.
+    """
+    from src.job_logging import setup_job_logging
+
+    base = Path(job_log_dir) if job_log_dir else Path("logs")
+    try:
+        log_path = base / f"job_{mode}_{os.getpid()}.log"
+        return setup_job_logging(log_path)
+    except OSError:
+        return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -481,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.mode == "ingest":
             print("Starting ingestion mode...", file=sys.stderr, flush=True)
+            _setup_job_logger("ingest", args.job_log_dir)
             ingestion_options = _ingestion_args(args)
             run_ingestion(
                 args.data_dir,
@@ -492,19 +519,26 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.mode == "index":
             print("Starting index mode...", file=sys.stderr, flush=True)
-            run_indexing(
-                args.md_dir,
-                args.db_dir,
-                progress_enabled=not args.no_progress,
-                embedding_model=args.embedding_model or "nomic-embed-text",
-                embedding_batch_size=args.embedding_batch_size or 8,
-                embedding_timeout=args.embedding_timeout or 30.0,
-                index_backend=args.index_backend,
-                reuse_db_dir=args.reuse_db_dir,
-                summary_mode=args.summary_mode,
-                chunk_target_tokens=args.chunk_target_tokens,
-                chunk_overlap_tokens=args.chunk_overlap_tokens,
-            )
+            # Acquire the cross-process index lock on the target dir. For a
+            # direct CLI build into the live db/ this prevents racing the
+            # server's publish/backup/restore; for a staged build (db_dir is a
+            # fresh unique dir) the lock is trivially acquired and harmless.
+            from src.file_lock import acquire_index_lock
+
+            with acquire_index_lock(args.db_dir):
+                run_indexing(
+                    args.md_dir,
+                    args.db_dir,
+                    progress_enabled=not args.no_progress,
+                    embedding_model=args.embedding_model or "nomic-embed-text",
+                    embedding_batch_size=args.embedding_batch_size or 8,
+                    embedding_timeout=args.embedding_timeout or 30.0,
+                    index_backend=args.index_backend,
+                    reuse_db_dir=args.reuse_db_dir,
+                    summary_mode=args.summary_mode,
+                    chunk_target_tokens=args.chunk_target_tokens,
+                    chunk_overlap_tokens=args.chunk_overlap_tokens,
+                )
             return 0
 
         if args.mode == "query":

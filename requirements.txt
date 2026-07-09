@@ -22,6 +22,7 @@ tqdm
 lancedb
 pylance
 pyarrow
+portalocker
 
 # API and browser UI
 fastapi

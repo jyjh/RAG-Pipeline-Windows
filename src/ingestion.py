@@ -33,6 +33,10 @@ from src.defaults import (
 )
 
 from src._class_module_support import import_split_class
+from src.atomic_io import write_json_atomic
+from src.job_logging import RunTimer, log_event, write_run_summary
+
+INGEST_RESULT_FILENAME = ".ingest_result.json"
 
 _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_usable_vision_description",
@@ -442,12 +446,30 @@ def run_ingestion(
 ):
     os.makedirs(output_dir, exist_ok=True)
     from src.asset_store import ImageAssetStore
-    from src.pdf_registry import sha256_file, write_source_entry
+    from src.pdf_registry import (
+        load_source_map,
+        sha256_file,
+        write_source_entry,
+    )
 
     _progress_status(f"Discovering PDFs in {input_dir}...", enabled=progress_enabled)
     input_paths = _iter_pdf_paths(input_dir)
     _progress_status(f"Found {len(input_paths)} PDF(s).", enabled=progress_enabled)
+
+    timer = RunTimer()
+    processed: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     processor: DocumentProcessor | None = None
+
+    # Load the existing source map once for resume checks. A PDF whose content
+    # hash already maps to its processed Markdown in the source map has already
+    # been parsed; re-parsing it (the expensive step) is skipped on resume. A
+    # changed PDF has a new hash and won't match, so it re-parses normally.
+    existing_source_map = load_source_map(output_dir).get("documents", {})
+    if not isinstance(existing_source_map, dict):
+        existing_source_map = {}
+
     for input_path in _iter_with_progress(
         input_paths,
         enabled=progress_enabled,
@@ -455,51 +477,124 @@ def run_ingestion(
         desc="Ingest documents",
         unit="doc",
     ):
-        _progress_status(f"Starting ingest: {input_path.name}", enabled=progress_enabled)
-        source_hash = sha256_file(input_path)
-        if processor is None:
-            _progress_status("Preparing PDF parser...", enabled=progress_enabled)
-            processor = DocumentProcessor(
-                vision_model=vision_model,
-                parser_mode=parser_mode,
-                accelerator=accelerator,
-                num_threads=num_threads,
-                vision_enabled=vision_enabled,
-                asset_triggers=asset_triggers,
-                asset_dir=asset_dir,
-                code_enrichment=code_enrichment,
-                formula_enrichment=formula_enrichment,
-                ocr_backend=ocr_backend,
-                ocr_langs=ocr_langs,
-                ocr_force_full_page=ocr_force_full_page,
-                ocr_bitmap_area_threshold=ocr_bitmap_area_threshold,
-                rapidocr_backend=rapidocr_backend,
-                tesseract_cmd=tesseract_cmd,
-                tesseract_data_path=tesseract_data_path,
-                tesseract_psm=tesseract_psm,
-                progress_enabled=progress_enabled,
-            )
-
-        ImageAssetStore(asset_dir).remove_source_assets(source_hash)
-        processor.set_source_context(source_hash=source_hash, source_pdf_name=input_path.name)
-        md_content = processor.process_pdf(str(input_path))
-        if not md_content.strip():
-            raise RuntimeError(
-                f"Ingestion produced empty Markdown for {input_path.name}. "
-                "Check OCR dependencies or enable vision-based scanned-page fallback."
-            )
-
+        file_name = input_path.name
         output_path = Path(output_dir) / f"{input_path.stem}.md"
-        with output_path.open("w", encoding="utf-8") as handle:
-            handle.write(md_content)
-        write_source_entry(
-            processed_dir=output_dir,
-            markdown_path=output_path,
-            source_hash=source_hash,
-            source_pdf_name=input_path.name,
-            source_pdf_path=input_path,
+        try:
+            _progress_status(f"Starting ingest: {file_name}", enabled=progress_enabled)
+            source_hash = sha256_file(input_path)
+
+            # Resume: if this exact source (content-addressed by hash) already
+            # produced its Markdown and the source map still maps it, the parse
+            # is idempotent -- skip the expensive re-parse.
+            existing_entry = existing_source_map.get(output_path.name)
+            if (
+                isinstance(existing_entry, dict)
+                and str(existing_entry.get("source_hash") or "") == source_hash
+                and output_path.exists()
+            ):
+                _progress_status(
+                    f"Already ingested (source hash unchanged): {file_name}. Skipping parse.",
+                    enabled=progress_enabled,
+                )
+                skipped.append({"file": file_name, "hash": source_hash})
+                log_event("file_ingest_skipped", file=file_name, hash=source_hash)
+                continue
+
+            if processor is None:
+                _progress_status("Preparing PDF parser...", enabled=progress_enabled)
+                processor = DocumentProcessor(
+                    vision_model=vision_model,
+                    parser_mode=parser_mode,
+                    accelerator=accelerator,
+                    num_threads=num_threads,
+                    vision_enabled=vision_enabled,
+                    asset_triggers=asset_triggers,
+                    asset_dir=asset_dir,
+                    code_enrichment=code_enrichment,
+                    formula_enrichment=formula_enrichment,
+                    ocr_backend=ocr_backend,
+                    ocr_langs=ocr_langs,
+                    ocr_force_full_page=ocr_force_full_page,
+                    ocr_bitmap_area_threshold=ocr_bitmap_area_threshold,
+                    rapidocr_backend=rapidocr_backend,
+                    tesseract_cmd=tesseract_cmd,
+                    tesseract_data_path=tesseract_data_path,
+                    tesseract_psm=tesseract_psm,
+                    progress_enabled=progress_enabled,
+                )
+
+            ImageAssetStore(asset_dir).remove_source_assets(source_hash)
+            processor.set_source_context(source_hash=source_hash, source_pdf_name=file_name)
+            md_content = processor.process_pdf(str(input_path))
+            if not md_content.strip():
+                # Per-file failure instead of aborting the whole batch: one
+                # blank/unparseable PDF should not kill the other N-1.
+                raise RuntimeError(
+                    f"Ingestion produced empty Markdown for {file_name}. "
+                    "Check OCR dependencies or enable vision-based scanned-page fallback."
+                )
+
+            with output_path.open("w", encoding="utf-8") as handle:
+                handle.write(md_content)
+            write_source_entry(
+                processed_dir=output_dir,
+                markdown_path=output_path,
+                source_hash=source_hash,
+                source_pdf_name=file_name,
+                source_pdf_path=input_path,
+            )
+            processed.append({"file": file_name, "hash": source_hash})
+            logger.info("Processed %s -> %s", file_name, output_path)
+            log_event("file_ingested", file=file_name, hash=source_hash)
+        except Exception as exc:
+            failed.append({"file": file_name, "hash": "", "error": str(exc)})
+            _progress_status(
+                f"Failed to ingest {file_name}: {exc}. Continuing with remaining documents.",
+                enabled=progress_enabled,
+            )
+            logger.exception("Ingestion failed for %s", file_name)
+            log_event("file_ingest_failed", file=file_name, error=str(exc))
+
+    elapsed = timer.elapsed()
+    result_path = Path(output_dir) / INGEST_RESULT_FILENAME
+    write_run_summary(
+        result_path,
+        phase="ingest",
+        files_processed=len(processed) + len(skipped),
+        files_failed=len(failed),
+        elapsed_s=elapsed,
+        errors=failed or None,
+    )
+    # Persist the structured per-run result so the job queue can surface a
+    # processed/failed/skipped breakdown in the job log without coupling the
+    # subprocess to the server-side registry.
+    write_json_atomic(
+        result_path,
+        {
+            "phase": "ingest",
+            "processed": processed,
+            "skipped": skipped,
+            "failed": failed,
+            "elapsed_s": round(elapsed, 3),
+        },
+    )
+
+    # Only an all-failed (and nothing processed/skipped) run aborts: an empty
+    # output must still surface as an error. Partial success continues so the
+    # indexing stage can proceed on whatever was produced.
+    total_input = len(input_paths)
+    succeeded = len(processed) + len(skipped)
+    if total_input and succeeded == 0:
+        first_error = failed[0]["error"] if failed else "no documents were produced"
+        raise RuntimeError(
+            f"Ingestion failed for all {len(failed)} document(s). First error: {first_error}"
         )
-        logger.info("Processed %s -> %s", input_path.name, output_path)
+
+    _progress_status(
+        f"Ingestion complete: {len(processed)} processed, {len(skipped)} skipped, "
+        f"{len(failed)} failed in {elapsed:.1f}s.",
+        enabled=progress_enabled,
+    )
 
 
 if __name__ == "__main__":
