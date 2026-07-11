@@ -49,6 +49,11 @@ def _wait_for_shutdown(*, old_pid: int, host: str, port: int, timeout_seconds: f
 
 
 def _start_server(*, root: Path, app: str, host: str, port: int, log_path: Path) -> subprocess.Popen:
+    # Bound the restart-log size across many restarts: if the existing log has
+    # grown past the ceiling, trim it down to its tail before appending. This is
+    # a raw stdout redirect (not a logging.Handler), so rotating-file semantics
+    # don't apply; a tail-trim on each restart keeps it bounded.
+    _trim_log_tail(log_path, max_bytes=RESTART_LOG_MAX_BYTES)
     command = [
         sys.executable,
         "-m",
@@ -75,6 +80,36 @@ def _start_server(*, root: Path, app: str, host: str, port: int, log_path: Path)
         )
     finally:
         log_handle.close()
+
+
+# Ceiling for the restart log (raw uvicorn stdout redirect). Trimmed on each
+# restart so repeated restarts can't grow it without bound.
+RESTART_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _trim_log_tail(log_path: Path, *, max_bytes: int) -> None:
+    """Keep only the trailing ``max_bytes`` of ``log_path`` if it exceeds the cap.
+
+    Preserves recent context (the most useful part of a restart log) while
+    preventing unbounded growth across many restarts. No-op if the file is
+    missing, empty, or already under the cap.
+    """
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        return
+    if size <= max_bytes:
+        return
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(-max_bytes, os.SEEK_END)
+            _ = handle.read(1)  # discard partial leading line
+            tail = handle.read()
+        with log_path.open("wb") as handle:
+            handle.write(tail)
+    except OSError:
+        # Best-effort: never let log trimming break a restart.
+        return
 
 
 def build_parser() -> argparse.ArgumentParser:

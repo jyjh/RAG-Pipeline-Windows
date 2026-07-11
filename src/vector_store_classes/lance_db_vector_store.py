@@ -331,7 +331,9 @@ class LanceDBVectorStore:
     def search(self, vector: list[float], *, top_k: int) -> list[dict[str, Any]]:
         if not self.exists():
             return []
-        rows = self._table().search(vector).limit(max(1, top_k)).to_list()
+        query = self._table().search(vector).limit(max(1, top_k))
+        query = _apply_ann_search_params(query)
+        rows = query.to_list()
         return [self._normalize_result(row) for row in rows]
 
     def child_chunks(self, parent: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
@@ -343,13 +345,22 @@ class LanceDBVectorStore:
             where = f"parent_id = {sql_string(str(parent.get('id', '')))} AND node_type = 'chunk'"
             rows = self._where(where, limit=max(1, limit))
             if not rows and parent.get("section_path"):
+                # Fallback for summary nodes whose children share a section_path
+                # prefix but don't carry this node's parent_id. Previously this
+                # loaded the entire index via _scan_rows() and filtered in Python
+                # (OOM at scale). Instead, narrow server-side to the one document
+                # first, then apply the prefix filter in Python on just that
+                # document's rows.
+                doc_id = sql_string(str(parent.get("doc_id", "")))
                 prefix = str(parent.get("section_path", ""))
+                candidates = self._where(
+                    f"doc_id = {doc_id} AND node_type = 'chunk'",
+                    limit=max(1, limit) * 4,
+                )
                 rows = [
                     row
-                    for row in self._scan_rows()
-                    if row.get("doc_id") == parent.get("doc_id")
-                    and row.get("node_type") == "chunk"
-                    and str(row.get("section_path", "")).startswith(prefix)
+                    for row in candidates
+                    if str(row.get("section_path", "")).startswith(prefix)
                 ]
         rows.sort(key=lambda row: int(row.get("chunk_index") or 0))
         return [self._normalize_result(row) for row in rows[:limit]]
@@ -360,6 +371,132 @@ class LanceDBVectorStore:
         if self._db_conn is None:
             self._db_conn = lancedb.connect(str(self.db_path))
         return self._db_conn
+
+    def has_vector_index(self) -> bool:
+        """True if an ANN index exists on the vector column.
+
+        Below :data:`ANN_MIN_ROWS` the table is intentionally left un-indexed
+        (flat scan is faster for small tables), so callers should check this
+        before reporting whether queries use the ANN path.
+        """
+        if not self.exists():
+            return False
+        try:
+            stats = self._table().index_stats("vector_idx")
+            return stats is not None
+        except Exception:
+            return False
+
+    def create_vector_index(
+        self,
+        *,
+        index_type: str | None = None,
+        num_partitions: int | None = None,
+        max_partitions: int | None = None,
+        num_sub_vectors: int | None = None,
+        num_bits: int | None = None,
+        min_rows: int | None = None,
+        metric: str = "L2",
+    ) -> dict[str, Any]:
+        """Build (or rebuild) an ANN index on the vector column.
+
+        Idempotent and safe to call on a freshly-built staged table before
+        publish, so the published index is already query-accelerated. Returns a
+        small diagnostics dict describing what was done. No-op (returns
+        ``{"built": False, ...}``) when the table is below ``min_rows`` -- the
+        flat scan is faster there and the build cost is wasted.
+
+        Vectors are L2-normalized at embed time, so the metric is L2 (monotonic
+        with cosine) to keep the existing score formula valid.
+        """
+        # Resolve defaults from the proxied module constants at call time (they
+        # are not available as parameter defaults because the class body is
+        # evaluated before the proxy binding populates them).
+        index_type = str(index_type or ANN_INDEX_TYPE)
+        max_partitions = int(max_partitions or ANN_MAX_PARTITIONS)
+        num_sub_vectors = int(num_sub_vectors or ANN_NUM_SUB_VECTORS)
+        num_bits = int(num_bits or ANN_NUM_BITS)
+        min_rows = int(min_rows or ANN_MIN_ROWS)
+        if num_partitions is None or num_partitions <= 0:
+            num_partitions = 0  # auto
+
+        if not self.exists():
+            return {"built": False, "reason": "table_missing"}
+        count = self.count()
+        if count < max(1, int(min_rows)):
+            return {"built": False, "reason": "below_min_rows", "rows": count, "min_rows": min_rows}
+
+        # Resolve num_partitions. 0 means auto: sqrt(N) capped at max_partitions.
+        import math
+
+        if not num_partitions or num_partitions <= 0:
+            num_partitions = min(int(max_partitions), max(1, int(math.isqrt(count))))
+
+        metric_normalized = str(metric or "L2").strip().lower()
+        if metric_normalized not in {"l2", "cosine", "dot", "hamming"}:
+            metric_normalized = "l2"
+
+        # PQ-family indices need >= 2^num_bits training rows per sub-vector to
+        # build the codebook. If the corpus is too small for PQ, transparently
+        # fall back to IVF_FLAT (no quantization) so the index still builds and
+        # search is still accelerated. This only triggers near the min_rows
+        # boundary; at true scale (millions of chunks) PQ trains easily.
+        pq_types = {"IVF_PQ", "IVF_HNSW_PQ", "IVF_RQ"}
+        pq_min_rows = 2 ** int(num_bits)
+        if index_type.upper() in pq_types and count < pq_min_rows:
+            index_type = "IVF_FLAT"
+
+        # Clamp sub-vectors for short vectors (768/16 = 48 dims each is fine).
+        num_sub_vectors = max(1, min(int(num_sub_vectors), 768 // 8))
+
+        metric_normalized = str(metric or "L2").strip().lower()
+        if metric_normalized not in {"l2", "cosine", "dot", "hamming"}:
+            metric_normalized = "l2"
+
+        table = self._table()
+        kwargs: dict[str, Any] = {
+            "metric": metric_normalized,
+            "num_partitions": int(num_partitions),
+            "vector_column_name": "vector",
+            "index_type": str(index_type or "IVF_PQ").upper(),
+            "replace": True,
+        }
+        # num_sub_vectors applies to PQ-family index types.
+        if str(index_type or "IVF_PQ").upper() in {
+            "IVF_PQ",
+            "IVF_HNSW_PQ",
+            "IVF_RQ",
+        }:
+            kwargs["num_sub_vectors"] = int(num_sub_vectors)
+            kwargs["num_bits"] = int(num_bits)
+        table.create_index(**kwargs)
+        self._invalidate_table()
+        try:
+            stats = table.index_stats("vector_idx")
+        except Exception:
+            stats = None
+        return {
+            "built": True,
+            "index_type": kwargs["index_type"],
+            "num_partitions": int(num_partitions),
+            "num_sub_vectors": kwargs.get("num_sub_vectors"),
+            "metric": metric_normalized,
+            "rows": count,
+            "stats": str(stats) if stats is not None else None,
+        }
+
+    def drop_vector_index(self) -> dict[str, Any]:
+        """Drop the ANN index if present (used before a rebuild)."""
+        if not self.exists():
+            return {"dropped": False, "reason": "table_missing"}
+        if not self.has_vector_index():
+            return {"dropped": False, "reason": "no_index"}
+        try:
+            self._table().drop_index("vector_idx")
+            self._invalidate_table()
+            return {"dropped": True}
+        except Exception as exc:
+            return {"dropped": False, "reason": str(exc)}
 
     def _table(self):
         signature = self._read_table_signature()
@@ -503,6 +640,28 @@ class LanceDBVectorStore:
                 pa.field("vector", pa.list_(pa.float32(), embedding_dim)),
             ]
         )
+
+def _apply_ann_search_params(query):
+    """Chain nprobes/refine_factor onto a LanceDB vector query when applicable.
+
+    These only affect the ANN index path; on a flat-scan table they are silently
+    ignored by LanceDB, so it's safe to always apply them. Wrapped so a future
+    LanceDB API change degrades to the plain query rather than crashing search.
+    """
+    try:
+        nprobes = _source_module.ANN_NPROBES
+        if nprobes and hasattr(query, "nprobes"):
+            query = query.nprobes(int(nprobes))
+    except Exception:
+        pass
+    try:
+        refine = _source_module.ANN_REFINE_FACTOR
+        if refine and hasattr(query, "refine_factor"):
+            query = query.refine_factor(int(refine))
+    except Exception:
+        pass
+    return query
+
 
 LanceDBVectorStore.__module__ = _source_module.__name__
 finalize_split_class(_source_module, LanceDBVectorStore)

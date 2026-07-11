@@ -65,6 +65,20 @@ LIST_RECORD_COLUMNS = [
     "embedding_dim",
 ]
 
+# Approximate-nearest-neighbour (ANN) vector index settings. Below ANN_MIN_ROWS
+# LanceDB's flat (brute-force) scan is faster, so we skip building an index for
+# small corpora. Above it, an IVF_PQ index turns every query from an O(N) scan
+# into a sublinear lookup. Vectors are L2-normalized at embed time, so L2
+# distance is monotonic with cosine and the existing score formula stays valid.
+ANN_INDEX_TYPE = "IVF_PQ"
+ANN_NUM_PARTITIONS = 0  # 0 = auto sqrt(N), capped at ANN_MAX_PARTITIONS
+ANN_MAX_PARTITIONS = 1024
+ANN_NUM_SUB_VECTORS = 16
+ANN_NUM_BITS = 8
+ANN_NPROBES = 20
+ANN_REFINE_FACTOR = 10
+ANN_MIN_ROWS = 50_000
+
 
 VectorStore = import_split_class("src.vector_store_classes.vector_store", "VectorStore")
 VectorStore.__module__ = __name__

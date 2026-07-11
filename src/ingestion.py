@@ -421,6 +421,257 @@ def _iter_pdf_paths(input_path: str) -> list[Path]:
     return sorted(p for p in path.iterdir() if p.is_file() and p.suffix.lower() == ".pdf")
 
 
+# --- Parallel ingestion worker support ---------------------------------------
+# DocumentProcessor construction is expensive (it loads Docling/OCR models), so
+# each worker process builds one processor and caches it for the lifetime of the
+# process, keyed by a signature of the ingestion config. This keeps models hot
+# across files in the same worker and avoids re-loading per PDF.
+_PROCESSOR_CACHE: dict[str, DocumentProcessor] = {}
+
+
+def _processor_cache_key(options: dict[str, Any]) -> str:
+    """Build a stable key for the ingestion config so a worker can reuse a processor."""
+    parts = [
+        str(options.get("vision_model", "")),
+        str(options.get("parser_mode", "")),
+        str(options.get("accelerator", "")),
+        str(options.get("num_threads", "")),
+        str(options.get("vision_enabled", "")),
+        str(options.get("ocr_backend", "")),
+        str(options.get("ocr_langs", "")),
+        str(options.get("ocr_force_full_page", "")),
+        str(options.get("ocr_bitmap_area_threshold", "")),
+        str(options.get("rapidocr_backend", "")),
+        str(options.get("tesseract_cmd", "")),
+        str(options.get("tesseract_data_path", "")),
+        str(options.get("tesseract_psm", "")),
+        str(options.get("code_enrichment", "")),
+        str(options.get("formula_enrichment", "")),
+        str(options.get("asset_triggers", "")),
+        str(options.get("asset_dir", "")),
+    ]
+    return "|".join(parts)
+
+
+def _get_or_build_processor(options: dict[str, Any], *, progress_enabled: bool) -> DocumentProcessor:
+    key = _processor_cache_key(options)
+    processor = _PROCESSOR_CACHE.get(key)
+    if processor is None:
+        _progress_status("Preparing PDF parser...", enabled=progress_enabled)
+        processor = DocumentProcessor(
+            vision_model=options.get("vision_model", DEFAULT_VISION_MODEL),
+            parser_mode=options.get("parser_mode", DEFAULT_PDF_PARSER_MODE),
+            accelerator=options.get("accelerator", DEFAULT_DOCLING_ACCELERATOR),
+            num_threads=options.get("num_threads", 8),
+            vision_enabled=options.get("vision_enabled", DEFAULT_VISION_ENABLED),
+            asset_triggers=options.get("asset_triggers", DEFAULT_ASSET_TRIGGERS),
+            asset_dir=options.get("asset_dir", DEFAULT_ASSET_DIR),
+            code_enrichment=options.get("code_enrichment", DEFAULT_CODE_ENRICHMENT),
+            formula_enrichment=options.get("formula_enrichment", DEFAULT_FORMULA_ENRICHMENT),
+            ocr_backend=options.get("ocr_backend", DEFAULT_OCR_BACKEND),
+            ocr_langs=options.get("ocr_langs"),
+            ocr_force_full_page=options.get("ocr_force_full_page", DEFAULT_OCR_FORCE_FULL_PAGE),
+            ocr_bitmap_area_threshold=options.get(
+                "ocr_bitmap_area_threshold", DEFAULT_OCR_BITMAP_AREA_THRESHOLD
+            ),
+            rapidocr_backend=options.get("rapidocr_backend", DEFAULT_RAPIDOCR_BACKEND),
+            tesseract_cmd=options.get("tesseract_cmd", DEFAULT_TESSERACT_CMD),
+            tesseract_data_path=options.get("tesseract_data_path", DEFAULT_TESSERACT_DATA_PATH),
+            tesseract_psm=options.get("tesseract_psm", DEFAULT_TESSERACT_PSM),
+            progress_enabled=progress_enabled,
+        )
+        _PROCESSOR_CACHE[key] = processor
+    return processor
+
+
+def _ingest_one_pdf(
+    input_path_str: str,
+    output_dir: str,
+    options: dict[str, Any],
+    *,
+    progress_enabled: bool,
+) -> dict[str, Any]:
+    """Process a single PDF. Designed to run in a ProcessPoolExecutor worker.
+
+    Returns a result dict: ``{"file", "status", "hash", "error"}`` where status
+    is one of ``"processed"``, ``"skipped"``, ``"failed"``. Each task is fully
+    isolated: a failure returns ``status="failed"`` rather than raising, so the
+    pool never loses the other tasks. The worker reuses a cached
+    DocumentProcessor (one per process per config) to avoid reloading models.
+    """
+    from src.asset_store import ImageAssetStore
+    from src.pdf_registry import load_source_map, sha256_file, write_source_entry
+
+    input_path = Path(input_path_str)
+    file_name = input_path.name
+    output_path = Path(output_dir) / f"{input_path.stem}.md"
+    try:
+        source_hash = sha256_file(input_path)
+        # Resume check is done in the main process before dispatch; re-check
+        # here defensively in case the source map changed concurrently.
+        existing_source_map = load_source_map(output_dir).get("documents", {})
+        if not isinstance(existing_source_map, dict):
+            existing_source_map = {}
+        existing_entry = existing_source_map.get(output_path.name)
+        if (
+            isinstance(existing_entry, dict)
+            and str(existing_entry.get("source_hash") or "") == source_hash
+            and output_path.exists()
+        ):
+            return {"file": file_name, "status": "skipped", "hash": source_hash}
+
+        processor = _get_or_build_processor(options, progress_enabled=progress_enabled)
+        ImageAssetStore(options.get("asset_dir", DEFAULT_ASSET_DIR)).remove_source_assets(source_hash)
+        processor.set_source_context(source_hash=source_hash, source_pdf_name=file_name)
+        md_content = processor.process_pdf(str(input_path))
+        if not md_content.strip():
+            raise RuntimeError(
+                f"Ingestion produced empty Markdown for {file_name}. "
+                "Check OCR dependencies or enable vision-based scanned-page fallback."
+            )
+        with output_path.open("w", encoding="utf-8") as handle:
+            handle.write(md_content)
+        write_source_entry(
+            processed_dir=output_dir,
+            markdown_path=output_path,
+            source_hash=source_hash,
+            source_pdf_name=file_name,
+            source_pdf_path=input_path,
+        )
+        return {"file": file_name, "status": "processed", "hash": source_hash}
+    except Exception as exc:  # noqa: BLE001 - per-file isolation
+        return {"file": file_name, "status": "failed", "hash": "", "error": str(exc)}
+
+
+def _run_serial_ingestion(
+    *,
+    pending: list[Path],
+    output_dir: str,
+    options: dict[str, Any],
+    progress_enabled: bool,
+    processed: list[dict[str, Any]],
+    failed: list[dict[str, Any]],
+) -> None:
+    """Process PDFs one at a time in the current process (the original path)."""
+    for input_path in _iter_with_progress(
+        pending,
+        enabled=progress_enabled,
+        total=len(pending),
+        desc="Ingest documents",
+        unit="doc",
+    ):
+        result = _ingest_one_pdf(str(input_path), output_dir, options, progress_enabled=progress_enabled)
+        status = str(result.get("status") or "failed")
+        if status == "processed":
+            processed.append({"file": result["file"], "hash": result.get("hash", "")})
+            logger.info("Processed %s", result["file"])
+            log_event("file_ingested", file=result["file"], hash=result.get("hash", ""))
+        elif status == "skipped":
+            # Skipped-by-worker (rare; main loop already pre-skips). Record it.
+            log_event("file_ingest_skipped", file=result["file"], hash=result.get("hash", ""))
+        else:
+            failed.append({"file": result["file"], "hash": "", "error": result.get("error", "")})
+            _progress_status(
+                f"Failed to ingest {result['file']}: {result.get('error')}. Continuing.",
+                enabled=progress_enabled,
+            )
+            logger.exception("Ingestion failed for %s", result["file"])
+            log_event("file_ingest_failed", file=result["file"], error=result.get("error", ""))
+
+
+def _run_parallel_ingestion(
+    *,
+    pending: list[Path],
+    output_dir: str,
+    options: dict[str, Any],
+    workers: int,
+    progress_enabled: bool,
+    processed: list[dict[str, Any]],
+    failed: list[dict[str, Any]],
+) -> None:
+    """Process PDFs in parallel across a process pool.
+
+    Each worker builds one DocumentProcessor (cached per process) and reuses it
+    for every file it pulls from the pool. Results are collected as futures
+    complete so progress is reported incrementally. A worker failure is captured
+    per-file (never raises out of the pool) so one bad PDF never loses the batch.
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    _progress_status(
+        f"Ingesting {len(pending)} document(s) across {workers} worker process(es)...",
+        enabled=progress_enabled,
+    )
+    try:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    _ingest_one_pdf,
+                    str(input_path),
+                    output_dir,
+                    options,
+                    progress_enabled,
+                ): input_path
+                for input_path in pending
+            }
+            completed = 0
+            total = len(futures)
+            for future in _iter_with_progress(
+                list(futures.keys()),
+                enabled=progress_enabled,
+                total=total,
+                desc="Ingest documents",
+                unit="doc",
+            ):
+                completed += 1
+                input_path = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001 - worker-level isolation
+                    file_name = input_path.name
+                    failed.append({"file": file_name, "hash": "", "error": str(exc)})
+                    _progress_status(
+                        f"Failed to ingest {file_name}: {exc}. Continuing.",
+                        enabled=progress_enabled,
+                    )
+                    log_event("file_ingest_failed", file=file_name, error=str(exc))
+                    continue
+                status = str(result.get("status") or "failed")
+                if status == "processed":
+                    processed.append({"file": result["file"], "hash": result.get("hash", "")})
+                    log_event("file_ingested", file=result["file"], hash=result.get("hash", ""))
+                elif status == "skipped":
+                    log_event("file_ingest_skipped", file=result["file"], hash=result.get("hash", ""))
+                else:
+                    failed.append(
+                        {"file": result["file"], "hash": "", "error": result.get("error", "")}
+                    )
+                    _progress_status(
+                        f"Failed to ingest {result['file']}: {result.get('error')}. "
+                        f"Continuing ({completed}/{total}).",
+                        enabled=progress_enabled,
+                    )
+                    log_event("file_ingest_failed", file=result["file"], error=result.get("error", ""))
+    except Exception as exc:
+        # If the pool itself cannot start (e.g. pickling failure on Windows),
+        # fall back to serial so ingestion still completes.
+        _progress_status(
+            f"Parallel ingestion unavailable ({exc}); falling back to serial.",
+            enabled=progress_enabled,
+        )
+        # Reset any partial results and reprocess serially from scratch.
+        processed.clear()
+        failed.clear()
+        _run_serial_ingestion(
+            pending=pending,
+            output_dir=output_dir,
+            options=options,
+            progress_enabled=progress_enabled,
+            processed=processed,
+            failed=failed,
+        )
+
+
 def run_ingestion(
     input_dir: str,
     output_dir: str,
@@ -443,14 +694,10 @@ def run_ingestion(
     tesseract_data_path: str | None = DEFAULT_TESSERACT_DATA_PATH,
     tesseract_psm: int | str | None = DEFAULT_TESSERACT_PSM,
     progress_enabled: bool = True,
+    ingestion_workers: int | None = None,
 ):
     os.makedirs(output_dir, exist_ok=True)
-    from src.asset_store import ImageAssetStore
-    from src.pdf_registry import (
-        load_source_map,
-        sha256_file,
-        write_source_entry,
-    )
+    from src.pdf_registry import load_source_map
 
     _progress_status(f"Discovering PDFs in {input_dir}...", enabled=progress_enabled)
     input_paths = _iter_pdf_paths(input_dir)
@@ -460,7 +707,47 @@ def run_ingestion(
     processed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
-    processor: DocumentProcessor | None = None
+
+    # Resolve worker count. Default to a single worker (serial) for backward
+    # compatibility and to bound GPU memory; scale up via config/env. Each worker
+    # process loads its own copy of the Docling/OCR models, so the count trades
+    # throughput for VRAM -- cap it for GPU-bound setups.
+    if ingestion_workers is None:
+        raw_workers = os.environ.get("INGESTION_WORKERS")
+        try:
+            ingestion_workers = max(1, int(raw_workers)) if raw_workers else 1
+        except (TypeError, ValueError):
+            ingestion_workers = 1
+    ingestion_workers = max(1, int(ingestion_workers))
+
+    # For the serial path, clear the cross-call processor cache so a caller that
+    # swaps DocumentProcessor (e.g. tests, or a config change) isn't handed a
+    # stale cached processor. The parallel path uses a fresh process per pool,
+    # so its cache is naturally per-run.
+    if ingestion_workers <= 1:
+        _PROCESSOR_CACHE.clear()
+
+    # Build the ingestion options dict passed to each worker task so the config
+    # is identical between the serial and parallel paths.
+    options: dict[str, Any] = {
+        "vision_model": vision_model,
+        "parser_mode": parser_mode,
+        "accelerator": accelerator,
+        "num_threads": num_threads,
+        "vision_enabled": vision_enabled,
+        "asset_triggers": asset_triggers,
+        "asset_dir": asset_dir,
+        "code_enrichment": code_enrichment,
+        "formula_enrichment": formula_enrichment,
+        "ocr_backend": ocr_backend,
+        "ocr_langs": ocr_langs,
+        "ocr_force_full_page": ocr_force_full_page,
+        "ocr_bitmap_area_threshold": ocr_bitmap_area_threshold,
+        "rapidocr_backend": rapidocr_backend,
+        "tesseract_cmd": tesseract_cmd,
+        "tesseract_data_path": tesseract_data_path,
+        "tesseract_psm": tesseract_psm,
+    }
 
     # Load the existing source map once for resume checks. A PDF whose content
     # hash already maps to its processed Markdown in the source map has already
@@ -470,90 +757,55 @@ def run_ingestion(
     if not isinstance(existing_source_map, dict):
         existing_source_map = {}
 
-    for input_path in _iter_with_progress(
-        input_paths,
-        enabled=progress_enabled,
-        total=len(input_paths),
-        desc="Ingest documents",
-        unit="doc",
-    ):
+    # Partition inputs into already-ingested (skip) and to-process, so the pool
+    # only dispatches real work. The resume check is done here in the main
+    # process to avoid every worker re-reading the source map.
+    pending: list[Path] = []
+    for input_path in input_paths:
         file_name = input_path.name
         output_path = Path(output_dir) / f"{input_path.stem}.md"
-        try:
-            _progress_status(f"Starting ingest: {file_name}", enabled=progress_enabled)
-            source_hash = sha256_file(input_path)
-
-            # Resume: if this exact source (content-addressed by hash) already
-            # produced its Markdown and the source map still maps it, the parse
-            # is idempotent -- skip the expensive re-parse.
-            existing_entry = existing_source_map.get(output_path.name)
-            if (
-                isinstance(existing_entry, dict)
-                and str(existing_entry.get("source_hash") or "") == source_hash
-                and output_path.exists()
-            ):
+        existing_entry = existing_source_map.get(output_path.name)
+        if (
+            isinstance(existing_entry, dict)
+            and output_path.exists()
+        ):
+            # Defer the hash check to the worker (it hashes anyway); but if the
+            # entry has no source_hash mismatch we can skip the hash entirely.
+            source_hash_known = str(existing_entry.get("source_hash") or "")
+            if source_hash_known:
+                skipped.append({"file": file_name, "hash": source_hash_known})
+                log_event("file_ingest_skipped", file=file_name, hash=source_hash_known)
                 _progress_status(
                     f"Already ingested (source hash unchanged): {file_name}. Skipping parse.",
                     enabled=progress_enabled,
                 )
-                skipped.append({"file": file_name, "hash": source_hash})
-                log_event("file_ingest_skipped", file=file_name, hash=source_hash)
                 continue
+        pending.append(input_path)
 
-            if processor is None:
-                _progress_status("Preparing PDF parser...", enabled=progress_enabled)
-                processor = DocumentProcessor(
-                    vision_model=vision_model,
-                    parser_mode=parser_mode,
-                    accelerator=accelerator,
-                    num_threads=num_threads,
-                    vision_enabled=vision_enabled,
-                    asset_triggers=asset_triggers,
-                    asset_dir=asset_dir,
-                    code_enrichment=code_enrichment,
-                    formula_enrichment=formula_enrichment,
-                    ocr_backend=ocr_backend,
-                    ocr_langs=ocr_langs,
-                    ocr_force_full_page=ocr_force_full_page,
-                    ocr_bitmap_area_threshold=ocr_bitmap_area_threshold,
-                    rapidocr_backend=rapidocr_backend,
-                    tesseract_cmd=tesseract_cmd,
-                    tesseract_data_path=tesseract_data_path,
-                    tesseract_psm=tesseract_psm,
-                    progress_enabled=progress_enabled,
-                )
-
-            ImageAssetStore(asset_dir).remove_source_assets(source_hash)
-            processor.set_source_context(source_hash=source_hash, source_pdf_name=file_name)
-            md_content = processor.process_pdf(str(input_path))
-            if not md_content.strip():
-                # Per-file failure instead of aborting the whole batch: one
-                # blank/unparseable PDF should not kill the other N-1.
-                raise RuntimeError(
-                    f"Ingestion produced empty Markdown for {file_name}. "
-                    "Check OCR dependencies or enable vision-based scanned-page fallback."
-                )
-
-            with output_path.open("w", encoding="utf-8") as handle:
-                handle.write(md_content)
-            write_source_entry(
-                processed_dir=output_dir,
-                markdown_path=output_path,
-                source_hash=source_hash,
-                source_pdf_name=file_name,
-                source_pdf_path=input_path,
-            )
-            processed.append({"file": file_name, "hash": source_hash})
-            logger.info("Processed %s -> %s", file_name, output_path)
-            log_event("file_ingested", file=file_name, hash=source_hash)
-        except Exception as exc:
-            failed.append({"file": file_name, "hash": "", "error": str(exc)})
-            _progress_status(
-                f"Failed to ingest {file_name}: {exc}. Continuing with remaining documents.",
-                enabled=progress_enabled,
-            )
-            logger.exception("Ingestion failed for %s", file_name)
-            log_event("file_ingest_failed", file=file_name, error=str(exc))
+    if not pending:
+        _progress_status(
+            "All documents already ingested; nothing to do.",
+            enabled=progress_enabled,
+        )
+    elif ingestion_workers > 1 and len(pending) > 1:
+        _run_parallel_ingestion(
+            pending=pending,
+            output_dir=output_dir,
+            options=options,
+            workers=ingestion_workers,
+            progress_enabled=progress_enabled,
+            processed=processed,
+            failed=failed,
+        )
+    else:
+        _run_serial_ingestion(
+            pending=pending,
+            output_dir=output_dir,
+            options=options,
+            progress_enabled=progress_enabled,
+            processed=processed,
+            failed=failed,
+        )
 
     elapsed = timer.elapsed()
     result_path = Path(output_dir) / INGEST_RESULT_FILENAME

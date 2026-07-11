@@ -18,19 +18,37 @@ class RagJobQueue:
         processed_dir: Path = PROCESSED_DIR,
         db_dir: Path = DB_DIR,
         registry_path: Path = PDF_REGISTRY_PATH,
+        job_ledger_path: Path = JOB_LEDGER_PATH,
         run_ingestion_func=None,
         run_indexing_func=None,
+        max_workers: int = 1,
     ):
         self.upload_root = Path(upload_root)
         self.processed_dir = Path(processed_dir)
         self.db_dir = Path(db_dir)
         self.registry = PdfRegistry(registry_path)
+        # Durable ledger for non-upload jobs (reindex/rebuild/backup/restore).
+        # Upload jobs recover via the PDF registry; the ledger covers the rest.
+        from src.job_ledger import JobLedger
+
+        self.ledger = JobLedger(job_ledger_path)
         self._run_ingestion_func = run_ingestion_func
         self._run_indexing_func = run_indexing_func
         self._condition = threading.Condition(threading.RLock())
         self._jobs: dict[str, QueueJob] = {}
         self._queue: deque[str] = deque()
-        self._worker: threading.Thread | None = None
+        # Multiple worker threads pull from the shared deque (each pop is atomic
+        # under the condition lock, so no two workers get the same job). This
+        # lets ingestion-only phases of different upload jobs overlap. Index-
+        # mutating phases are serialized via ``_index_write_lock`` below.
+        self._max_workers = max(1, int(max_workers))
+        self._workers: list[threading.Thread] = []
+        # Serializes all index-mutating operations (reindex, rebuild, backup,
+        # restore, rebuild_vector_index, and the upload job's indexing phase).
+        # These all write to the same ``db/`` dir and share the cross-process
+        # index lock; only one may run at a time. Ingestion-only phases (parsing
+        # PDFs into processed_docs/) do NOT take this lock, so they overlap.
+        self._index_write_lock = threading.Lock()
         self.active_query_count = 0
 
     def begin_query(self) -> None:
@@ -188,6 +206,26 @@ class RagJobQueue:
         )
         return self._enqueue(job, auto_start=auto_start)
 
+    def enqueue_rebuild_vector_index(
+        self,
+        *,
+        job_id: str | None = None,
+        options: dict[str, Any] | None = None,
+        auto_start: bool = True,
+    ) -> QueueJob:
+        """Re-train the ANN vector index on the live DB without re-embedding.
+
+        Useful after many incremental reindex_source operations leave the IVF
+        partitions suboptimal. Reads existing vectors, drops the old index, and
+        rebuilds in place under the index lock.
+        """
+        job = QueueJob(
+            id=job_id or uuid.uuid4().hex,
+            kind="rebuild_vector_index",
+            options=options or {},
+        )
+        return self._enqueue(job, auto_start=auto_start)
+
     def enqueue_restore(
         self,
         *,
@@ -211,19 +249,30 @@ class RagJobQueue:
             if auto_start:
                 self._ensure_worker_locked()
             self._condition.notify_all()
-            return job
+        # Persist non-upload jobs so they survive a crash. Done outside the
+        # condition lock because the ledger has its own lock and is best-effort.
+        self._ledger_record(job)
+        return job
 
     def _ensure_worker_locked(self) -> None:
-        if self._worker is not None and self._worker.is_alive():
-            return
-        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
-        self._worker.start()
+        # Spawn enough workers to reach ``_max_workers`` as long as there is
+        # queued work. Each worker exits when the queue empties (see
+        # ``_worker_loop``), so the pool naturally winds down to zero when idle.
+        alive = sum(1 for w in self._workers if w.is_alive())
+        while alive < self._max_workers and self._queue:
+            worker = threading.Thread(target=self._worker_loop, daemon=True)
+            self._workers.append(worker)
+            worker.start()
+            alive += 1
 
     def _worker_loop(self) -> None:
         while True:
             with self._condition:
                 if not self._queue:
-                    self._worker = None
+                    # Remove this worker from the pool; it will be re-spawned by
+                    # ``_ensure_worker_locked`` on the next enqueue if needed.
+                    current = threading.current_thread()
+                    self._workers = [w for w in self._workers if w is not current]
                     return
                 job = self._jobs[self._queue.popleft()]
                 if job.cancel_requested:
@@ -238,6 +287,7 @@ class RagJobQueue:
 
             if cancelled_before_start:
                 self._record_interrupted(job, "Job cancelled by user.")
+                self._ledger_remove(job)
                 continue
 
             try:
@@ -256,6 +306,7 @@ class RagJobQueue:
                     with self._condition:
                         self._mark_cancelled_locked(job, message)
                         self._condition.notify_all()
+                    self._ledger_remove(job)
                     continue
                 if job.kind == "upload" and job.uploads:
                     self.registry.mark_job_status(
@@ -283,6 +334,39 @@ class RagJobQueue:
                     self._condition.notify_all()
                 if record_cancelled:
                     self._record_interrupted(job, "Job cancelled by user.")
+            # Any terminal state (done/failed/cancelled) removes the job from
+            # the durable ledger so it is not re-enqueued on the next startup.
+            self._ledger_remove(job)
+
+    def _ledger_record(self, job: QueueJob) -> None:
+        """Persist a tracked (non-upload) job so it survives a crash.
+
+        Only the fields needed to reconstruct the job on recovery are stored;
+        transient state (log tail, status) is not, since the recovered job
+        restarts fresh.
+        """
+        if job.kind not in {"reindex", "reindex_source", "rebuild", "backup", "restore", "rebuild_vector_index"}:
+            return
+        try:
+            self.ledger.record(
+                job.id,
+                kind=job.kind,
+                source_hashes=list(job.source_hashes or []),
+                backup_name=job.backup_name,
+                options=dict(job.options or {}),
+            )
+        except Exception:
+            # Ledger is best-effort: never let it block an enqueue.
+            pass
+
+    def _ledger_remove(self, job: QueueJob) -> None:
+        """Remove a job from the durable ledger once it reaches a terminal state."""
+        if job.kind not in {"reindex", "reindex_source", "rebuild", "backup", "restore", "rebuild_vector_index"}:
+            return
+        try:
+            self.ledger.remove(job.id)
+        except Exception:
+            pass
 
     def _run_job(self, job: QueueJob) -> None:
         if job.kind == "upload":
@@ -290,70 +374,95 @@ class RagJobQueue:
             self._run_upload_job(job)
             return
 
-        if job.kind == "reindex":
-            self._wait_for_no_queries(job, "indexing")
-            self._raise_if_cancelled(job)
-            self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
-            return
+        # All non-upload job kinds mutate the live index and must be serialized
+        # so only one writes to ``db/`` at a time. The lock is held for the
+        # entire job (including the query-wait) so a second index job doesn't
+        # start its query-wait while the first is still publishing.
+        with self._index_write_lock:
+            if job.kind == "reindex":
+                self._wait_for_no_queries(job, "indexing")
+                self._raise_if_cancelled(job)
+                self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
+                return
 
-        if job.kind == "reindex_source":
-            self._wait_for_no_queries(job, "indexing")
-            self._raise_if_cancelled(job)
-            self._delete_source_index_records(job.source_hashes)
-            self._raise_if_cancelled(job)
-            self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
-            return
+            if job.kind == "reindex_source":
+                self._wait_for_no_queries(job, "indexing")
+                self._raise_if_cancelled(job)
+                self._delete_source_index_records(job.source_hashes)
+                self._raise_if_cancelled(job)
+                self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
+                return
 
-        if job.kind == "backup":
-            self._wait_for_no_queries(job, "backing_up")
-            self._raise_if_cancelled(job)
-            snapshot = _source_module.create_index_backup(self.db_dir)
-            self._append_job_log(
-                job,
-                f"Backed up LanceDB index to {snapshot.get('name')} ({snapshot.get('record_count')} records).",
-            )
-            return
-
-        if job.kind == "rebuild":
-            self._wait_for_no_queries(job, "indexing")
-            self._raise_if_cancelled(job)
-            self._drop_live_index()
-            self._raise_if_cancelled(job)
-            rebuild_options = dict(job.options or {})
-            # Fresh rebuild: never reuse vectors from the (possibly corrupt)
-            # live index we just dropped.
-            rebuild_options["reuse_db_dir"] = None
-            self._run_indexing(str(self.processed_dir), str(self.db_dir), rebuild_options, job=job)
-            return
-
-        if job.kind == "restore":
-            self._wait_for_no_queries(job, "restoring")
-            self._raise_if_cancelled(job)
-            if not job.backup_name:
-                raise ValueError("Restore job is missing a backup name.")
-            result = _source_module.restore_index_from_backup(self.db_dir, job.backup_name)
-            self._append_job_log(
-                job,
-                f"Restored LanceDB index from backup {job.backup_name}.",
-            )
-            if result.get("safety_backup"):
+            if job.kind == "backup":
+                self._wait_for_no_queries(job, "backing_up")
+                self._raise_if_cancelled(job)
+                snapshot = _source_module.create_index_backup(self.db_dir)
                 self._append_job_log(
                     job,
-                    f"Pre-restore index rolled back to backup {result['safety_backup'].get('name')}.",
+                    f"Backed up LanceDB index to {snapshot.get('name')} ({snapshot.get('record_count')} records).",
                 )
-            return
+                return
+
+            if job.kind == "rebuild":
+                self._wait_for_no_queries(job, "indexing")
+                self._raise_if_cancelled(job)
+                self._drop_live_index()
+                self._raise_if_cancelled(job)
+                rebuild_options = dict(job.options or {})
+                # Fresh rebuild: never reuse vectors from the (possibly corrupt)
+                # live index we just dropped.
+                rebuild_options["reuse_db_dir"] = None
+                self._run_indexing(str(self.processed_dir), str(self.db_dir), rebuild_options, job=job)
+                return
+
+            if job.kind == "restore":
+                self._wait_for_no_queries(job, "restoring")
+                self._raise_if_cancelled(job)
+                if not job.backup_name:
+                    raise ValueError("Restore job is missing a backup name.")
+                result = _source_module.restore_index_from_backup(self.db_dir, job.backup_name)
+                self._append_job_log(
+                    job,
+                    f"Restored LanceDB index from backup {job.backup_name}.",
+                )
+                if result.get("safety_backup"):
+                    self._append_job_log(
+                        job,
+                        f"Pre-restore index rolled back to backup {result['safety_backup'].get('name')}.",
+                    )
+                return
+
+            if job.kind == "rebuild_vector_index":
+                self._wait_for_no_queries(job, "rebuilding_index")
+                self._raise_if_cancelled(job)
+                result = self._rebuild_vector_index()
+                if result.get("built"):
+                    self._append_job_log(
+                        job,
+                        f"Rebuilt {result.get('index_type')} ANN vector index "
+                        f"({result.get('num_partitions')} partitions, {result.get('rows')} rows).",
+                    )
+                else:
+                    self._append_job_log(
+                        job,
+                        f"ANN index rebuild skipped: {result.get('reason')} "
+                        f"(rows={result.get('rows')}).",
+                    )
+                return
 
         raise ValueError(f"Unknown job kind: {job.kind}")
 
     def _run_upload_job(self, job: QueueJob) -> None:
         resume_status = job.resume_status or "queued"
         if resume_status == "ingested" and self._job_processed_paths_exist(job):
-            self._wait_for_no_queries(job, "indexing")
-            self._raise_if_cancelled(job)
-            self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
-            self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="indexed")
+            # Resume directly into the indexing phase (ingestion already done).
+            self._run_upload_indexing_phase(job)
             return
 
+        # --- Ingestion phase (no index lock) ---
+        # Saving uploads and parsing PDFs only touches data/uploads/ and
+        # processed_docs/. Multiple upload jobs can ingest concurrently since
+        # each writes to its own job-scoped upload dir and per-file markdown.
         upload_dir = self._ensure_upload_dir(job)
         self._wait_for_no_queries(job, "ingesting")
         self._raise_if_cancelled(job)
@@ -364,10 +473,22 @@ class RagJobQueue:
         self._raise_if_cancelled(job)
         self._mark_processed_paths(job)
         self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="ingested")
-        self._wait_for_no_queries(job, "indexing")
-        self._raise_if_cancelled(job)
-        self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
-        self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="indexed")
+
+        # --- Indexing phase (serialized with other index-mutating jobs) ---
+        self._run_upload_indexing_phase(job)
+
+    def _run_upload_indexing_phase(self, job: QueueJob) -> None:
+        """The indexing + publish phase of an upload job.
+
+        Serialized via ``_index_write_lock`` so only one job writes to ``db/``
+        at a time. The query-wait happens inside the lock so a second indexing
+        job doesn't start waiting while the first is still publishing.
+        """
+        with self._index_write_lock:
+            self._wait_for_no_queries(job, "indexing")
+            self._raise_if_cancelled(job)
+            self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
+            self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="indexed")
 
     def _wait_for_no_queries(self, job: QueueJob, phase: str) -> None:
         with self._condition:
@@ -589,6 +710,9 @@ class RagJobQueue:
             "tesseract_cmd": options.get("tesseract_cmd", INGESTION_CONFIG["tesseract_cmd"]),
             "tesseract_data_path": options.get("tesseract_data_path", INGESTION_CONFIG["tesseract_data_path"]),
             "tesseract_psm": options.get("tesseract_psm", INGESTION_CONFIG["tesseract_psm"]),
+            "ingestion_workers": options.get(
+                "ingestion_workers", INGESTION_CONFIG.get("ingestion_workers", 1)
+            ),
             "progress_enabled": options.get("progress_enabled", False),
         }
         if run_ingestion_func is not None:
@@ -625,6 +749,7 @@ class RagJobQueue:
         _append_cli_option(command, "--tesseract_cmd", resolved["tesseract_cmd"])
         _append_cli_option(command, "--tesseract_data_path", resolved["tesseract_data_path"])
         _append_cli_option(command, "--tesseract_psm", resolved["tesseract_psm"])
+        _append_cli_option(command, "--ingestion_workers", resolved["ingestion_workers"])
         command.append("--no_progress")
         self._run_pipeline_subprocess(command, job=job)
         self._summarize_ingest_result(job, output_dir)
@@ -729,11 +854,34 @@ class RagJobQueue:
 
         staged_db_dir = _source_module._staged_index_dir(db_dir)
         # The staged build writes a second full copy of the index alongside the
-        # live one; refuse to start if the volume can't hold both. Budget for
-        # the existing index plus the processed Markdown corpus it rebuilds from.
+        # live one, and the publish step then creates a third copy (a safety
+        # backup of the live index before swapping). Budget for the full
+        # footprint: staged index (~existing index size, since it reuses vectors
+        # and rewrites all records) + the Markdown corpus it rebuilds from + a
+        # publish-time backup of the live index, plus a safety factor. See
+        # disk_space.py for why the tripling matters at scale.
         existing_index = _source_module.estimate_dir_bytes(_source_module.lancedb_path(db_dir))
         corpus_bytes = _source_module.estimate_dir_bytes(md_dir)
-        _source_module.check_disk_space(db_dir, existing_index + corpus_bytes)
+        # The staged index approximates the live one; the publish safety backup
+        # is another full copy. So peak transient cost is ~2× existing index +
+        # corpus. Add a configurable safety factor for headroom.
+        safety_factor = _source_module.SERVER_CONFIG.get("disk_safety_factor", 1.15)
+        try:
+            safety_factor = float(safety_factor)
+        except (TypeError, ValueError):
+            safety_factor = 1.15
+        safety_factor = max(1.0, safety_factor)
+        required_bytes = int((existing_index * 2 + corpus_bytes) * safety_factor)
+        try:
+            _source_module.check_disk_space(db_dir, required_bytes)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Not enough free disk space to stage the index build. "
+                f"Estimated peak: staged index (~{existing_index/1e6:.1f}MB) + "
+                f"publish backup (~{existing_index/1e6:.1f}MB) + "
+                f"corpus ({corpus_bytes/1e6:.1f}MB) "
+                f"×{safety_factor:g} ≈ {required_bytes/1e9:.2f}GB. {exc}"
+            ) from exc
         command = [
             sys.executable,
             str(ROOT_DIR / "main.py"),
@@ -797,6 +945,26 @@ class RagJobQueue:
                 store = _index_store(self.db_dir)
                 store._invalidate_table()
 
+    def _rebuild_vector_index(self) -> dict[str, Any]:
+        """Re-train the ANN vector index on the live DB in place.
+
+        Drops any existing ANN index and rebuilds it from the current vectors
+        (no re-embedding). Done under the cross-process index lock so concurrent
+        queries/edits don't race. Returns the ``create_vector_index`` diagnostics.
+        """
+        with INDEX_LOCK:
+            with _source_module.acquire_index_lock(self.db_dir):
+                store = _index_store(self.db_dir)
+                if not store.exists():
+                    return {"built": False, "reason": "table_missing"}
+                # Drop the old index first so the rebuild trains fresh partitions
+                # on the current data distribution (incremental reindex_source
+                # jobs can leave the old IVF partitions suboptimal).
+                store.drop_vector_index()
+                result = store.create_vector_index()
+                _source_module._invalidate_index_caches(self.db_dir)
+                return result
+
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._condition:
             job = self._jobs.get(job_id)
@@ -816,6 +984,19 @@ class RagJobQueue:
                 self._jobs[job.id] = job
                 self._queue.append(job.id)
                 recovered.append(job)
+            # Re-enqueue non-upload jobs (reindex/rebuild/backup/restore) that
+            # were interrupted by a crash and persisted in the durable ledger.
+            # These are not in the PDF registry, so without the ledger they'd be
+            # silently lost on every restart.
+            for job in self._recovery_jobs_from_ledger():
+                if job.id in self._jobs:
+                    continue
+                self._jobs[job.id] = job
+                self._queue.append(job.id)
+                recovered.append(job)
+                # Re-record so a second crash before completion still recovers
+                # the job. Done under the condition lock is fine (best-effort).
+                self._ledger_record(job)
             if auto_start and recovered:
                 self._ensure_worker_locked()
             if recovered:
@@ -824,6 +1005,43 @@ class RagJobQueue:
             "recovered": len(recovered),
             "jobs": [job.to_dict() for job in recovered],
         }
+
+    def _recovery_jobs_from_ledger(self) -> list[QueueJob]:
+        """Reconstruct tracked jobs left in the ledger by a crashed run.
+
+        Each ledger entry carries the kind plus the options needed to rebuild
+        the job. Recovered jobs are marked ``recovered`` so the UI can surface
+        that they were resumed rather than freshly enqueued. We re-record them
+        on enqueue (so a second crash still recovers them) and they're removed
+        when they next reach a terminal state.
+        """
+        jobs: list[QueueJob] = []
+        try:
+            entries = self.ledger.pending_entries()
+        except Exception:
+            return jobs
+        for job_id, entry in entries:
+            kind = str(entry.get("kind") or "")
+            options = dict(entry.get("options") or {}) if isinstance(entry.get("options"), dict) else {}
+            source_hashes = [
+                str(value)
+                for value in (entry.get("source_hashes") or [])
+                if value
+            ]
+            backup_name = entry.get("backup_name")
+            jobs.append(
+                QueueJob(
+                    id=str(job_id),
+                    kind=kind,
+                    phase="recovered",
+                    source_hashes=source_hashes,
+                    backup_name=str(backup_name) if backup_name else None,
+                    options=options,
+                    recovered=True,
+                    created_at=str(entry.get("recorded_at") or _utcnow()),
+                )
+            )
+        return jobs
 
     def _recovery_jobs_from_registry(self) -> list[QueueJob]:
         payload = self.registry.load()

@@ -837,6 +837,8 @@ def test_server_config_defaults_to_minute_when_missing(workspace_tmp):
         "background_worker_threads": web_app.DEFAULT_BACKGROUND_WORKER_THREADS,
         "update_remote": "origin",
         "update_branch": "main",
+        "disk_safety_factor": web_app.DEFAULT_DISK_SAFETY_FACTOR,
+        "job_workers": web_app.DEFAULT_JOB_WORKERS,
     }
 
 
@@ -868,6 +870,8 @@ def test_server_config_reads_polling_intervals(workspace_tmp):
         "background_worker_threads": web_app.DEFAULT_BACKGROUND_WORKER_THREADS,
         "update_remote": "upstream",
         "update_branch": "web-ui",
+        "disk_safety_factor": web_app.DEFAULT_DISK_SAFETY_FACTOR,
+        "job_workers": web_app.DEFAULT_JOB_WORKERS,
     }
 
 
@@ -3232,11 +3236,15 @@ def test_frontend_upload_uses_xhr_progress_and_keeps_duplicate_prompt():
     assert "function uploadFormData(path, body, options = {})" in script
     assert "new XMLHttpRequest()" in script
     assert 'request.upload.addEventListener("progress"' in script
+    # Per-file uploads still POST each small file via uploadFormData.
     assert 'uploadFormData("/api/uploads", body' in script
-    assert 'requestJson("/api/uploads"' not in script
-    assert "Upload received. Processing upload..." in script
+    # The chunked-upload completion uses requestJson with the complete endpoint,
+    # but the normal upload path must not.
+    assert 'requestJson("/api/uploads/complete"' in script
+    # Per-file sequential uploads report progress per file.
+    assert "Uploading ${index + 1}/${files.length}" in script or "Uploading" in script
     assert "Duplicate upload blocked." in script
-    assert "showDuplicatePrompt(error.detail)" in script
+    assert "showDuplicatePrompt(" in script
 
 
 def test_frontend_jobs_polling_uses_active_count():

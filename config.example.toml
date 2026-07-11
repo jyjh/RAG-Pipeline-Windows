@@ -30,6 +30,10 @@ accelerator = "auto"
 num_threads = 8
 asset_triggers = "auto"
 progress_enabled = true
+# Number of parallel worker processes for PDF ingestion. Each worker loads its
+# own copy of the Docling/OCR models, so this trades throughput for VRAM. 1 =
+# serial (safe default). Set to 2-4 on a GPU with headroom for a large corpus.
+ingestion_workers = 1
 
 [chunking]
 max_tokens = 900
@@ -37,6 +41,23 @@ overlap_tokens = 120
 adjacent_block_window = 1
 summary_mode = "hybrid"
 index_backend = "lancedb"
+
+# Approximate-nearest-neighbour (ANN) vector index. Below ann_min_rows the
+# table uses a flat (brute-force) scan which is faster for small corpora; above
+# it, an IVF_PQ index makes every query sublinear. These defaults are tuned for
+# nomic-embed-text (768-dim, L2-normalized vectors).
+[indexing]
+ann_min_rows = 50000
+ann_nprobes = 20
+ann_refine_factor = 10
+
+[uploads]
+# Per-file and per-corpus size caps in bytes (0 = unlimited). Set these on a
+# shared deployment to prevent one upload from exhausting disk.
+max_upload_bytes = 0
+max_corpus_bytes = 0
+# Chunk size for the resumable chunked-upload endpoint (large single files).
+chunk_bytes = 16777216
 
 [retrieval]
 top_k = 8
@@ -77,3 +98,12 @@ update_branch = "main"
 health_poll_interval_ms = 60000
 jobs_poll_interval_ms = 60000
 background_worker_threads = 2
+# Multiplier applied to the estimated peak disk footprint of an index build
+# (staged index + publish backup + corpus) before the pre-build disk-space
+# check refuses to start. 1.15 = 15% headroom.
+disk_safety_factor = 1.15
+# Number of parallel job-worker threads. 1 = serial (safe default). With >1,
+# ingestion-only phases of different upload jobs run concurrently; index-mutating
+# phases (indexing, backup, restore, rebuild) are serialized internally so only
+# one writes to db/ at a time. Each ingestion worker loads its own parser models.
+job_workers = 1

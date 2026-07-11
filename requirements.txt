@@ -3,43 +3,55 @@
 # Install PyTorch separately first with the CUDA wheel that matches the machine:
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 #
+# The torch/torchvision pins below are for the CPU build; the --index-url above
+# overrides them with the CUDA-enabled wheel of the same version. If you change
+# the pin, update the --index-url tag to match.
+#
 # Then install the rest:
 #   pip install -r requirements.txt
+#
+# Pins use ~= (compatible-release): patch updates are allowed, but minor/major
+# jumps are blocked. This balances reproducibility with security fixes.
 
 # PDF/document parsing and OCR
-docling
-pypdf
-onnxruntime
+docling~=2.105.0
+pypdf~=6.14.0
+onnxruntime~=1.27.0
 
 # Local LLM/VLM serving
-ollama
+ollama~=0.6.2
 
 # Numeric/runtime support
-numpy
-pydantic
-python-dotenv
-tqdm
-lancedb
-pylance
-pyarrow
-portalocker
+numpy~=2.4.6
+pydantic~=2.13.4
+python-dotenv~=1.2.2
+tqdm~=4.68.3
+lancedb~=0.33.0
+pylance~=7.0.0
+pyarrow~=24.0.0
+portalocker~=3.2.0
 
 # API and browser UI
-fastapi
-uvicorn[standard]
-streamlit
-requests
-python-multipart
-markdown-it-py
-latex2mathml
+fastapi~=0.138.0
+uvicorn[standard]~=0.49.0
+# streamlit is listed but not currently used by the active web UI; retained for
+# potential future use. Remove if not needed.
+streamlit~=1.58.0
+requests~=2.34.2
+python-multipart~=0.0.32
+markdown-it-py~=4.2.0
+latex2mathml~=3.81.0
+
+# Image handling (imported directly via PIL in ingestion_classes)
+pillow~=12.2.0
 
 # Deep learning runtime, install CUDA wheels explicitly where possible
-torch
-torchvision
+torch~=2.12.1
+torchvision~=0.27.1
 
 # Tests
-pytest
+pytest~=9.1.1
 
 
 # Others
-einops
+einops~=0.8.2

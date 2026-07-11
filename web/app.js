@@ -339,6 +339,72 @@ function isAbortError(error) {
   return error && error.name === "AbortError";
 }
 
+// Threshold above which a single file is uploaded via the chunked/resumable
+// endpoint instead of a single multipart POST. Below this, the overhead of
+// per-chunk requests isn't worth it; above it, resumability matters.
+const CHUNKED_UPLOAD_THRESHOLD = 128 * 1024 * 1024; // 128 MiB
+const CHUNKED_UPLOAD_CHUNK_SIZE = 16 * 1024 * 1024; // 16 MiB
+
+// Upload a single large file via the chunked/resumable protocol. Splits the
+// file into CHUNKED_UPLOAD_CHUNK_SIZE pieces, POSTs each to /api/uploads/chunk,
+// then finalizes with /api/uploads/complete. On a 409 offset-mismatch (server
+// has more/fewer bytes than expected), re-syncs via /api/uploads/chunk_status
+// and resumes from the server's offset. Returns the completion response.
+async function uploadFileChunked(file, { sourceGroup = "", onProgress = null } = {}) {
+  const totalSize = file.size;
+  const chunkSize = CHUNKED_UPLOAD_CHUNK_SIZE;
+  const uploadId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  let offset = 0;
+
+  // Try to resume an existing partial upload for this id (rare on first run).
+  try {
+    const status = await requestJson(`/api/uploads/chunk_status?upload_id=${encodeURIComponent(uploadId)}`);
+    if (status && typeof status.offset === "number") {
+      offset = status.offset;
+    }
+  } catch (_) {
+    // Ignore -- start from 0.
+  }
+
+  while (offset < totalSize) {
+    const end = Math.min(offset + chunkSize, totalSize);
+    const blob = file.slice(offset, end);
+    const body = new FormData();
+    body.append("upload_id", uploadId);
+    body.append("filename", file.name);
+    body.append("offset", String(offset));
+    body.append("total_size", String(totalSize));
+    body.append("chunk", blob, file.name);
+    try {
+      const result = await uploadFormData("/api/uploads/chunk", body, {
+        onProgress(progress) {
+          if (!onProgress || progress.percent === null) return;
+          const overall = Math.round(((offset + (progress.loaded || 0)) / totalSize) * 100);
+          onProgress({ percent: Math.min(99, overall) });
+        },
+      });
+      offset = Number(result.offset || end);
+    } catch (err) {
+      if (err && err.status === 409 && err.detail && typeof err.detail.expected_offset === "number") {
+        // Re-sync to the server's offset and continue.
+        offset = err.detail.expected_offset;
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  const completeBody = { upload_id: uploadId, filename: file.name };
+  if (sourceGroup) completeBody.source_groups = sourceGroup;
+  const completeResult = await requestJson("/api/uploads/complete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(completeBody),
+  });
+  if (onProgress) onProgress({ percent: 100 });
+  return completeResult;
+}
+
 function startIndexLoad() {
   if (state.indexAbortController) {
     state.indexAbortController.abort();
@@ -1916,58 +1982,17 @@ function isZipFile(file) {
   );
 }
 
-// Expand a single .zip File into PDF File objects. Subfolders are flattened to
-// basenames; the server's existing batch dedupe handles same-name collisions.
-// Returns { accepted: File[], rejected: string[], errors: string[] }.
+// Zip files are now sent to the server verbatim and extracted server-side.
+// Previously this decompressed the entire archive in browser memory via
+// fflate.unzipSync, which OOM'd on multi-GB zips. The server streams the zip to
+// disk and extracts PDF entries one at a time (bounded memory). We keep the
+// File as-is so the server-side path handles it.
 async function extractPdfsFromZip(file) {
   const accepted = [];
   const rejected = [];
   const errors = [];
   const displayName = file.name || "archive.zip";
-
-  if (typeof fflate === "undefined" || !fflate.unzipSync) {
-    errors.push(`Zip support failed to load — pick PDFs directly instead of ${displayName}.`);
-    return { accepted, rejected, errors };
-  }
-
-  let buffer;
-  try {
-    buffer = await file.arrayBuffer();
-  } catch (err) {
-    errors.push(`Could not read ${displayName}: ${err && err.message ? err.message : err}.`);
-    return { accepted, rejected, errors };
-  }
-
-  let entries;
-  try {
-    entries = fflate.unzipSync(new Uint8Array(buffer));
-  } catch (err) {
-    errors.push(`Could not unzip ${displayName}: ${err && err.message ? err.message : err}.`);
-    return { accepted, rejected, errors };
-  }
-
-  const names = Object.keys(entries);
-  if (!names.length) {
-    errors.push(`${displayName} contains no files.`);
-    return { accepted, rejected, errors };
-  }
-
-  for (const entryName of names) {
-    if (!entryName || entryName.endsWith("/")) continue; // directory entry
-    if (isIgnoredZipEntry(entryName)) continue;
-    const base = entryName.split("/").pop() || entryName;
-    if (!base.toLowerCase().endsWith(".pdf")) {
-      rejected.push(entryName);
-      continue;
-    }
-    const bytes = entries[entryName];
-    if (!(bytes instanceof Uint8Array) || bytes.length === 0) {
-      rejected.push(entryName);
-      continue;
-    }
-    accepted.push(new File([bytes], base, { type: "application/pdf" }));
-    fileZipOrigin.set(accepted[accepted.length - 1], file);
-  }
+  accepted.push(file);
   return { accepted, rejected, errors };
 }
 
@@ -2233,79 +2258,117 @@ async function uploadFiles(forceDuplicates = false, forceToken = "") {
     return;
   }
 
-  const body = new FormData();
-  for (const [index, file] of files.entries()) {
+  els.uploadButton.disabled = true;
+  els.forceUploadButton.disabled = true;
+
+  // Upload each file as its own request so a network drop only loses the
+  // current file, not the whole batch. The server dedupes per-file via the
+  // registry, so completed files are not re-uploaded on retry. Each file
+  // becomes its own ingest/index job.
+  const allJobs = [];
+  const errors = [];
+  let firstDuplicateDetail = null;
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index];
+    const body = new FormData();
     body.append("files", file);
     if (sourceGroups[index]) {
       body.append("source_groups", sourceGroups[index]);
     }
-  }
-  if (isForced) {
-    body.append("force_duplicates", "true");
-    if (forceToken) {
-      body.append("force_token", forceToken);
+    if (isForced) {
+      body.append("force_duplicates", "true");
+      if (forceToken) {
+        body.append("force_token", forceToken);
+      }
+    }
+    const displayName = file.name || `file ${index + 1}`;
+    setStatus(
+      els.uploadStatus,
+      `Uploading ${index + 1}/${files.length}: ${displayName}...`,
+    );
+    try {
+      let result;
+      // Large files use the chunked/resumable path so a network drop only
+      // loses the current 16 MiB chunk, not the whole file.
+      if (file.size >= CHUNKED_UPLOAD_THRESHOLD) {
+        result = await uploadFileChunked(file, {
+          sourceGroup: sourceGroups[index] || "",
+          onProgress(progress) {
+            if (progress.percent === null) {
+              setStatus(
+                els.uploadStatus,
+                `Uploading ${index + 1}/${files.length}: ${displayName}...`,
+              );
+              return;
+            }
+            setStatus(
+              els.uploadStatus,
+              `Uploading ${index + 1}/${files.length}: ${displayName} ${progress.percent}%...`,
+            );
+          },
+        });
+      } else {
+        result = await uploadFormData("/api/uploads", body, {
+          onProgress(progress) {
+            if (progress.percent === null) {
+              setStatus(
+                els.uploadStatus,
+                `Uploading ${index + 1}/${files.length}: ${displayName}...`,
+              );
+              return;
+            }
+            setStatus(
+              els.uploadStatus,
+              `Uploading ${index + 1}/${files.length}: ${displayName} ${progress.percent}%...`,
+            );
+          },
+        });
+      }
+      const jobs = Array.isArray(result.jobs) && result.jobs.length ? result.jobs : [result];
+      allJobs.push(...jobs);
+    } catch (error) {
+      if (
+        error.status === 409 &&
+        error.detail &&
+        error.detail.can_force !== false &&
+        error.detail.force_token &&
+        !firstDuplicateDetail
+      ) {
+        firstDuplicateDetail = error.detail;
+      }
+      errors.push(`${displayName}: ${error.message || error.detail || "upload failed"}`);
     }
   }
 
-  els.uploadButton.disabled = true;
-  els.forceUploadButton.disabled = true;
-  setStatus(els.uploadStatus, isForced ? "Uploading forced upload..." : "Uploading...");
-  try {
-    const result = await uploadFormData("/api/uploads", body, {
-      onProgress(progress) {
-        if (progress.percent === null) {
-          setStatus(els.uploadStatus, isForced ? "Uploading forced upload..." : "Uploading...");
-          return;
-        }
-        if (progress.percent >= 100) {
-          setStatus(els.uploadStatus, "Upload received. Processing upload...");
-          return;
-        }
-        const prefix = isForced ? "Uploading forced upload" : "Uploading";
-        setStatus(els.uploadStatus, `${prefix} ${progress.percent}%...`);
-      },
-    });
-    const jobs = Array.isArray(result.jobs) && result.jobs.length ? result.jobs : [result];
-    els.fileInput.value = "";
-    updateSelectedFilesLabel();
-    renderUploadGroupSelectors();
+  els.fileInput.value = "";
+  updateSelectedFilesLabel();
+  renderUploadGroupSelectors();
+  state.jobsOffset = 0;
+  state.pdfOffset = 0;
+
+  if (firstDuplicateDetail && allJobs.length === 0) {
+    showDuplicatePrompt(firstDuplicateDetail);
+    setStatus(
+      els.uploadStatus,
+      isForced ? "Forced upload was blocked. Review the warning below and retry." : "Duplicate upload blocked.",
+      true,
+    );
+  } else if (errors.length && allJobs.length === 0) {
     clearDuplicatePrompt();
-    state.jobsOffset = 0;
-    state.pdfOffset = 0;
-    if (jobs.length === 1) {
-      setStatus(els.uploadStatus, `Queued job ${jobs[0].id.slice(0, 8)}.`);
-    } else {
-      setStatus(els.uploadStatus, `Queued ${jobs.length} jobs.`);
-    }
-    markIndexDirty();
-    await refreshJobs({ force: true });
-    await refreshPdfs({ force: true });
-  } catch (error) {
-    if (
-      error.status === 409 &&
-      error.detail &&
-      error.detail.can_force !== false &&
-      error.detail.force_token
-    ) {
-      showDuplicatePrompt(error.detail);
-      setStatus(
-        els.uploadStatus,
-        isForced ? "Forced upload was blocked. Review the warning below and retry." : "Duplicate upload blocked.",
-        true,
-      );
-      return;
-    }
-    if (error.status === 409 && error.detail) {
-      clearDuplicatePrompt();
-      setStatus(els.uploadStatus, duplicateUploadMessage(error.detail), true);
-      return;
-    }
+    setStatus(els.uploadStatus, errors.join("; "), true);
+  } else {
     clearDuplicatePrompt();
-    setStatus(els.uploadStatus, error.message, true);
-  } finally {
-    els.uploadButton.disabled = false;
-    els.forceUploadButton.disabled = !state.pendingForceUploadToken;
+    let msg = `Queued ${allJobs.length} job(s).`;
+    if (errors.length) {
+      msg += ` ${errors.length} file(s) failed: ${errors.join("; ")}`;
+    }
+    setStatus(els.uploadStatus, msg, errors.length ? true : false);
   }
+  markIndexDirty();
+  await refreshJobs({ force: true });
+  await refreshPdfs({ force: true });
+  els.uploadButton.disabled = false;
+  els.forceUploadButton.disabled = !state.pendingForceUploadToken;
 }
 
 async function enqueueReindex() {
@@ -2637,7 +2700,15 @@ async function loadIndex() {
     els.pageLabel.textContent = `${start}-${end} of ${state.total} summaries`;
     els.prevPageButton.disabled = state.offset <= 0;
     els.nextPageButton.disabled = state.offset + state.limit >= state.total;
-    setStatus(els.indexStatus, `Embedding model: ${data.embedding_model || "unknown"}`);
+    if (data.degraded) {
+      setStatus(
+        els.indexStatus,
+        `Large index — showing a flat list. ${data.degraded_reason || ""}`,
+        true,
+      );
+    } else {
+      setStatus(els.indexStatus, `Embedding model: ${data.embedding_model || "unknown"}`);
+    }
   } catch (error) {
     if (isAbortError(error) || !isActiveIndexLoad(load)) {
       return;

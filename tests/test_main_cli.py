@@ -26,6 +26,7 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         tesseract_data_path,
         tesseract_psm,
         progress_enabled,
+        ingestion_workers=1,
     ):
         calls["data_dir"] = data_dir
         calls["md_dir"] = md_dir

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import logging.handlers
 import os
 import time
 from datetime import datetime, timezone
@@ -24,6 +25,11 @@ from src.atomic_io import write_json_atomic
 # job events apart from library/dependency log lines.
 JOB_LOGGER_NAME = "local_rag.job"
 JOB_EVENT_MARKER = "JOB_EVENT"
+
+# Rotate job/server logs so a multi-day 100GB ingest cannot grow them without
+# bound. 10 MiB × 5 backups = ~50 MiB ceiling per log file.
+JOB_LOG_MAX_BYTES = 10 * 1024 * 1024
+JOB_LOG_BACKUP_COUNT = 5
 
 _CONFIGURED_PATHS: set[str] = set()
 
@@ -48,7 +54,12 @@ def setup_job_logging(log_path: str | Path) -> logging.Logger:
         return logger
 
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler = logging.handlers.RotatingFileHandler(
+        log_path,
+        maxBytes=JOB_LOG_MAX_BYTES,
+        backupCount=JOB_LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
     handler.setLevel(logging.INFO)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)

@@ -171,6 +171,7 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
         "tesseract_cmd": str(ingestion.get("tesseract_cmd") or DEFAULT_TESSERACT_CMD),
         "tesseract_data_path": str(ingestion.get("tesseract_data_path") or DEFAULT_TESSERACT_DATA_PATH),
         "tesseract_psm": _as_optional_int(ingestion.get("tesseract_psm"), DEFAULT_TESSERACT_PSM),
+        "ingestion_workers": _as_positive_int(ingestion.get("ingestion_workers"), 1),
     }
 
 
@@ -229,6 +230,11 @@ def _ingestion_args(args: argparse.Namespace) -> dict[str, Any]:
         "tesseract_cmd": args.tesseract_cmd or config["tesseract_cmd"],
         "tesseract_data_path": args.tesseract_data_path or config["tesseract_data_path"],
         "tesseract_psm": args.tesseract_psm if args.tesseract_psm is not None else config["tesseract_psm"],
+        "ingestion_workers": (
+            args.ingestion_workers
+            if getattr(args, "ingestion_workers", None) is not None
+            else config.get("ingestion_workers", 1)
+        ),
     }
 
 
@@ -465,6 +471,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tesseract_cmd", default=None, help="Tesseract executable path or command.")
     parser.add_argument("--tesseract_data_path", default=None, help="Tesseract language data directory.")
     parser.add_argument("--tesseract_psm", type=int, default=None, help="Tesseract page segmentation mode.")
+    parser.add_argument(
+        "--ingestion_workers",
+        type=int,
+        default=None,
+        help="Number of parallel worker processes for PDF ingestion (1 = serial). "
+        "Each worker loads its own parser models, so cap for GPU memory.",
+    )
     parser.add_argument(
         "--no_progress",
         action="store_true",

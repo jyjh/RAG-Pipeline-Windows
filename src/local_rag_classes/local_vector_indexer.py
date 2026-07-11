@@ -47,7 +47,7 @@ class LocalVectorIndexer:
         )
         self.embedding_batch_size = _positive_int(
             embedding_batch_size or os.environ.get("LOCAL_RAG_EMBED_BATCH_SIZE"),
-            8,
+            64,
         )
         _status(
             f"Local index: using Ollama embedding model {self.embedding_model} "
@@ -100,10 +100,31 @@ class LocalVectorIndexer:
             vectors.extend(batch_vectors)
         return np.asarray(vectors)
 
-    def _reuse_candidates(self, store: LanceDBVectorStore) -> dict[str, dict[str, Any]]:
+    def _reuse_candidates(
+        self,
+        store: LanceDBVectorStore,
+        *,
+        max_records: int = 100_000,
+    ) -> dict[str, dict[str, Any]]:
+        # Safety ceiling: loading the entire index into RAM (one Python dict
+        # entry per record, each holding a 768-float vector) is only safe for
+        # small corpora. At 100GB-scale this would hold gigabytes of vectors and
+        # OOM the process. The streaming indexer uses
+        # :meth:`_reuse_candidates_for_source` (one source at a time) instead;
+        # this whole-index path is an edge-case fallback kept for callers that
+        # build records without a source_hash. Guard it so an accidental large
+        # index fails loudly instead of silently exhausting memory.
         if not store.exists():
             return {}
         try:
+            total = store.count()
+            if total > max_records:
+                _status(
+                    f"Local index: whole-index reuse scan refused for {total} records "
+                    f"(cap {max_records}); skipping vector reuse for this batch.",
+                    enabled=self.progress_enabled,
+                )
+                return {}
             model, dim = store.metadata()
             if model != self.embedding_model or dim != 768:
                 return {}
@@ -287,6 +308,36 @@ class LocalVectorIndexer:
             grouped.setdefault(file_name, []).append(item)
         return grouped
 
+    def _write_file_records(
+        self,
+        store: LanceDBVectorStore,
+        source_groups: list[tuple[str, list[dict[str, Any]]]],
+        manifest: dict[str, Any],
+    ) -> None:
+        """Write one file's already-embedded records to the store (writer thread).
+
+        Called from a background ThreadPoolExecutor thread so the LanceDB write
+        overlaps the next file's embedding on the main thread. Each source is
+        replaced/appended independently and merged into the shared manifest.
+        Writes are serialized (one writer thread, ordered by submission), so
+        LanceDB never sees concurrent writes to the same table from this path.
+        """
+        for source_hash, source_records in source_groups:
+            if source_hash:
+                store.replace_records_by_source_hash(
+                    source_hash=source_hash,
+                    records=source_records,
+                    embedding_model=self.embedding_model,
+                    embedding_dim=768,
+                )
+            else:
+                store.append_records(
+                    source_records,
+                    embedding_model=self.embedding_model,
+                    embedding_dim=768,
+                )
+            _merge_records_into_manifest(manifest, source_records)
+
     def index_markdown(self, markdown_dir: str) -> None:
         """Build the index one Markdown file at a time.
 
@@ -339,97 +390,149 @@ class LocalVectorIndexer:
         failed_files = 0
         index_errors: list[dict[str, Any]] = []
 
-        for file_path in _iter_with_progress(
-            files,
-            enabled=self.progress_enabled,
-            total=len(files),
-            desc="Local index",
-            unit="doc",
-        ):
-            file_name = file_path.name
-            try:
-                _status(f"Local index: reading {file_name}", enabled=self.progress_enabled)
-                if not file_path.read_text(encoding="utf-8").strip():
-                    _status(
-                        f"Local index: skipping empty Markdown file {file_name}",
-                        enabled=self.progress_enabled,
-                    )
-                    continue
-                file_records = build_section_records(
-                    file_path,
-                    source_root=Path.cwd(),
-                    summary_mode=self.summary_mode,
-                    chunk_target_tokens=self.chunk_target_tokens,
-                    chunk_overlap_tokens=self.chunk_overlap_tokens,
-                )
-                if not file_records:
-                    continue
+        # Two-stage pipeline: the main thread reads + sections + embeds (GPU-
+        # bound), while a single background thread writes the previous file's
+        # records to LanceDB (CPU/disk-bound). This overlaps the GPU and I/O so
+        # the GPU is never idle waiting for a write. At most one write is in
+        # flight at a time, so peak memory stays ~2 files instead of ~1.
+        from concurrent.futures import ThreadPoolExecutor
 
-                before_overrides = len(file_records)
-                file_records = apply_overrides_to_records(file_records, overrides)
-                removed_by_overrides = before_overrides - len(file_records)
-                if removed_by_overrides:
-                    _status(
-                        f"Local index: skipped {removed_by_overrides} record(s) hidden by "
-                        f"persisted index overrides in {file_name}.",
-                        enabled=self.progress_enabled,
-                    )
-                if not file_records:
-                    continue
+        write_executor = ThreadPoolExecutor(max_workers=1)
+        pending_write = None  # Future of the in-flight write, if any
 
-                _status(
-                    f"Local index: prepared {len(file_records)} structured record(s) from {file_name}",
-                    enabled=self.progress_enabled,
-                )
+        def _await_pending_write() -> None:
+            nonlocal pending_write
+            if pending_write is not None:
+                pending_write.result()  # propagate write errors synchronously
+                pending_write = None
 
-                # Process each source in the file independently so reuse and the
-                # per-source replace stay scoped. In production a file maps to
-                # exactly one source, so this loop runs once.
-                for source_hash, source_records in self._group_records_by_source(file_records).items():
-                    reused, embedded = self._attach_vectors_for_file(
-                        source_records,
-                        source_hash=source_hash,
-                        store=reuse_store,
-                    )
-                    total_reused += reused
-                    total_embedded += embedded
-
-                    if source_hash:
-                        store.replace_records_by_source_hash(
-                            source_hash=source_hash,
-                            records=source_records,
-                            embedding_model=self.embedding_model,
-                            embedding_dim=768,
+        try:
+            for file_path in _iter_with_progress(
+                files,
+                enabled=self.progress_enabled,
+                total=len(files),
+                desc="Local index",
+                unit="doc",
+            ):
+                file_name = file_path.name
+                try:
+                    _status(f"Local index: reading {file_name}", enabled=self.progress_enabled)
+                    if not file_path.read_text(encoding="utf-8").strip():
+                        _status(
+                            f"Local index: skipping empty Markdown file {file_name}",
+                            enabled=self.progress_enabled,
                         )
-                    else:
-                        store.append_records(
+                        continue
+                    file_records = build_section_records(
+                        file_path,
+                        source_root=Path.cwd(),
+                        summary_mode=self.summary_mode,
+                        chunk_target_tokens=self.chunk_target_tokens,
+                        chunk_overlap_tokens=self.chunk_overlap_tokens,
+                    )
+                    if not file_records:
+                        continue
+
+                    before_overrides = len(file_records)
+                    file_records = apply_overrides_to_records(file_records, overrides)
+                    removed_by_overrides = before_overrides - len(file_records)
+                    if removed_by_overrides:
+                        _status(
+                            f"Local index: skipped {removed_by_overrides} record(s) hidden by "
+                            f"persisted index overrides in {file_name}.",
+                            enabled=self.progress_enabled,
+                        )
+                    if not file_records:
+                        continue
+
+                    _status(
+                        f"Local index: prepared {len(file_records)} structured record(s) from {file_name}",
+                        enabled=self.progress_enabled,
+                    )
+
+                    # Embed all sources for this file on the main thread (GPU).
+                    source_groups = self._group_records_by_source(file_records)
+                    file_reused = 0
+                    file_embedded = 0
+                    for source_hash, source_records in source_groups.items():
+                        reused, embedded = self._attach_vectors_for_file(
                             source_records,
-                            embedding_model=self.embedding_model,
-                            embedding_dim=768,
+                            source_hash=source_hash,
+                            store=reuse_store,
                         )
-                    _merge_records_into_manifest(manifest, source_records)
-                    written_records += len(source_records)
+                        file_reused += reused
+                        file_embedded += embedded
+                    total_reused += file_reused
+                    total_embedded += file_embedded
 
-                processed_files += 1
-                _status(
-                    f"Local index: wrote {len(file_records)} record(s) from {file_name} "
-                    f"({total_embedded} embedded, {total_reused} reused cumulative)",
-                    enabled=self.progress_enabled,
-                )
-                # Drop this file's records before reading the next one.
-                del file_records
-            except Exception as exc:
-                failed_files += 1
-                index_errors.append({"file": file_name, "error": str(exc)})
-                _status(
-                    f"Local index: failed to index {file_name}: {exc}. Continuing.",
-                    enabled=self.progress_enabled,
-                )
+                    # Wait for the previous write to finish before queueing this
+                    # one (bounds memory to ~2 files and preserves write order).
+                    _await_pending_write()
+
+                    # Snapshot what the background writer needs, then queue it.
+                    # manifest merging happens in the writer to keep the main
+                    # thread free for the next file's embedding.
+                    groups_snapshot = [
+                        (sh, [dict(r) for r in recs])
+                        for sh, recs in source_groups.items()
+                    ]
+                    pending_write = write_executor.submit(
+                        self._write_file_records,
+                        store,
+                        groups_snapshot,
+                        manifest,
+                    )
+                    written_records += len(file_records)
+                    processed_files += 1
+                    _status(
+                        f"Local index: wrote {len(file_records)} record(s) from {file_name} "
+                        f"({total_embedded} embedded, {total_reused} reused cumulative)",
+                        enabled=self.progress_enabled,
+                    )
+                    # Drop this file's records before reading the next one.
+                    del file_records
+                except Exception as exc:
+                    failed_files += 1
+                    index_errors.append({"file": file_name, "error": str(exc)})
+                    _status(
+                        f"Local index: failed to index {file_name}: {exc}. Continuing.",
+                        enabled=self.progress_enabled,
+                    )
+        finally:
+            # Flush the last in-flight write before continuing to ANN build.
+            _await_pending_write()
+            write_executor.shutdown(wait=True)
+
 
         write_index_manifest_payload(self.working_dir, manifest)
         if self.reuse_db_dir:
             copy_index_overrides(self.reuse_db_dir, self.working_dir)
         output_target = store.db_path / "chunks"
+
+        # Build the ANN vector index on the staged table so the published index
+        # is already query-accelerated. Below ANN_MIN_ROWS this is a no-op (flat
+        # scan is faster there); above it, IVF_PQ turns every query from an O(N)
+        # scan into a sublinear lookup. Best-effort: an index-build failure must
+        # not abort an otherwise-successful index build (search falls back to
+        # flat scan when no index is present).
+        try:
+            ann_result = store.create_vector_index()
+            if ann_result.get("built"):
+                _status(
+                    f"Local index: built {ann_result.get('index_type')} ANN vector index "
+                    f"({ann_result.get('num_partitions')} partitions, {ann_result.get('rows')} rows).",
+                    enabled=self.progress_enabled,
+                )
+            else:
+                _status(
+                    f"Local index: skipped ANN index build ({ann_result.get('reason')}).",
+                    enabled=self.progress_enabled,
+                )
+        except Exception as exc:
+            _status(
+                f"Local index: ANN index build failed (queries will use flat scan): {exc}",
+                enabled=self.progress_enabled,
+            )
 
         # Persist a structured index run-summary (mirrors the ingest result) so
         # the job queue can surface a processed/failed breakdown and disk usage

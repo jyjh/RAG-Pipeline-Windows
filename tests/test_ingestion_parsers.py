@@ -122,6 +122,9 @@ class RecordingVisionDescriber:
         self.calls.append({"image_data": image_data, "prompt": prompt})
         return self.response
 
+    def describe_many(self, images, *, prompt=None, max_workers=4):
+        return [self.describe(img, prompt=prompt) for img in images]
+
 
 def test_docling_converter_defaults_to_rapidocr_onnx_full_page():
     from docling.datamodel.base_models import InputFormat

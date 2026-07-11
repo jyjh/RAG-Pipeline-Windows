@@ -36,27 +36,51 @@ class ScannedPageImageParser:
             raise RuntimeError(f"Could not open scanned PDF for page-image fallback: {file_path}") from exc
 
         pages = getattr(reader, "pages", [])
-        page_iter = _iter_with_progress(
-            enumerate(pages, start=1),
-            enabled=self.progress_enabled,
-            total=len(pages),
-            desc=f"Analyze page images: {Path(file_path).name}",
-            unit="page",
-        )
-        parts: list[str] = []
-        for page_no, page in page_iter:
+        # Gather all page images up front so they can be described concurrently
+        # (each is an independent Ollama HTTP call). Previously this described
+        # images one at a time, serially -- the dominant cost for scanned docs.
+        page_images: list[tuple[int, list[bytes]]] = []
+        for page_no, page in enumerate(pages, start=1):
             image_bytes = self._page_image_bytes(page)
-            if not image_bytes:
-                continue
-            page_parts = [f"## Page {page_no}"]
-            for image_data in image_bytes:
-                description = self.vision_describer.describe(
-                    image_data,
-                    prompt=SCANNED_PAGE_VISION_PROMPT,
-                )
-                if self._is_usable_description(description):
-                    page_parts.append(f"> [Page Image Analysis]: {description.strip()}")
-            if len(page_parts) > 1:
+            if image_bytes:
+                page_images.append((page_no, image_bytes))
+
+        # Flatten into a single batch for concurrent description, remembering the
+        # (page_no, index) each image belongs to so results map back correctly.
+        flat_images: list[bytes] = []
+        flat_index: list[tuple[int, int]] = []
+        for page_no, image_bytes in page_images:
+            for img_idx, image_data in enumerate(image_bytes):
+                flat_images.append(image_data)
+                flat_index.append((page_no, img_idx))
+
+        if not flat_images:
+            raise RuntimeError(
+                f"No usable page-image analysis was produced for scanned PDF fallback: {Path(file_path).name}"
+            )
+
+        _progress_status(
+            f"Describing {len(flat_images)} page image(s) across {len(page_images)} page(s) "
+            f"for scanned PDF fallback: {Path(file_path).name}",
+            enabled=self.progress_enabled,
+        )
+        descriptions = self.vision_describer.describe_many(
+            flat_images,
+            prompt=SCANNED_PAGE_VISION_PROMPT,
+        )
+
+        # Re-group descriptions by page and build the Markdown parts.
+        per_page: dict[int, list[str]] = {}
+        for (page_no, _img_idx), description in zip(flat_index, descriptions):
+            if self._is_usable_description(description):
+                per_page.setdefault(page_no, []).append(description.strip())
+
+        parts: list[str] = []
+        for page_no, _ in page_images:
+            descs = per_page.get(page_no)
+            if descs:
+                page_parts = [f"## Page {page_no}"]
+                page_parts.extend(f"> [Page Image Analysis]: {d}" for d in descs)
                 parts.append("\n\n".join(page_parts))
 
         if not parts:

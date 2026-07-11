@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import uuid
 from collections import deque
@@ -99,6 +100,9 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_job_subprocess_creationflags",
     "_process_output_tail",
     "_run_job_subprocess",
+    "_register_child_subprocess",
+    "_unregister_child_subprocess",
+    "terminate_child_subprocesses",
     "_staged_index_dir",
     "_remove_path",
     "_publish_staged_index",
@@ -222,6 +226,7 @@ DATA_DIR = ROOT_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 STAGING_DIR = DATA_DIR / ".upload_queue"
 PDF_REGISTRY_PATH = DATA_DIR / ".pdf_upload_registry.json"
+JOB_LEDGER_PATH = DATA_DIR / ".job_ledger.json"
 DOCUMENT_TRUST_PATH = DATA_DIR / ".document_trust.json"
 PROCESSED_DIR = ROOT_DIR / "processed_docs"
 DB_DIR = ROOT_DIR / "db"
@@ -235,7 +240,7 @@ def _resolve_root_path(raw_path: Any, *, default: str | Path | None = None) -> P
 
 
 DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
-DEFAULT_EMBEDDING_BATCH_SIZE = 8
+DEFAULT_EMBEDDING_BATCH_SIZE = 64
 DEFAULT_EMBEDDING_TIMEOUT = 30.0
 DEFAULT_TEMPERATURE = 0.3
 DEFAULT_MAX_K = 40
@@ -259,6 +264,18 @@ DEFAULT_INDEX_BACKEND = "lancedb"
 DEFAULT_SUMMARY_MODE = "hybrid"
 DEFAULT_CHUNK_TARGET_TOKENS = 900
 DEFAULT_CHUNK_OVERLAP_TOKENS = 120
+# ANN vector-index settings live in src/vector_store.py (where the store class
+# can resolve them) and are re-exported here for the rest of the app.
+from src.vector_store import (  # noqa: E402
+    ANN_INDEX_TYPE,
+    ANN_MAX_PARTITIONS,
+    ANN_MIN_ROWS,
+    ANN_NPROBES,
+    ANN_NUM_BITS,
+    ANN_NUM_PARTITIONS,
+    ANN_NUM_SUB_VECTORS,
+    ANN_REFINE_FACTOR,
+)
 DEFAULT_HEALTH_POLL_INTERVAL_MS = 60_000
 DEFAULT_JOBS_POLL_INTERVAL_MS = 60_000
 DEFAULT_SERVER_HOST = "127.0.0.1"
@@ -267,6 +284,12 @@ DEFAULT_SERVER_PORT = 8000
 DEFAULT_BACKGROUND_WORKER_THREADS = min(4, max(1, (os.cpu_count() or 2) // 2))
 DEFAULT_UPDATE_REMOTE = "origin"
 DEFAULT_UPDATE_BRANCH = "main"
+DEFAULT_DISK_SAFETY_FACTOR = 1.15
+# Number of parallel job-worker threads. 1 = serial (backwards-compatible).
+# With >1, ingestion-only phases of different upload jobs overlap; index-
+# mutating phases are serialized via an internal lock. Cap conservatively
+# since each worker's ingestion subprocess loads its own parser models.
+DEFAULT_JOB_WORKERS = 1
 JOB_LOG_TAIL_LINES = 200
 GIT_TIMEOUT_SECONDS = 30.0
 GIT_PULL_TIMEOUT_SECONDS = 300.0
@@ -276,9 +299,25 @@ INDEX_STREAM_WORKERS = min(8, max(2, os.cpu_count() or 2))
 INDEX_SUMMARY_NODE_TYPES = {"document_summary", "section_summary"}
 INDEX_CHILD_DEFAULT_LIMIT = 100
 INDEX_CHILD_MAX_LIMIT = 500
+# Above this row count the hierarchy/child views refuse to materialize the full
+# index into RAM (which would OOM at millions of chunks). Callers must fall back
+# to the paginated flat list (list_index_rows) or a server-side filtered query.
+INDEX_SNAPSHOT_MAX_ROWS = 100_000
 DEFAULT_INDEX_VECTOR_RELEVANCE_FLOOR = 0.70
 FORCE_UPLOAD_TOKEN_TTL_SECONDS = 15 * 60
 UPLOAD_FORCE_TOKEN_SECRET = os.urandom(32)
+# Upload size guards. 0 = no limit (backwards-compatible default). Configurable
+# via [uploads] max_upload_bytes / max_corpus_bytes so operators can cap a shared
+# deployment. The chunked-upload endpoint (4.3) enforces per-chunk and per-file
+# limits so a multi-GB single PDF can't silently exhaust disk.
+DEFAULT_MAX_UPLOAD_BYTES = 0
+DEFAULT_MAX_CORPUS_BYTES = 0
+# Default per-chunk size for the chunked-upload endpoint (16 MiB). Large enough
+# to amortize HTTP overhead, small enough that a dropped chunk is cheap to retry.
+DEFAULT_UPLOAD_CHUNK_BYTES = 16 * 1024 * 1024
+# Cap on the number of PDF entries extracted from a single uploaded zip. Guards
+# against a zip-bomb of tiny entries exhausting the staging dir.
+MAX_ZIP_ENTRIES = 10_000
 RECOVERABLE_UPLOAD_STATUSES = {"queued", "saving_uploads", "ingesting", "ingested"}
 UPLOAD_RESUME_STATUS_ORDER = {
     "queued": 0,
@@ -468,6 +507,14 @@ def _load_server_config(config_path: Path | None = None) -> dict[str, Any]:
         ),
         "update_remote": _nonempty_str(server_config.get("update_remote"), DEFAULT_UPDATE_REMOTE),
         "update_branch": _nonempty_str(server_config.get("update_branch"), DEFAULT_UPDATE_BRANCH),
+        "disk_safety_factor": _positive_float(
+            server_config.get("disk_safety_factor"),
+            DEFAULT_DISK_SAFETY_FACTOR,
+        ),
+        "job_workers": _positive_int(
+            server_config.get("job_workers"),
+            DEFAULT_JOB_WORKERS,
+        ),
     }
 
 
@@ -537,12 +584,25 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
         "tesseract_cmd": _nonempty_str(ingestion.get("tesseract_cmd"), DEFAULT_TESSERACT_CMD),
         "tesseract_data_path": str(ingestion.get("tesseract_data_path") or DEFAULT_TESSERACT_DATA_PATH),
         "tesseract_psm": _optional_int(ingestion.get("tesseract_psm"), DEFAULT_TESSERACT_PSM),
+        "ingestion_workers": _positive_int(ingestion.get("ingestion_workers"), 1),
+    }
+
+
+def _load_uploads_config(config_path: Path | None = None) -> dict[str, Any]:
+    config_path = config_path or (ROOT_DIR / "config.toml")
+    payload = _load_toml_config(config_path)
+    uploads = payload.get("uploads", {}) if isinstance(payload.get("uploads"), dict) else {}
+    return {
+        "max_upload_bytes": max(0, int(uploads.get("max_upload_bytes", 0) or 0)),
+        "max_corpus_bytes": max(0, int(uploads.get("max_corpus_bytes", 0) or 0)),
+        "chunk_bytes": _positive_int(uploads.get("chunk_bytes"), DEFAULT_UPLOAD_CHUNK_BYTES),
     }
 
 
 SERVER_CONFIG = _load_server_config()
 CHAT_CONFIG = _load_chat_config()
 INGESTION_CONFIG = _load_ingestion_config()
+UPLOADS_CONFIG = _load_uploads_config()
 ASSET_DIR = _resolve_root_path(INGESTION_CONFIG["asset_dir"], default=DEFAULT_ASSET_DIR)
 
 
@@ -652,6 +712,10 @@ def _run_job_subprocess(
     kwargs["stderr"] = subprocess.STDOUT
 
     process = subprocess.Popen(command, **kwargs)
+    # Track the live subprocess so a graceful shutdown (e.g. update/restart)
+    # can terminate it before the hard os._exit(0). Without this, an indexing
+    # subprocess can orphan on a server restart and publish into a dead server.
+    _register_child_subprocess(process)
     output_lines: list[str] = []
     reader_done = threading.Event()
 
@@ -673,21 +737,24 @@ def _run_job_subprocess(
 
     reader = threading.Thread(target=read_output, daemon=True)
     reader.start()
-    while True:
-        returncode = process.poll()
-        if returncode is not None:
-            reader_done.wait(timeout=5)
-            break
-        if cancel_event.is_set():
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-            reader_done.wait(timeout=5)
-            raise JobCancelled("Job cancelled by user.")
-        reader_done.wait(timeout=0.2)
+    try:
+        while True:
+            returncode = process.poll()
+            if returncode is not None:
+                reader_done.wait(timeout=5)
+                break
+            if cancel_event.is_set():
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                reader_done.wait(timeout=5)
+                raise JobCancelled("Job cancelled by user.")
+            reader_done.wait(timeout=0.2)
+    finally:
+        _unregister_child_subprocess(process)
 
     stdout = "\n".join(output_lines)
     result = subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr="")
@@ -699,6 +766,54 @@ def _run_job_subprocess(
     if detail:
         message = f"{message}\n{detail}"
     raise RuntimeError(message)
+
+
+# Registry of currently-running pipeline subprocesses, so a graceful shutdown
+# can terminate them instead of orphaning them across a hard os._exit.
+_CHILD_SUBPROCESSES: set[subprocess.Popen] = set()
+_CHILD_SUBPROCESS_LOCK = threading.Lock()
+
+
+def _register_child_subprocess(process: subprocess.Popen) -> None:
+    with _CHILD_SUBPROCESS_LOCK:
+        _CHILD_SUBPROCESSES.add(process)
+
+
+def _unregister_child_subprocess(process: subprocess.Popen) -> None:
+    with _CHILD_SUBPROCESS_LOCK:
+        _CHILD_SUBPROCESSES.discard(process)
+
+
+def terminate_child_subprocesses(*, grace_seconds: float = 5.0) -> int:
+    """Terminate all tracked pipeline subprocesses with a grace period.
+
+    Called before a hard ``os._exit`` (e.g. on update/restart) so an indexing
+    subprocess does not keep running and publish into a dead server. Returns
+    the number of subprocesses a signal was sent to. Best-effort: a subprocess
+    that ignores SIGTERM is killed after the grace period.
+    """
+    with _CHILD_SUBPROCESS_LOCK:
+        processes = [p for p in _CHILD_SUBPROCESSES if p.poll() is None]
+    if not processes:
+        return 0
+    for process in processes:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    deadline = time.time() + max(0.0, grace_seconds)
+    for process in processes:
+        remaining = max(0.0, deadline - time.time())
+        try:
+            process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+                process.wait(timeout=2.0)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        _unregister_child_subprocess(process)
+    return len(processes)
 
 
 def _staged_index_dir(live_db_dir: str | Path) -> Path:
@@ -863,9 +978,51 @@ def list_index_backups(db_dir: str | Path) -> list[dict[str, Any]]:
                 "manifest_present": manifest.exists(),
                 "record_count": record_count,
                 "size_bytes": _backup_size_bytes(child),
+                "hardlinked": _backup_is_hardlinked(child),
             }
         )
     return entries
+
+
+# Whether the filesystem supports hardlinks (probed once on first backup).
+# None = not yet probed. If False, backups fall back to full copies.
+_BACKUP_HARDLINKS_SUPPORTED: bool | None = None
+
+
+def _hardlink_or_copy(src: str | Path, dst: str | Path) -> None:
+    """Copy ``src`` to ``dst`` via hardlink, falling back to a full copy.
+
+    Hardlinked snapshots share data blocks with the live index, so N backups
+    cost ~1× the index size instead of ~N×. On filesystems that don't support
+    hardlinks (or cross-device), this transparently falls back to ``shutil.copy2``.
+    """
+    global _BACKUP_HARDLINKS_SUPPORTED
+    if _BACKUP_HARDLINKS_SUPPORTED is not False:
+        try:
+            os.link(src, dst)
+            _BACKUP_HARDLINKS_SUPPORTED = True
+            return
+        except OSError:
+            _BACKUP_HARDLINKS_SUPPORTED = False
+    shutil.copy2(src, dst)
+
+
+def _backup_is_hardlinked(snapshot_dir: Path) -> bool:
+    """Check whether a snapshot's LanceDB files are hardlinked (st_nlink > 1).
+
+    Probes the first regular file found under the snapshot's lancedb/ tree.
+    Returns False if the snapshot is missing, empty, or its files are standalone.
+    """
+    lancedb_dir = snapshot_dir / LANCEDB_DIRNAME
+    if not lancedb_dir.is_dir():
+        return False
+    for path in lancedb_dir.rglob("*"):
+        if path.is_file():
+            try:
+                return path.stat().st_nlink > 1
+            except OSError:
+                return False
+    return False
 
 
 def create_index_backup(db_dir: str | Path) -> dict[str, Any]:
@@ -883,12 +1040,16 @@ def create_index_backup(db_dir: str | Path) -> dict[str, Any]:
         )
     backup_root = index_backup_root(resolved_db_dir)
     backup_root.mkdir(parents=True, exist_ok=True)
-    # copytree duplicates the whole index on disk; refuse before touching it if
-    # free space can't cover the copy (a mid-copy exhaustion corrupts the
-    # snapshot and can cascade into publish/restore failures).
-    required = estimate_dir_bytes(live_lancedb)
-    if required > 0:
-        check_disk_space(backup_root, required)
+    # Hardlinked snapshots share data blocks with the live index, so the actual
+    # disk cost is near-zero (just inodes/metadata). But if the filesystem
+    # doesn't support hardlinks, the fallback is a full copy -- require enough
+    # free space for that worst case before starting.
+    index_bytes = estimate_dir_bytes(live_lancedb)
+    if index_bytes > 0 and _BACKUP_HARDLINKS_SUPPORTED is not False:
+        # Hardlinks expected; only need a small metadata overhead.
+        check_disk_space(backup_root, max(1, index_bytes // 1000))
+    elif index_bytes > 0:
+        check_disk_space(backup_root, index_bytes)
     with acquire_index_lock(resolved_db_dir):
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         snapshot_dir = backup_root / f"{stamp}-{uuid.uuid4().hex[:6]}"
@@ -901,16 +1062,23 @@ def create_index_backup(db_dir: str | Path) -> dict[str, Any]:
                     continue
                 destination = snapshot_dir / source.name
                 if source.is_dir():
-                    shutil.copytree(source, destination)
+                    shutil.copytree(source, destination, copy_function=_hardlink_or_copy)
                 else:
-                    shutil.copy2(source, destination)
+                    _hardlink_or_copy(source, destination)
         except Exception:
             _remove_path(snapshot_dir)
             raise
 
+        # If the fallback to copy2 happened (hardlinks unsupported), re-check
+        # that the full copy actually fit -- a mid-copy exhaustion would have
+        # raised above, but this is a belt-and-suspenders guard.
+        if _BACKUP_HARDLINKS_SUPPORTED is False and index_bytes > 0:
+            check_disk_space(backup_root, 1)
+
         _prune_index_backups(backup_root)
         _invalidate_index_caches(resolved_db_dir)
         snapshot_entries = list_index_backups(resolved_db_dir)
+    hardlinked = _BACKUP_HARDLINKS_SUPPORTED is True and _backup_is_hardlinked(snapshot_dir)
     return next(
         (entry for entry in snapshot_entries if entry["name"] == snapshot_dir.name),
         {
@@ -921,6 +1089,7 @@ def create_index_backup(db_dir: str | Path) -> dict[str, Any]:
             "manifest_present": (snapshot_dir / INDEX_MANIFEST_FILENAME).exists(),
             "record_count": None,
             "size_bytes": _backup_size_bytes(snapshot_dir),
+            "hardlinked": hardlinked,
         },
     )
 
@@ -937,12 +1106,23 @@ def _prune_index_backups(backup_root: Path) -> None:
         _remove_path(stale)
 
 
-def _swap_index_into(source_db_dir: str | Path, live_db_dir: str | Path) -> None:
-    """Atomically swap the LanceDB/manifest/overrides from ``source`` into ``live``.
+def _swap_index_into(
+    source_db_dir: str | Path,
+    live_db_dir: str | Path,
+    *,
+    copy_mode: bool = False,
+) -> None:
+    """Swap the LanceDB/manifest/overrides from ``source`` into ``live``.
 
     The current live components are moved aside into a ``.index_rollover_<hex>``
     directory first so a failed swap can roll back, mirroring the safe-swap logic
     already used by ``_publish_staged_index``.
+
+    When ``copy_mode`` is False (the default for staged builds), the source
+    components are *moved* (renamed) into place -- atomic and cheap. When
+    ``copy_mode`` is True (used by restore from a hardlinked backup), the source
+    components are *copied* instead so the backup's shared inodes are not renamed
+    away (which would break other snapshots that hardlink the same data).
     """
     source_db = Path(source_db_dir)
     live_db = Path(live_db_dir)
@@ -960,7 +1140,15 @@ def _swap_index_into(source_db_dir: str | Path, live_db_dir: str | Path) -> None
                     shutil.move(str(live_component), str(rollover_target))
             for source_component, live_component in zip(source_components, live_components):
                 if source_component.exists():
-                    shutil.move(str(source_component), str(live_component))
+                    if copy_mode:
+                        # Copy (not move) so the backup snapshot's hardlinked
+                        # inodes stay intact for other snapshots / future restores.
+                        if source_component.is_dir():
+                            shutil.copytree(source_component, live_component, copy_function=shutil.copy2)
+                        else:
+                            shutil.copy2(source_component, live_component)
+                    else:
+                        shutil.move(str(source_component), str(live_component))
         except Exception:
             for live_component, rollover_target in zip(live_components, rollover_targets):
                 _remove_path(live_component)
@@ -1012,7 +1200,12 @@ def restore_index_from_backup(db_dir: str | Path, backup_name: str) -> dict[str,
         except Exception:
             safety_backup = None
 
-    _swap_index_into(snapshot_dir, resolved_db_dir)
+    # If the backup snapshot is hardlinked (shares inodes with the live index or
+    # other snapshots), restore must COPY rather than MOVE -- otherwise renaming
+    # the shared inodes would break the backup and any other snapshots that
+    # reference the same data blocks.
+    hardlinked_source = _backup_is_hardlinked(snapshot_dir)
+    _swap_index_into(snapshot_dir, resolved_db_dir, copy_mode=hardlinked_source)
     return {
         "restored": True,
         "backup_name": name,
@@ -1346,7 +1539,16 @@ def _spawn_restart_helper(*, old_pid: int, host: str, port: int) -> None:
 
 
 def _schedule_process_exit(delay_seconds: float = 0.5) -> None:
-    timer = threading.Timer(delay_seconds, lambda: os._exit(0))
+    def _exit_with_cleanup() -> None:
+        # Terminate any in-flight pipeline subprocess before the hard exit so an
+        # indexing job does not orphan and publish into a dead/restarting server.
+        try:
+            terminate_child_subprocesses(grace_seconds=5.0)
+        except Exception:
+            pass
+        os._exit(0)
+
+    timer = threading.Timer(delay_seconds, _exit_with_cleanup)
     timer.daemon = True
     timer.start()
 
@@ -1421,6 +1623,11 @@ def _index_records_snapshot(db_dir: Path | None = None) -> tuple[list[dict[str, 
         rows, model, dim = cached[1]
         return [dict(row) for row in rows], model, dim
     count = store.count()
+    # Guard the whole-index materialization. Above the cap this would hold
+    # every row (including full chunk text) in process memory and OOM at scale.
+    # Hierarchy/child callers degrade to a paginated/paged response instead.
+    if count > INDEX_SNAPSHOT_MAX_ROWS:
+        raise _IndexSnapshotTooLargeError(count, INDEX_SNAPSHOT_MAX_ROWS)
     if count <= 0:
         model, dim = store.metadata()
         result = ([], model, dim)
@@ -1434,6 +1641,23 @@ def _index_records_snapshot(db_dir: Path | None = None) -> tuple[list[dict[str, 
     )
     _INDEX_RECORDS_SNAPSHOT_CACHE[cache_key] = (signature, result)
     return [dict(row) for row in result[0]], result[1], result[2]
+
+
+class _IndexSnapshotTooLargeError(Exception):
+    """Raised when the index is too large to materialize for the hierarchy view.
+
+    The hierarchy/child-row views build an in-memory tree of every record; at
+    millions of chunks this OOMs. Callers catch this and return a degraded
+    response that points the client at the paginated flat list instead.
+    """
+
+    def __init__(self, count: int, cap: int) -> None:
+        super().__init__(
+            f"Index has {count} records, exceeding the in-memory hierarchy cap of {cap}. "
+            "Use the paginated flat list view."
+        )
+        self.count = count
+        self.cap = cap
 
 
 def _is_index_summary(row: dict[str, Any]) -> bool:
@@ -1545,8 +1769,19 @@ def list_index_summary_rows(
     resolved_limit = None if int(limit) <= 0 else min(max(1, int(limit)), 200)
     query = str(search or "").strip()
 
-    with INDEX_LOCK:
-        rows, embedding_model, embedding_dim = _index_records_snapshot(db_dir)
+    try:
+        with INDEX_LOCK:
+            rows, embedding_model, embedding_dim = _index_records_snapshot(db_dir)
+    except _IndexSnapshotTooLargeError as exc:
+        # Index too large to build an in-memory tree: degrade to a paginated
+        # flat-list view with the same pagination envelope. The frontend treats
+        # this the same as a normal page but renders rows flat instead of as a
+        # collapsible hierarchy.
+        payload = list_index_rows(offset=offset, limit=resolved_limit or 50, search=search, db_dir=db_dir)
+        payload["view"] = "flat"
+        payload["degraded"] = True
+        payload["degraded_reason"] = str(exc)
+        return payload
 
     by_id = {str(row.get("id") or ""): row for row in rows if row.get("id")}
     top_rows = _index_top_summary_rows(rows)
@@ -1598,8 +1833,20 @@ def list_index_child_rows(
     resolved_limit = min(max(1, int(limit)), INDEX_CHILD_MAX_LIMIT)
     query = str(search or "").strip()
 
-    with INDEX_LOCK:
-        rows, embedding_model, embedding_dim = _index_records_snapshot(db_dir)
+    try:
+        with INDEX_LOCK:
+            rows, embedding_model, embedding_dim = _index_records_snapshot(db_dir)
+    except _IndexSnapshotTooLargeError:
+        # Index too large for the in-memory tree: fetch the parent and its
+        # children directly from the store (server-side filtered query) so the
+        # child view still works without materializing the whole index.
+        return _list_index_child_rows_degraded(
+            parent_id=parent_id,
+            offset=offset,
+            limit=resolved_limit,
+            search=query,
+            db_dir=db_dir,
+        )
 
     by_id = {str(row.get("id") or ""): row for row in rows if row.get("id")}
     parent = by_id.get(parent_id)
@@ -1623,6 +1870,50 @@ def list_index_child_rows(
         "embedding_model": embedding_model,
         "embedding_dim": embedding_dim,
         "view": "hierarchy_children",
+    }
+
+
+def _list_index_child_rows_degraded(
+    *,
+    parent_id: str,
+    offset: int,
+    limit: int,
+    search: str,
+    db_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Server-side child lookup for oversized indexes (no full materialization).
+
+    Fetches the parent record then its children via LanceDB ``_where`` filters
+    on ``parent_id`` / ``doc_id``, paged in Python after the server-side fetch.
+    Caps the fetch at ``INDEX_CHILD_MAX_LIMIT`` * 4 to bound memory.
+    """
+    store = _index_store(db_dir)
+    with INDEX_LOCK:
+        try:
+            parent = store.get_record(parent_id)
+        except (KeyError, Exception) as exc:
+            raise KeyError(parent_id) from exc
+        model, dim = store.metadata()
+        # Fetch children server-side. Use a generous fetch cap then page in Python.
+        fetch_cap = max(limit * 4, INDEX_CHILD_MAX_LIMIT)
+        children = store.child_chunks(parent, limit=fetch_cap)
+    if search:
+        children = [row for row in children if record_matches(row, search)]
+    children = sorted(children, key=_index_sort_key)
+    page = _page_slice(children, offset=offset, limit=limit)
+    return {
+        "parent_id": parent_id,
+        "offset": page["offset"],
+        "limit": page["limit"],
+        "total": page["total"],
+        "rows": _with_index_assets_for_rows(_with_index_override_metadata_for_rows([
+            _with_index_hierarchy_metadata(row, children=[], parent=parent)
+            for row in page["rows"]
+        ], db_dir=db_dir)),
+        "embedding_model": model,
+        "embedding_dim": dim,
+        "view": "hierarchy_children",
+        "degraded": True,
     }
 
 
@@ -2976,7 +3267,7 @@ def render_markdown_text(text: str) -> str:
     return rendered
 
 
-job_queue = RagJobQueue()
+job_queue = RagJobQueue(max_workers=SERVER_CONFIG.get("job_workers", DEFAULT_JOB_WORKERS))
 
 
 def recover_pending_upload_jobs_on_startup() -> dict[str, Any]:
@@ -3104,6 +3395,14 @@ def _upload_options_from_form(form: Any) -> dict[str, Any]:
         "chunk_overlap_tokens": _nonnegative_int(form.get("chunk_overlap_tokens"), DEFAULT_CHUNK_OVERLAP_TOKENS),
         "progress_enabled": False,
     }
+
+
+def _default_upload_options() -> dict[str, Any]:
+    """Upload options built from the active config (no form overrides).
+
+    Used by the chunked-upload completion path, which has no multipart form.
+    """
+    return _upload_options_from_form({})
 
 
 def _sha256_text(value: Any) -> str:
@@ -3340,16 +3639,125 @@ def _cached_pdf_hash(path: Path) -> str:
     return digest
 
 
-def _copy_upload_file_to_path(upload: StarletteUploadFile, destination: Path) -> str:
+def _copy_upload_file_to_path(
+    upload: StarletteUploadFile,
+    destination: Path,
+    *,
+    max_bytes: int = 0,
+) -> str:
+    """Stream ``upload`` to ``destination`` in 1 MiB chunks, hashing incrementally.
+
+    When ``max_bytes > 0`` the copy aborts mid-stream if the file exceeds the
+    cap, deleting the partial destination and raising ``ValueError``. This
+    prevents a single oversized upload from exhausting disk before the copy
+    finishes.
+    """
     digest = hashlib.sha256()
     destination.parent.mkdir(parents=True, exist_ok=True)
     upload.file.seek(0)
+    total = 0
     with destination.open("wb") as handle:
         for chunk in iter(lambda: upload.file.read(1024 * 1024), b""):
+            total += len(chunk)
+            if max_bytes and total > max_bytes:
+                handle.close()
+                try:
+                    destination.unlink()
+                except OSError:
+                    pass
+                raise ValueError(
+                    f"Uploaded file exceeds the per-file size limit "
+                    f"({total} > {max_bytes} bytes)."
+                )
             digest.update(chunk)
             handle.write(chunk)
     upload.file.seek(0)
     return digest.hexdigest()
+
+
+def _is_zip_filename(filename: str) -> bool:
+    return Path(filename).suffix.lower() == ".zip"
+
+
+def _ignored_zip_entry(name: str) -> bool:
+    """Skip macOS/Windows junk and directory entries inside a zip."""
+    if not name or name.endswith("/"):
+        return True
+    parts = name.replace("\\", "/").split("/")
+    if any(part.startswith("__MACOSX") or part == ".DS_Store" for part in parts):
+        return True
+    return False
+
+
+def _extract_pdfs_from_zip(
+    zip_path: Path,
+    staging_dir: Path,
+    *,
+    used_names: set[str],
+    max_entries: int = MAX_ZIP_ENTRIES,
+    max_bytes: int = 0,
+) -> list[tuple[str, str]]:
+    """Stream-extract PDFs from ``zip_path`` into ``staging_dir``.
+
+    Returns ``[(filename, sha256), ...]`` for each extracted PDF. Guards against
+    zip bombs: caps the entry count and (when ``max_bytes > 0``) per-entry size,
+    and rejects path-traversal entries (absolute paths or ``..`` components).
+    Each entry is written in 1 MiB chunks so memory stays flat regardless of zip
+    size. This replaces the previous client-side ``fflate.unzipSync`` path that
+    decompressed the entire archive into browser memory (OOM on multi-GB zips).
+    """
+    import zipfile
+
+    results: list[tuple[str, str]] = []
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            infos = [info for info in archive.infolist() if not info.is_dir()]
+            if len(infos) > max_entries:
+                raise ValueError(
+                    f"Zip contains {len(infos)} entries, exceeding the cap of {max_entries}."
+                )
+            for info in infos:
+                name = info.filename.replace("\\", "/")
+                if _ignored_zip_entry(name):
+                    continue
+                base = name.split("/")[-1]
+                if not base.lower().endswith(".pdf"):
+                    continue
+                # Path-traversal guard: reject absolute paths and parent refs.
+                if base.startswith(("/", "\\")) or ".." in Path(base).parts:
+                    continue
+                # De-duplicate within this upload.
+                unique = base
+                counter = 1
+                while unique.lower() in used_names:
+                    unique = f"{Path(base).stem}-{counter}.pdf"
+                    counter += 1
+                used_names.add(unique.lower())
+                destination = staging_dir / unique
+                digest = hashlib.sha256()
+                total = 0
+                with archive.open(info, "r") as src, destination.open("wb") as dst:
+                    while True:
+                        chunk = src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if max_bytes and total > max_bytes:
+                            dst.close()
+                            try:
+                                destination.unlink()
+                            except OSError:
+                                pass
+                            raise ValueError(
+                                f"Zip entry '{name}' exceeds the per-file size limit "
+                                f"({total} > {max_bytes} bytes)."
+                            )
+                        digest.update(chunk)
+                        dst.write(chunk)
+                results.append((unique, digest.hexdigest()))
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"Not a valid zip archive: {exc}") from exc
+    return results
 
 
 def _known_data_pdf_paths(
@@ -3500,8 +3908,60 @@ async def _handle_upload_request(request: Request, *, require_source_groups: boo
                 continue
 
             filename = _safe_filename(value.filename or "")
-            if Path(filename).suffix.lower() != ".pdf":
-                raise HTTPException(status_code=400, detail=f"Only PDF uploads are supported: {filename}")
+            suffix = Path(filename).suffix.lower()
+
+            if suffix == ".zip":
+                # Server-side zip extraction (replaces browser-side fflate
+                # unzipSync, which decompressed the whole archive into memory and
+                # OOM'd on multi-GB zips). The zip is streamed to a temp file,
+                # then PDF entries are extracted one at a time in 1 MiB chunks.
+                zip_destination = staging_dir / f"{filename}.bin"
+                try:
+                    await run_in_threadpool(
+                        _copy_upload_file_to_path,
+                        value,
+                        zip_destination,
+                        max_bytes=UPLOADS_CONFIG["max_upload_bytes"],
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=413, detail=str(exc)) from exc
+                finally:
+                    await value.close()
+                try:
+                    extracted = await run_in_threadpool(
+                        _extract_pdfs_from_zip,
+                        zip_destination,
+                        staging_dir,
+                        used_names=used_names,
+                        max_bytes=UPLOADS_CONFIG["max_upload_bytes"],
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=413, detail=str(exc)) from exc
+                finally:
+                    try:
+                        zip_destination.unlink()
+                    except OSError:
+                        pass
+                if not extracted:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"No PDF files were found inside {filename}.",
+                    )
+                for pdf_name, pdf_hash in extracted:
+                    filenames.append(pdf_name)
+                    uploads.append(
+                        {
+                            "filename": pdf_name,
+                            "hash": pdf_hash,
+                            "staging_path": str(staging_dir / pdf_name),
+                            "staging_dir": str(staging_dir),
+                            "job_id": job_id,
+                        }
+                    )
+                continue
+
+            if suffix != ".pdf":
+                raise HTTPException(status_code=400, detail=f"Only PDF or ZIP uploads are supported: {filename}")
 
             base = filename
             counter = 1
@@ -3513,7 +3973,14 @@ async def _handle_upload_request(request: Request, *, require_source_groups: boo
 
             destination = staging_dir / filename
             try:
-                digest = await run_in_threadpool(_copy_upload_file_to_path, value, destination)
+                digest = await run_in_threadpool(
+                    _copy_upload_file_to_path,
+                    value,
+                    destination,
+                    max_bytes=UPLOADS_CONFIG["max_upload_bytes"],
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=413, detail=str(exc)) from exc
             finally:
                 await value.close()
             filenames.append(filename)
@@ -3651,6 +4118,193 @@ async def upload_files_direct(request: Request):
     return await _handle_upload_request(request, require_source_groups=False)
 
 
+# --- Chunked / resumable uploads -------------------------------------------
+# For large single files (multi-GB PDFs) a single multipart POST is unreliable:
+# a network drop at 80% restarts from zero. This three-step protocol lets the
+# client upload in configurable chunks, resuming from the last received offset
+# after a dropout:
+#   1. POST /api/uploads/chunk      -> append a chunk to a .part file
+#   2. GET  /api/uploads/chunk_status -> query current offset (for resume)
+#   3. POST /api/uploads/complete   -> finalize, hash, register, enqueue
+# The .part files live in the staging dir and are cleaned up on complete/abort.
+
+_CHUNK_UPLOADS: dict[str, dict[str, Any]] = {}
+_CHUNK_UPLOADS_LOCK = threading.Lock()
+
+
+def _chunk_part_path(upload_id: str) -> Path:
+    return STAGING_DIR / upload_id / f"{upload_id}.part"
+
+
+@app.post("/api/uploads/chunk")
+async def upload_chunk(request: Request):
+    """Append one chunk to a resumable .part file.
+
+    Accepts multipart with fields: ``upload_id``, ``filename``, ``offset``,
+    ``total_size``, and ``chunk`` (the bytes). The chunk is appended to
+    ``<staging>/<upload_id>/<upload_id>.part`` after validating the offset
+    matches the current file size (sequential append). Returns the new offset
+    so the client knows where to resume.
+    """
+    form = await request.form()
+    upload_id = str(form.get("upload_id") or uuid.uuid4().hex)
+    filename = _safe_filename(str(form.get("filename") or "upload.pdf"))
+    total_size = int(form.get("total_size") or 0)
+    offset = int(form.get("offset") or 0)
+    chunk_field = form.get("chunk")
+    if not isinstance(chunk_field, StarletteUploadFile):
+        raise HTTPException(status_code=400, detail="Missing 'chunk' file field.")
+    if Path(filename).suffix.lower() not in {".pdf", ".zip"}:
+        raise HTTPException(status_code=400, detail=f"Only PDF or ZIP chunks are supported: {filename}")
+
+    max_upload = UPLOADS_CONFIG["max_upload_bytes"]
+    if max_upload and total_size > max_upload:
+        raise HTTPException(status_code=413, detail=f"File exceeds size limit ({total_size} > {max_upload}).")
+
+    part_path = _chunk_part_path(upload_id)
+    part_path.parent.mkdir(parents=True, exist_ok=True)
+    current_size = part_path.stat().st_size if part_path.exists() else 0
+    if offset != current_size:
+        # Offset mismatch: client is out of sync. Tell it the real offset.
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "offset_mismatch", "expected_offset": current_size},
+        )
+
+    # Append the chunk in 1 MiB pieces so memory stays flat.
+    chunk_field.file.seek(0)
+    written = 0
+    digest_update = False
+    with part_path.open("ab") as handle:
+        for piece in iter(lambda: chunk_field.file.read(1024 * 1024), b""):
+            handle.write(piece)
+            written += len(piece)
+    await chunk_field.close()
+
+    new_size = current_size + written
+    with _CHUNK_UPLOADS_LOCK:
+        _CHUNK_UPLOADS[upload_id] = {
+            "filename": filename,
+            "total_size": total_size,
+            "received": new_size,
+            "started_at": _CHUNK_UPLOADS.get(upload_id, {}).get("started_at") or _utcnow(),
+        }
+    return {"upload_id": upload_id, "offset": new_size, "received": written}
+
+
+@app.get("/api/uploads/chunk_status")
+def chunk_status(upload_id: str):
+    """Return the current received offset for a chunked upload (for resume)."""
+    part_path = _chunk_part_path(upload_id)
+    size = part_path.stat().st_size if part_path.exists() else 0
+    meta = _CHUNK_UPLOADS.get(upload_id, {})
+    return {
+        "upload_id": upload_id,
+        "offset": size,
+        "filename": meta.get("filename", ""),
+        "total_size": meta.get("total_size", 0),
+        "complete": bool(meta.get("total_size")) and size >= int(meta.get("total_size") or 0),
+    }
+
+
+@app.post("/api/uploads/complete")
+async def complete_chunked_upload(request: Request):
+    """Finalize a chunked upload: rename .part, hash, and enqueue as an upload job.
+
+    Accepts JSON: ``{upload_id, filename, source_groups?, force_duplicates?}``.
+    The .part file is renamed to its final filename and processed exactly like
+    a normal upload (dedupe, registry, ingest/index job).
+    """
+    payload = await _optional_json(request)
+    upload_id = str(payload.get("upload_id") or "")
+    filename = _safe_filename(str(payload.get("filename") or "upload.pdf"))
+    if not upload_id:
+        raise HTTPException(status_code=400, detail="upload_id is required.")
+    part_path = _chunk_part_path(upload_id)
+    if not part_path.exists():
+        raise HTTPException(status_code=404, detail=f"No chunked upload found for {upload_id}.")
+    if Path(filename).suffix.lower() not in {".pdf", ".zip"}:
+        raise HTTPException(status_code=400, detail=f"Only PDF or ZIP uploads are supported: {filename}")
+
+    job_id = uuid.uuid4().hex
+    staging_dir = STAGING_DIR / job_id
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    digest = hashlib.sha256()
+    final_path = staging_dir / filename
+    with part_path.open("rb") as src, final_path.open("wb") as dst:
+        for piece in iter(lambda: src.read(1024 * 1024), b""):
+            digest.update(piece)
+            dst.write(piece)
+    try:
+        part_path.unlink()
+    except OSError:
+        pass
+
+    file_hash = digest.hexdigest()
+    uploads = [{
+        "filename": filename,
+        "hash": file_hash,
+        "staging_path": str(final_path),
+        "staging_dir": str(staging_dir),
+        "job_id": job_id,
+    }]
+    force_duplicates = str(payload.get("force_duplicates") or "").lower() in {"1", "true", "yes", "on"}
+    source_group = normalize_source_group(payload.get("source_groups") or "")
+    with _CHUNK_UPLOADS_LOCK:
+        _CHUNK_UPLOADS.pop(upload_id, None)
+
+    # Inline registration: dedupe check then register + enqueue. Mirrors the
+    # tail of _handle_upload_request but for a single already-on-disk file.
+    duplicate_entries = await run_in_threadpool(_blocking_duplicate_entries, uploads)
+    if duplicate_entries and not force_duplicates:
+        raise HTTPException(
+            status_code=409,
+            detail=_duplicate_response_detail(
+                message="This PDF has already been uploaded or queued.",
+                duplicates=duplicate_entries,
+                files=uploads,
+            ),
+        )
+    forced_hashes = {entry["hash"] for entry in duplicate_entries} if force_duplicates else set()
+    file_uploads = [{
+        "filename": filename,
+        "hash": file_hash,
+        "staging_path": str(final_path),
+        "source_group": source_group,
+    }]
+    options = _default_upload_options()
+    try:
+        PdfRegistry(PDF_REGISTRY_PATH).register_queued(
+            job_id=job_id,
+            files=file_uploads,
+            forced_hashes=forced_hashes,
+            options=options,
+        )
+        job = job_queue.enqueue_upload(
+            staging_dir=staging_dir,
+            filenames=[filename],
+            uploads=file_uploads,
+            force_duplicate_hashes=sorted(forced_hashes),
+            job_id=job_id,
+            options=options,
+        )
+        response = job.to_dict()
+        response["jobs"] = [response]
+        response["job_count"] = 1
+        response["filenames"] = [filename]
+        return response
+    except Exception:
+        PdfRegistry(PDF_REGISTRY_PATH).mark_job_status(
+            job_id=job_id,
+            files=file_uploads,
+            status="failed",
+            error="Chunked upload was not queued.",
+        )
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+
+
 async def _optional_json(request: Request) -> dict[str, Any]:
     body = await request.body()
     if not body:
@@ -3720,6 +4374,21 @@ def rebuild_index(request: Request):
     if blocker:
         raise HTTPException(status_code=409, detail=blocker)
     job = job_queue.enqueue_rebuild()
+    return job.to_dict()
+
+
+@app.post("/api/index/rebuild_vector_index")
+def rebuild_vector_index(request: Request):
+    """Re-train the ANN vector index on the live DB without re-embedding.
+
+    Useful after many incremental reindex_source operations leave the IVF
+    partitions suboptimal. Cheaper than a full rebuild (no embedding) but still
+    blocks queries briefly while the index is rebuilt under the index lock.
+    """
+    blocker = _index_mutation_blocker()
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
+    job = job_queue.enqueue_rebuild_vector_index()
     return job.to_dict()
 
 
@@ -4169,10 +4838,18 @@ def chat_stream(payload: ChatRequest):
 def run_server() -> None:
     import uvicorn
 
+    # Cap the request body size so a single oversized multipart upload cannot
+    # exhaust memory/disk. Sized to the configured upload chunk (default 16 MiB)
+    # plus headroom for form metadata, since the chunked-upload endpoint is the
+    # robust path for large files. A direct single-shot multipart upload above
+    # this cap is rejected with 413 -- clients must use the chunked endpoint.
+    chunk_bytes = int(UPLOADS_CONFIG.get("chunk_bytes") or DEFAULT_UPLOAD_CHUNK_BYTES)
+    limit_max_request_bytes = chunk_bytes * 2 + 2 * 1024 * 1024
     uvicorn.run(
         "src.web_app:app",
         host=str(SERVER_CONFIG["host"]),
         port=int(SERVER_CONFIG["port"]),
+        limit_max_request_bytes=limit_max_request_bytes,
     )
 
 

@@ -10,6 +10,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -79,11 +80,12 @@ class EmbeddingEngine:
         ollama_batch_size: int | None = None,
         ollama_timeout: float | None = None,
         ollama_retries: int | None = None,
+        max_cache_entries: int | None = None,
     ):
         self.model_name = model_name
         self.ollama_batch_size = _positive_int(
             ollama_batch_size or os.environ.get("OLLAMA_EMBED_BATCH_SIZE"),
-            8,
+            64,
         )
         self.ollama_timeout = _positive_float(
             ollama_timeout or os.environ.get("OLLAMA_EMBED_TIMEOUT"),
@@ -98,7 +100,18 @@ class EmbeddingEngine:
             ollama_retries if ollama_retries is not None else os.environ.get("OLLAMA_EMBED_RETRIES"),
             3,
         )
-        self._cache: dict[tuple[int, int, str], Any] = {}
+        # Bounded LRU cache. At 100GB-scale cold indexing almost every chunk is
+        # unique, so an unbounded dict would grow to hold every embedding for
+        # the whole run (768 floats each) and OOM the process. A bounded LRU
+        # caps the footprint while preserving the hit rate for the realistic
+        # repeat cases (re-index reuse, repeated queries). Default 50k entries ≈
+        # ~150MB at 768 float32 each; env-overridable.
+        self.max_cache_entries = _positive_int(
+            max_cache_entries if max_cache_entries is not None
+            else os.environ.get("OLLAMA_EMBED_CACHE_MAX"),
+            50_000,
+        )
+        self._cache: OrderedDict[tuple[int, int, str], Any] = OrderedDict()
 
         if model_name == "nomic-ai/nomic-embed-text-v1.5":
             model_name = "nomic-embed-text"
@@ -135,6 +148,9 @@ class EmbeddingEngine:
             key = self._cache_key(text, truncate_dim, prefix)
             cached = self._cache.get(key)
             if cached is not None:
+                # LRU: mark as recently used so the entry is not evicted while
+                # still being queried.
+                self._cache.move_to_end(key)
                 results[i] = cached
             else:
                 to_compute_indices.append(i)
@@ -149,6 +165,10 @@ class EmbeddingEngine:
             for j, idx in enumerate(to_compute_indices):
                 key = self._cache_key(texts[idx], truncate_dim, prefix)
                 self._cache[key] = truncated[j]
+                # Enforce the cap after each insert. Eviction is FIFO by default;
+                # combined with move_to_end on hit this is true LRU.
+                while len(self._cache) > self.max_cache_entries:
+                    self._cache.popitem(last=False)
                 results[idx] = truncated[j]
 
         return np.array(results)

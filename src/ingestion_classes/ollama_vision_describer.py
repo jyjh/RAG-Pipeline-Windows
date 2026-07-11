@@ -45,6 +45,35 @@ class OllamaVisionDescriber:
             logger.error("Error processing image with vision model: %s", exc)
             return "[Image description failed]"
 
+    def describe_many(
+        self,
+        images: list[bytes],
+        *,
+        prompt: str | None = None,
+        max_workers: int = 4,
+    ) -> list[str]:
+        """Describe multiple images concurrently.
+
+        Each image is an independent Ollama HTTP call, so a bounded thread pool
+        overlaps them -- a scanned-document with N pages describes N page images
+        in roughly ``ceil(N / max_workers)`` round-trips instead of N. Concurrency
+        is capped to avoid overloading Ollama. Falls back to serial on error.
+        """
+        if not images:
+            return []
+        if len(images) == 1 or max_workers <= 1:
+            return [self.describe(img, prompt=prompt) for img in images]
+        self._ensure_loaded()
+        from concurrent.futures import ThreadPoolExecutor
+
+        max_workers = max(1, min(int(max_workers), len(images)))
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                return list(executor.map(lambda img: self.describe(img, prompt=prompt), images))
+        except Exception:
+            # Fall back to serial; concurrency is best-effort.
+            return [self.describe(img, prompt=prompt) for img in images]
+
 OllamaVisionDescriber.__module__ = _source_module.__name__
 finalize_split_class(_source_module, OllamaVisionDescriber)
 
