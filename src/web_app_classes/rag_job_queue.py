@@ -436,9 +436,20 @@ class RagJobQueue:
             if job.kind == "reindex_source":
                 self._wait_for_no_queries(job, "indexing")
                 self._raise_if_cancelled(job)
-                self._delete_source_index_records(job.source_hashes)
-                self._raise_if_cancelled(job)
-                self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
+                if self._run_indexing_func is not None:
+                    # Keep custom/injected indexers on the historical contract.
+                    self._delete_source_index_records(job.source_hashes)
+                    self._raise_if_cancelled(job)
+                    self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
+                else:
+                    incremental_options = dict(job.options or {})
+                    incremental_options["source_hashes"] = list(job.source_hashes)
+                    self._run_incremental_indexing(
+                        str(self.processed_dir),
+                        str(self.db_dir),
+                        incremental_options,
+                        job=job,
+                    )
                 return
 
             if job.kind == "backup":
@@ -554,7 +565,19 @@ class RagJobQueue:
         with self._index_write_lock:
             self._wait_for_no_queries(job, "indexing")
             self._raise_if_cancelled(job)
-            self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
+            if self._run_indexing_func is not None:
+                self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
+            else:
+                incremental_options = dict(job.options or {})
+                incremental_options["source_hashes"] = [
+                    str(item.get("hash") or "") for item in job.uploads if item.get("hash")
+                ]
+                self._run_incremental_indexing(
+                    str(self.processed_dir),
+                    str(self.db_dir),
+                    incremental_options,
+                    job=job,
+                )
             self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="indexed")
 
     def _wait_for_no_queries(self, job: QueueJob, phase: str) -> None:
@@ -720,6 +743,12 @@ class RagJobQueue:
                 resolved.write_text("", encoding="utf-8")
             except OSError:
                 pass
+        try:
+            sidecar = resolved.with_suffix(".pages.json")
+            sidecar.relative_to(processed_root)
+            sidecar.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
 
     def _mark_processed_paths(self, job: QueueJob) -> None:
         for item in job.uploads:
@@ -780,6 +809,9 @@ class RagJobQueue:
             "ingestion_workers": options.get(
                 "ingestion_workers", INGESTION_CONFIG.get("ingestion_workers", 1)
             ),
+            "max_pages_whole_doc": options.get(
+                "max_pages_whole_doc", INGESTION_CONFIG.get("max_pages_whole_doc", 50)
+            ),
             "progress_enabled": options.get("progress_enabled", False),
         }
         if run_ingestion_func is not None:
@@ -817,6 +849,7 @@ class RagJobQueue:
         _append_cli_option(command, "--tesseract_data_path", resolved["tesseract_data_path"])
         _append_cli_option(command, "--tesseract_psm", resolved["tesseract_psm"])
         _append_cli_option(command, "--ingestion_workers", resolved["ingestion_workers"])
+        _append_cli_option(command, "--max_pages_whole_doc", resolved["max_pages_whole_doc"])
         command.append("--no_progress")
         self._run_pipeline_subprocess(command, job=job)
         self._summarize_ingest_result(job, output_dir)
@@ -912,6 +945,7 @@ class RagJobQueue:
             "summary_mode": options.get("summary_mode", DEFAULT_SUMMARY_MODE),
             "chunk_target_tokens": options.get("chunk_target_tokens", DEFAULT_CHUNK_TARGET_TOKENS),
             "chunk_overlap_tokens": options.get("chunk_overlap_tokens", DEFAULT_CHUNK_OVERLAP_TOKENS),
+            "source_hashes": options.get("source_hashes") or [],
         }
         if run_indexing_func is not None:
             self._raise_if_cancelled(job)
@@ -968,6 +1002,7 @@ class RagJobQueue:
         _append_cli_option(command, "--summary_mode", resolved["summary_mode"])
         _append_cli_option(command, "--chunk_target_tokens", resolved["chunk_target_tokens"])
         _append_cli_option(command, "--chunk_overlap_tokens", resolved["chunk_overlap_tokens"])
+        _append_cli_option(command, "--source_hashes", resolved["source_hashes"])
         command.append("--no_progress")
 
         try:
@@ -981,6 +1016,37 @@ class RagJobQueue:
                 _source_module._publish_staged_index(staged_db_dir, db_dir)
         finally:
             shutil.rmtree(staged_db_dir, ignore_errors=True)
+
+    def _run_incremental_indexing(
+        self,
+        md_dir: str,
+        db_dir: str,
+        options: dict[str, Any],
+        *,
+        job: QueueJob | None = None,
+    ) -> None:
+        """Replace selected source rows directly in the live index."""
+        hashes = [str(value) for value in options.get("source_hashes") or [] if value]
+        if not hashes:
+            return
+        from src.indexing import run_indexing
+
+        self._raise_if_cancelled(job)
+        with _source_module.acquire_index_lock(db_dir):
+            run_indexing(
+                md_dir,
+                db_dir,
+                progress_enabled=bool(options.get("progress_enabled", False)),
+                embedding_model=options.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
+                embedding_batch_size=options.get("embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE),
+                embedding_timeout=options.get("embedding_timeout", DEFAULT_EMBEDDING_TIMEOUT),
+                index_backend=options.get("index_backend", DEFAULT_INDEX_BACKEND),
+                summary_mode=options.get("summary_mode", DEFAULT_SUMMARY_MODE),
+                chunk_target_tokens=options.get("chunk_target_tokens", DEFAULT_CHUNK_TARGET_TOKENS),
+                chunk_overlap_tokens=options.get("chunk_overlap_tokens", DEFAULT_CHUNK_OVERLAP_TOKENS),
+                source_hashes=hashes,
+            )
+        self._raise_if_cancelled(job)
 
     def _delete_source_index_records(self, source_hashes: list[str]) -> None:
         """Drop existing vectors for the given sources so re-indexing rebuilds them.

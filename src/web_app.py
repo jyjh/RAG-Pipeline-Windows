@@ -57,6 +57,7 @@ from src.local_rag import (
     DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
     DEFAULT_QUERY_SYSTEM_PROMPT,
     INDEX_MANIFEST_FILENAME,
+    update_index_manifest_sources,
     write_index_manifest,
 )
 from src.index_overrides import (
@@ -2035,12 +2036,20 @@ def update_index_record(
         )
         persist_index_edit(resolved_db_dir, record, content)
         manifest_model, manifest_dim = store.metadata()
-        write_index_manifest(
-            resolved_db_dir,
-            store.all_records(),
-            embedding_model=manifest_model,
-            embedding_dim=manifest_dim,
-        )
+        source_hash = str(record.get("source_hash") or "")
+        source_key = source_hash or str(record.get("file_path") or "")
+        if source_key:
+            source_records = (
+                store.records_by_source_hash([source_hash])
+                if source_hash
+                else store.records_by_file_path(str(record.get("file_path") or ""))
+            )
+            update_index_manifest_sources(
+                resolved_db_dir,
+                {source_key: source_records},
+                embedding_model=manifest_model,
+                embedding_dim=manifest_dim,
+            )
         row["edited"] = True
         return row
 
@@ -2062,12 +2071,24 @@ def delete_index_records(*, record_ids: list[str], db_dir: Path | None = None) -
         result = store.delete_records(record_ids=list(ids))
         persist_index_deletions(resolved_db_dir, records_to_tombstone)
         model, dim = store.metadata()
-        write_index_manifest(
-            resolved_db_dir,
-            store.all_records(),
-            embedding_model=model,
-            embedding_dim=dim,
-        )
+        source_updates: dict[str, list[dict[str, Any]]] = {}
+        for record in records_to_tombstone:
+            source_hash = str(record.get("source_hash") or "")
+            file_path = str(record.get("file_path") or "")
+            source_key = source_hash or file_path
+            if source_key:
+                source_updates[source_key] = (
+                    store.records_by_source_hash([source_hash])
+                    if source_hash
+                    else store.records_by_file_path(file_path)
+                )
+        if source_updates:
+            update_index_manifest_sources(
+                resolved_db_dir,
+                source_updates,
+                embedding_model=model,
+                embedding_dim=dim,
+            )
         return result
 
 
@@ -2801,9 +2822,9 @@ def _delete_source_vectors(
             legacy_doc_ids=legacy_doc_ids,
         )
         model, dim = store.metadata()
-        write_index_manifest(
+        update_index_manifest_sources(
             resolved_db_dir,
-            store.all_records(),
+            {source_hash: []},
             embedding_model=model,
             embedding_dim=dim,
         )
@@ -2835,6 +2856,14 @@ def _delete_processed_markdown_files(
             resolved.unlink()
         except PermissionError:
             resolved.write_text("", encoding="utf-8")
+        # The page-text sidecar is derived data and must not accumulate after
+        # deleting/replacing a source PDF.
+        sidecar = resolved.with_suffix(".pages.json")
+        try:
+            sidecar.relative_to(processed_root)
+            sidecar.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
         deleted += 1
     return deleted
 
@@ -3511,6 +3540,9 @@ def _upload_options_from_form(form: Any) -> dict[str, Any]:
         "tesseract_cmd": str(form.get("tesseract_cmd") or INGESTION_CONFIG["tesseract_cmd"]),
         "tesseract_data_path": str(form.get("tesseract_data_path") or INGESTION_CONFIG["tesseract_data_path"]),
         "tesseract_psm": _optional_int(form.get("tesseract_psm"), INGESTION_CONFIG["tesseract_psm"]),
+        "max_pages_whole_doc": _nonnegative_int(
+            form.get("max_pages_whole_doc"), INGESTION_CONFIG.get("max_pages_whole_doc", 50)
+        ),
         "embedding_model": str(form.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
         "embedding_batch_size": _positive_int(form.get("embedding_batch_size"), DEFAULT_EMBEDDING_BATCH_SIZE),
         "embedding_timeout": _positive_float(form.get("embedding_timeout"), DEFAULT_EMBEDDING_TIMEOUT),

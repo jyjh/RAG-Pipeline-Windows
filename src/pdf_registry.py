@@ -303,6 +303,8 @@ def write_source_entry(
     source_hash: str,
     source_pdf_name: str,
     source_pdf_path: str | Path,
+    source_size: int | None = None,
+    source_mtime_ns: int | None = None,
 ) -> dict[str, Any]:
     markdown = Path(markdown_path)
     entry = {
@@ -312,6 +314,10 @@ def write_source_entry(
         "processed_markdown_path": str(markdown),
         "updated_at": utcnow(),
     }
+    if source_size is not None:
+        entry["source_size"] = int(source_size)
+    if source_mtime_ns is not None:
+        entry["source_mtime_ns"] = int(source_mtime_ns)
     with _registry_lock_for(source_map_path(processed_dir)):
         payload = load_source_map(processed_dir)
         payload["documents"][markdown.name] = entry

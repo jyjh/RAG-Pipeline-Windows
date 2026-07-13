@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -342,7 +343,7 @@ def pages_sidecar_path(markdown_path: Path) -> Path:
     return markdown_path.with_suffix(".pages.json")
 
 
-def write_pages_sidecar(markdown_path: Path, page_texts: list[str]) -> None:
+def write_pages_sidecar(markdown_path: Path, page_texts: Iterable[str]) -> None:
     """Persist normalized per-page text next to the Markdown output.
 
     Called from ingestion after page extraction. ``page_texts`` are raw
@@ -353,13 +354,26 @@ def write_pages_sidecar(markdown_path: Path, page_texts: list[str]) -> None:
     import json
 
     sidecar = pages_sidecar_path(markdown_path)
-    payload = {
-        "version": _PAGES_SIDECAR_VERSION,
-        "page_count": len(page_texts),
-        "pages": [normalize_page_text(text) for text in page_texts],
-    }
     tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    # Stream the page array so a very large PDF does not create a second full
+    # normalized-page list just to serialize the sidecar. The reader accepts
+    # the same JSON shape, including the exact page_count field.
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write('{"version":%d,"page_count":' % _PAGES_SIDECAR_VERSION)
+        count_position = handle.tell()
+        handle.write("0".ljust(20))
+        handle.write(',"pages":[')
+        count = 0
+        for text in page_texts:
+            if count:
+                handle.write(",")
+            json.dump(normalize_page_text(text), handle, ensure_ascii=False)
+            count += 1
+        handle.write("]}")
+        end_position = handle.tell()
+        handle.seek(count_position)
+        handle.write(str(count).ljust(20))
+        handle.seek(end_position)
     tmp.replace(sidecar)
 
 

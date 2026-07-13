@@ -79,6 +79,7 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_merge_records_into_manifest",
     "write_index_manifest",
     "write_index_manifest_payload",
+    "update_index_manifest_sources",
     "load_content_hash_sidecar",
     "_content_hash_sidecar_path",
     "_content_hash_sidecar_dir",
@@ -1060,6 +1061,8 @@ def _merge_records_into_manifest(
                 "content_char_count": 0,
                 "page_start": 0,
                 "page_end": 0,
+                "embedded_count": 0,
+                "reused_count": 0,
             },
         )
         node_type = str(record.get("node_type") or "")
@@ -1082,8 +1085,10 @@ def _merge_records_into_manifest(
             document["page_end"] = max(int(document.get("page_end") or 0), page_end)
         if record.get("vector_reused"):
             reused += 1
+            document["reused_count"] = int(document.get("reused_count") or 0) + 1
         else:
             embedded += 1
+            document["embedded_count"] = int(document.get("embedded_count") or 0) + 1
         total += 1
     manifest["total_records"] = total
     manifest["embedded_records"] = embedded
@@ -1189,6 +1194,66 @@ def write_index_manifest(
     manifest["_working_dir"] = str(working_dir)
     _merge_records_into_manifest(manifest, records)
     return write_index_manifest_payload(working_dir, manifest)
+
+
+def update_index_manifest_sources(
+    working_dir: str | Path,
+    source_records: dict[str, list[dict[str, Any]]],
+    *,
+    embedding_model: str,
+    embedding_dim: int,
+) -> dict[str, Any]:
+    """Update manifest entries for selected sources without scanning the index.
+
+    ``source_records`` maps source hashes to their current records. An empty
+    list removes that source. This keeps row edits, deletes, and incremental
+    reindex jobs proportional to the affected source rather than materializing
+    every chunk in the corpus.
+    """
+    path = Path(working_dir) / INDEX_MANIFEST_FILENAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    documents = payload.setdefault("documents", {})
+    if not isinstance(documents, dict):
+        documents = {}
+        payload["documents"] = documents
+
+    for source_key, records in source_records.items():
+        key = str(source_key or "")
+        if not key:
+            continue
+        documents.pop(key, None)
+        if not records:
+            continue
+        mini = _empty_manifest(embedding_model, embedding_dim)
+        mini["_working_dir"] = str(working_dir)
+        _merge_records_into_manifest(mini, records)
+        entry = mini.get("documents", {}).get(key)
+        if isinstance(entry, dict):
+            documents[key] = entry
+
+    embedded = 0
+    reused = 0
+    total = 0
+    for entry in documents.values():
+        if not isinstance(entry, dict):
+            continue
+        count = int(entry.get("record_count") or 0)
+        total += count
+        embedded += int(entry.get("embedded_count") or count)
+        reused += int(entry.get("reused_count") or 0)
+    payload["version"] = int(payload.get("version") or 1)
+    payload["embedding_model"] = str(embedding_model)
+    payload["embedding_dim"] = int(embedding_dim)
+    payload["total_records"] = total
+    payload["embedded_records"] = embedded
+    payload["reused_records"] = reused
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return write_index_manifest_payload(working_dir, payload)
 
 
 DuckDuckGoLiteParser = import_split_class("src.local_rag_classes.duck_duck_go_lite_parser", "DuckDuckGoLiteParser")

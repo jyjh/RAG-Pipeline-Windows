@@ -23,6 +23,7 @@ def run_indexing(
     summary_mode: str = "hybrid",
     chunk_target_tokens: int = 900,
     chunk_overlap_tokens: int = 120,
+    source_hashes: list[str] | set[str] | None = None,
 ):
     _progress_status("Starting Ollama local indexing pipeline...", enabled=progress_enabled)
     _progress_status(f"Checking Markdown directory: {md_dir}", enabled=progress_enabled)
@@ -51,7 +52,10 @@ def run_indexing(
         chunk_overlap_tokens=chunk_overlap_tokens,
         progress_enabled=progress_enabled,
     )
-    indexer.index_markdown(md_dir)
+    if source_hashes:
+        indexer.index_markdown_sources(md_dir, source_hashes)
+    else:
+        indexer.index_markdown(md_dir)
 
 
 if __name__ == "__main__":

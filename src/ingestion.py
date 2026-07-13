@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import logging
 import os
 import re
 import sys
 import tempfile
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -418,7 +420,38 @@ def _iter_pdf_paths(input_path: str) -> list[Path]:
         raise RuntimeError(f"PDF input path does not exist: {input_path}")
     if path.is_file():
         return [path] if path.suffix.lower() == ".pdf" else []
-    return sorted(p for p in path.iterdir() if p.is_file() and p.suffix.lower() == ".pdf")
+    # Corpus directories are commonly organized by year/project. Walk nested
+    # directories so discovery does not silently omit most of a corpus.
+    return sorted(p for p in path.rglob("*") if p.is_file() and p.suffix.lower() == ".pdf")
+
+
+def _markdown_name_for_pdf(
+    input_path: Path,
+    *,
+    input_root: str | Path | None = None,
+    duplicate_stems: set[str] | None = None,
+) -> str:
+    """Return a stable flat Markdown name without nested-corpus collisions."""
+    stem = input_path.stem
+    if stem.casefold() not in (duplicate_stems or set()):
+        return f"{stem}.md"
+
+    root = Path(input_root) if input_root is not None else None
+    relative = input_path
+    if root is not None:
+        try:
+            relative = input_path.relative_to(root)
+        except ValueError:
+            pass
+    # Preserve the historical name for a root-level PDF when it shares a stem
+    # with nested files; only the nested paths need disambiguation.
+    if len(relative.parts) <= 1:
+        return f"{stem}.md"
+    digest = hashlib.blake2s(
+        str(relative).replace("\\", "/").casefold().encode("utf-8"),
+        digest_size=6,
+    ).hexdigest()
+    return f"{stem}__{digest}.md"
 
 
 # --- Parallel ingestion worker support ---------------------------------------
@@ -505,9 +538,21 @@ def _ingest_one_pdf(
 
     input_path = Path(input_path_str)
     file_name = input_path.name
-    output_path = Path(output_dir) / f"{input_path.stem}.md"
+    output_name = _markdown_name_for_pdf(
+        input_path,
+        input_root=options.get("input_root"),
+        duplicate_stems=set(options.get("duplicate_stems") or ()),
+    )
+    output_path = Path(output_dir) / output_name
     try:
         source_hash = sha256_file(input_path)
+        try:
+            source_stat = input_path.stat()
+            source_size = int(source_stat.st_size)
+            source_mtime_ns = int(source_stat.st_mtime_ns)
+        except OSError:
+            source_size = None
+            source_mtime_ns = None
         # Resume check is done in the main process before dispatch; re-check
         # here defensively in case the source map changed concurrently.
         existing_source_map = load_source_map(output_dir).get("documents", {})
@@ -542,13 +587,14 @@ def _ingest_one_pdf(
             from pypdf import PdfReader
 
             reader = PdfReader(str(input_path))
-            sidecar_texts = []
-            for page in reader.pages:
-                try:
-                    sidecar_texts.append(page.extract_text() or "")
-                except Exception:  # noqa: BLE001 - per-page isolation
-                    sidecar_texts.append("")
-            write_pages_sidecar(output_path, sidecar_texts)
+            def _page_texts():
+                for page in reader.pages:
+                    try:
+                        yield page.extract_text() or ""
+                    except Exception:  # noqa: BLE001 - per-page isolation
+                        yield ""
+
+            write_pages_sidecar(output_path, _page_texts())
         except Exception as exc:  # noqa: BLE001 - sidecar is an optimization
             logger.warning("Could not write page-text sidecar for %s: %s", file_name, exc)
         write_source_entry(
@@ -557,6 +603,8 @@ def _ingest_one_pdf(
             source_hash=source_hash,
             source_pdf_name=file_name,
             source_pdf_path=input_path,
+            source_size=source_size,
+            source_mtime_ns=source_mtime_ns,
         )
         return {"file": file_name, "status": "processed", "hash": source_hash}
     except Exception as exc:  # noqa: BLE001 - per-file isolation
@@ -630,7 +678,7 @@ def _run_parallel_ingestion(
                     str(input_path),
                     output_dir,
                     options,
-                    progress_enabled,
+                    progress_enabled=progress_enabled,
                 ): input_path
                 for input_path in pending
             }
@@ -715,13 +763,15 @@ def run_ingestion(
     tesseract_psm: int | str | None = DEFAULT_TESSERACT_PSM,
     progress_enabled: bool = True,
     ingestion_workers: int | None = None,
+    max_pages_whole_doc: int = 50,
 ):
     os.makedirs(output_dir, exist_ok=True)
-    from src.pdf_registry import load_source_map
+    from src.pdf_registry import load_source_map, sha256_file
 
     _progress_status(f"Discovering PDFs in {input_dir}...", enabled=progress_enabled)
     input_paths = _iter_pdf_paths(input_dir)
     _progress_status(f"Found {len(input_paths)} PDF(s).", enabled=progress_enabled)
+    stem_counts = Counter(path.stem.casefold() for path in input_paths)
 
     timer = RunTimer()
     processed: list[dict[str, Any]] = []
@@ -767,6 +817,9 @@ def run_ingestion(
         "tesseract_cmd": tesseract_cmd,
         "tesseract_data_path": tesseract_data_path,
         "tesseract_psm": tesseract_psm,
+        "max_pages_whole_doc": max_pages_whole_doc,
+        "input_root": str(Path(input_dir)),
+        "duplicate_stems": {stem for stem, count in stem_counts.items() if count > 1},
     }
 
     # Load the existing source map once for resume checks. A PDF whose content
@@ -783,20 +836,41 @@ def run_ingestion(
     pending: list[Path] = []
     for input_path in input_paths:
         file_name = input_path.name
-        output_path = Path(output_dir) / f"{input_path.stem}.md"
+        output_path = Path(output_dir) / _markdown_name_for_pdf(
+            input_path,
+            input_root=options.get("input_root"),
+            duplicate_stems=set(options.get("duplicate_stems") or ()),
+        )
         existing_entry = existing_source_map.get(output_path.name)
-        if (
-            isinstance(existing_entry, dict)
-            and output_path.exists()
-        ):
-            # Defer the hash check to the worker (it hashes anyway); but if the
-            # entry has no source_hash mismatch we can skip the hash entirely.
+        if isinstance(existing_entry, dict) and output_path.exists():
             source_hash_known = str(existing_entry.get("source_hash") or "")
-            if source_hash_known:
+            unchanged = False
+            try:
+                source_stat = input_path.stat()
+                recorded_size = existing_entry.get("source_size")
+                recorded_mtime_ns = existing_entry.get("source_mtime_ns")
+                if recorded_size is not None and recorded_mtime_ns is not None:
+                    unchanged = (
+                        int(recorded_size) == int(source_stat.st_size)
+                        and int(recorded_mtime_ns) == int(source_stat.st_mtime_ns)
+                    )
+                elif source_hash_known:
+                    # Legacy entries predate the source fingerprint fields.
+                    # Hash those files once so resume remains content-correct;
+                    # newly written entries use the cheaper stat comparison.
+                    unchanged = sha256_file(input_path) == source_hash_known
+            except (OSError, TypeError, ValueError):
+                unchanged = False
+
+            # A missing source hash cannot establish that the output is current.
+            if not unchanged and not source_hash_known:
+                pending.append(input_path)
+                continue
+            if unchanged or source_hash_known == "":
                 skipped.append({"file": file_name, "hash": source_hash_known})
                 log_event("file_ingest_skipped", file=file_name, hash=source_hash_known)
                 _progress_status(
-                    f"Already ingested (source hash unchanged): {file_name}. Skipping parse.",
+                    f"Already ingested (source fingerprint unchanged): {file_name}. Skipping parse.",
                     enabled=progress_enabled,
                 )
                 continue

@@ -23,6 +23,7 @@ class ModelConfig:
     reranker_model: str = ""
     embedding_dim: int = 768
     allow_hash_embeddings: bool = True
+    native_embeddings: bool = False
 
 
 @dataclass

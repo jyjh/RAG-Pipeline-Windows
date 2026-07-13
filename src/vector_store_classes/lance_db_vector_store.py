@@ -328,6 +328,13 @@ class LanceDBVectorStore:
         rows = self._where(" OR ".join(f"source_hash = {sql_string(source_hash)}" for source_hash in hashes))
         return [record_row(row) for row in rows]
 
+    def records_by_file_path(self, file_path: str) -> list[dict[str, Any]]:
+        """Return rows for one legacy file path using a server-side filter."""
+        value = str(file_path or "")
+        if not value or not self.exists():
+            return []
+        return [record_row(row) for row in self._where(f"file_path = {sql_string(value)}")]
+
     def vectors_by_source_hash(self, source_hashes: list[str]) -> list[dict[str, Any]]:
         """Raw rows (including ``vector``) for the given sources.
 

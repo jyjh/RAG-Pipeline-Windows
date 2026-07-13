@@ -393,6 +393,94 @@ def test_run_ingestion_skips_already_processed_pdf(monkeypatch, tmp_path):
     assert md_path.read_text(encoding="utf-8") == "# existing"
 
 
+def test_run_ingestion_reprocesses_pdf_when_fingerprint_changes(monkeypatch, tmp_path):
+    """A stale Markdown entry must not hide a changed source PDF."""
+    import src.ingestion as ingestion
+    from src.pdf_registry import write_source_entry
+
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "out"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    input_pdf = input_dir / "doc.pdf"
+    input_pdf.write_bytes(b"%PDF-1.4 changed")
+    md_path = output_dir / "doc.md"
+    md_path.write_text("# stale", encoding="utf-8")
+    write_source_entry(
+        processed_dir=output_dir,
+        markdown_path=md_path,
+        source_hash="old-hash",
+        source_pdf_name="doc.pdf",
+        source_pdf_path=input_pdf,
+        source_size=1,
+        source_mtime_ns=1,
+    )
+
+    processed_calls = []
+
+    class FakeProcessor:
+        def __init__(self, **kwargs):
+            pass
+
+        def set_source_context(self, **kwargs):
+            pass
+
+        def process_pdf(self, path):
+            processed_calls.append(Path(path).name)
+            return "# refreshed"
+
+    monkeypatch.setattr(ingestion, "DocumentProcessor", FakeProcessor)
+
+    class FakeAssetStore:
+        def __init__(self, _dir):
+            pass
+
+        def remove_source_assets(self, _hash):
+            pass
+
+    monkeypatch.setattr("src.asset_store.ImageAssetStore", FakeAssetStore)
+
+    ingestion.run_ingestion(str(input_dir), str(output_dir), progress_enabled=False)
+
+    assert processed_calls == ["doc.pdf"]
+    assert md_path.read_text(encoding="utf-8") == "# refreshed"
+
+
+def test_pdf_discovery_walks_nested_corpus_directories(tmp_path):
+    from src.ingestion import _iter_pdf_paths
+
+    nested = tmp_path / "year" / "project"
+    nested.mkdir(parents=True)
+    first = nested / "first.pdf"
+    second = tmp_path / "second.PDF"
+    first.write_bytes(b"pdf")
+    second.write_bytes(b"pdf")
+
+    assert _iter_pdf_paths(str(tmp_path)) == sorted([first, second])
+
+
+def test_nested_pdfs_with_duplicate_stems_get_distinct_markdown_names(tmp_path):
+    from src.ingestion import _markdown_name_for_pdf
+
+    root_pdf = tmp_path / "manual.pdf"
+    nested_pdf = tmp_path / "2026" / "manual.pdf"
+    duplicate_stems = {"manual"}
+
+    assert _markdown_name_for_pdf(
+        root_pdf,
+        input_root=tmp_path,
+        duplicate_stems=duplicate_stems,
+    ) == "manual.md"
+    nested_name = _markdown_name_for_pdf(
+        nested_pdf,
+        input_root=tmp_path,
+        duplicate_stems=duplicate_stems,
+    )
+    assert nested_name.startswith("manual__")
+    assert nested_name.endswith(".md")
+    assert nested_name != "manual.md"
+
+
 # --------------------------------------------------------------------------- #
 # Layer 5: disk-space guard                                                   #
 # --------------------------------------------------------------------------- #

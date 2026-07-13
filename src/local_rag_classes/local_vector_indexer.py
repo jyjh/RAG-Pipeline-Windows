@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from src._class_module_support import bind_module_namespace, finalize_split_class
 import src.local_rag as _source_module
 from src.index_overrides import (
@@ -420,12 +422,6 @@ class LocalVectorIndexer:
                 file_name = file_path.name
                 try:
                     _status(f"Local index: reading {file_name}", enabled=self.progress_enabled)
-                    if not file_path.read_text(encoding="utf-8").strip():
-                        _status(
-                            f"Local index: skipping empty Markdown file {file_name}",
-                            enabled=self.progress_enabled,
-                        )
-                        continue
                     file_records = build_section_records(
                         file_path,
                         source_root=Path.cwd(),
@@ -532,6 +528,13 @@ class LocalVectorIndexer:
                     enabled=self.progress_enabled,
                 )
         except Exception as exc:
+            from src.vector_store import ANN_MIN_ROWS
+
+            if store.count() >= ANN_MIN_ROWS:
+                raise RuntimeError(
+                    "ANN index construction failed for a large corpus; refusing to publish "
+                    f"a flat-scan index ({store.count()} records). Original error: {exc}"
+                ) from exc
             _status(
                 f"Local index: ANN index build failed (queries will use flat scan): {exc}",
                 enabled=self.progress_enabled,
@@ -584,6 +587,107 @@ class LocalVectorIndexer:
             f"from {processed_files} file(s) ({total_embedded} embedded, {total_reused} reused"
             + (f", {failed_files} failed" if failed_files else "")
             + ")",
+            enabled=self.progress_enabled,
+        )
+
+    def index_markdown_sources(self, markdown_dir: str, source_hashes: list[str] | set[str]) -> None:
+        """Replace only selected sources in an existing live LanceDB table.
+
+        This is the upload/reindex-source path. A missing table falls back to a
+        full build because there is no unaffected corpus to preserve.
+        """
+        requested = {str(value).strip() for value in source_hashes if str(value).strip()}
+        if not requested:
+            return
+
+        store = LanceDBVectorStore(self.working_dir)
+        if not store.exists():
+            self.index_markdown(markdown_dir)
+            return
+
+        self._preflight_embeddings()
+        overrides = load_index_overrides(self.working_dir)
+        manifest_path = Path(self.working_dir) / _source_module.INDEX_MANIFEST_FILENAME
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                "Incremental indexing requires a readable index manifest. "
+                "Run a full rebuild to recreate it."
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise RuntimeError("Incremental indexing found an invalid index manifest. Run a full rebuild.")
+        documents = manifest.setdefault("documents", {})
+        if not isinstance(documents, dict):
+            documents = {}
+            manifest["documents"] = documents
+
+        from src.pdf_registry import source_entry_for_markdown
+
+        files_by_hash: dict[str, Path] = {}
+        for file_path in sorted(Path(markdown_dir).glob("*.md")):
+            entry = source_entry_for_markdown(file_path)
+            source_hash = str(entry.get("source_hash") or "").strip()
+            if source_hash in requested:
+                files_by_hash[source_hash] = file_path
+
+        had_ann = store.has_vector_index()
+        changed_rows = 0
+        seen: set[str] = set()
+        source_updates: dict[str, list[dict[str, Any]]] = {}
+
+        for source_hash, file_path in files_by_hash.items():
+            _status(
+                f"Local incremental index: reading {file_path.name}",
+                enabled=self.progress_enabled,
+            )
+            records = build_section_records(
+                file_path,
+                source_root=Path.cwd(),
+                summary_mode=self.summary_mode,
+                chunk_target_tokens=self.chunk_target_tokens,
+                chunk_overlap_tokens=self.chunk_overlap_tokens,
+            )
+            records = apply_overrides_to_records(records, overrides)
+            if records:
+                self._attach_vectors_for_file(records, source_hash=source_hash, store=store)
+            store.replace_records_by_source_hash(
+                source_hash=source_hash,
+                records=records,
+                embedding_model=self.embedding_model,
+                embedding_dim=768,
+            )
+            source_updates[source_hash] = records
+            changed_rows += len(records)
+            seen.add(source_hash)
+
+        # Forced re-upload cleanup removes the old Markdown before this method
+        # runs. Remove any requested source with no replacement as well.
+        missing = requested - seen
+        if missing:
+            store.delete_records_by_source_hash(source_hashes=sorted(missing))
+            for source_hash in missing:
+                source_updates[source_hash] = []
+
+        # Update only the affected manifest entries. The manifest is already a
+        # compact document-level summary; records remain in LanceDB.
+        _source_module.update_index_manifest_sources(
+            self.working_dir,
+            source_updates,
+            embedding_model=self.embedding_model,
+            embedding_dim=768,
+        )
+
+        if had_ann:
+            ann_result = store.create_vector_index()
+            if not ann_result.get("built"):
+                raise RuntimeError(
+                    "Incremental indexing changed a corpus with an ANN index, "
+                    f"but ANN rebuild did not complete: {ann_result}"
+                )
+        _status(
+            f"Local incremental index: replaced {len(source_updates)} source(s), "
+            f"{changed_rows} record(s).",
             enabled=self.progress_enabled,
         )
 

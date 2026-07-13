@@ -172,6 +172,7 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
         "tesseract_data_path": str(ingestion.get("tesseract_data_path") or DEFAULT_TESSERACT_DATA_PATH),
         "tesseract_psm": _as_optional_int(ingestion.get("tesseract_psm"), DEFAULT_TESSERACT_PSM),
         "ingestion_workers": _as_positive_int(ingestion.get("ingestion_workers"), 1),
+        "max_pages_whole_doc": max(0, int(ingestion.get("max_pages_whole_doc", 50) or 0)),
     }
 
 
@@ -291,6 +292,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=120,
         help="Overlap used only when splitting an oversized detected section.",
+    )
+    parser.add_argument(
+        "--source_hashes",
+        default="",
+        help="Comma-separated source hashes for incremental indexing.",
     )
     parser.add_argument("--question", help="Question to ask in query mode")
     parser.add_argument(
@@ -479,6 +485,12 @@ def build_parser() -> argparse.ArgumentParser:
         "Each worker loads its own parser models, so cap for GPU memory.",
     )
     parser.add_argument(
+        "--max_pages_whole_doc",
+        type=int,
+        default=None,
+        help="Force page-at-a-time Docling parsing above this page count (0 disables).",
+    )
+    parser.add_argument(
         "--no_progress",
         action="store_true",
         help="Disable ingestion progress bars",
@@ -522,6 +534,13 @@ def main(argv: list[str] | None = None) -> int:
             print("Starting ingestion mode...", file=sys.stderr, flush=True)
             _setup_job_logger("ingest", args.job_log_dir)
             ingestion_options = _ingestion_args(args)
+            configured_max_pages = config_max_pages = _load_ingestion_config().get("max_pages_whole_doc", 50)
+            if getattr(args, "max_pages_whole_doc", None) is not None or config_max_pages != 50:
+                ingestion_options["max_pages_whole_doc"] = (
+                    args.max_pages_whole_doc
+                    if getattr(args, "max_pages_whole_doc", None) is not None
+                    else configured_max_pages
+                )
             run_ingestion(
                 args.data_dir,
                 args.md_dir,
@@ -539,9 +558,9 @@ def main(argv: list[str] | None = None) -> int:
             from src.file_lock import acquire_index_lock
 
             with acquire_index_lock(args.db_dir):
-                run_indexing(
-                    args.md_dir,
-                    args.db_dir,
+                index_kwargs = dict(
+                    md_dir=args.md_dir,
+                    db_dir=args.db_dir,
                     progress_enabled=not args.no_progress,
                     embedding_model=args.embedding_model or "nomic-embed-text",
                     embedding_batch_size=args.embedding_batch_size or 8,
@@ -552,6 +571,10 @@ def main(argv: list[str] | None = None) -> int:
                     chunk_target_tokens=args.chunk_target_tokens,
                     chunk_overlap_tokens=args.chunk_overlap_tokens,
                 )
+                source_hashes = [value.strip() for value in args.source_hashes.split(",") if value.strip()]
+                if source_hashes:
+                    index_kwargs["source_hashes"] = source_hashes
+                run_indexing(**index_kwargs)
             return 0
 
         if args.mode == "query":

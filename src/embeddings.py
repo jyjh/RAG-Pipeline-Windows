@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import hashlib
@@ -168,14 +168,36 @@ class EmbeddingEngine:
         )
         self._cache: OrderedDict[tuple[int, int, str], Any] = OrderedDict()
 
+        from src.config import load_config
+        self.native_embeddings = load_config().models.native_embeddings
+        self._native_model = None
+
         if model_name == "nomic-ai/nomic-embed-text-v1.5":
             model_name = "nomic-embed-text"
             self.model_name = model_name
-        logger.info("Using Ollama embedding model: %s", model_name)
-        _status(
-            f"Using Ollama embedding model: {model_name} "
-            f"(batch_size={self.ollama_batch_size}, timeout={self.ollama_timeout:g}s)"
-        )
+
+        if self.native_embeddings:
+            logger.info("Using Native embedding model (SentenceTransformers): %s", model_name)
+            _status(f"Using Native embedding model (SentenceTransformers): {model_name}")
+            self._init_native_model()
+        else:
+            logger.info("Using Ollama embedding model: %s", model_name)
+            _status(
+                f"Using Ollama embedding model: {model_name} "
+                f"(batch_size={self.ollama_batch_size}, timeout={self.ollama_timeout:g}s)"
+            )
+
+    def _init_native_model(self):
+        try:
+            from sentence_transformers import SentenceTransformer
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._native_model = SentenceTransformer(self.model_name, trust_remote_code=True, device=device)
+            _status(f"Native model loaded on device: {device}")
+        except Exception as exc:
+            _status(f"Failed to load native embedding model: {exc}. Falling back to Ollama.")
+            logger.error("Native embedding load failed: %s", exc)
+            self.native_embeddings = False
 
     def _cache_key(self, text: str, truncate_dim: int, prefix: str) -> tuple[int, int, str]:
         digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
@@ -212,10 +234,11 @@ class EmbeddingEngine:
                 to_compute_texts.append(text)
 
         if to_compute_texts:
-            truncated = self._ollama_embeddings(
-                [f"{prefix}{text}" for text in to_compute_texts],
-                truncate_dim,
-            )
+            prefixed = [f"{prefix}{text}" for text in to_compute_texts]
+            if self.native_embeddings and self._native_model is not None:
+                truncated = self._native_embeddings(prefixed, truncate_dim)
+            else:
+                truncated = self._ollama_embeddings(prefixed, truncate_dim)
 
             for j, idx in enumerate(to_compute_indices):
                 key = self._cache_key(texts[idx], truncate_dim, prefix)
@@ -227,6 +250,26 @@ class EmbeddingEngine:
                 results[idx] = truncated[j]
 
         return np.array(results)
+
+    def _native_embeddings(self, texts: list[str], truncate_dim: int):
+        import numpy as np
+        if not texts:
+            return np.empty((0, truncate_dim), dtype=np.float32)
+        
+        vectors = self._native_model.encode(texts, batch_size=self.ollama_batch_size, convert_to_numpy=True)
+        if vectors.ndim == 1:
+            vectors = vectors.reshape(1, -1)
+            
+        if vectors.shape[1] < truncate_dim:
+            padded = np.zeros((vectors.shape[0], truncate_dim), dtype=np.float32)
+            padded[:, : vectors.shape[1]] = vectors
+            vectors = padded
+        else:
+            vectors = vectors[:, :truncate_dim].copy()
+
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1, norms)
+        return vectors / norms
 
     def _ollama_embeddings(self, texts: list[str], truncate_dim: int):
         import numpy as np
