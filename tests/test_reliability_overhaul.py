@@ -298,7 +298,7 @@ def test_embedding_retry_recovers_after_transient_failure(monkeypatch):
     engine = EmbeddingEngine(model_name="nomic-embed-text", ollama_retries=3)
     calls = {"n": 0}
 
-    def flaky_api(_path, _payload):
+    def flaky_api(_path, _payload, **_kwargs):
         calls["n"] += 1
         if calls["n"] < 3:
             raise RuntimeError("transient timeout")
@@ -320,7 +320,7 @@ def test_embedding_retry_exhausts_and_raises(monkeypatch):
     )
     calls = {"n": 0}
 
-    def always_fails(_path, _payload):
+    def always_fails(_path, _payload, **_kwargs):
         calls["n"] += 1
         raise RuntimeError("persistent failure")
 

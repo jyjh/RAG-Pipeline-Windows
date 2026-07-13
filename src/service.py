@@ -1,3 +1,9 @@
+"""DEPRECATED: legacy SQLite-backed v1 pipeline module.
+
+Not imported by the active web app or the LanceDB-based ingestion/indexing
+pipeline. Retained for legacy test coverage. See src/store.py for the full
+deprecation note. New work belongs in the LanceDB-backed modules.
+"""
 from __future__ import annotations
 
 from pathlib import Path

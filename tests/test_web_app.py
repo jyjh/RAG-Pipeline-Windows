@@ -563,7 +563,11 @@ def test_update_index_record_reembeds_and_saves(monkeypatch, lancedb_tmp):
     manifest = json.loads(db_dir.joinpath(local_rag.INDEX_MANIFEST_FILENAME).read_text(encoding="utf-8"))
     document = manifest["documents"]["processed_docs/doc.md"]
     assert manifest["total_records"] == 2
-    assert document["content_hashes"]["doc.md:0"] == local_rag.index_record_content_hash(record)
+    # content_hashes now live in a per-source sidecar (sharded out of the
+    # monolithic manifest to keep it small at scale), not in the document entry.
+    assert "content_hashes" not in document, "content_hashes should be in sidecar, not manifest"
+    hashes = local_rag.load_content_hash_sidecar(db_dir, "processed_docs/doc.md")
+    assert hashes["doc.md:0"] == local_rag.index_record_content_hash(record)
     assert load_index_overrides(db_dir)["edits"]["doc.md:0"]["content"] == "edited context"
     edited_rows = {
         item["id"]: item
@@ -839,6 +843,7 @@ def test_server_config_defaults_to_minute_when_missing(workspace_tmp):
         "update_branch": "main",
         "disk_safety_factor": web_app.DEFAULT_DISK_SAFETY_FACTOR,
         "job_workers": web_app.DEFAULT_JOB_WORKERS,
+        "api_token": "",
     }
 
 
@@ -872,6 +877,7 @@ def test_server_config_reads_polling_intervals(workspace_tmp):
         "update_branch": "web-ui",
         "disk_safety_factor": web_app.DEFAULT_DISK_SAFETY_FACTOR,
         "job_workers": web_app.DEFAULT_JOB_WORKERS,
+        "api_token": "",
     }
 
 
@@ -3899,3 +3905,106 @@ def test_reingest_endpoint_blocks_during_indexing(monkeypatch):
     monkeypatch.setattr(web_app, "job_queue", ActiveIndexingQueue())
     response = TestClient(web_app.app).post("/api/reingest")
     assert response.status_code == 409
+
+
+def test_api_token_middleware_blocks_mutation_without_token(monkeypatch):
+    """When api_token is set, mutating requests without it are rejected (401)."""
+    monkeypatch.setattr(web_app, "_API_TOKEN", "secret-token-123")
+
+    # A POST without the token -> 401.
+    response = TestClient(web_app.app).post("/api/reindex")
+    assert response.status_code == 401
+    assert "token" in response.json()["detail"].lower()
+
+
+def test_api_token_middleware_allows_mutation_with_correct_token(monkeypatch):
+    """Mutating requests with the correct X-API-Token header succeed (past auth)."""
+    monkeypatch.setattr(web_app, "_API_TOKEN", "secret-token-123")
+
+    # Stub the job queue so the reindex endpoint reaches a real handler state.
+    class StubQueue:
+        def __init__(self):
+            self.enqueued = None
+
+        def enqueue_reindex(self, **kwargs):
+            class Job:
+                id = "job-reindex-1"
+
+                def to_dict(self):
+                    return {"id": self.id, "kind": "reindex", "status": "queued"}
+
+            self.enqueued = kwargs
+            return Job()
+
+        def summary(self):
+            return {"indexing_job_ids": []}
+
+    monkeypatch.setattr(web_app, "job_queue", StubQueue())
+    response = TestClient(web_app.app).post(
+        "/api/reindex",
+        headers={"X-API-Token": "secret-token-123"},
+    )
+    # The auth gate passed -- the request is NOT 401. (The exact downstream
+    # status depends on handler internals; the contract under test is "auth
+    # accepted with the correct token".)
+    assert response.status_code != 401, "correct token should pass auth"
+
+
+def test_api_token_middleware_allows_get_without_token(monkeypatch):
+    """GET requests (health, listings) must work even when a token is set."""
+    monkeypatch.setattr(web_app, "_API_TOKEN", "secret-token-123")
+
+    response = TestClient(web_app.app).get("/api/health")
+    assert response.status_code == 200
+
+
+def test_api_token_middleware_disabled_when_empty(monkeypatch):
+    """When api_token is empty (default), all requests pass through."""
+    monkeypatch.setattr(web_app, "_API_TOKEN", "")
+
+    response = TestClient(web_app.app).get("/api/health")
+    assert response.status_code == 200
+
+
+def test_metrics_endpoint_returns_operational_snapshot(monkeypatch):
+    """/api/metrics exposes record count, index size, document count, queue state."""
+    # Stub the store so we don't need a real LanceDB index.
+    class StubStore:
+        def exists(self):
+            return True
+
+        def count(self):
+            return 12345
+
+        def _on_disk_bytes(self):
+            return 1024 * 1024 * 42
+
+        def table_version_hint_path(self):
+            return Path("/tmp/nonexistent_hint")
+
+    monkeypatch.setattr(web_app, "_index_store", lambda *a, **k: StubStore())
+
+    class StubQueue:
+        def summary(self):
+            return {"active_query_count": 2, "queued_count": 1, "running_job_ids": [], "indexing_job_ids": [], "active_job_count": 3, "job_count": 5}
+
+    monkeypatch.setattr(web_app, "job_queue", StubQueue())
+    monkeypatch.setattr(web_app, "_load_index_manifest", lambda *a, **k: {
+        "documents": {"hash-a": {}, "hash-b": {}, "hash-c": {}},
+        "embedded_records": 9000,
+        "reused_records": 3345,
+    })
+    monkeypatch.setattr(web_app, "_ollama_status_snapshot", lambda: {"reachable": True})
+
+    response = TestClient(web_app.app).get("/api/metrics")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["index_exists"] is True
+    assert body["record_count"] == 12345
+    assert body["index_bytes"] == 1024 * 1024 * 42
+    assert body["document_count"] == 3
+    assert body["embedded_records"] == 9000
+    assert body["reused_records"] == 3345
+    assert body["queue"]["active_query_count"] == 2
+    assert body["ollama"]["reachable"] is True

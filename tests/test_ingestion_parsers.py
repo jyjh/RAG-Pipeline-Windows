@@ -724,3 +724,196 @@ def test_run_ingestion_removes_stale_assets_before_processing(monkeypatch, safe_
     assert calls["asset_exists_during_process"] is False
     assert store.load_manifest()["assets"] == {}
     assert (output_dir / "source.md").read_text(encoding="utf-8") == "fresh markdown"
+
+
+def test_scanned_page_parser_windows_bound_memory():
+    """Pages are described in streaming windows so memory stays bounded.
+
+    With max_pages_per_window=4 and 10 image-bearing pages, the describer must
+    be invoked in batches of at most 4 images (3 windows: 4, 4, 2). Previously
+    the parser gathered every page image before describing any, which OOMs on a
+    large scanned book; this test pins the windowed behavior.
+    """
+
+    class WindowSpyDescriber:
+        def __init__(self):
+            self.batch_sizes: list[int] = []
+
+        def describe_many(self, images, *, prompt=None, max_workers=4):
+            self.batch_sizes.append(len(images))
+            return [f"desc-{i}" for i in range(len(images))]
+
+    spy = WindowSpyDescriber()
+    # 10 pages, each with exactly 1 image.
+    images_by_page = {i: [FakeImage()] for i in range(1, 11)}
+    parser = ScannedPageImageParser(
+        vision_describer=spy,
+        vision_enabled=True,
+        reader_factory=reader_factory([""] * 10, images_by_page=images_by_page),
+        max_pages_per_window=4,
+    )
+
+    output = parser.parse("big-scan.pdf")
+
+    # Each describe_many batch must respect the window cap.
+    assert spy.batch_sizes == [4, 4, 2], f"unexpected windowing: {spy.batch_sizes}"
+    # All 10 pages must be represented in the output.
+    for page_no in range(1, 11):
+        assert f"## Page {page_no}" in output
+
+
+def test_scanned_page_parser_output_matches_non_windowed():
+    """Windowing must not change the output -- only memory use.
+
+    The page descriptions and ordering must be identical whether the window
+    holds every page or just a few. We verify by comparing the output of a
+    small-window parse against a large-window parse of the same pages.
+    """
+
+    class DistinguishingImage:
+        """A FakeImage variant whose PNG bytes encode its page number."""
+
+        is_displayed = True
+
+        def __init__(self, tag):
+            self.image = self
+            self._tag = tag
+
+        def save(self, handle, format):
+            handle.write(f"png-{self._tag}".encode())
+
+    class Describer:
+        def describe_many(self, images, *, prompt=None, max_workers=4):
+            # Description derives from the image bytes, so it's stable across
+            # window sizes (independent of batch index).
+            out = []
+            for img in images:
+                raw = img.decode("utf-8", errors="replace") if isinstance(img, bytes) else str(img)
+                out.append(f"desc-{raw}")
+            return out
+
+    images_by_page = {i: [DistinguishingImage(f"p{i}")] for i in range(1, 7)}
+
+    def make_parser(window):
+        return ScannedPageImageParser(
+            vision_describer=Describer(),
+            vision_enabled=True,
+            reader_factory=reader_factory([""] * 6, images_by_page=images_by_page),
+            max_pages_per_window=window,
+        )
+
+    small_window = make_parser(2).parse("doc.pdf")
+    large_window = make_parser(100).parse("doc.pdf")
+
+    assert small_window == large_window
+    # Sanity: every page appears and carries its own tag-derived description.
+    for i in range(1, 7):
+        assert f"## Page {i}" in small_window
+
+
+def test_scanned_page_parser_single_huge_image_page_flushes():
+    """A page whose image count would exceed the window still flushes correctly.
+
+    Each FakePage here contributes 3 images but the window is 1 page, so each
+    flush contains exactly one page's images (3) -- the per-image cap is on
+    pages, not images, so a multi-image page is described as one batch.
+    """
+
+    class Spy:
+        def __init__(self):
+            self.batches = []
+
+        def describe_many(self, images, *, prompt=None, max_workers=4):
+            self.batches.append(len(images))
+            return [f"d{i}" for i in range(len(images))]
+
+    spy = Spy()
+    images_by_page = {1: [FakeImage(), FakeImage(), FakeImage()], 2: [FakeImage(), FakeImage()]}
+    parser = ScannedPageImageParser(
+        vision_describer=spy,
+        vision_enabled=True,
+        reader_factory=reader_factory(["", ""], images_by_page=images_by_page),
+        max_pages_per_window=1,
+    )
+
+    output = parser.parse("multi.pdf")
+
+    # Two flushes: page 1 (3 images), then page 2 (2 images).
+    assert spy.batches == [3, 2]
+    assert "## Page 1" in output
+    assert "## Page 2" in output
+
+
+def test_docling_parser_forces_per_page_above_threshold():
+    """A large scanned PDF uses parse_by_page even with progress disabled.
+
+    The whole-document path (self.convert(...).document) holds the full Docling
+    model in memory and OOMs on multi-thousand-page scanned books. The web app
+    runs ingestion with --no_progress, so max_pages_whole_doc is the guard that
+    routes large PDFs to the memory-safe page-at-a-time path.
+    """
+    # Spy on which code path parse() took. We patch parse_by_page and convert
+    # (the two branches) so we observe the routing decision without depending on
+    # real pypdf page extraction internals.
+    routing: list[str] = []
+
+    sixty_pages = [""] * 60
+    parser = DoclingPdfParser(
+        vision_describer=DisabledVisionDescriber(),
+        converter=FakeConverter(FakeDoc([])),
+        progress_enabled=False,
+        reader_factory=reader_factory(sixty_pages),
+        max_pages_whole_doc=50,
+    )
+    # Override the two branches to record which one fired.
+    parser.parse_by_page = lambda file_path: routing.append("per_page") or ""
+    parser.convert = lambda file_path: routing.append("whole_doc") or SimpleNamespace(
+        document=FakeDoc([])
+    )
+
+    parser.parse("big.pdf")
+
+    # Above the threshold -> per-page path taken, whole-document path avoided.
+    assert routing == ["per_page"], f"expected per-page routing, got: {routing}"
+
+
+def test_docling_parser_small_pdf_uses_whole_doc_path():
+    """Below the threshold the whole-document fast path is preserved."""
+    routing: list[str] = []
+
+    parser = DoclingPdfParser(
+        vision_describer=DisabledVisionDescriber(),
+        converter=FakeConverter(FakeDoc([])),
+        progress_enabled=False,
+        reader_factory=reader_factory([""] * 10),
+        max_pages_whole_doc=50,
+    )
+    parser.parse_by_page = lambda file_path: routing.append("per_page") or ""
+    parser.convert = lambda file_path: routing.append("whole_doc") or SimpleNamespace(
+        document=FakeDoc([])
+    )
+
+    parser.parse("small.pdf")
+
+    assert routing == ["whole_doc"], f"expected whole-doc routing, got: {routing}"
+
+
+def test_docling_parser_threshold_zero_never_forces():
+    """max_pages_whole_doc=0 preserves the original behavior (never force)."""
+    routing: list[str] = []
+
+    parser = DoclingPdfParser(
+        vision_describer=DisabledVisionDescriber(),
+        converter=FakeConverter(FakeDoc([])),
+        progress_enabled=False,
+        reader_factory=reader_factory([""] * 5000),
+        max_pages_whole_doc=0,
+    )
+    parser.parse_by_page = lambda file_path: routing.append("per_page") or ""
+    parser.convert = lambda file_path: routing.append("whole_doc") or SimpleNamespace(
+        document=FakeDoc([])
+    )
+
+    parser.parse("huge.pdf")
+
+    assert routing == ["whole_doc"], f"expected whole-doc routing, got: {routing}"

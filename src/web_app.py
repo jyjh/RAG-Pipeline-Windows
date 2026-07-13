@@ -240,7 +240,12 @@ def _resolve_root_path(raw_path: Any, *, default: str | Path | None = None) -> P
 
 
 DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
-DEFAULT_EMBEDDING_BATCH_SIZE = 64
+# Texts per Ollama embedding request. Raised from 64 -> 128: nomic-embed-text
+# (~137M params) fits comfortably on a 20GB GPU, and a larger batch amortizes
+# the per-request overhead that dominates cold indexing at 100GB scale. The
+# Pydantic request models cap this at 256 (ge=1, le=256); override via
+# OLLAMA_EMBED_BATCH_SIZE env or --embedding_batch_size CLI flag.
+DEFAULT_EMBEDDING_BATCH_SIZE = 128
 DEFAULT_EMBEDDING_TIMEOUT = 30.0
 DEFAULT_TEMPERATURE = 0.3
 DEFAULT_MAX_K = 40
@@ -330,7 +335,15 @@ INDEX_LOCK = threading.RLock()
 TRUST_LOCK = threading.RLock()
 LANCEDB_BACKUP_DIRNAME = "backups"
 LANCEDB_BACKUP_KEEP = 5
-INDEX_BACKUP_COMPONENTS = (LANCEDB_DIRNAME, INDEX_MANIFEST_FILENAME, "index_overrides.json")
+INDEX_BACKUP_COMPONENTS = (
+    LANCEDB_DIRNAME,
+    INDEX_MANIFEST_FILENAME,
+    "index_overrides.json",
+    # Per-source content-hash sidecars (db/hashes/<source>.json). Regenerable
+    # from LanceDB records, but included in backups so a restore doesn't lose
+    # them. Handled as a directory by the backup copytree path.
+    "hashes",
+)
 TRUST_REVIEW_STATUSES = {"unreviewed", "approved", "rejected", "stale"}
 TRUST_SOURCE_TYPES = {
     "unknown",
@@ -515,6 +528,7 @@ def _load_server_config(config_path: Path | None = None) -> dict[str, Any]:
             server_config.get("job_workers"),
             DEFAULT_JOB_WORKERS,
         ),
+        "api_token": str(server_config.get("api_token") or ""),
     }
 
 
@@ -585,6 +599,7 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
         "tesseract_data_path": str(ingestion.get("tesseract_data_path") or DEFAULT_TESSERACT_DATA_PATH),
         "tesseract_psm": _optional_int(ingestion.get("tesseract_psm"), DEFAULT_TESSERACT_PSM),
         "ingestion_workers": _positive_int(ingestion.get("ingestion_workers"), 1),
+        "max_pages_whole_doc": max(0, int(ingestion.get("max_pages_whole_doc", 50))),
     }
 
 
@@ -836,9 +851,11 @@ def _publish_staged_index(staged_db_dir: str | Path, live_db_dir: str | Path) ->
     staged_lancedb = lancedb_path(staged_db)
     staged_manifest = staged_db / INDEX_MANIFEST_FILENAME
     staged_overrides = index_overrides_path(staged_db)
+    staged_hashes = staged_db / "hashes"
     live_lancedb = lancedb_path(live_db)
     live_manifest = live_db / INDEX_MANIFEST_FILENAME
     live_overrides = index_overrides_path(live_db)
+    live_hashes = live_db / "hashes"
 
     if not staged_lancedb.exists():
         raise RuntimeError(f"Indexing did not create a LanceDB directory at {staged_lancedb}")
@@ -858,6 +875,7 @@ def _publish_staged_index(staged_db_dir: str | Path, live_db_dir: str | Path) ->
         backup_lancedb = backup_dir / LANCEDB_DIRNAME
         backup_manifest = backup_dir / INDEX_MANIFEST_FILENAME
         backup_overrides = backup_dir / index_overrides_path(live_db).name
+        backup_hashes = backup_dir / "hashes"
 
         try:
             if live_lancedb.exists():
@@ -866,22 +884,31 @@ def _publish_staged_index(staged_db_dir: str | Path, live_db_dir: str | Path) ->
                 shutil.move(str(live_manifest), str(backup_manifest))
             if live_overrides.exists():
                 shutil.move(str(live_overrides), str(backup_overrides))
+            if live_hashes.exists():
+                shutil.move(str(live_hashes), str(backup_hashes))
             shutil.move(str(staged_lancedb), str(live_lancedb))
             shutil.move(str(staged_manifest), str(live_manifest))
             if staged_overrides.exists():
                 shutil.move(str(staged_overrides), str(live_overrides))
             elif backup_overrides.exists():
                 shutil.move(str(backup_overrides), str(live_overrides))
+            if staged_hashes.exists():
+                shutil.move(str(staged_hashes), str(live_hashes))
+            elif backup_hashes.exists():
+                shutil.move(str(backup_hashes), str(live_hashes))
         except Exception:
             _remove_path(live_lancedb)
             _remove_path(live_manifest)
             _remove_path(live_overrides)
+            _remove_path(live_hashes)
             if backup_lancedb.exists():
                 shutil.move(str(backup_lancedb), str(live_lancedb))
             if backup_manifest.exists():
                 shutil.move(str(backup_manifest), str(live_manifest))
             if backup_overrides.exists():
                 shutil.move(str(backup_overrides), str(live_overrides))
+            if backup_hashes.exists():
+                shutil.move(str(backup_hashes), str(live_hashes))
             raise
         finally:
             shutil.rmtree(backup_dir, ignore_errors=True)
@@ -897,7 +924,7 @@ def index_backup_root(db_dir: str | Path) -> Path:
 def _index_backup_component_paths(db_dir: str | Path) -> list[Path]:
     base = Path(db_dir)
     overrides = index_overrides_path(base)
-    return [lancedb_path(base), base / INDEX_MANIFEST_FILENAME, overrides]
+    return [lancedb_path(base), base / INDEX_MANIFEST_FILENAME, overrides, base / "hashes"]
 
 
 def _backup_created_at_from_name(name: str) -> str:
@@ -3291,6 +3318,40 @@ app = FastAPI(title="Local FSAE RAG Pipeline", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 
+# API-token auth middleware. When [server] api_token is set (non-empty), all
+# state-changing requests (POST/PUT/DELETE/PATCH) to /api/* must carry it via
+# the ``X-API-Token`` header or ``?token=`` query param. GET requests and the
+# root/static paths stay open so the UI loads and health/poll endpoints work.
+# When api_token is empty (the default), this is a no-op -- zero behavior change
+# for the common single-user / Tailscale-only deployment.
+_API_TOKEN = str(SERVER_CONFIG.get("api_token") or "").strip()
+_MUTATING_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
+
+
+@app.middleware("http")
+async def _enforce_api_token(request: Request, call_next):
+    # Read the token dynamically (not via closure) so tests can patch it.
+    token = (globals().get("_API_TOKEN") or "").strip()
+    if not token:
+        return await call_next(request)
+    # Only /api/* mutating routes are gated; static assets, the root page, and
+    # all GET reads (health, listings, chat stream via POST is below) are open.
+    path = request.url.path
+    if not path.startswith("/api/"):
+        return await call_next(request)
+    # Chat streaming is POST but must stay usable by the browser UI which cannot
+    # easily inject headers into an SSE/fetch stream without code changes. Treat
+    # /api/chat/stream as read-only (it only reads the index, never mutates).
+    if request.method in _MUTATING_METHODS and path not in {"/api/chat/stream", "/api/render"}:
+        supplied = request.headers.get("X-API-Token") or request.query_params.get("token") or ""
+        if supplied != token:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing API token."},
+            )
+    return await call_next(request)
+
+
 @app.get("/")
 def root():
     index_path = WEB_DIR / "index.html"
@@ -3339,6 +3400,70 @@ def health(request: Request):
     }
     seed = _payload_signature(payload, _file_signature(_index_store().table_version_hint_path(), DB_DIR / INDEX_MANIFEST_FILENAME))
     return _conditional_json(request, payload, seed)
+
+
+@app.get("/api/metrics")
+def metrics(request: Request):
+    """Lightweight operational metrics for monitoring a multi-day ingest.
+
+    Cheap to gather: record count, index on-disk size, document/source count
+    from the manifest, the queue summary, and (if available) embedding-cache
+    hit stats. Read-only; safe to poll alongside /api/health. Intended for
+    ad-hoc dashboards during a 100GB-scale ingestion where throughput, queue
+    depth, and index growth are the signals that matter.
+    """
+    store = _index_store()
+    index_exists = store.exists()
+    record_count = 0
+    index_bytes = 0
+    if index_exists:
+        try:
+            with INDEX_LOCK:
+                record_count = store.count()
+                index_bytes = store._on_disk_bytes()
+        except Exception:
+            record_count = 0
+            index_bytes = 0
+    # Document/source counts + embedded/reused tallies from the manifest.
+    document_count = 0
+    embedded_records = 0
+    reused_records = 0
+    try:
+        manifest = _load_index_manifest(DB_DIR)
+        documents = manifest.get("documents", {})
+        document_count = len(documents) if isinstance(documents, dict) else 0
+        embedded_records = int(manifest.get("embedded_records") or 0)
+        reused_records = int(manifest.get("reused_records") or 0)
+    except Exception:
+        pass
+    # Embedding cache stats: best-effort. The cache lives on the query engine's
+    # EmbeddingEngine, which is built on first chat and not held at module scope,
+    # so this is None until a chat has occurred. Kept as a hook so a future
+    # engine-singleton can populate it without changing the endpoint shape.
+    cache_stats: dict[str, Any] | None = None
+    payload = {
+        "ok": True,
+        "index_exists": index_exists,
+        "record_count": record_count,
+        "document_count": document_count,
+        "embedded_records": embedded_records,
+        "reused_records": reused_records,
+        "index_bytes": index_bytes,
+        "embedding_cache": cache_stats,
+        "queue": job_queue.summary(),
+        "ollama": _ollama_status_snapshot(),
+    }
+    return _etagged_json(request, payload, _file_signature(_index_store().table_version_hint_path()))
+
+
+def _ollama_status_snapshot() -> dict[str, Any]:
+    """Best-effort Ollama reachability snapshot for the metrics endpoint."""
+    try:
+        from src.local_rag import _ollama_server_healthy
+
+        return {"reachable": bool(_ollama_server_healthy())}
+    except Exception:
+        return {"reachable": None}
 
 
 @app.get("/api/update/status")

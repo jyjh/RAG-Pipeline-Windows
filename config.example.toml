@@ -34,6 +34,11 @@ progress_enabled = true
 # own copy of the Docling/OCR models, so this trades throughput for VRAM. 1 =
 # serial (safe default). Set to 2-4 on a GPU with headroom for a large corpus.
 ingestion_workers = 1
+# Above this page count, Docling parsing switches to a page-at-a-time path to
+# bound memory (the whole-document path materializes the full Docling model +
+# OCR state in RAM and OOMs on a multi-thousand-page scanned book). 0 = never
+# force (always use the whole-document path when progress is disabled).
+max_pages_whole_doc = 50
 
 [chunking]
 max_tokens = 900

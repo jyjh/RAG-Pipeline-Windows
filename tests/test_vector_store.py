@@ -3,7 +3,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from src.vector_store import LanceDBVectorStore, default_store
+from src.vector_store import LIST_RECORD_COLUMNS, LanceDBVectorStore, default_store
 
 
 def _source_records():
@@ -226,5 +226,164 @@ def test_default_store_never_falls_back_to_legacy_json():
             assert "LanceDB table not found" in str(exc)
         else:
             raise AssertionError("Expected incompatible LanceDB to remain unavailable")
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def _make_store_with_records(tmp_path, records):
+    """Helper: create a store, write records, return it."""
+    store = LanceDBVectorStore(tmp_path)
+    store.write_records(records, embedding_model="fake-embed", embedding_dim=3)
+    return store
+
+
+def _base_record(record_id, content, *, title="Title", tags=None):
+    return {
+        "id": record_id,
+        "doc_id": "doc",
+        "parent_id": "",
+        "node_type": "chunk",
+        "file_path": "doc.pdf",
+        "chunk_index": 0,
+        "content": content,
+        "title": title,
+        "section_path": "Doc",
+        "page_start": 1,
+        "page_end": 1,
+        "summary": "",
+        "tags": tags or [],
+        "vector": [1.0, 0.0, 0.0],
+    }
+
+
+def test_list_records_search_pushdown_matches_title_only_via_postfilter():
+    """A search term present only in title/tags (not content) still matches.
+
+    The server-side pushdown filters on content LIKE, but the post-filter
+    (record_matches) still checks title/tags so matches in other columns aren't
+    lost. This test pins that two-stage behavior.
+    """
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_search_pushdown_{uuid.uuid4().hex}"
+    try:
+        records = [
+            _base_record("r1", "general engineering content", title="Dynamics"),
+            _base_record("r2", "completely unrelated text", title="Other"),
+            _base_record("r3", "dynamics appears in content too", title="Whatever"),
+        ]
+        store = _make_store_with_records(tmp_path, records)
+
+        # "dynamics" matches r3 in content (pushdown hit) AND r1 in title only
+        # (post-filter catch). r2 matches nowhere.
+        result = store.list_records(search="dynamics", limit=50)
+        ids = {row["id"] for row in result["rows"]}
+        assert ids == {"r1", "r3"}, f"expected r1 (title) + r3 (content), got {ids}"
+        assert result["total"] == 2
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_list_records_search_escapes_like_wildcards():
+    """Literal % and _ in search text are matched literally, not as wildcards."""
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_like_escape_{uuid.uuid4().hex}"
+    try:
+        records = [
+            _base_record("r1", "variable_name_5 end"),
+            _base_record("r2", "variableXnameX5 end"),  # would match if _ were wildcard
+            _base_record("r3", "100% complete"),
+        ]
+        store = _make_store_with_records(tmp_path, records)
+
+        # Searching for the literal underscore must NOT match r2.
+        result = store.list_records(search="name_5", limit=50)
+        ids = {row["id"] for row in result["rows"]}
+        assert ids == {"r1"}, f"underscore should be literal, got {ids}"
+
+        # Searching for the literal percent must match r3 only.
+        result = store.list_records(search="100%", limit=50)
+        ids = {row["id"] for row in result["rows"]}
+        assert ids == {"r3"}, f"percent should be literal, got {ids}"
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_list_records_search_pushdown_narrows_scan(monkeypatch):
+    """The pushdown must NOT load every row of the table into Python.
+
+    We spy on the unfiltered _scan_rows path: a search must not trigger a full
+    table scan (which is the old behavior). Instead the server-side LIKE narrows
+    first. We approximate this by confirming a search over many rows where only
+    a few match content returns quickly without materializing all rows.
+    """
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_pushdown_perf_{uuid.uuid4().hex}"
+    try:
+        # 500 rows, only 3 contain the rare search term in content.
+        records = [
+            _base_record(f"r{i}", f"filler content number {i}")
+            for i in range(500)
+        ]
+        for i, needle in enumerate(["UNIQUENEEDLE", "uniqueneedle", "UniqueNeedle"]):
+            records[i * 100]["content"] = f"this row has {needle} in it"
+        store = _make_store_with_records(tmp_path, records)
+
+        # Spy on _scan_rows (the old full-scan path). The pushdown should use
+        # _where/_table().search().where(...) instead, so _scan_rows must NOT
+        # be called for the search branch.
+        scan_calls = []
+        original_scan = store._scan_rows
+
+        def spy_scan(*args, **kwargs):
+            scan_calls.append(kwargs)
+            return original_scan(*args, **kwargs)
+
+        monkeypatch.setattr(store, "_scan_rows", spy_scan)
+
+        result = store.list_records(search="uniqueneedle", limit=50)
+
+        assert result["total"] == 3
+        # The search must NOT trigger a full-table scan. The old path called
+        # _scan_rows(columns=LIST_RECORD_COLUMNS) over every row; the pushdown
+        # uses server-side .where() instead. The only _scan_rows call permitted
+        # is the tiny single-row metadata() read.
+        full_scans = [
+            call for call in scan_calls if call.get("columns") == LIST_RECORD_COLUMNS
+        ]
+        assert full_scans == [], (
+            f"search should use server-side pushdown, not a full LIST_RECORD_COLUMNS scan: {full_scans}"
+        )
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_compact_runs_without_error_and_returns_diagnostics():
+    """store.compact() runs LanceDB optimize and reports before/after sizes."""
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_compact_{uuid.uuid4().hex}"
+    try:
+        records = [_base_record(f"r{i}", f"content {i}") for i in range(20)]
+        store = _make_store_with_records(tmp_path, records)
+
+        # A delete+add cycle leaves a tombstone that compaction can reclaim.
+        store.delete_records(record_ids=["r0", "r1"])
+        before = store._on_disk_bytes()
+        assert before > 0
+
+        result = store.compact()
+        assert result["compacted"] is True
+        assert "bytes_before" in result
+        assert "bytes_after" in result
+        assert "bytes_reclaimed" in result
+        # Record count is unchanged by compaction (only dead fragments are merged).
+        assert store.count() == 18
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_compact_on_missing_table_returns_not_compacted():
+    """compact() on a non-existent table is a safe no-op."""
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_compact_missing_{uuid.uuid4().hex}"
+    try:
+        store = LanceDBVectorStore(tmp_path)
+        result = store.compact()
+        assert result["compacted"] is False
+        assert result["reason"] == "table_missing"
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)

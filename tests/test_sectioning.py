@@ -167,7 +167,7 @@ def test_section_records_index_enriched_markdown_when_source_pdf_has_no_text(mon
             source_pdf_path=pdf_path,
         )
 
-        def fake_sections_from_pdf(path):
+        def fake_sections_from_pdf(path, **kwargs):
             return (
                 [
                     SectionNode(
@@ -192,3 +192,104 @@ def test_section_records_index_enriched_markdown_when_source_pdf_has_no_text(mon
         assert {record["source_pdf_path"] for record in records} == {str(pdf_path)}
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_pages_sidecar_round_trip(tmp_path):
+    """write_pages_sidecar then read_pages_sidecar returns the normalized texts."""
+    from src.sectioning import (
+        normalize_page_text,
+        pages_sidecar_path,
+        read_pages_sidecar,
+        write_pages_sidecar,
+    )
+
+    md = tmp_path / "doc.md"
+    md.write_text("body", encoding="utf-8")
+    raw_pages = ["  Hello World  \n\n", "Page 2\n3\n", ""]
+    write_pages_sidecar(md, raw_pages)
+
+    # Sidecar lands next to the markdown with the expected suffix.
+    assert pages_sidecar_path(md) == tmp_path / "doc.pages.json"
+
+    loaded = read_pages_sidecar(md)
+    assert loaded is not None
+    assert loaded == [normalize_page_text(p) for p in raw_pages]
+    assert loaded[0] == "Hello World"
+
+
+def test_read_pages_sidecar_missing_returns_none(tmp_path):
+    from src.sectioning import read_pages_sidecar
+
+    md = tmp_path / "absent.md"
+    md.write_text("body", encoding="utf-8")
+    assert read_pages_sidecar(md) is None
+
+
+def test_read_pages_sidecar_wrong_version_returns_none(tmp_path):
+    import json
+
+    from src.sectioning import read_pages_sidecar
+
+    md = tmp_path / "doc.md"
+    md.write_text("body", encoding="utf-8")
+    (tmp_path / "doc.pages.json").write_text(
+        json.dumps({"version": 999, "pages": ["x"]}), encoding="utf-8"
+    )
+    assert read_pages_sidecar(md) is None
+
+
+def test_read_pages_sidecar_corrupt_returns_none(tmp_path):
+    from src.sectioning import read_pages_sidecar
+
+    md = tmp_path / "doc.md"
+    md.write_text("body", encoding="utf-8")
+    (tmp_path / "doc.pages.json").write_text("not json{", encoding="utf-8")
+    assert read_pages_sidecar(md) is None
+
+
+def test_build_section_records_uses_sidecar_and_skips_extract_text(tmp_path, monkeypatch):
+    """When a sidecar exists, build_section_records must not call pypdf extract_text."""
+    from src.sectioning import build_section_records, write_pages_sidecar
+
+    root = tmp_path
+    pdf_path = root / "data" / "doc.pdf"
+    pdf_path.parent.mkdir(parents=True)
+    pdf_path.write_bytes(b"%PDF-1.4")
+    md_path = root / "processed" / "doc.md"
+    md_path.parent.mkdir(parents=True)
+    md_path.write_text("## Page 1\n\nSome real body text here.", encoding="utf-8")
+    write_source_entry(
+        processed_dir=md_path.parent,
+        markdown_path=md_path,
+        source_hash="h-doc",
+        source_pdf_name="doc.pdf",
+        source_pdf_path=pdf_path,
+    )
+    # Write a sidecar with one page so sections_from_pdf's cached_pages branch is taken.
+    write_pages_sidecar(md_path, ["Some real body text here."])
+
+    # Spy on pypdf's extract_text -- it must NOT be called when the sidecar is used.
+    extract_calls: list[int] = []
+
+    class FakePage:
+        def extract_text(self):
+            extract_calls.append(1)
+            return "SHOULD NOT BE USED"
+
+    class FakeReader:
+        def __init__(self):
+            self.outline = []
+            self.pages = [FakePage()]
+
+    import src.sectioning as sectioning_mod
+
+    monkeypatch.setattr("pypdf.PdfReader", lambda *_a, **_k: FakeReader())
+
+    records = build_section_records(md_path, source_root=root)
+
+    # extract_text must never have run -- the sidecar supplied the page text.
+    assert extract_calls == [], "sidecar should have prevented extract_text() calls"
+    chunks = [r for r in records if r["node_type"] == "chunk"]
+    assert chunks, "expected at least one chunk record"
+    # The chunk content should come from the sidecar text, not from pypdf.
+    assert any("real body text" in r["content"] for r in chunks)

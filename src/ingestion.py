@@ -479,6 +479,7 @@ def _get_or_build_processor(options: dict[str, Any], *, progress_enabled: bool) 
             tesseract_data_path=options.get("tesseract_data_path", DEFAULT_TESSERACT_DATA_PATH),
             tesseract_psm=options.get("tesseract_psm", DEFAULT_TESSERACT_PSM),
             progress_enabled=progress_enabled,
+            max_pages_whole_doc=int(options.get("max_pages_whole_doc", 50)),
         )
         _PROCESSOR_CACHE[key] = processor
     return processor
@@ -531,6 +532,25 @@ def _ingest_one_pdf(
             )
         with output_path.open("w", encoding="utf-8") as handle:
             handle.write(md_content)
+        # Persist normalized per-page text next to the Markdown so the indexing
+        # pass can skip re-running pypdf's extract_text() over every page. This
+        # single extraction at ingest time replaces the per-file re-extraction
+        # that sections_from_pdf would otherwise do on every index/reindex cycle.
+        # Best-effort: a failure here is logged but never fails the ingest.
+        try:
+            from src.sectioning import write_pages_sidecar
+            from pypdf import PdfReader
+
+            reader = PdfReader(str(input_path))
+            sidecar_texts = []
+            for page in reader.pages:
+                try:
+                    sidecar_texts.append(page.extract_text() or "")
+                except Exception:  # noqa: BLE001 - per-page isolation
+                    sidecar_texts.append("")
+            write_pages_sidecar(output_path, sidecar_texts)
+        except Exception as exc:  # noqa: BLE001 - sidecar is an optimization
+            logger.warning("Could not write page-text sidecar for %s: %s", file_name, exc)
         write_source_entry(
             processed_dir=output_dir,
             markdown_path=output_path,

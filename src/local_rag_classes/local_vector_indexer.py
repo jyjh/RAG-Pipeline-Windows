@@ -383,6 +383,9 @@ class LocalVectorIndexer:
         )
 
         manifest = _empty_manifest(self.embedding_model, 768)
+        # Stash the working dir so _merge_records_into_manifest can write
+        # per-source content-hash sidecars next to the manifest.
+        manifest["_working_dir"] = str(self.working_dir)
         total_reused = 0
         total_embedded = 0
         written_records = 0

@@ -18,6 +18,7 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "record_matches_source",
     "sql_match_clauses",
     "sql_string",
+    "sql_like_escape",
 )
 
 
@@ -194,3 +195,16 @@ def sql_match_clauses(
 
 def sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def sql_like_escape(value: str) -> str:
+    """Escape a literal for use inside a SQL ``LIKE`` predicate.
+
+    Escapes single quotes (like :func:`sql_string`) and the LIKE wildcard
+    characters ``%`` and ``_`` so user-supplied search text is matched literally
+    rather than interpreted as a pattern. Callers wrap the result in a
+    ``'%...%'`` pattern and prefix with ``ESCAPE '\\'`` on the predicate.
+    """
+    escaped = value.replace("\\", "\\\\").replace("'", "''")
+    escaped = escaped.replace("%", "\\%").replace("_", "\\_")
+    return escaped

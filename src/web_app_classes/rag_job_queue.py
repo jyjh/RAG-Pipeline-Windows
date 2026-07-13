@@ -10,6 +10,18 @@ bind_module_namespace(
 )
 
 
+def _human_bytes(value: int | float | None) -> str:
+    """Format a byte count as a short human-readable string (e.g. '1.2 GB')."""
+    if value is None:
+        return "0 B"
+    value = float(value)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(value) < 1024.0 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} TB"
+
+
 class RagJobQueue:
     def __init__(
         self,
@@ -242,6 +254,26 @@ class RagJobQueue:
         )
         return self._enqueue(job, auto_start=auto_start)
 
+    def enqueue_compact(
+        self,
+        *,
+        job_id: str | None = None,
+        options: dict[str, Any] | None = None,
+        auto_start: bool = True,
+    ) -> QueueJob:
+        """Compact the live LanceDB table, reclaiming space from reindex cycles.
+
+        Re-indexing uses logical delete + add, so dead fragments accumulate and
+        the on-disk table grows (and scans slow) until a compaction runs. Safe
+        to run any time; recommended after a large reindex or periodically.
+        """
+        job = QueueJob(
+            id=job_id or uuid.uuid4().hex,
+            kind="compact",
+            options=options or {},
+        )
+        return self._enqueue(job, auto_start=auto_start)
+
     def _enqueue(self, job: QueueJob, *, auto_start: bool) -> QueueJob:
         with self._condition:
             self._jobs[job.id] = job
@@ -345,7 +377,15 @@ class RagJobQueue:
         transient state (log tail, status) is not, since the recovered job
         restarts fresh.
         """
-        if job.kind not in {"reindex", "reindex_source", "rebuild", "backup", "restore", "rebuild_vector_index"}:
+        if job.kind not in {
+            "reindex",
+            "reindex_source",
+            "rebuild",
+            "backup",
+            "restore",
+            "rebuild_vector_index",
+            "compact",
+        }:
             return
         try:
             self.ledger.record(
@@ -361,7 +401,15 @@ class RagJobQueue:
 
     def _ledger_remove(self, job: QueueJob) -> None:
         """Remove a job from the durable ledger once it reaches a terminal state."""
-        if job.kind not in {"reindex", "reindex_source", "rebuild", "backup", "restore", "rebuild_vector_index"}:
+        if job.kind not in {
+            "reindex",
+            "reindex_source",
+            "rebuild",
+            "backup",
+            "restore",
+            "rebuild_vector_index",
+            "compact",
+        }:
             return
         try:
             self.ledger.remove(job.id)
@@ -447,6 +495,25 @@ class RagJobQueue:
                         job,
                         f"ANN index rebuild skipped: {result.get('reason')} "
                         f"(rows={result.get('rows')}).",
+                    )
+                return
+
+            if job.kind == "compact":
+                self._wait_for_no_queries(job, "compacting")
+                self._raise_if_cancelled(job)
+                result = self._compact_index()
+                if result.get("compacted"):
+                    reclaimed = result.get("bytes_reclaimed", 0)
+                    self._append_job_log(
+                        job,
+                        f"Compacted LanceDB index: reclaimed {_human_bytes(reclaimed)} "
+                        f"({_human_bytes(result.get('bytes_before', 0))} -> "
+                        f"{_human_bytes(result.get('bytes_after', 0))}).",
+                    )
+                else:
+                    self._append_job_log(
+                        job,
+                        f"Compaction skipped: {result.get('reason')}.",
                     )
                 return
 
@@ -962,6 +1029,22 @@ class RagJobQueue:
                 # jobs can leave the old IVF partitions suboptimal).
                 store.drop_vector_index()
                 result = store.create_vector_index()
+                _source_module._invalidate_index_caches(self.db_dir)
+                return result
+
+    def _compact_index(self) -> dict[str, Any]:
+        """Compact the live LanceDB table in place.
+
+        Re-indexing uses logical delete (deletion vectors) + add, so repeated
+        reindex_source cycles leave dead fragments that grow the on-disk table
+        and slow scans. LanceDB's optimize() merges fragments and drops the
+        tombstones. Done under the cross-process index lock so concurrent
+        queries/edits don't race.
+        """
+        with INDEX_LOCK:
+            with _source_module.acquire_index_lock(self.db_dir):
+                store = _index_store(self.db_dir)
+                result = store.compact()
                 _source_module._invalidate_index_caches(self.db_dir)
                 return result
 

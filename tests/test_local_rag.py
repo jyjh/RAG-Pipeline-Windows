@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 import src.local_rag as local_rag
 from src.asset_store import ImageAssetStore, image_asset_marker
@@ -111,6 +112,104 @@ def test_write_index_manifest_summarizes_source_quality_counts():
         assert manifest["documents"]["hash-a"]["summary_count"] == 1
         assert manifest["documents"]["hash-a"]["page_start"] == 1
         assert manifest["documents"]["hash-a"]["page_end"] == 3
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_manifest_content_hashes_live_in_sidecar_not_manifest():
+    """content_hashes are sharded into per-source sidecars, not the monolithic manifest.
+
+    At scale (millions of chunks) embedding content_hashes in index_manifest.json
+    would make it hundreds of MB and re-serialize on every write. The refactor
+    moves them to db/hashes/<source>.json so the manifest stays small.
+    """
+    import json
+
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_sidecar_{uuid.uuid4().hex}"
+    try:
+        records = [
+            {
+                "id": "doc.md:0",
+                "node_type": "chunk",
+                "content": "alpha context",
+                "source_hash": "hash-a",
+                "source_pdf_name": "doc.pdf",
+                "source_pdf_path": "data/doc.pdf",
+                "page_start": 1,
+                "page_end": 1,
+            },
+            {
+                "id": "doc.md:1",
+                "node_type": "chunk",
+                "content": "beta context",
+                "source_hash": "hash-a",
+                "source_pdf_name": "doc.pdf",
+                "source_pdf_path": "data/doc.pdf",
+                "page_start": 2,
+                "page_end": 2,
+            },
+        ]
+
+        local_rag.write_index_manifest(
+            tmp_path, records, embedding_model="fake-embed", embedding_dim=3
+        )
+
+        # The manifest document entry must NOT contain content_hashes anymore.
+        manifest = json.loads(
+            tmp_path.joinpath(local_rag.INDEX_MANIFEST_FILENAME).read_text(encoding="utf-8")
+        )
+        assert "content_hashes" not in manifest["documents"]["hash-a"]
+
+        # The hashes must be in the per-source sidecar, readable via the helper.
+        hashes = local_rag.load_content_hash_sidecar(tmp_path, "hash-a")
+        assert set(hashes.keys()) == {"doc.md:0", "doc.md:1"}
+        assert hashes["doc.md:0"] == local_rag.index_record_content_hash(records[0])
+        assert hashes["doc.md:1"] == local_rag.index_record_content_hash(records[1])
+
+        # The sidecar directory exists with exactly one file for this source.
+        sidecar_dir = tmp_path / "hashes"
+        assert sidecar_dir.exists()
+        assert len(list(sidecar_dir.glob("*.json"))) == 1
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_manifest_sidecar_missing_returns_empty():
+    """load_content_hash_sidecar returns {} for an unknown source (no crash)."""
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_sidecar_missing_{uuid.uuid4().hex}"
+    try:
+        assert local_rag.load_content_hash_sidecar(tmp_path, "never-indexed") == {}
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_remove_source_from_manifest_cleans_up_sidecar():
+    """Removing a source also deletes its content-hash sidecar."""
+    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_sidecar_remove_{uuid.uuid4().hex}"
+    try:
+        records = [
+            {
+                "id": "doc.md:0",
+                "node_type": "chunk",
+                "content": "alpha",
+                "source_hash": "hash-a",
+                "source_pdf_name": "a.pdf",
+                "source_pdf_path": "data/a.pdf",
+                "page_start": 1,
+                "page_end": 1,
+            }
+        ]
+        manifest = local_rag.write_index_manifest(
+            tmp_path, records, embedding_model="fake-embed", embedding_dim=3
+        )
+        manifest["_working_dir"] = str(tmp_path)
+        sidecar = local_rag._content_hash_sidecar_path(tmp_path, "hash-a")
+        assert sidecar.exists()
+
+        local_rag._remove_source_from_manifest(manifest, "hash-a")
+
+        assert not sidecar.exists(), "sidecar should be removed with its source"
+        assert "hash-a" not in manifest["documents"]
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -1882,3 +1981,123 @@ def test_custom_prompt_used_verbatim_when_planner_disabled():
         assert "{web_instruction}" not in system_content
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_bm25_scores_rare_term_above_common_term():
+    """BM25 should score a rare (high-IDF) query term higher than a common one.
+
+    A document matching a rare term gets a higher BM25 score than one matching
+    a term that appears in every document -- the IDF weighting that Jaccard
+    overlap lacks. This is the core quality win of BM25 over set intersection.
+    """
+    query_terms = {"damping", "the"}  # 'the' is a stopword; use real terms
+    query_terms = {"rareword", "commonword"}
+    records = [
+        {"id": "r1", "content": "rareword appears here only once in the pool"},
+        {"id": "r2", "content": "commonword is in every document here"},
+        {"id": "r3", "content": "commonword also here and here"},
+    ]
+    scores = local_rag._bm25_scores(query_terms, records)
+    # r1 matches rareword (appears in 1/3 docs -> high IDF).
+    # r2/r3 match commonword (appears in 2/3 docs -> lower IDF).
+    assert scores["r1"] > scores["r2"]
+    assert scores["r1"] > scores["r3"]
+
+
+def test_bm25_empty_query_or_records_returns_empty():
+    assert local_rag._bm25_scores(set(), [{"id": "r1", "content": "x"}]) == {}
+    assert local_rag._bm25_scores({"x"}, []) == {}
+
+
+def test_rrf_fuse_combines_rankings():
+    """RRF blends two ranked lists; an id in both lists scores highest."""
+    vector_ranked = ["a", "b", "c"]
+    lexical_ranked = ["b", "a", "d"]
+    fused = local_rag._rrf_fuse(vector_ranked, lexical_ranked, rrf_k=60)
+
+    # 'a' is rank 1 vector + rank 2 lexical; 'b' is rank 2 vector + rank 1 lexical
+    # -- they should both beat 'c' (only in vector) and 'd' (only in lexical).
+    assert fused["a"] > fused["c"]
+    assert fused["b"] > fused["c"]
+    assert fused["a"] > fused["d"]
+    assert fused["b"] > fused["d"]
+    # a and b have symmetric ranks (1+2 vs 2+1) so their RRF scores are equal.
+    assert abs(fused["a"] - fused["b"]) < 1e-9
+
+
+def test_rrf_fuse_handles_disjoint_lists():
+    """Ids present in only one list still get a (single-list) contribution."""
+    fused = local_rag._rrf_fuse(["a"], ["b"], rrf_k=60)
+    assert fused["a"] == pytest.approx(1.0 / 61)
+    assert fused["b"] == pytest.approx(1.0 / 61)
+
+
+def test_retrieval_bm25_promotes_lexical_match_over_dense_only():
+    """A chunk with a strong lexical (BM25) match should not be buried by dense-only order.
+
+    This pins the BM25+RRF wiring: the fused ranking must reflect the lexical
+    signal, not just the vector score order. Two chunks have equal vector
+    scores, but one contains the query term and the other doesn't -- the
+    matching one must rank first.
+    """
+
+    class FakeEngine:
+        def get_mrl_embeddings(self, texts, truncate_dim=768, prefix=""):
+            return np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+    class FakeStore:
+        def exists(self):
+            return True
+
+        def count(self):
+            return 2
+
+        def search(self, vector, *, top_k):
+            # Both candidates return the SAME vector score so dense-only order
+            # would be arbitrary. The lexical match must break the tie.
+            return [
+                {
+                    "id": "no-match",
+                    "node_type": "chunk",
+                    "title": "General",
+                    "section_path": "General",
+                    "content": "unrelated filler content with no query terms",
+                    "score": 0.9,
+                    "tags": [],
+                },
+                {
+                    "id": "lexical-match",
+                    "node_type": "chunk",
+                    "title": "Viscous damping",
+                    "section_path": "Dynamics > Damping",
+                    "content": "viscous damping coefficient and the damped oscillator",
+                    "score": 0.9,
+                    "tags": [],
+                },
+            ]
+
+        def child_chunks(self, parent, *, limit=100):
+            return []
+
+    engine = local_rag.LocalQueryEngine.__new__(local_rag.LocalQueryEngine)
+    engine.engine = FakeEngine()
+    engine.store = FakeStore()
+    engine.record_count = 2
+    engine.retrieval_candidate_k = 10
+    engine.retrieval_min_score = 0.0
+    engine.retrieval_relative_cutoff = 0.0
+    engine.retrieval_lexical_weight = 0.5
+    engine.retrieval_rrf_k = 60
+    engine.context_window = 8192
+    engine.context_token_fraction = 0.6
+    engine.reliability_registry = None
+    engine._reliability_details = lambda record: {"key": "ungrouped", "weight": 1.0}
+
+    results = engine._retrieve("viscous damping")
+
+    assert results, "expected at least one result"
+    # The lexical match must rank first (its BM25 score promotes it above the
+    # equal-vector-score non-match).
+    assert results[0]["id"] == "lexical-match", (
+        f"BM25+RRF should promote the lexical match; got order {[r['id'] for r in results]}"
+    )

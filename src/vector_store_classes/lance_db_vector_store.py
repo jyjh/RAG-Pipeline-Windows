@@ -10,6 +10,15 @@ bind_module_namespace(
 )
 
 
+# Upper bound on how many server-side-filtered rows a list_records(search=...)
+# call will scan before applying the Python-side post-filter. The previous
+# implementation loaded EVERY row of the table into Python and filtered there,
+# which degraded badly at millions of chunks. The pushdown narrows server-side
+# via a content LIKE first; this cap protects against a wildly broad search
+# (e.g. a single common letter) returning an unbounded intermediate set.
+LIST_RECORDS_SEARCH_SCAN_CAP = 50_000
+
+
 class LanceDBVectorStore:
     def __init__(self, working_dir: str | Path):
         self.working_dir = Path(working_dir)
@@ -161,7 +170,11 @@ class LanceDBVectorStore:
         if not self.exists():
             raise FileNotFoundError(f"LanceDB table not found at {self.db_path / TABLE_NAME}")
         if search:
-            rows = [row for row in self._scan_rows(columns=LIST_RECORD_COLUMNS) if record_matches(row, search)]
+            # Push the dominant filter (content substring) into LanceDB so we
+            # don't load every row of a multi-million-chunk table into Python.
+            # The full record_matches() post-filter still runs on the narrowed
+            # candidate set to catch matches in title/tags/section_path/etc.
+            rows = self._search_records_pushdown(search)
             total = len(rows)
             page = rows[offset : offset + limit]
         else:
@@ -498,6 +511,48 @@ class LanceDBVectorStore:
         except Exception as exc:
             return {"dropped": False, "reason": str(exc)}
 
+    def compact(self, *, cleanup_older_than_seconds: float | None = None) -> dict[str, Any]:
+        """Compact the Lance table, reclaiming space from delete+add cycles.
+
+        Re-indexing uses logical delete (deletion vectors) then add, so over
+        many reindex rounds the ``data/*.lance`` fragments accumulate dead rows
+        and scan cost rises. LanceDB's ``optimize()`` merges fragments and drops
+        deletion tombstones. Safe to call any time -- it is the LanceDB-recommended
+        maintenance op. Returns before/after on-disk size for logging.
+        """
+        if not self.exists():
+            return {"compacted": False, "reason": "table_missing"}
+        before = self._on_disk_bytes()
+        table = self._table()
+        cleanup = None
+        if cleanup_older_than_seconds is not None and cleanup_older_than_seconds > 0:
+            from datetime import timedelta
+
+            cleanup = timedelta(seconds=float(cleanup_older_than_seconds))
+        try:
+            table.optimize(cleanup_older_than=cleanup)
+        except TypeError:
+            # Older LanceDB signatures may not accept kwargs; fall back to plain.
+            table.optimize()
+        self._invalidate_table()
+        after = self._on_disk_bytes()
+        return {
+            "compacted": True,
+            "bytes_before": before,
+            "bytes_after": after,
+            "bytes_reclaimed": max(0, before - after),
+        }
+
+    def _on_disk_bytes(self) -> int:
+        """Total bytes used by the Lance table directory on disk."""
+        try:
+            table_dir = self.db_path / f"{TABLE_NAME}.lance"
+            if not table_dir.exists():
+                return 0
+            return sum(f.stat().st_size for f in table_dir.rglob("*") if f.is_file())
+        except OSError:
+            return 0
+
     def _table(self):
         signature = self._read_table_signature()
         if self._table_obj is not None and self._table_signature == signature:
@@ -523,6 +578,58 @@ class LanceDBVectorStore:
         if limit is not None:
             query = query.limit(limit)
         return query.to_list()
+
+    def _search_records_pushdown(self, search: str) -> list[dict[str, Any]]:
+        """Server-side-filtered + Python-post-filtered record search.
+
+        The previous list_records(search=...) loaded every row of the table into
+        Python and filtered with record_matches -- O(N) in memory and time. This
+        pushes a multi-column ``lower(col) LIKE '%search%' OR ...`` predicate
+        into LanceDB to narrow the candidate set server-side, then applies the
+        full record_matches() post-filter (which also checks tags and the
+        remaining columns) on the narrowed set. The server-side predicate covers
+        the same text columns as record_matches (minus ``tags``, which is a list
+        and isn't LIKE-able -- the post-filter catches those) so the visible
+        result set is unchanged. The intermediate server-side result is capped
+        to LIST_RECORDS_SEARCH_SCAN_CAP rows so a very broad search can't
+        exhaust memory.
+        """
+        search = (search or "").strip()
+        if not search:
+            return []
+        escaped = sql_like_escape(search).lower()
+        # Push down every text column record_matches checks. tags is a list and
+        # isn't LIKE-able in LanceDB, so it's covered by the post-filter only.
+        # id/source_hash are excluded (rarely searched; including them would add
+        # clauses with no meaningful benefit).
+        columns = [
+            "content",
+            "doc_id",
+            "node_type",
+            "file_path",
+            "title",
+            "section_path",
+            "source_pdf_name",
+            "source_pdf_path",
+        ]
+        clause = f"lower({columns[0]}) LIKE '%{escaped}%' ESCAPE '\\'"
+        for col in columns[1:]:
+            clause += f" OR lower({col}) LIKE '%{escaped}%' ESCAPE '\\'"
+        try:
+            raw_rows = (
+                self._table()
+                .search()
+                .where(clause)
+                .select(LIST_RECORD_COLUMNS)
+                .limit(LIST_RECORDS_SEARCH_SCAN_CAP)
+                .to_list()
+            )
+        except Exception:
+            # If the LIKE/ESCAPE dialect is unsupported in a future LanceDB
+            # version, fall back to the original full-scan behavior rather than
+            # breaking the admin UI. Correctness over speed.
+            raw_rows = self._scan_rows(columns=LIST_RECORD_COLUMNS)
+        return [row for row in raw_rows if record_matches(row, search)]
 
     def _scan_rows(
         self,

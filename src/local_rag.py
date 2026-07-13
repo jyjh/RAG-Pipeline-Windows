@@ -67,13 +67,22 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_claim_keywords",
     "_record_text_for_lexical_score",
     "_lexical_relevance",
+    "_bm25_scores",
+    "_rrf_fuse",
     "_claim_fragments",
     "_tool_source_texts",
     "citation_support_warnings",
     "_manifest_source_key",
     "index_record_content_hash",
     "_build_index_manifest",
+    "_empty_manifest",
+    "_merge_records_into_manifest",
     "write_index_manifest",
+    "write_index_manifest_payload",
+    "load_content_hash_sidecar",
+    "_content_hash_sidecar_path",
+    "_content_hash_sidecar_dir",
+    "_write_content_hash_sidecar",
     "normalize_search_url",
     "web_search_duckduckgo_lite",
 )
@@ -88,6 +97,7 @@ DEFAULT_RETRIEVAL_CANDIDATE_K = 80
 DEFAULT_RETRIEVAL_MIN_SCORE = 0.50
 DEFAULT_RETRIEVAL_RELATIVE_CUTOFF = 0.72
 DEFAULT_RETRIEVAL_LEXICAL_WEIGHT = 0.20
+DEFAULT_RRF_K = 60
 DEFAULT_CONTEXT_TOKEN_FRACTION = 0.60
 DEFAULT_TOOL_MAX_ROUNDS = 4
 DEFAULT_TOOL_MAX_CALLS = 8
@@ -823,6 +833,94 @@ def _lexical_relevance(
     return min(1.0, overlap + (0.15 * title_overlap))
 
 
+def _bm25_scores(
+    query_terms: set[str],
+    records: list[dict[str, Any]],
+    *,
+    k1: float = 1.5,
+    b: float = 0.75,
+) -> dict[str, float]:
+    """Compute Okapi BM25 scores for ``records`` against ``query_terms``.
+
+    A proper lexical ranker over the candidate pool: term-frequency saturation
+    (k1) and document-length normalization (b) that the Jaccard overlap score
+    lacks. Returns ``{record_id: bm25_score}`` (un-normalized; callers map to
+    ranks for RRF). Built over the small candidate set (vector top-k + children)
+    so the corpus statistics are local -- not a global BM25 over the whole index,
+    but a far stronger lexical signal than set-overlap.
+    """
+    if not query_terms or not records:
+        return {}
+
+    # Tokenize each document once (reuse the same keyword extractor as the
+    # Jaccard path so tokenization is consistent across the two lexical scores).
+    doc_terms: list[set[str]] = []
+    doc_ids: list[str] = []
+    for record in records:
+        record_id = str(record.get("id") or "")
+        if not record_id:
+            continue
+        terms = _claim_keywords(_record_text_for_lexical_score(record))
+        if not terms:
+            terms = set()
+        doc_terms.append(terms)
+        doc_ids.append(record_id)
+    if not doc_ids:
+        return {}
+
+    n = len(doc_ids)
+    avgdl = sum(len(terms) for terms in doc_terms) / n if n else 0.0
+    if avgdl <= 0:
+        avgdl = 1.0
+
+    # Document frequency per query term across the candidate pool.
+    df: dict[str, int] = {}
+    for term in query_terms:
+        df[term] = sum(1 for terms in doc_terms if term in terms)
+
+    scores: dict[str, float] = {}
+    for idx, record_id in enumerate(doc_ids):
+        terms = doc_terms[idx]
+        dl = len(terms)
+        score = 0.0
+        for term in query_terms:
+            if term not in terms:
+                continue
+            term_df = df.get(term, 0)
+            if term_df <= 0:
+                continue
+            # BM25 IDF (with +1 smoothing to keep it non-negative for in-pool df).
+            idf = math.log(1.0 + (n - term_df + 0.5) / (term_df + 0.5))
+            tf = 1  # binary tf within the keyword set (each term counted once)
+            denom = tf + k1 * (1.0 - b + b * (dl / avgdl))
+            score += idf * (tf * (k1 + 1.0)) / denom
+        scores[record_id] = score
+    return scores
+
+
+def _rrf_fuse(
+    vector_ranked: list[str],
+    lexical_ranked: list[str],
+    *,
+    rrf_k: int = 60,
+) -> dict[str, float]:
+    """Reciproical Rank Fusion of two ranked id lists.
+
+    Combines a vector-search ranking and a lexical (BM25) ranking into a single
+    fused score: ``score(id) = 1/(rrf_k + rank_vector) + 1/(rrf_k + rank_lex)``
+    (1-indexed ranks; ids absent from one list contribute 0 from that list).
+    ``rrf_k`` (default 60) dampens the influence of highly-ranked items so a
+    single dominant list can't swamp the other. This is the standard RRF used in
+    hybrid retrieval; the ``rrf_k`` config knob has been present but unused.
+    """
+    scores: dict[str, float] = {}
+    for rank, record_id in enumerate(vector_ranked, start=1):
+        scores[record_id] = scores.get(record_id, 0.0) + 1.0 / (rrf_k + rank)
+    for rank, record_id in enumerate(lexical_ranked, start=1):
+        scores[record_id] = scores.get(record_id, 0.0) + 1.0 / (rrf_k + rank)
+    return scores
+
+
 def _claim_fragments(answer_text: str) -> list[str]:
     fragments = []
     for line in re.split(r"\n+", answer_text or ""):
@@ -933,11 +1031,20 @@ def _merge_records_into_manifest(
     Safe to call repeatedly (once per file during streaming indexing). For
     re-indexing a source that already has an entry, pass only that file's
     records and delete the existing document key first.
+
+    Per-record content hashes are written to a per-source sidecar file
+    (``hashes/<source_key>.json``) rather than embedded in the manifest, so the
+    monolithic ``index_manifest.json`` stays small at scale (millions of chunks
+    would otherwise make it hundreds of MB and re-serialize on every write).
+    The hashes are consumed by tests and available for future vector-reuse
+    bookkeeping; the runtime reuse path computes its own in-memory hashes.
     """
     documents: dict[str, dict[str, Any]] = manifest.setdefault("documents", {})
     embedded = int(manifest.get("embedded_records") or 0)
     reused = int(manifest.get("reused_records") or 0)
     total = int(manifest.get("total_records") or 0)
+    # Accumulate per-source content hashes for the sidecar write.
+    sidecar_hashes: dict[str, dict[str, str]] = {}
     for record in records:
         key = _manifest_source_key(record)
         document = documents.setdefault(
@@ -957,9 +1064,9 @@ def _merge_records_into_manifest(
         )
         node_type = str(record.get("node_type") or "")
         content = str(record.get("content") or "")
-        existing_hashes = document.setdefault("content_hashes", {})
-        if isinstance(existing_hashes, dict):
-            existing_hashes[str(record.get("id") or "")] = index_record_content_hash(record)
+        record_id = str(record.get("id") or "")
+        if record_id:
+            sidecar_hashes.setdefault(key, {})[record_id] = index_record_content_hash(record)
         document["record_count"] += 1
         document["content_char_count"] += len(content)
         if node_type == "chunk":
@@ -982,10 +1089,57 @@ def _merge_records_into_manifest(
     manifest["embedded_records"] = embedded
     manifest["reused_records"] = reused
     manifest["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Write the per-source content-hash sidecars (one file per source touched in
+    # this merge). Cheap: each sidecar is ~one source's worth of hashes.
+    working_dir = manifest.get("_working_dir")
+    if isinstance(working_dir, str) and sidecar_hashes:
+        for source_key, hashes in sidecar_hashes.items():
+            _write_content_hash_sidecar(working_dir, source_key, hashes)
+
+
+def _content_hash_sidecar_dir(working_dir: str | Path) -> Path:
+    return Path(working_dir) / "hashes"
+
+
+def _content_hash_sidecar_path(working_dir: str | Path, source_key: str) -> Path:
+    # The source_key can be a path (e.g. "processed_docs/doc.md") which is not a
+    # safe filename. Hash it to a stable, filesystem-safe basename.
+    safe = hashlib.sha256(source_key.encode("utf-8", errors="ignore")).hexdigest()[:32]
+    return _content_hash_sidecar_dir(working_dir) / f"{safe}.json"
+
+
+def _write_content_hash_sidecar(
+    working_dir: str | Path, source_key: str, hashes: dict[str, str]
+) -> None:
+    """Atomically write one source's content hashes to its sidecar file."""
+    sidecar_dir = _content_hash_sidecar_dir(working_dir)
+    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"source_key": source_key, "content_hashes": hashes}
+    path = _content_hash_sidecar_path(working_dir, source_key)
+    write_json_atomic(path, payload)
+
+
+def load_content_hash_sidecar(
+    working_dir: str | Path, source_key: str
+) -> dict[str, str]:
+    """Read one source's content-hash sidecar, or ``{}`` if absent/corrupt."""
+    path = _content_hash_sidecar_path(working_dir, source_key)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    hashes = payload.get("content_hashes") if isinstance(payload, dict) else None
+    return dict(hashes) if isinstance(hashes, dict) else {}
 
 
 def _remove_source_from_manifest(manifest: dict[str, Any], source_key: str) -> None:
-    """Drop a document entry from ``manifest`` and recompute running totals."""
+    """Drop a document entry from ``manifest`` and recompute running totals.
+
+    Also removes the per-source content-hash sidecar if the manifest carries a
+    ``_working_dir`` (so a source delete cleans up its hashes file too).
+    """
     documents: dict[str, dict[str, Any]] = manifest.setdefault("documents", {})
     document = documents.pop(source_key, None)
     if not document:
@@ -998,6 +1152,15 @@ def _remove_source_from_manifest(manifest: dict[str, Any], source_key: str) -> N
     # per-doc embedded/reused, so leave the totals as upper-bound-ish and let
     # the final write be authoritative for a full rebuild. For incremental
     # re-index the merged records re-add the correct counts.
+    # Best-effort sidecar cleanup.
+    working_dir = manifest.get("_working_dir")
+    if isinstance(working_dir, str):
+        try:
+            sidecar = _content_hash_sidecar_path(working_dir, source_key)
+            if sidecar.exists():
+                sidecar.unlink()
+        except OSError:
+            pass
 
 
 def write_index_manifest_payload(
@@ -1005,9 +1168,12 @@ def write_index_manifest_payload(
     manifest: dict[str, Any],
 ) -> dict[str, Any]:
     """Write a pre-built manifest dict to ``working_dir`` atomically."""
+    # Strip the internal _working_dir key (used only to route sidecar writes
+    # during _merge_records_into_manifest) so it never lands in the JSON file.
+    payload = {k: v for k, v in manifest.items() if k != "_working_dir"}
     path = Path(working_dir) / INDEX_MANIFEST_FILENAME
-    write_json_atomic(path, manifest)
-    return manifest
+    write_json_atomic(path, payload)
+    return payload
 
 
 def write_index_manifest(
@@ -1017,7 +1183,11 @@ def write_index_manifest(
     embedding_model: str,
     embedding_dim: int,
 ) -> dict[str, Any]:
-    manifest = _build_index_manifest(records, embedding_model=embedding_model, embedding_dim=embedding_dim)
+    # Build the manifest shell, set the working dir so the merge writes
+    # per-source content-hash sidecars next to the manifest, then merge once.
+    manifest = _empty_manifest(embedding_model, embedding_dim)
+    manifest["_working_dir"] = str(working_dir)
+    _merge_records_into_manifest(manifest, records)
     return write_index_manifest_payload(working_dir, manifest)
 
 

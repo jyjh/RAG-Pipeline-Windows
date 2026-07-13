@@ -1,3 +1,14 @@
+"""DEPRECATED: legacy SQLite-backed v1 storage layer.
+
+This module (and the ``*_v1.py`` / ``service.py`` / ``retrieval.py`` /
+``generation.py`` / ``validation.py`` / ``vector_index.py`` family) implements
+the original SQLite + FTS5 pipeline. It is NOT imported by the active web app
+(``src/web_app.py``), the streaming indexer (``src/local_rag_classes/``), or
+the ingestion pipeline (``src/ingestion.py``), all of which use LanceDB. It is
+retained for test coverage of the legacy path and as a reference BM25/FTS5
+implementation. Do not add new features here; new work belongs in the
+LanceDB-backed modules.
+"""
 from __future__ import annotations
 
 import json

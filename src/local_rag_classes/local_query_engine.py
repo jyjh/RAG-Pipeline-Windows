@@ -38,6 +38,7 @@ class LocalQueryEngine:
         retrieval_min_score: float | None = None,
         retrieval_relative_cutoff: float | None = None,
         retrieval_lexical_weight: float | None = None,
+        retrieval_rrf_k: int | None = None,
         context_token_fraction: float | None = None,
         web_search_enabled: bool = True,
         web_search_timeout: float | None = None,
@@ -126,6 +127,15 @@ class LocalQueryEngine:
             if retrieval_lexical_weight is not None
             else os.environ.get("LOCAL_RAG_RETRIEVAL_LEXICAL_WEIGHT"),
             DEFAULT_RETRIEVAL_LEXICAL_WEIGHT,
+        )
+        # RRF damping constant for fusing vector + BM25 rankings. 60 is the
+        # standard default from the original RRF paper. Exposed via config so
+        # operators can tune; the bm25+rrf path activates automatically.
+        self.retrieval_rrf_k = _positive_int(
+            retrieval_rrf_k
+            if retrieval_rrf_k is not None
+            else os.environ.get("LOCAL_RAG_RETRIEVAL_RRF_K"),
+            getattr(_source_module, "DEFAULT_RRF_K", 60),
         )
         self.context_token_fraction = _positive_float(
             context_token_fraction
@@ -366,13 +376,60 @@ class LocalQueryEngine:
         results: list[dict[str, Any]] = []
         keyword_cache: dict[str, tuple[set[str], set[str]]] = {}
 
+        # BM25 over the candidate pool + reciprocal-rank fusion with the vector
+        # ranking. Replaces the old weighted-linear hybrid (vector*0.8 +
+        # jaccard*0.2): BM25 gives proper term-frequency saturation and length
+        # normalization that set-overlap lacks, and RRF combines the two ranked
+        # lists without requiring score-scale calibration. The fused score is
+        # used for ranking; vector_score/lexical_score remain on the record for
+        # display and for the score_cutoff gate (which still uses vector score).
+        bm25_scores: dict[str, float] = _bm25_scores(query_terms, candidates) if query_terms else {}
+        bm25_ranked = [
+            record_id
+            for record_id, _ in sorted(bm25_scores.items(), key=lambda kv: kv[1], reverse=True)
+            if bm25_scores.get(record_id, 0.0) > 0.0
+        ]
+        vector_ranked = [
+            str(candidate.get("id") or "")
+            for candidate in sorted(
+                candidates,
+                key=lambda cand: float(cand.get("score") or 0.0),
+                reverse=True,
+            )
+            if str(candidate.get("id") or "")
+        ]
+        rrf_scores: dict[str, float] = _rrf_fuse(
+            vector_ranked, bm25_ranked, rrf_k=self.retrieval_rrf_k
+        ) if bm25_ranked else {}
+        # Normalize RRF scores to [0, 1] for the score_cutoff gate to stay
+        # meaningful alongside the existing min_score/relative_cutoff knobs.
+        max_rrf = max(rrf_scores.values()) if rrf_scores else 0.0
+
+        def _fused_score(record_id: str, vector_score: float) -> float:
+            """Blend the RRF fusion score with the vector score.
+
+            When BM25 produced a ranking, RRF supplies the lexical signal
+            (scaled into [0,1]). When the pool had no lexical matches, fall back
+            to the pure vector score so dense-only retrieval still works.
+            """
+            if not rrf_scores or not max_rrf:
+                return vector_score
+            rrf = rrf_scores.get(record_id, 0.0) / max_rrf if max_rrf > 0 else 0.0
+            return (1.0 - self.retrieval_lexical_weight) * vector_score + self.retrieval_lexical_weight * rrf
+
         def rank_record(record: dict[str, Any], *, inherited_score: float | None = None) -> dict[str, Any]:
             vector_score = float(record.get("score") or inherited_score or 0.0)
             lexical_score = _lexical_relevance(query_terms, record, keyword_cache=keyword_cache)
-            hybrid_score = (
-                (1.0 - self.retrieval_lexical_weight) * vector_score
-                + self.retrieval_lexical_weight * lexical_score
-            )
+            record_id = str(record.get("id") or "")
+            # Extend BM25/RRF to children fetched after the initial pool. Children
+            # weren't in the top-level candidate set, so score them on demand and
+            # fold their (rank-1) contribution into the fusion map.
+            if record_id and record_id not in rrf_scores and query_terms:
+                child_bm25 = _bm25_scores(query_terms, [record])
+                if child_bm25.get(record_id, 0.0) > 0.0:
+                    rrf_scores[record_id] = 1.0 / (self.retrieval_rrf_k + 1)
+                    bm25_ranked.insert(0, record_id)
+            hybrid_score = _fused_score(record_id, vector_score)
             reliability = self._reliability_details(record)
             reliability_modifier = float(reliability.get("weight") or source_group_weight(SOURCE_GROUP_UNGROUPED))
             final_score = hybrid_score * reliability_modifier

@@ -63,6 +63,61 @@ def _ollama_host() -> str:
         return host.rstrip("/")
     return f"http://{host.rstrip('/')}"
 
+
+def _normalize_ollama_host(raw: str) -> str:
+    """Normalize a single Ollama host string (scheme + trailing slash trim)."""
+    host = raw.strip()
+    if not host:
+        return "http://127.0.0.1:11434"
+    if host.startswith(("http://", "https://")):
+        return host.rstrip("/")
+    return f"http://{host.rstrip('/')}"
+
+
+def _resolve_ollama_hosts() -> list[str]:
+    """Resolve the list of Ollama embedding endpoints.
+
+    A comma-separated ``OLLAMA_EMBED_HOSTS`` env var enables multi-replica
+    embedding: batches are round-robined across the listed hosts in parallel.
+    When unset, falls back to the single ``OLLAMA_HOST`` (so the default is
+    zero behavior change). Duplicates are removed while preserving order.
+
+    Examples::
+
+        OLLAMA_EMBED_HOSTS=http://gpu-a:11434,http://gpu-b:11434
+        # -> ["http://gpu-a:11434", "http://gpu-b:11434"]
+    """
+    raw = os.environ.get("OLLAMA_EMBED_HOSTS", "").strip()
+    if not raw:
+        return [_ollama_host()]
+    hosts: list[str] = []
+    seen: set[str] = set()
+    for piece in raw.split(","):
+        normalized = _normalize_ollama_host(piece)
+        if normalized not in seen:
+            seen.add(normalized)
+            hosts.append(normalized)
+    return hosts or [_ollama_host()]
+
+
+def _resolve_embed_concurrency() -> int:
+    """Worker threads for parallel batch embedding.
+
+    Default 1 = serial (preserves existing single-host behavior). When
+    ``OLLAMA_EMBED_HOSTS`` lists multiple replicas the effective parallelism is
+    ``max(concurrency, len(hosts))`` so every replica is used concurrently even
+    if the operator left this at 1. Override with ``OLLAMA_EMBED_CONCURRENCY``
+    to push more in-flight batches per host (e.g. with ``OLLAMA_NUM_PARALLEL>1``
+    on the Ollama server).
+    """
+    raw = os.environ.get("OLLAMA_EMBED_CONCURRENCY", "").strip()
+    try:
+        value = int(raw) if raw else 1
+    except (TypeError, ValueError):
+        value = 1
+    return max(1, value)
+
+
 class EmbeddingEngine:
     """
     Ollama-backed embedding engine with an internal cache.
@@ -179,56 +234,58 @@ class EmbeddingEngine:
         if not texts:
             return np.empty((0, truncate_dim), dtype=np.float32)
 
-        embeddings = []
         batch_size = self.ollama_batch_size
         total_batches = (len(texts) + batch_size - 1) // batch_size
 
+        # Build the list of (batch_number, batch_texts, target_host). Hosts are
+        # round-robined across replicas so a multi-replica deployment shares
+        # load evenly; with a single host every batch targets it (but may still
+        # run concurrently if OLLAMA_EMBED_CONCURRENCY > 1, see below).
+        hosts = _resolve_ollama_hosts()
+        batches: list[tuple[int, list[str], str]] = []
         for batch_number, start in enumerate(range(0, len(texts), batch_size), start=1):
             batch = texts[start : start + batch_size]
-            total_chars = sum(len(text) for text in batch)
-            try:
-                _status(
-                    f"Requesting embeddings from Ollama model: {self.model_name} "
-                    f"batch {batch_number}/{total_batches} "
-                    f"({len(batch)} text(s), {total_chars} chars, timeout={self.ollama_timeout:g}s)"
-                )
-                payload_input = batch[0] if len(batch) == 1 else batch
-                response = self._ollama_api_with_retry(
-                    "/api/embed",
-                    {"model": self.model_name, "input": payload_input},
-                )
-                batch_embeddings = response.get("embeddings")
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Ollama embedding failed for model '{self.model_name}' "
-                    f"on batch {batch_number}/{total_batches}. "
-                    f"Run `{_ollama_pull_command(self.model_name)}` and ensure Ollama is running. "
-                    f"Original error: {exc}"
-                ) from exc
+            host = hosts[(batch_number - 1) % len(hosts)]
+            batches.append((batch_number, batch, host))
 
-            if batch_embeddings is None:
-                batch_embeddings = []
-                for text_index, text in enumerate(batch, start=1):
-                    _status(
-                        f"Requesting single embedding fallback from Ollama model: "
-                        f"{self.model_name} batch {batch_number}/{total_batches} "
-                        f"text {text_index}/{len(batch)} ({len(text)} chars, timeout={self.ollama_timeout:g}s)"
-                    )
-                    response = self._ollama_api_with_retry(
-                        "/api/embeddings",
-                        {"model": self.model_name, "prompt": text},
-                    )
-                    embedding = response.get("embedding")
-                    if embedding is None:
-                        raise RuntimeError("Ollama embedding response did not contain an embedding.")
-                    batch_embeddings.append(embedding)
+        # Decide concurrency. Default 1 = serial (preserves the historical
+        # single-host, single-batch-at-a-time behavior exactly). With multiple
+        # replicas we always parallelize at least len(hosts) ways; an explicit
+        # OLLAMA_EMBED_CONCURRENCY can push higher (e.g. OLLAMA_NUM_PARALLEL>1).
+        requested = _resolve_embed_concurrency()
+        max_workers = max(requested, len(hosts)) if len(hosts) > 1 else requested
+        use_pool = max_workers > 1 and len(batches) > 1
 
-            if len(batch_embeddings) != len(batch):
-                raise RuntimeError(
-                    f"Ollama returned {len(batch_embeddings)} embedding(s) for "
-                    f"{len(batch)} input text(s) in batch {batch_number}/{total_batches}."
-                )
-            embeddings.extend(batch_embeddings)
+        # Ordered result slots filled by either the serial or the parallel path.
+        per_batch: list[list[list[float]] | None] = [None] * len(batches)
+
+        if use_pool:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_index = {
+                    executor.submit(
+                        self._embed_one_batch,
+                        batch_number,
+                        batch,
+                        total_batches,
+                        host,
+                    ): index
+                    for index, (batch_number, batch, host) in enumerate(batches)
+                }
+                # Reproduce the serial path's fail-fast semantics: the first
+                # failing batch raises RuntimeError out of result() and the
+                # remaining in-flight work is cancelled on context exit.
+                for future, index in future_to_index.items():
+                    per_batch[index] = future.result()
+        else:
+            for index, (batch_number, batch, host) in enumerate(batches):
+                per_batch[index] = self._embed_one_batch(batch_number, batch, total_batches, host)
+
+        embeddings: list[list[float]] = []
+        for chunk in per_batch:
+            assert chunk is not None
+            embeddings.extend(chunk)
 
         vectors = np.asarray(embeddings, dtype=np.float32)
         if vectors.ndim == 1:
@@ -245,8 +302,74 @@ class EmbeddingEngine:
         norms = np.where(norms == 0, 1, norms)
         return vectors / norms
 
-    def _ollama_api(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        url = f"{_ollama_host()}{path}"
+    def _embed_one_batch(
+        self,
+        batch_number: int,
+        batch: list[str],
+        total_batches: int,
+        host: str,
+    ) -> list[list[float]]:
+        """Embed one batch against ``host``.
+
+        Encapsulates the primary ``/api/embed`` call plus the one-by-one
+        ``/api/embeddings`` fallback so the parallel dispatcher can submit
+        whole batches as independent units of work. Raises RuntimeError on
+        failure so the caller (serial loop or ``Future.result``) propagates it.
+        """
+        total_chars = sum(len(text) for text in batch)
+        _status(
+            f"Requesting embeddings from Ollama model: {self.model_name} "
+            f"batch {batch_number}/{total_batches} "
+            f"({len(batch)} text(s), {total_chars} chars, timeout={self.ollama_timeout}s) "
+            f"-> {host}"
+        )
+        try:
+            payload_input = batch[0] if len(batch) == 1 else batch
+            response = self._ollama_api_with_retry(
+                "/api/embed",
+                {"model": self.model_name, "input": payload_input},
+                host=host,
+            )
+            batch_embeddings = response.get("embeddings")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Ollama embedding failed for model '{self.model_name}' "
+                f"on batch {batch_number}/{total_batches}. "
+                f"Run `{_ollama_pull_command(self.model_name)}` and ensure Ollama is running. "
+                f"Original error: {exc}"
+            ) from exc
+
+        if batch_embeddings is None:
+            batch_embeddings = []
+            for text_index, text in enumerate(batch, start=1):
+                _status(
+                    f"Requesting single embedding fallback from Ollama model: "
+                    f"{self.model_name} batch {batch_number}/{total_batches} "
+                    f"text {text_index}/{len(batch)} ({len(text)} chars, timeout={self.ollama_timeout}s)"
+                )
+                response = self._ollama_api_with_retry(
+                    "/api/embeddings",
+                    {"model": self.model_name, "prompt": text},
+                    host=host,
+                )
+                embedding = response.get("embedding")
+                if embedding is None:
+                    raise RuntimeError("Ollama embedding response did not contain an embedding.")
+                batch_embeddings.append(embedding)
+
+        if len(batch_embeddings) != len(batch):
+            raise RuntimeError(
+                f"Ollama returned {len(batch_embeddings)} embedding(s) for "
+                f"{len(batch)} input text(s) in batch {batch_number}/{total_batches}."
+            )
+        return batch_embeddings
+
+    def _ollama_api(self, path: str, payload: dict[str, Any], host: str | None = None) -> dict[str, Any]:
+        # ``host`` defaults to the single OLLAMA_HOST for backward compatibility
+        # (existing callers and tests use the 2-arg form). The parallel batch
+        # dispatcher passes the round-robin target host explicitly.
+        base = host if host is not None else _ollama_host()
+        url = f"{base}{path}"
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             url,
@@ -264,7 +387,9 @@ class EmbeddingEngine:
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Ollama request failed at {url}: {exc}") from exc
 
-    def _ollama_api_with_retry(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _ollama_api_with_retry(
+        self, path: str, payload: dict[str, Any], host: str | None = None
+    ) -> dict[str, Any]:
         """Call :meth:`_ollama_api` with bounded exponential-backoff retry.
 
         Retries on the transient errors ``_ollama_api`` raises (RuntimeError
@@ -278,7 +403,7 @@ class EmbeddingEngine:
         last_exc: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                return self._ollama_api(path, payload)
+                return self._ollama_api(path, payload, host=host)
             except RuntimeError as exc:
                 last_exc = exc
                 if attempt >= attempts:

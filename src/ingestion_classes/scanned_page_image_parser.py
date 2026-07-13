@@ -18,11 +18,19 @@ class ScannedPageImageParser:
         vision_enabled: bool,
         reader_factory: Callable[[str], Any] = _default_pdf_reader,
         progress_enabled: bool = False,
+        max_pages_per_window: int = 16,
     ):
         self.vision_describer = vision_describer
         self.vision_enabled = vision_enabled
         self.reader_factory = reader_factory
         self.progress_enabled = progress_enabled
+        # Maximum number of pages whose rendered images are held in memory at
+        # once. The original implementation gathered EVERY page image before
+        # describing any, which OOMs on a large scanned PDF (e.g. a 5000-page
+        # book at ~1-2 MB PNG/page = several GB of raw bytes). The windowed
+        # approach keeps the same concurrency benefit within each batch while
+        # bounding peak memory to ~max_pages_per_window pages of image bytes.
+        self.max_pages_per_window = max(1, int(max_pages_per_window))
 
     def parse(self, file_path: str) -> str:
         if not self.vision_enabled:
@@ -36,47 +44,72 @@ class ScannedPageImageParser:
             raise RuntimeError(f"Could not open scanned PDF for page-image fallback: {file_path}") from exc
 
         pages = getattr(reader, "pages", [])
-        # Gather all page images up front so they can be described concurrently
-        # (each is an independent Ollama HTTP call). Previously this described
-        # images one at a time, serially -- the dominant cost for scanned docs.
-        page_images: list[tuple[int, list[bytes]]] = []
+
+        # Re-group descriptions by page (accumulated across all windows).
+        per_page: dict[int, list[str]] = {}
+        page_order: list[int] = []
+        any_described = False
+
+        # Process pages in streaming windows: accumulate up to
+        # max_pages_per_window pages' worth of images, describe them
+        # concurrently, merge into per_page, then free the window before
+        # moving on. This bounds peak memory regardless of document size.
+        window: list[tuple[int, list[bytes]]] = []
+
+        def flush_window() -> bool:
+            nonlocal any_described
+            if not window:
+                return False
+            # Flatten the window's images, tracking (page_no, img_idx) so the
+            # descriptions map back to the right page.
+            flat_images: list[bytes] = []
+            flat_index: list[tuple[int, int]] = []
+            for page_no, image_bytes in window:
+                for img_idx, image_data in enumerate(image_bytes):
+                    flat_images.append(image_data)
+                    flat_index.append((page_no, img_idx))
+
+            window_page_count = len(window)
+            window.clear()
+
+            if not flat_images:
+                return False
+
+            _progress_status(
+                f"Describing {len(flat_images)} page image(s) for {window_page_count} page(s) "
+                f"for scanned PDF fallback: {Path(file_path).name}",
+                enabled=self.progress_enabled,
+            )
+            descriptions = self.vision_describer.describe_many(
+                flat_images,
+                prompt=SCANNED_PAGE_VISION_PROMPT,
+            )
+            for (page_no, _img_idx), description in zip(flat_index, descriptions):
+                if self._is_usable_description(description):
+                    per_page.setdefault(page_no, []).append(description.strip())
+            any_described = True
+            return True
+
         for page_no, page in enumerate(pages, start=1):
             image_bytes = self._page_image_bytes(page)
             if image_bytes:
-                page_images.append((page_no, image_bytes))
+                window.append((page_no, image_bytes))
+                page_order.append(page_no)
+            # Flush when the window reaches capacity (always forward-progress:
+            # a page with a single huge image still flushes as its own window).
+            if len(window) >= self.max_pages_per_window:
+                flush_window()
 
-        # Flatten into a single batch for concurrent description, remembering the
-        # (page_no, index) each image belongs to so results map back correctly.
-        flat_images: list[bytes] = []
-        flat_index: list[tuple[int, int]] = []
-        for page_no, image_bytes in page_images:
-            for img_idx, image_data in enumerate(image_bytes):
-                flat_images.append(image_data)
-                flat_index.append((page_no, img_idx))
+        # Flush any remaining pages in the final partial window.
+        flush_window()
 
-        if not flat_images:
+        if not any_described:
             raise RuntimeError(
                 f"No usable page-image analysis was produced for scanned PDF fallback: {Path(file_path).name}"
             )
 
-        _progress_status(
-            f"Describing {len(flat_images)} page image(s) across {len(page_images)} page(s) "
-            f"for scanned PDF fallback: {Path(file_path).name}",
-            enabled=self.progress_enabled,
-        )
-        descriptions = self.vision_describer.describe_many(
-            flat_images,
-            prompt=SCANNED_PAGE_VISION_PROMPT,
-        )
-
-        # Re-group descriptions by page and build the Markdown parts.
-        per_page: dict[int, list[str]] = {}
-        for (page_no, _img_idx), description in zip(flat_index, descriptions):
-            if self._is_usable_description(description):
-                per_page.setdefault(page_no, []).append(description.strip())
-
         parts: list[str] = []
-        for page_no, _ in page_images:
+        for page_no in page_order:
             descs = per_page.get(page_no)
             if descs:
                 page_parts = [f"## Page {page_no}"]

@@ -31,6 +31,14 @@ class DoclingPdfParser:
     reader_factory: Callable[[str], Any] = _default_pdf_reader
     image_asset_store: Any | None = None
     converter: Any | None = None
+    # Above this page count, parse() forces the page-at-a-time path even when
+    # progress is disabled. The whole-document path (self.convert(...).document)
+    # materializes the full Docling document model + OCR state in memory, which
+    # OOMs on a multi-thousand-page scanned book. The web app runs ingestion
+    # with --no_progress, so without this guard every large scanned PDF routed
+    # to Docling would hit the whole-document path. 0 = never force (preserve
+    # the original behavior exactly).
+    max_pages_whole_doc: int = 50
 
     def __post_init__(self) -> None:
         self.renderer = DoclingMarkdownRenderer(self.vision_describer, image_asset_store=self.image_asset_store)
@@ -43,6 +51,33 @@ class DoclingPdfParser:
         _progress_status(f"Docling parse: {Path(file_path).name}", enabled=self.progress_enabled)
         if self.progress_enabled:
             return self.parse_by_page(file_path)
+
+        # Memory guard: a large scanned PDF in the whole-document path holds the
+        # entire Docling model + OCR state in RAM. Fall back to page-at-a-time
+        # parsing above the configured threshold (cheap pypdf page-count check).
+        if self.max_pages_whole_doc > 0:
+            try:
+                reader = self.reader_factory(file_path)
+                page_count = len(getattr(reader, "pages", []))
+            except Exception as exc:  # noqa: BLE001 - best-effort guard
+                logger.warning(
+                    "Could not read page count for Docling memory guard; parsing whole file: %s",
+                    exc,
+                )
+                page_count = 0
+            if page_count > self.max_pages_whole_doc:
+                logger.info(
+                    "Docling parse: %s has %d pages (> %d); using page-at-a-time path to bound memory",
+                    Path(file_path).name,
+                    page_count,
+                    self.max_pages_whole_doc,
+                )
+                _progress_status(
+                    f"Docling large-PDF memory guard: {page_count} pages -> per-page parse "
+                    f"({Path(file_path).name})",
+                    enabled=self.progress_enabled,
+                )
+                return self.parse_by_page(file_path)
 
         doc = self.convert(file_path).document
         return self.renderer.render_document(doc)

@@ -126,6 +126,18 @@ $response.embeddings[0].Count
 
 The final command should print an embedding dimension, normally `768`. If `/api/tags` works but `/api/embed` times out, Ollama is running but the embedding model runner is wedged or stalled; use the recovery steps in [Troubleshooting](#troubleshooting).
 
+#### Scaling embeddings across multiple GPUs / Ollama replicas
+
+At 100GB-scale, single-track embedding through one Ollama server is the dominant indexing bottleneck (millions of chunks, one batch at a time). The pipeline can round-robin embedding batches across any number of Ollama replicas in parallel. Set `OLLAMA_EMBED_HOSTS` to a comma-separated list of replica base URLs:
+
+```powershell
+# Two Ollama servers (e.g. one per GPU). Batches are round-robined and
+# dispatched concurrently across the replicas.
+$env:OLLAMA_EMBED_HOSTS = "http://127.0.0.1:11434,http://127.0.0.1:11435"
+```
+
+To run multiple replicas on one host, start separate `ollama serve` processes on different ports (`OLLAMA_HOST=127.0.0.1:11435 ollama serve`). Fine-tune in-flight batches per host with `OLLAMA_EMBED_CONCURRENCY` (default `1` = one batch per host at a time; raise it when the Ollama server is configured with `OLLAMA_NUM_PARALLEL>1`). With a single replica and the default concurrency, embedding behavior is unchanged (serial, one batch at a time). The embedding batch size itself defaults to 128 texts per request (override via `OLLAMA_EMBED_BATCH_SIZE` or `--embedding_batch_size`).
+
 ## Usage
 
 Intended CLI flow:

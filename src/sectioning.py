@@ -59,6 +59,9 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "format_page_range",
     "clean_title",
     "normalized_heading",
+    "pages_sidecar_path",
+    "write_pages_sidecar",
+    "read_pages_sidecar",
     "stable_id",
 )
 
@@ -107,7 +110,12 @@ def build_section_records(
     overlap_chars = max(0, chunk_overlap_tokens * CHARS_PER_TOKEN)
     use_markdown_content = has_enriched_markdown(markdown_content)
     if pdf_path is not None:
-        sections, pages = sections_from_pdf(pdf_path)
+        # Prefer the page-text sidecar written at ingestion time to skip the
+        # expensive pypdf extract_text() loop on every page. Falls back to None
+        # (full re-extraction) if the sidecar is missing or stale -- so old /
+        # manually-added Markdown still indexes identically.
+        cached_pages = read_pages_sidecar(markdown_path)
+        sections, pages = sections_from_pdf(pdf_path, cached_pages=cached_pages)
         source_path = str(pdf_path)
         doc_title = pdf_path.stem
         if use_markdown_content or not any(page.text.strip() for page in pages):
@@ -316,14 +324,88 @@ def find_source_pdf(markdown_path: Path, *, source_root: Path) -> Path | None:
     return None
 
 
-def sections_from_pdf(pdf_path: Path) -> tuple[list[SectionNode], list[PageText]]:
+# --- Page-text sidecar -------------------------------------------------------
+# Every PDF is pypdf-parsed twice in the pipeline: once during ingestion (to
+# produce Markdown) and once during indexing (sections_from_pdf re-extracts
+# every page). At 100GB scale that doubles pypdf CPU. The sidecar persists the
+# normalized per-page text next to the Markdown output so the indexing pass can
+# skip the expensive extract_text() loop and only pay for the cheap outline
+# read. Stored values are already normalize_page_text()-ed -- byte-identical to
+# what sections_from_pdf would compute -- so consuming them directly cannot
+# change indexing output.
+
+_PAGES_SIDECAR_VERSION = 1
+
+
+def pages_sidecar_path(markdown_path: Path) -> Path:
+    """Sidecar path for a given Markdown output (``<file>.md`` -> ``<file>.pages.json``)."""
+    return markdown_path.with_suffix(".pages.json")
+
+
+def write_pages_sidecar(markdown_path: Path, page_texts: list[str]) -> None:
+    """Persist normalized per-page text next to the Markdown output.
+
+    Called from ingestion after page extraction. ``page_texts`` are raw
+    extracted strings; this applies ``normalize_page_text`` so the values match
+    what ``sections_from_pdf`` would produce, guaranteeing index-time parity.
+    Writes atomically so a crash cannot leave a half-written sidecar.
+    """
+    import json
+
+    sidecar = pages_sidecar_path(markdown_path)
+    payload = {
+        "version": _PAGES_SIDECAR_VERSION,
+        "page_count": len(page_texts),
+        "pages": [normalize_page_text(text) for text in page_texts],
+    }
+    tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(sidecar)
+
+
+def read_pages_sidecar(markdown_path: Path) -> list[str] | None:
+    """Read the page-text sidecar, or ``None`` if absent/invalid.
+
+    Returns the list of normalized page texts (1-based by position). Any
+    schema/version mismatch returns ``None`` so the caller falls back to
+    re-extraction -- a missing sidecar must never change indexing output.
+    """
+    import json
+
+    sidecar = pages_sidecar_path(markdown_path)
+    if not sidecar.exists():
+        return None
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("version") != _PAGES_SIDECAR_VERSION:
+        return None
+    pages = payload.get("pages")
+    if not isinstance(pages, list) or not all(isinstance(p, str) for p in pages):
+        return None
+    return pages
+
+
+def sections_from_pdf(
+    pdf_path: Path,
+    *,
+    cached_pages: list[str] | None = None,
+) -> tuple[list[SectionNode], list[PageText]]:
     from pypdf import PdfReader
 
     reader = PdfReader(str(pdf_path))
-    pages = [
-        PageText(index + 1, normalize_page_text(page.extract_text() or ""))
-        for index, page in enumerate(reader.pages)
-    ]
+    if cached_pages is not None and len(cached_pages) == len(reader.pages):
+        # Skip the expensive extract_text() loop -- the caller (build_section_records)
+        # already loaded normalized page text from the sidecar written at ingest time.
+        pages = [PageText(index + 1, text) for index, text in enumerate(cached_pages)]
+    else:
+        pages = [
+            PageText(index + 1, normalize_page_text(page.extract_text() or ""))
+            for index, page in enumerate(reader.pages)
+        ]
     outline = getattr(reader, "outline", None) or []
     sections = outline_sections(reader, outline, page_count=len(pages))
     if not sections:

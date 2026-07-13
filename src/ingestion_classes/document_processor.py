@@ -32,6 +32,7 @@ class DocumentProcessor:
         tesseract_data_path: str | None = DEFAULT_TESSERACT_DATA_PATH,
         tesseract_psm: int | str | None = DEFAULT_TESSERACT_PSM,
         progress_enabled: bool = True,
+        max_pages_whole_doc: int = 50,
     ):
         self.vision_model = vision_model
         vision_enabled = _normalize_bool(vision_enabled, DEFAULT_VISION_ENABLED)
@@ -62,6 +63,7 @@ class DocumentProcessor:
             tesseract_data_path=tesseract_data_path,
             tesseract_psm=tesseract_psm,
             progress_enabled=progress_enabled,
+            max_pages_whole_doc=max_pages_whole_doc,
         )
         self.asset_docling_parser = DoclingPdfParser(
             vision_describer=self.vision_describer,
@@ -78,6 +80,7 @@ class DocumentProcessor:
             tesseract_data_path=tesseract_data_path,
             tesseract_psm=tesseract_psm,
             progress_enabled=progress_enabled,
+            max_pages_whole_doc=max_pages_whole_doc,
         )
         self.enriched_asset_docling_parser = DoclingPdfParser(
             vision_describer=self.vision_describer,
@@ -96,6 +99,7 @@ class DocumentProcessor:
             tesseract_data_path=tesseract_data_path,
             tesseract_psm=tesseract_psm,
             progress_enabled=progress_enabled,
+            max_pages_whole_doc=max_pages_whole_doc,
         )
         self.manual_parser = ManualTextPdfParser(
             docling_parser=self.asset_docling_parser,
