@@ -30,6 +30,11 @@ class QueueJob:
     error: str | None = None
     log_tail: list[str] = field(default_factory=list)
     log_line_count: int = 0
+    # Live structured progress parsed from the subprocess's __RAG_PROGRESS__
+    # lines (see src/progress_protocol.py). None until the first progress line
+    # arrives; replaced on each subsequent line so /api/jobs always returns the
+    # freshest done/total/rate snapshot. Cleared on terminal state.
+    progress: dict[str, Any] | None = None
     created_at: str = field(default_factory=_utcnow)
     started_at: str | None = None
     finished_at: str | None = None
@@ -55,6 +60,7 @@ class QueueJob:
             "error": self.error,
             "log_tail": "\n".join(self.log_tail),
             "log_line_count": self.log_line_count,
+            "progress": dict(self.progress) if self.progress else None,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,

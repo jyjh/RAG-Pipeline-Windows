@@ -101,6 +101,7 @@ class RagJobQueue:
         job.phase = "cancelled"
         job.error = message
         job.finished_at = _utcnow()
+        job.progress = None
 
     def _record_interrupted(self, job: QueueJob, message: str) -> None:
         if job.kind == "upload" and job.uploads:
@@ -130,6 +131,21 @@ class RagJobQueue:
             job.log_tail.append(line)
             if len(job.log_tail) > JOB_LOG_TAIL_LINES:
                 del job.log_tail[: len(job.log_tail) - JOB_LOG_TAIL_LINES]
+            self._condition.notify_all()
+
+    def _set_job_progress(self, job: QueueJob, payload: dict[str, Any]) -> None:
+        """Store the latest structured progress payload on the job.
+
+        Called from the subprocess reader thread whenever a ``__RAG_PROGRESS__``
+        line arrives (see ``src/progress_protocol.py``). Replaces the previous
+        payload wholesale so ``/api/jobs`` always returns the freshest snapshot.
+        Guarded against malformed payloads: the protocol parser already drops
+        non-dict values, so this only runs for valid dicts.
+        """
+        if not isinstance(payload, dict):
+            return
+        with self._condition:
+            job.progress = payload
             self._condition.notify_all()
 
     def enqueue_upload(
@@ -352,6 +368,7 @@ class RagJobQueue:
                     job.phase = "failed"
                     job.error = str(exc)
                     job.finished_at = _utcnow()
+                    job.progress = None
                     self._condition.notify_all()
             else:
                 with self._condition:
@@ -362,6 +379,7 @@ class RagJobQueue:
                         job.status = "done"
                         job.phase = "done"
                         job.finished_at = _utcnow()
+                        job.progress = None
                         record_cancelled = False
                     self._condition.notify_all()
                 if record_cancelled:
@@ -768,9 +786,10 @@ class RagJobQueue:
                 worker_threads=worker_threads,
                 cancel_event=job._cancel_event,
                 log_callback=lambda line: self._append_job_log(job, line),
+                progress_callback=lambda payload: self._set_job_progress(job, payload),
             )
         except TypeError as exc:
-            if "cancel_event" not in str(exc) and "log_callback" not in str(exc):
+            if "cancel_event" not in str(exc) and "log_callback" not in str(exc) and "progress_callback" not in str(exc):
                 raise
             self._raise_if_cancelled(job)
             _source_module._run_job_subprocess(command, worker_threads=worker_threads)
@@ -814,6 +833,28 @@ class RagJobQueue:
             ),
             "progress_enabled": options.get("progress_enabled", False),
         }
+        # Fail fast if the output filesystem can't hold the expanded corpus.
+        # Ingestion turns each PDF into Markdown + a .pages.json sidecar, so the
+        # processed_docs/ footprint is ~expansion_factor x the source size
+        # (born-digital ~1.5x, OCR/vision-enriched scanned PDFs 2x+). Without
+        # this check, a 100GB corpus can exhaust disk mid-ingest and surface as
+        # a confusing crash deep in the worker. Mirrors _run_indexing's guard.
+        corpus_bytes = _source_module.estimate_dir_bytes(input_dir)
+        expansion_factor = float(INGESTION_CONFIG.get("ingest_expansion_factor", 2.0))
+        safety_factor = _source_module.SERVER_CONFIG.get("disk_safety_factor", 1.15)
+        try:
+            safety_factor = float(safety_factor)
+        except (TypeError, ValueError):
+            safety_factor = 1.15
+        required_bytes = int(corpus_bytes * expansion_factor * max(1.0, safety_factor))
+        try:
+            _source_module.check_disk_space(output_dir, required_bytes)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Not enough free disk space to start ingestion. "
+                f"Estimated: {corpus_bytes/1e9:.1f}GB corpus x {expansion_factor:g} "
+                f"expansion x{safety_factor:g} safety ~= {required_bytes/1e9:.2f}GB required. {exc}"
+            ) from exc
         if run_ingestion_func is not None:
             self._raise_if_cancelled(job)
             run_ingestion_func(input_dir, output_dir, **resolved)
@@ -953,7 +994,17 @@ class RagJobQueue:
             self._raise_if_cancelled(job)
             return
 
-        staged_db_dir = _source_module._staged_index_dir(db_dir)
+        # Crash-resume: if a prior build of this index crashed and left a staged
+        # dir with a valid checkpoint, reuse it (and pass --resume) so the build
+        # skips already-completed files instead of restarting from zero. At 100GB
+        # scale this turns a crashed multi-day build into a resume, not a redo.
+        resumable = _source_module._find_resumable_staged_dir(db_dir)
+        if resumable is not None:
+            staged_db_dir = resumable
+            if job is not None:
+                self._append_job_log(job, f"Resuming staged index build from {staged_db_dir.name}.")
+        else:
+            staged_db_dir = _source_module._staged_index_dir(db_dir)
         # The staged build writes a second full copy of the index alongside the
         # live one, and the publish step then creates a third copy (a safety
         # backup of the live index before swapping). Budget for the full
@@ -1003,8 +1054,14 @@ class RagJobQueue:
         _append_cli_option(command, "--chunk_target_tokens", resolved["chunk_target_tokens"])
         _append_cli_option(command, "--chunk_overlap_tokens", resolved["chunk_overlap_tokens"])
         _append_cli_option(command, "--source_hashes", resolved["source_hashes"])
+        # Pass --resume whenever we reused an existing staged dir. The indexer
+        # re-validates the checkpoint against current inputs, so a stale one is
+        # safely ignored. Harmless on a fresh staged dir (no checkpoint present).
+        if resumable is not None:
+            command.append("--resume")
         command.append("--no_progress")
 
+        build_succeeded = False
         try:
             self._run_pipeline_subprocess(command, job=job)
             # Read the staged index run-summary before publish deletes the dir,
@@ -1014,8 +1071,19 @@ class RagJobQueue:
                 self._wait_for_no_queries(job, "publishing_index")
             with INDEX_LOCK:
                 _source_module._publish_staged_index(staged_db_dir, db_dir)
+            build_succeeded = True
         finally:
-            shutil.rmtree(staged_db_dir, ignore_errors=True)
+            # Only clean up the staged dir once its contents have been published
+            # (success) OR the build gave up cleanly (cancellation / a fatal
+            # error the operator does not intend to resume). On a crash that left
+            # a valid checkpoint, the dir must survive so a retry can resume it.
+            if build_succeeded:
+                shutil.rmtree(staged_db_dir, ignore_errors=True)
+            elif job is not None and job.cancel_requested:
+                # Explicit cancellation: the operator opted out of resuming.
+                shutil.rmtree(staged_db_dir, ignore_errors=True)
+            # else: a crash/exception path -- leave the staged dir in place so
+            # the next attempt can resume from its checkpoint.
 
     def _run_incremental_indexing(
         self,

@@ -63,6 +63,37 @@ class ServerConfig:
 
 
 @dataclass
+class EmbeddingsConfig:
+    """Embedding-engine tuning. These are the dominant cost at corpus scale
+    (a 100GB cold index is weeks of embedding work on a single host), so they
+    are surfaced in config rather than env-only.
+
+    Precedence at construction time (see ``EmbeddingEngine.__init__``) is:
+    explicit constructor arg > env var (``OLLAMA_EMBED_*``) > these config
+    values > hardcoded defaults. The env vars remain the escape hatch for
+    ad-hoc overrides without editing the config file.
+    """
+
+    batch_size: int = 128
+    timeout_seconds: float = 30.0
+    retries: int = 3
+    cache_max_entries: int = 50_000
+    # Scale the per-request timeout with batch size so a large batch on a slow
+    # GPU does not silently trip the retry loop. The effective timeout is
+    # ``timeout_seconds * max(1.0, batch_size / timeout_batch_baseline)``,
+    # capped at ``timeout_max_seconds``. Set ``timeout_batch_baseline`` equal to
+    # the batch size at which ``timeout_seconds`` was measured (default 128).
+    timeout_batch_baseline: int = 128
+    timeout_max_seconds: float = 600.0
+    # List of Ollama replica URLs for multi-host embedding (the primary
+    # scale-out lever). Empty = single host via ``OLLAMA_HOST``.
+    hosts: list[str] = field(default_factory=list)
+    # In-flight embedding batches per host. Set >1 when the Ollama server runs
+    # with ``OLLAMA_NUM_PARALLEL>1``. 1 = one batch per host at a time.
+    concurrency: int = 1
+
+
+@dataclass
 class PipelineConfig:
     paths: PathsConfig = field(default_factory=PathsConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
@@ -70,6 +101,7 @@ class PipelineConfig:
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
 
     def ensure_dirs(self) -> None:
         for value in (self.paths.data_dir, self.paths.processed_dir, self.paths.db_dir, self.paths.asset_dir):

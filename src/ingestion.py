@@ -619,12 +619,31 @@ def _run_serial_ingestion(
     progress_enabled: bool,
     processed: list[dict[str, Any]],
     failed: list[dict[str, Any]],
+    skipped_count: int = 0,
+    total_files: int | None = None,
 ) -> None:
     """Process PDFs one at a time in the current process (the original path)."""
+    from src.progress_protocol import emit_progress
+
+    total_pending = len(pending)
+    total = total_files if total_files is not None else total_pending
+    ingest_timer = RunTimer()
+    done_in_batch = 0
+
+    def _emit(done: int) -> None:
+        elapsed_min = max(ingest_timer.elapsed() / 60.0, 1e-9)
+        emit_progress(
+            phase="ingesting",
+            done=done + skipped_count,
+            total=total,
+            unit="files",
+            rate_per_min=done / elapsed_min,
+        )
+
     for input_path in _iter_with_progress(
         pending,
         enabled=progress_enabled,
-        total=len(pending),
+        total=total_pending,
         desc="Ingest documents",
         unit="doc",
     ):
@@ -645,6 +664,8 @@ def _run_serial_ingestion(
             )
             logger.exception("Ingestion failed for %s", result["file"])
             log_event("file_ingest_failed", file=result["file"], error=result.get("error", ""))
+        done_in_batch += 1
+        _emit(done_in_batch)
 
 
 def _run_parallel_ingestion(
@@ -656,6 +677,8 @@ def _run_parallel_ingestion(
     progress_enabled: bool,
     processed: list[dict[str, Any]],
     failed: list[dict[str, Any]],
+    skipped_count: int = 0,
+    total_files: int | None = None,
 ) -> None:
     """Process PDFs in parallel across a process pool.
 
@@ -666,10 +689,14 @@ def _run_parallel_ingestion(
     """
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
+    from src.progress_protocol import emit_progress
+
     _progress_status(
         f"Ingesting {len(pending)} document(s) across {workers} worker process(es)...",
         enabled=progress_enabled,
     )
+    total = total_files if total_files is not None else len(pending)
+    ingest_timer = RunTimer()
     try:
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {
@@ -683,11 +710,11 @@ def _run_parallel_ingestion(
                 for input_path in pending
             }
             completed = 0
-            total = len(futures)
+            total_futures = len(futures)
             for future in _iter_with_progress(
                 list(futures.keys()),
                 enabled=progress_enabled,
-                total=total,
+                total=total_futures,
                 desc="Ingest documents",
                 unit="doc",
             ):
@@ -703,23 +730,32 @@ def _run_parallel_ingestion(
                         enabled=progress_enabled,
                     )
                     log_event("file_ingest_failed", file=file_name, error=str(exc))
-                    continue
-                status = str(result.get("status") or "failed")
-                if status == "processed":
-                    processed.append({"file": result["file"], "hash": result.get("hash", "")})
-                    log_event("file_ingested", file=result["file"], hash=result.get("hash", ""))
-                elif status == "skipped":
-                    log_event("file_ingest_skipped", file=result["file"], hash=result.get("hash", ""))
                 else:
-                    failed.append(
-                        {"file": result["file"], "hash": "", "error": result.get("error", "")}
-                    )
-                    _progress_status(
-                        f"Failed to ingest {result['file']}: {result.get('error')}. "
-                        f"Continuing ({completed}/{total}).",
-                        enabled=progress_enabled,
-                    )
-                    log_event("file_ingest_failed", file=result["file"], error=result.get("error", ""))
+                    status = str(result.get("status") or "failed")
+                    if status == "processed":
+                        processed.append({"file": result["file"], "hash": result.get("hash", "")})
+                        log_event("file_ingested", file=result["file"], hash=result.get("hash", ""))
+                    elif status == "skipped":
+                        log_event("file_ingest_skipped", file=result["file"], hash=result.get("hash", ""))
+                    else:
+                        failed.append(
+                            {"file": result["file"], "hash": "", "error": result.get("error", "")}
+                        )
+                        _progress_status(
+                            f"Failed to ingest {result['file']}: {result.get('error')}. "
+                            f"Continuing ({completed}/{total_futures}).",
+                            enabled=progress_enabled,
+                        )
+                        log_event("file_ingest_failed", file=result["file"], error=result.get("error", ""))
+                # Emit after every completed future (success or failure).
+                elapsed_min = max(ingest_timer.elapsed() / 60.0, 1e-9)
+                emit_progress(
+                    phase="ingesting",
+                    done=completed + skipped_count,
+                    total=total,
+                    unit="files",
+                    rate_per_min=completed / elapsed_min,
+                )
     except Exception as exc:
         # If the pool itself cannot start (e.g. pickling failure on Windows),
         # fall back to serial so ingestion still completes.
@@ -737,6 +773,8 @@ def _run_parallel_ingestion(
             progress_enabled=progress_enabled,
             processed=processed,
             failed=failed,
+            skipped_count=skipped_count,
+            total_files=total_files,
         )
 
 
@@ -890,6 +928,8 @@ def run_ingestion(
             progress_enabled=progress_enabled,
             processed=processed,
             failed=failed,
+            skipped_count=len(skipped),
+            total_files=len(input_paths),
         )
     else:
         _run_serial_ingestion(
@@ -899,6 +939,8 @@ def run_ingestion(
             progress_enabled=progress_enabled,
             processed=processed,
             failed=failed,
+            skipped_count=len(skipped),
+            total_files=len(input_paths),
         )
 
     elapsed = timer.elapsed()

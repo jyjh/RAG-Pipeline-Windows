@@ -1636,6 +1636,46 @@ function rememberJobLogOpenState() {
   }
 }
 
+function formatEta(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+  const s = Math.round(seconds);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const remS = s % 60;
+  if (m < 60) return `${m}m ${remS}s`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  if (h < 48) return `${h}h ${remM}m`;
+  const d = Math.floor(h / 24);
+  const remH = h % 24;
+  return `${d}d ${remH}h`;
+}
+
+function formatJobProgress(job) {
+  const p = job.progress;
+  if (!p || typeof p !== "object") return "";
+  const done = Number(p.done || 0);
+  const total = Number(p.total || 0);
+  const unit = escapeHtml(String(p.unit || "items"));
+  const phase = escapeHtml(String(p.phase || ""));
+  const rate = Number(p.rate_per_min || 0);
+  const eta = Number(p.eta_seconds || 0);
+  const parts = [];
+  if (phase) parts.push(phase);
+  if (total > 0) {
+    const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+    parts.push(`${done.toLocaleString()}/${total.toLocaleString()} ${unit} (${pct}%)`);
+  } else if (done > 0) {
+    parts.push(`${done.toLocaleString()} ${unit}`);
+  }
+  if (rate > 0) parts.push(`${Math.round(rate).toLocaleString()}/${unit.split(" ")[0]}/min`);
+  if (eta > 0) parts.push(`ETA ${formatEta(eta)}`);
+  // Surface cumulative record counters from the indexer's `extra` payload so a
+  // long indexing run shows records written/embedded alongside file progress.
+  const extra = p.records_written != null ? ` | ${Number(p.records_written).toLocaleString()} recs` : "";
+  return parts.length ? `<div class="job-progress">${parts.join(" · ")}${extra}</div>` : "";
+}
+
 function createJobRow(job) {
   const row = document.createElement("tr");
   const jobId = String(job.id || "");
@@ -1649,10 +1689,11 @@ function createJobRow(job) {
   const logBlock = logTail
     ? `<details class="job-log" data-job-id="${escapeHtml(jobId)}"${logOpen}><summary>Log (${Number(job.log_line_count || 0)} lines)</summary><pre>${escapeHtml(logTail)}</pre></details>`
     : "";
+  const progressBlock = formatJobProgress(job);
   row.innerHTML = `
     <td>${escapeHtml(jobId.slice(0, 8))}</td>
     <td>${escapeHtml(job.status)}</td>
-    <td>${escapeHtml(job.phase)}</td>
+    <td>${escapeHtml(job.phase)}${progressBlock}</td>
     <td>${escapeHtml((job.filenames || []).join(", "))}</td>
     <td>${escapeHtml(job.error || "")}${logBlock}</td>
     <td><div class="job-actions">${cancelButton}</div></td>

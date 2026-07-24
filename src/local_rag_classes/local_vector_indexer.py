@@ -10,6 +10,19 @@ from src.index_overrides import (
     copy_index_overrides,
     load_index_overrides,
 )
+from src.job_logging import RunTimer
+from src.progress_protocol import emit_progress
+
+# Crash-resume checkpoint for staged full builds. Written atomically into the
+# staged dir every CHECKPOINT_INTERVAL_FILES (or sooner on the last file) so a
+# hard crash/OOM/kill mid-build can resume from the last completed file instead
+# of restarting the whole (potentially multi-day) embedding pass. Resume is an
+# optimization, not a correctness requirement: replace_records_by_source_hash is
+# idempotent (delete-then-add per source), so re-running without --resume is
+# safe but wasteful. See index_markdown(resume=...).
+CHECKPOINT_FILENAME = ".index_build_checkpoint.json"
+CHECKPOINT_INTERVAL_FILES = 250
+CHECKPOINT_INTERVAL_SECONDS = 900.0  # 15 minutes
 
 bind_module_namespace(
     _source_module,
@@ -49,7 +62,7 @@ class LocalVectorIndexer:
         )
         self.embedding_batch_size = _positive_int(
             embedding_batch_size or os.environ.get("LOCAL_RAG_EMBED_BATCH_SIZE"),
-            64,
+            128,
         )
         _status(
             f"Local index: using Ollama embedding model {self.embedding_model} "
@@ -340,7 +353,73 @@ class LocalVectorIndexer:
                 )
             _merge_records_into_manifest(manifest, source_records)
 
-    def index_markdown(self, markdown_dir: str) -> None:
+    def _checkpoint_path(self) -> Path:
+        return Path(self.working_dir) / CHECKPOINT_FILENAME
+
+    def _load_checkpoint(self) -> dict[str, Any] | None:
+        """Load a valid resume checkpoint from the staged dir, or None.
+
+        A checkpoint is valid only if it was written for the same set of input
+        files (same file names + count). A mismatch (e.g. the corpus changed
+        between the crash and the resume) invalidates it so resume never skips
+        a file that should be (re)processed. Returns None on any issue so the
+        caller falls back to a fresh build.
+        """
+        path = self._checkpoint_path()
+        if not path.exists():
+            return None
+        try:
+            import json as _json
+
+            payload = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def _write_checkpoint(
+        self,
+        *,
+        completed_files: list[str],
+        processed_files: int,
+        failed_files: int,
+        written_records: int,
+        total_embedded: int,
+        total_reused: int,
+        manifest: dict[str, Any],
+    ) -> None:
+        """Atomically persist resume state.
+
+        Captures the set of completed markdown filenames plus a snapshot of the
+        running manifest so a resumed run can (a) skip re-sectioning/embedding
+        completed files and (b) reconstruct the manifest without re-reading the
+        already-written LanceDB rows. Atomic via temp+replace so a crash during
+        the write never leaves a half-written checkpoint.
+        """
+        from src.atomic_io import write_json_atomic
+
+        # Strip the non-persisted _working_dir routing key (same as
+        # write_index_manifest_payload) so it never lands in the checkpoint.
+        manifest_snapshot = {k: v for k, v in manifest.items() if k != "_working_dir"}
+        payload = {
+            "completed_files": sorted(set(completed_files)),
+            "processed_files": int(processed_files),
+            "failed_files": int(failed_files),
+            "written_records": int(written_records),
+            "total_embedded": int(total_embedded),
+            "total_reused": int(total_reused),
+            "manifest": manifest_snapshot,
+            "version": 1,
+        }
+        try:
+            write_json_atomic(self._checkpoint_path(), payload)
+        except Exception:
+            # Checkpoint is best-effort: a write failure must never abort the
+            # build. The next checkpoint attempt will overwrite this one.
+            pass
+
+    def index_markdown(self, markdown_dir: str, *, resume: bool = False) -> None:
         """Build the index one Markdown file at a time.
 
         Streaming model: each file is sectioned, embedded, and written
@@ -349,6 +428,14 @@ class LocalVectorIndexer:
         whole corpus. A single file that fails (e.g. an embedding error after
         retries) is recorded in the index summary and skipped; only an all-fail
         run aborts, so the staged build's failure keeps the live index intact.
+
+        When ``resume=True`` and a valid checkpoint exists in the working dir
+        (written by a prior interrupted run of this same build), files already
+        completed are skipped -- their LanceDB rows and manifest entries are
+        already in place. This turns a crash mid-way through a multi-day build
+        into a resume-from-last-checkpoint rather than a restart-from-zero.
+        Resume is an optimization: ``replace_records_by_source_hash`` is
+        idempotent, so re-running without resume is correct but wasteful.
         """
         os.makedirs(self.working_dir, exist_ok=True)
         files = sorted(Path(markdown_dir).glob("*.md"))
@@ -395,6 +482,56 @@ class LocalVectorIndexer:
         failed_files = 0
         index_errors: list[dict[str, Any]] = []
 
+        # --- Crash-resume: skip files already completed in a prior run. ---
+        # A checkpoint is only honored when resume=True AND it was written for
+        # exactly this set of input files (so a corpus change between crash and
+        # resume can't silently skip new/changed files). On a valid hit, seed
+        # the manifest + counters from the checkpoint and filter the file list.
+        completed_file_names: set[str] = set()
+        checkpoint = self._load_checkpoint() if resume else None
+        resuming = False
+        if checkpoint is not None:
+            cp_files = checkpoint.get("completed_files") or []
+            cp_file_set = {str(name) for name in cp_files}
+            current_names = {f.name for f in files}
+            # Only resume if the checkpoint's completed set is a subset of the
+            # current inputs (no missing files) AND non-empty. A superset or a
+            # mismatch means the corpus changed -- start fresh.
+            if cp_file_set and cp_file_set.issubset(current_names):
+                completed_file_names = cp_file_set
+                # Rebuild the manifest from the checkpoint so the final publish
+                # has correct document entries + embedded/reused totals for the
+                # skipped files without re-reading their LanceDB rows.
+                cp_manifest = checkpoint.get("manifest") or {}
+                if isinstance(cp_manifest, dict):
+                    for key, value in cp_manifest.items():
+                        if key != "_working_dir":
+                            manifest[key] = value
+                processed_files = int(checkpoint.get("processed_files") or 0)
+                failed_files = int(checkpoint.get("failed_files") or 0)
+                written_records = int(checkpoint.get("written_records") or 0)
+                total_embedded = int(checkpoint.get("total_embedded") or 0)
+                total_reused = int(checkpoint.get("total_reused") or 0)
+                resuming = True
+                _status(
+                    f"Local index: resuming from checkpoint -- skipping "
+                    f"{len(completed_file_names)} already-completed file(s).",
+                    enabled=self.progress_enabled,
+                )
+            else:
+                _status(
+                    "Local index: checkpoint present but inputs changed; starting a fresh build.",
+                    enabled=self.progress_enabled,
+                )
+        files_to_process = [f for f in files if f.name not in completed_file_names]
+        # Total file count is known up front; used for the progress ETA. The
+        # record-level total is unknown until sectioning, so we emit file-level
+        # progress here and embed the cumulative record totals as `extra` for the
+        # UI to display alongside. The done count includes previously-completed
+        # files so the progress bar reflects overall position, not just this run.
+        index_timer = RunTimer()
+        total_files_to_index = len(files)
+
         # Two-stage pipeline: the main thread reads + sections + embeds (GPU-
         # bound), while a single background thread writes the previous file's
         # records to LanceDB (CPU/disk-bound). This overlaps the GPU and I/O so
@@ -412,10 +549,18 @@ class LocalVectorIndexer:
                 pending_write = None
 
         try:
+            # Track the file currently in-flight on the writer thread so a
+            # checkpoint can record it as complete only once its write is
+            # durable (confirmed by the next _await_pending_write or the final
+            # flush). This is the key to crash-safety: a file recorded in the
+            # checkpoint is guaranteed to have its LanceDB rows + manifest entry.
+            pending_write_file: str | None = None
+            last_checkpoint_write = 0.0
+            files_done_this_run = 0
             for file_path in _iter_with_progress(
-                files,
+                files_to_process,
                 enabled=self.progress_enabled,
-                total=len(files),
+                total=len(files_to_process),
                 desc="Local index",
                 unit="doc",
             ):
@@ -430,6 +575,11 @@ class LocalVectorIndexer:
                         chunk_overlap_tokens=self.chunk_overlap_tokens,
                     )
                     if not file_records:
+                        # No records: nothing to write, but count it as processed
+                        # so progress is accurate. It is safe to record as
+                        # complete immediately (no write to await).
+                        processed_files += 1
+                        completed_file_names.add(file_name)
                         continue
 
                     before_overrides = len(file_records)
@@ -442,6 +592,8 @@ class LocalVectorIndexer:
                             enabled=self.progress_enabled,
                         )
                     if not file_records:
+                        processed_files += 1
+                        completed_file_names.add(file_name)
                         continue
 
                     _status(
@@ -466,7 +618,12 @@ class LocalVectorIndexer:
 
                     # Wait for the previous write to finish before queueing this
                     # one (bounds memory to ~2 files and preserves write order).
+                    # The previous file's write is now durable -- record it as
+                    # completed for the checkpoint.
                     _await_pending_write()
+                    if pending_write_file is not None:
+                        completed_file_names.add(pending_write_file)
+                        pending_write_file = None
 
                     # Snapshot what the background writer needs, then queue it.
                     # manifest merging happens in the writer to keep the main
@@ -481,13 +638,54 @@ class LocalVectorIndexer:
                         groups_snapshot,
                         manifest,
                     )
+                    pending_write_file = file_name
                     written_records += len(file_records)
                     processed_files += 1
+                    files_done_this_run += 1
                     _status(
                         f"Local index: wrote {len(file_records)} record(s) from {file_name} "
                         f"({total_embedded} embedded, {total_reused} reused cumulative)",
                         enabled=self.progress_enabled,
                     )
+                    # Structured progress for the web UI. Emitted unconditionally
+                    # (not gated by progress_enabled) so a multi-day index run
+                    # surfaced via the job queue still reports done/total/rate.
+                    # `done` includes files completed in a prior run (resume) so
+                    # the bar reflects overall position.
+                    elapsed_min = max(index_timer.elapsed() / 60.0, 1e-9)
+                    done_count = len(completed_file_names) + files_done_this_run
+                    emit_progress(
+                        phase="indexing",
+                        done=done_count,
+                        total=total_files_to_index,
+                        unit="files",
+                        rate_per_min=files_done_this_run / elapsed_min,
+                        extra={
+                            "records_written": written_records,
+                            "records_embedded": total_embedded,
+                            "records_reused": total_reused,
+                            "failed_files": failed_files,
+                            "resumed": resuming,
+                        },
+                    )
+                    # Periodic checkpoint so a crash loses at most ~one checkpoint
+                    # interval of work. Written only after the in-flight write for
+                    # the previous file is confirmed durable above.
+                    now = time.monotonic()
+                    if (
+                        files_done_this_run % CHECKPOINT_INTERVAL_FILES == 0
+                        or (now - last_checkpoint_write) >= CHECKPOINT_INTERVAL_SECONDS
+                    ):
+                        self._write_checkpoint(
+                            completed_files=sorted(completed_file_names),
+                            processed_files=processed_files,
+                            failed_files=failed_files,
+                            written_records=written_records,
+                            total_embedded=total_embedded,
+                            total_reused=total_reused,
+                            manifest=manifest,
+                        )
+                        last_checkpoint_write = now
                     # Drop this file's records before reading the next one.
                     del file_records
                 except Exception as exc:
@@ -497,13 +695,40 @@ class LocalVectorIndexer:
                         f"Local index: failed to index {file_name}: {exc}. Continuing.",
                         enabled=self.progress_enabled,
                     )
+                    elapsed_min = max(index_timer.elapsed() / 60.0, 1e-9)
+                    done_count = len(completed_file_names) + files_done_this_run
+                    emit_progress(
+                        phase="indexing",
+                        done=done_count,
+                        total=total_files_to_index,
+                        unit="files",
+                        rate_per_min=files_done_this_run / elapsed_min,
+                        extra={
+                            "records_written": written_records,
+                            "records_embedded": total_embedded,
+                            "records_reused": total_reused,
+                            "failed_files": failed_files,
+                            "resumed": resuming,
+                        },
+                    )
         finally:
             # Flush the last in-flight write before continuing to ANN build.
             _await_pending_write()
+            if pending_write_file is not None:
+                completed_file_names.add(pending_write_file)
+                pending_write_file = None
             write_executor.shutdown(wait=True)
 
 
         write_index_manifest_payload(self.working_dir, manifest)
+        # The build succeeded: the durable manifest supersedes the resume
+        # checkpoint, so remove it. A leftover checkpoint in the staged dir
+        # would otherwise be published into the live index (harmless but messy)
+        # and could mislead a future resume of a different build. Best-effort.
+        try:
+            self._checkpoint_path().unlink(missing_ok=True)
+        except Exception:
+            pass
         if self.reuse_db_dir:
             copy_index_overrides(self.reuse_db_dir, self.working_dir)
         output_target = store.db_path / "chunks"
@@ -514,6 +739,21 @@ class LocalVectorIndexer:
         # scan into a sublinear lookup. Best-effort: an index-build failure must
         # not abort an otherwise-successful index build (search falls back to
         # flat scan when no index is present).
+        #
+        # The IVF_PQ retrain on a large corpus can take minutes-to-tens-of-minutes
+        # with no other output, so emit a progress line first so the UI shows the
+        # job is training the ANN index rather than hung.
+        emit_progress(
+            phase="building_ann_index",
+            done=processed_files,
+            total=total_files_to_index,
+            unit="files",
+            extra={
+                "records_written": written_records,
+                "records_embedded": total_embedded,
+                "records_reused": total_reused,
+            },
+        )
         try:
             ann_result = store.create_vector_index()
             if ann_result.get("built"):
@@ -527,6 +767,13 @@ class LocalVectorIndexer:
                     f"Local index: skipped ANN index build ({ann_result.get('reason')}).",
                     enabled=self.progress_enabled,
                 )
+            emit_progress(
+                phase="ann_index_complete",
+                done=processed_files,
+                total=total_files_to_index,
+                unit="files",
+                extra={"ann_built": bool(ann_result.get("built"))},
+            )
         except Exception as exc:
             from src.vector_store import ANN_MIN_ROWS
 
@@ -679,11 +926,52 @@ class LocalVectorIndexer:
         )
 
         if had_ann:
-            ann_result = store.create_vector_index()
-            if not ann_result.get("built"):
-                raise RuntimeError(
-                    "Incremental indexing changed a corpus with an ANN index, "
-                    f"but ANN rebuild did not complete: {ann_result}"
+            # Retraining IVF_PQ from scratch is expensive at scale (minutes for
+            # millions of vectors). For small deltas the stale centroids still
+            # return good results (recall degrades gracefully, not incorrectly),
+            # so only retrain when the changed-row fraction crosses the
+            # configured threshold. Operators can force a retrain via the
+            # 'rebuild_vector_index' job.
+            total = store.count()
+            threshold = max(0.0, float(_source_module.ANN_RETRAIN_THRESHOLD))
+            retrain = not total or changed_rows / total >= threshold
+            if retrain:
+                ann_result = store.create_vector_index()
+                if not ann_result.get("built"):
+                    raise RuntimeError(
+                        "Incremental indexing changed a corpus with an ANN index, "
+                        f"but ANN rebuild did not complete: {ann_result}"
+                    )
+            else:
+                _status(
+                    f"Local incremental index: skipping ANN retrain "
+                    f"({changed_rows}/{total} rows changed < {threshold:.0%} threshold). "
+                    f"Run 'rebuild_vector_index' to retrain manually.",
+                    enabled=self.progress_enabled,
+                )
+
+        # Re-indexing uses logical delete (tombstones) then add, so repeated
+        # incremental runs accumulate dead fragments that raise scan cost and
+        # disk usage. compact() runs LanceDB optimize() to merge fragments and
+        # reclaim space -- safe to call any time. Auto-compacting here keeps the
+        # table healthy without a separate operator action.
+        if changed_rows and store.count():
+            try:
+                compact_result = store.compact()
+                if compact_result.get("compacted"):
+                    reclaimed = int(compact_result.get("bytes_reclaimed", 0))
+                    _status(
+                        f"Local incremental index: compacted table "
+                        f"(reclaimed {reclaimed/1e6:.1f}MB).",
+                        enabled=self.progress_enabled,
+                    )
+            except Exception as exc:
+                # Compaction is maintenance; a failure must not abort a
+                # successful incremental index. The operator can retry via the
+                # 'compact' job.
+                _status(
+                    f"Local incremental index: auto-compact skipped ({exc}).",
+                    enabled=self.progress_enabled,
                 )
         _status(
             f"Local incremental index: replaced {len(source_updates)} source(s), "

@@ -459,6 +459,46 @@ class ManualTextPdfParser:
             texts.append(self._normalize_text(text))
         return texts
 
+    def extract_sampled_page_texts(self, file_path: str, *, max_pages: int = 5) -> list[str]:
+        """Extract text from a spread of pages for a cheap usability probe.
+
+        Used by the hybrid parser to decide born-digital vs scanned WITHOUT
+        materializing every page's text for a large PDF. Samples up to
+        ``max_pages`` pages spread across the document (first, middle, last, and
+        evenly-spaced pages between). Each sampled page's text is extracted and
+        normalized exactly as in :meth:`extract_page_texts`, so the result is
+        directly usable with :meth:`is_text_usable`.
+
+        The reader is cached (via :meth:`_get_reader`) so opening it here does
+        not add a second full parse -- the subsequent full extraction reuses the
+        same parsed structure. Returns an empty list if the PDF has no pages.
+        """
+        reader = self._get_reader(file_path)
+        total = len(reader.pages)
+        if total == 0:
+            return []
+        if total <= max_pages:
+            # Small enough that sampling buys nothing; fall through to the
+            # full extraction path (the caller will do that anyway).
+            page_indices = list(range(total))
+        else:
+            # Evenly-spaced spread that always includes the first and last page
+            # so a leading/guard-page anomaly or a tail watermark is seen.
+            step = (total - 1) / max(1, max_pages - 1)
+            page_indices = sorted({int(round(i * step)) for i in range(max_pages)})
+        texts: list[str] = []
+        for index in page_indices:
+            page = reader.pages[index]
+            try:
+                text = page.extract_text(extraction_mode=self.extraction_mode) or ""
+            except TypeError:
+                text = page.extract_text() or ""
+            except Exception as exc:
+                logger.warning("Manual text extraction failed on page %s: %s", index + 1, exc)
+                text = ""
+            texts.append(self._normalize_text(text))
+        return texts
+
     @staticmethod
     def _normalize_text(text: str) -> str:
         lines = [line.rstrip() for line in text.replace("\r\n", "\n").split("\n")]

@@ -74,6 +74,11 @@ def run_indexing(*args, **kwargs):
 
 from src.cli_query_engine import QueryEngine
 
+# Unified default embedding batch size (matches web_app.py and the indexer so
+# the CLI path isn't accidentally 16x slower at scale). Env override
+# OLLAMA_EMBED_BATCH_SIZE and --embedding_batch_size still take precedence.
+DEFAULT_EMBEDDING_BATCH_SIZE = 128
+
 
 def _configure_console() -> None:
     for stream in (sys.stdout, sys.stderr):
@@ -174,6 +179,18 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
         "ingestion_workers": _as_positive_int(ingestion.get("ingestion_workers"), 1),
         "max_pages_whole_doc": max(0, int(ingestion.get("max_pages_whole_doc", 50) or 0)),
     }
+
+
+def _load_indexing_config(config_path: Path | None = None) -> dict[str, Any]:
+    """Load the raw ``[indexing]`` section for ANN tuning.
+
+    Values are applied to the module-level ANN constants in
+    :mod:`src.vector_store` via :func:`apply_indexing_config` before indexing
+    starts, so ``create_vector_index()`` and query-time search honor config.toml.
+    """
+    payload = _load_toml_config(config_path)
+    indexing = payload.get("indexing", {})
+    return indexing if isinstance(indexing, dict) else {}
 
 
 def _load_query_config(config_path: Path | None = None) -> dict[str, Any]:
@@ -297,6 +314,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--source_hashes",
         default="",
         help="Comma-separated source hashes for incremental indexing.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help=(
+            "Index mode only: resume a previously-interrupted full build from "
+            "its checkpoint (skips files already written). No effect on "
+            "incremental (--source_hashes) runs."
+        ),
     )
     parser.add_argument("--question", help="Question to ask in query mode")
     parser.add_argument(
@@ -558,18 +585,25 @@ def main(argv: list[str] | None = None) -> int:
             from src.file_lock import acquire_index_lock
 
             with acquire_index_lock(args.db_dir):
+                # Apply [indexing] ANN tuning to the module constants before the
+                # indexer runs (covers nprobes/refine_factor/min_rows/retrain
+                # threshold). Safe no-op when the section is absent.
+                from src.vector_store import apply_indexing_config
+
+                apply_indexing_config(_load_indexing_config())
                 index_kwargs = dict(
                     md_dir=args.md_dir,
                     db_dir=args.db_dir,
                     progress_enabled=not args.no_progress,
                     embedding_model=args.embedding_model or "nomic-embed-text",
-                    embedding_batch_size=args.embedding_batch_size or 8,
+                    embedding_batch_size=args.embedding_batch_size or DEFAULT_EMBEDDING_BATCH_SIZE,
                     embedding_timeout=args.embedding_timeout or 30.0,
                     index_backend=args.index_backend,
                     reuse_db_dir=args.reuse_db_dir,
                     summary_mode=args.summary_mode,
                     chunk_target_tokens=args.chunk_target_tokens,
                     chunk_overlap_tokens=args.chunk_overlap_tokens,
+                    resume=bool(args.resume),
                 )
                 source_hashes = [value.strip() for value in args.source_hashes.split(",") if value.strip()]
                 if source_hashes:
@@ -586,7 +620,7 @@ def main(argv: list[str] | None = None) -> int:
                 asset_dir=args.asset_dir or _load_ingestion_config()["asset_dir"],
                 model=args.llm_model or query_config["llm_model"],
                 embedding_model=args.embedding_model or query_config["embedding_model"],
-                embedding_batch_size=args.embedding_batch_size or 8,
+                embedding_batch_size=args.embedding_batch_size or DEFAULT_EMBEDDING_BATCH_SIZE,
                 embedding_timeout=args.embedding_timeout or 30.0,
                 llm_num_predict=args.llm_num_predict or query_config["llm_num_predict"],
                 llm_timeout=args.llm_timeout if args.llm_timeout is not None else query_config["llm_timeout"],

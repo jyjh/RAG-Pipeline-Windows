@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from src.atomic_io import write_json_atomic
+from src.caches import BoundedLRU
 from src.file_lock import acquire_registry_lock
 
 
@@ -18,7 +19,10 @@ REGISTRY_VERSION = 1
 BLOCKING_STATUSES = {"queued", "saving_uploads", "ingesting", "ingested", "indexed"}
 
 _LOCK = threading.RLock()
-_JSON_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+# Bounded LRU keyed by path. Over a 100GB-scale ingest the source map and
+# registry are the hot paths; bounding prevents unbounded growth if processed
+# dirs are ever rotated or many distinct dirs are queried over a long run.
+_JSON_CACHE = BoundedLRU(maxsize=256)
 
 
 def utcnow() -> str:

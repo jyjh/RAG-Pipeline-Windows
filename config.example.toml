@@ -39,6 +39,9 @@ ingestion_workers = 1
 # OCR state in RAM and OOMs on a multi-thousand-page scanned book). 0 = never
 # force (always use the whole-document path when progress is disabled).
 max_pages_whole_doc = 50
+# Estimated on-disk expansion when PDFs become Markdown + .pages.json sidecars.
+# Used by the ingest disk-space pre-check. Born-digital ~1.5x; scanned ~2x+.
+ingest_expansion_factor = 2.0
 
 [chunking]
 max_tokens = 900
@@ -50,11 +53,47 @@ index_backend = "lancedb"
 # Approximate-nearest-neighbour (ANN) vector index. Below ann_min_rows the
 # table uses a flat (brute-force) scan which is faster for small corpora; above
 # it, an IVF_PQ index makes every query sublinear. These defaults are tuned for
-# nomic-embed-text (768-dim, L2-normalized vectors).
+# nomic-embed-text (768-dim, L2-normalized vectors). Applied at startup via
+# src.vector_store.apply_indexing_config so builds and queries honor them.
 [indexing]
 ann_min_rows = 50000
-ann_nprobes = 20
-ann_refine_factor = 10
+ann_nprobes = 50
+ann_refine_factor = 20
+# Fraction of changed rows that triggers an IVF_PQ retrain during incremental
+# reindex. Below it, stale centroids are retained (graceful recall degradation).
+ann_retrain_threshold = 0.01
+
+# Embedding engine tuning. At corpus scale this is THE bottleneck: a 100GB
+# cold index is weeks of embedding work on a single Ollama host. The levers
+# below are surfaced in config (with env-var overrides OLLAMA_EMBED_* for
+# ad-hoc use). Precedence: constructor arg > env var > these values > defaults.
+[embeddings]
+# Native SentenceTransformers (GPU/CPU) is typically 2-5x faster than the
+# Ollama HTTP path for a one-time cold index. Use it for the initial build,
+# then switch back to Ollama (native_embeddings = false) for steady-state
+# incremental updates. Set in [models].native_embeddings instead.
+# Embedding batch size. Larger = better GPU utilization but more memory.
+# 128 is safe for nomic-embed-text; 256-512 on a GPU with headroom.
+batch_size = 128
+# Per-request timeout. The effective timeout scales with batch size (see
+# timeout_batch_baseline / timeout_max_seconds) so a large batch on a slow GPU
+# does not silently trip the retry loop.
+timeout_seconds = 30.0
+timeout_batch_baseline = 128
+timeout_max_seconds = 600.0
+# Bounded retry with exponential backoff for transient Ollama hiccups.
+retries = 3
+# Embedding LRU cache size (~150MB at 50k entries x 768 float32). Bounds RAM
+# during a 100GB-scale cold index where nearly every chunk is unique.
+cache_max_entries = 50000
+# Multi-host embedding: list Ollama replica URLs to shard batches across.
+# This is the PRIMARY scale-out lever -- N replicas ~= N x throughput.
+# Empty = single host via OLLAMA_HOST. Example:
+#   hosts = ["http://gpu-a:11434", "http://gpu-b:11434"]
+hosts = []
+# In-flight batches per host. Set >1 when the Ollama server runs with
+# OLLAMA_NUM_PARALLEL>1. 1 = one batch per host at a time.
+concurrency = 1
 
 [uploads]
 # Per-file and per-corpus size caps in bytes (0 = unlimited). Set these on a

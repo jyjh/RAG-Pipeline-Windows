@@ -19,6 +19,7 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "sql_match_clauses",
     "sql_string",
     "sql_like_escape",
+    "apply_indexing_config",
 )
 
 
@@ -79,6 +80,39 @@ ANN_NUM_BITS = 8
 ANN_NPROBES = 50
 ANN_REFINE_FACTOR = 20
 ANN_MIN_ROWS = 50_000
+# During incremental reindex, only retrain the IVF_PQ index when the changed
+# row fraction reaches this threshold. Below it, stale centroids are retained
+# (recall degrades gracefully, not incorrectly). Tunable via [indexing].
+ANN_RETRAIN_THRESHOLD = 0.01
+
+
+def apply_indexing_config(config: dict[str, Any] | None) -> None:
+    """Apply the ``[indexing]`` config values to the module-level ANN constants.
+
+    Called once at startup so :meth:`create_vector_index` defaults and
+    ``_apply_ann_search_params`` both honor ``config.toml``. Unknown, missing,
+    or non-integer keys leave the hardcoded defaults in place, so this is safe
+    to call with an empty/partial config (behavior-preserving). Idempotent.
+    """
+    if not config:
+        return
+    global ANN_MIN_ROWS, ANN_NPROBES, ANN_REFINE_FACTOR, ANN_RETRAIN_THRESHOLD
+    try:
+        ANN_MIN_ROWS = int(config.get("ann_min_rows", ANN_MIN_ROWS))
+    except (TypeError, ValueError):
+        pass
+    try:
+        ANN_NPROBES = int(config.get("ann_nprobes", ANN_NPROBES))
+    except (TypeError, ValueError):
+        pass
+    try:
+        ANN_REFINE_FACTOR = int(config.get("ann_refine_factor", ANN_REFINE_FACTOR))
+    except (TypeError, ValueError):
+        pass
+    try:
+        ANN_RETRAIN_THRESHOLD = float(config.get("ann_retrain_threshold", ANN_RETRAIN_THRESHOLD))
+    except (TypeError, ValueError):
+        pass
 
 
 VectorStore = import_split_class("src.vector_store_classes.vector_store", "VectorStore")

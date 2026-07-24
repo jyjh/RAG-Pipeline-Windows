@@ -24,6 +24,7 @@ def run_indexing(
     chunk_target_tokens: int = 900,
     chunk_overlap_tokens: int = 120,
     source_hashes: list[str] | set[str] | None = None,
+    resume: bool = False,
 ):
     _progress_status("Starting Ollama local indexing pipeline...", enabled=progress_enabled)
     _progress_status(f"Checking Markdown directory: {md_dir}", enabled=progress_enabled)
@@ -53,9 +54,11 @@ def run_indexing(
         progress_enabled=progress_enabled,
     )
     if source_hashes:
+        # Incremental per-source replace has no checkpoint path (it operates on
+        # the live table, not a staged build); resume only applies to full builds.
         indexer.index_markdown_sources(md_dir, source_hashes)
     else:
-        indexer.index_markdown(md_dir)
+        indexer.index_markdown(md_dir, resume=resume)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from src.atomic_io import write_json_atomic
+from src.caches import BoundedLRU
 
 LEDGER_FILENAME = ".job_ledger.json"
 LEDGER_VERSION = 1
@@ -32,7 +33,10 @@ LEDGER_VERSION = 1
 LEDGER_TRACKED_KINDS = {"reindex", "reindex_source", "rebuild", "backup", "restore", "rebuild_vector_index"}
 
 _LOCK = threading.RLock()
-_JSON_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+# Bounded LRU: the ledger is tiny (a handful of paths per server instance) so
+# this stays small in practice, but bounding it prevents unbounded growth if
+# the ledger path were ever rotated or the process ran for a very long time.
+_JSON_CACHE = BoundedLRU(maxsize=128)
 
 
 def utcnow() -> str:

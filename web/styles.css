@@ -1037,6 +1037,15 @@ input[type="file"] {
   margin-top: 6px;
 }
 
+/* Live structured progress parsed from a job's subprocess output
+   (done/total/rate/ETA). Rendered under the phase cell in createJobRow. */
+.job-progress {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-muted, #64748b);
+  word-break: break-word;
+}
+
 .job-log summary {
   color: var(--accent-strong);
   cursor: pointer;

@@ -30,6 +30,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from src.atomic_io import write_json_atomic
+from src.caches import BoundedLRU
 from src.disk_space import DiskSpaceError, check_disk_space, estimate_dir_bytes
 from src.file_lock import acquire_index_lock
 from src.job_logging import log_event, setup_job_logging
@@ -451,7 +452,7 @@ def _string_list(value: Any, default: tuple[str, ...]) -> list[str]:
     return list(default)
 
 
-_TOML_CONFIG_CACHE: dict[str, dict[str, Any]] = {}
+_TOML_CONFIG_CACHE = BoundedLRU(maxsize=128)
 
 
 def _load_toml_config(config_path: Path) -> dict[str, Any]:
@@ -601,6 +602,11 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
         "tesseract_psm": _optional_int(ingestion.get("tesseract_psm"), DEFAULT_TESSERACT_PSM),
         "ingestion_workers": _positive_int(ingestion.get("ingestion_workers"), 1),
         "max_pages_whole_doc": max(0, int(ingestion.get("max_pages_whole_doc", 50))),
+        # Estimated on-disk expansion when PDFs become Markdown + .pages.json
+        # sidecars. Used by the ingest disk-space pre-check so a 100GB corpus
+        # doesn't exhaust disk mid-ingest. Born-digital PDFs expand ~1.5x;
+        # OCR/vision-enriched scanned PDFs can exceed 2x.
+        "ingest_expansion_factor": _positive_float(ingestion.get("ingest_expansion_factor"), 2.0),
     }
 
 
@@ -615,10 +621,33 @@ def _load_uploads_config(config_path: Path | None = None) -> dict[str, Any]:
     }
 
 
+def _load_indexing_config(config_path: Path | None = None) -> dict[str, Any]:
+    """Load the ``[indexing]`` section (ANN tuning).
+
+    These values are applied to the module-level ANN constants in
+    :mod:`src.vector_store` at startup via :func:`apply_indexing_config`, so
+    both ``create_vector_index()`` defaults and query-time
+    ``_apply_ann_search_params`` honor them. Returns the raw section dict;
+    normalization (int coercion, fallbacks) happens in ``apply_indexing_config``.
+    """
+    config_path = config_path or (ROOT_DIR / "config.toml")
+    payload = _load_toml_config(config_path)
+    indexing = payload.get("indexing", {})
+    return indexing if isinstance(indexing, dict) else {}
+
+
 SERVER_CONFIG = _load_server_config()
 CHAT_CONFIG = _load_chat_config()
 INGESTION_CONFIG = _load_ingestion_config()
 UPLOADS_CONFIG = _load_uploads_config()
+INDEXING_CONFIG = _load_indexing_config()
+
+# Apply ANN tuning once at import so query-time _apply_ann_search_params and
+# create_vector_index() defaults both honor config.toml. Safe no-op when the
+# [indexing] section is absent or keys are missing (defaults are retained).
+from src.vector_store import apply_indexing_config as _apply_indexing_config
+
+_apply_indexing_config(INDEXING_CONFIG)
 ASSET_DIR = _resolve_root_path(INGESTION_CONFIG["asset_dir"], default=DEFAULT_ASSET_DIR)
 
 
@@ -700,6 +729,7 @@ def _run_job_subprocess(
     worker_threads: int | None = None,
     cancel_event: threading.Event | None = None,
     log_callback: Callable[[str], None] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     kwargs: dict[str, Any] = {
         "cwd": ROOT_DIR,
@@ -736,18 +766,30 @@ def _run_job_subprocess(
     reader_done = threading.Event()
 
     def read_output() -> None:
+        from src.progress_protocol import parse_progress_line
+
         try:
             stream = process.stdout
             if stream is None:
                 return
             for line in stream:
                 text = str(line).rstrip()
-                if text:
-                    output_lines.append(text)
-                    if len(output_lines) > JOB_LOG_TAIL_LINES:
-                        del output_lines[: len(output_lines) - JOB_LOG_TAIL_LINES]
-                    if log_callback is not None:
-                        log_callback(text)
+                if not text:
+                    continue
+                # Structured progress lines are routed to the progress callback
+                # and kept out of the human-readable log tail so the UI log
+                # stays clean and the progress dict stays the single source of
+                # truth for done/total/rate.
+                if progress_callback is not None:
+                    parsed = parse_progress_line(text)
+                    if parsed is not None:
+                        progress_callback(parsed)
+                        continue
+                output_lines.append(text)
+                if len(output_lines) > JOB_LOG_TAIL_LINES:
+                    del output_lines[: len(output_lines) - JOB_LOG_TAIL_LINES]
+                if log_callback is not None:
+                    log_callback(text)
         finally:
             reader_done.set()
 
@@ -835,6 +877,56 @@ def terminate_child_subprocesses(*, grace_seconds: float = 5.0) -> int:
 def _staged_index_dir(live_db_dir: str | Path) -> Path:
     live_path = Path(live_db_dir)
     return live_path.parent / f".index_build_{uuid.uuid4().hex}"
+
+
+# Checkpoint filename mirrored from local_vector_indexer.CHECKPOINT_FILENAME.
+# Duplicated as a string literal (rather than imported) to avoid pulling the
+# indexer module (and its heavy Docling/Ollama imports) into the web-app import
+# graph. The two must stay in sync.
+_STAGED_CHECKPOINT_FILENAME = ".index_build_checkpoint.json"
+
+
+def _find_resumable_staged_dir(live_db_dir: str | Path) -> Path | None:
+    """Return an existing staged build dir with a valid checkpoint, or None.
+
+    A crash/OOM/kill mid-build leaves an orphaned ``.index_build_<hex>`` dir
+    whose LanceDB rows + manifest checkpoint are intact. Reusing it (with
+    ``--resume``) skips the already-completed files instead of restarting the
+    whole multi-day build. A staged dir is resumable only if its checkpoint
+    file exists and parses as JSON; the indexer re-validates the checkpoint's
+    file set against the current inputs, so a stale-but-present checkpoint for
+    a different corpus is safely rejected there.
+
+    Picks the most recently modified candidate if several exist (unlikely; the
+    build serializes via the index lock). Returns None when none qualify so the
+    caller falls back to a fresh staged dir.
+    """
+    live_path = Path(live_db_dir)
+    parent = live_path.parent
+    if not parent.is_dir():
+        return None
+    candidates: list[Path] = []
+    for entry in parent.iterdir():
+        if not entry.is_dir():
+            continue
+        if not entry.name.startswith(".index_build_"):
+            continue
+        checkpoint = entry / _STAGED_CHECKPOINT_FILENAME
+        if not checkpoint.exists():
+            continue
+        try:
+            import json as _json
+
+            data = _json.loads(checkpoint.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("completed_files"), list):
+            candidates.append(entry)
+    if not candidates:
+        return None
+    # Most recently modified wins (ties broken by name for determinism).
+    candidates.sort(key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
+    return candidates[0]
 
 
 def _remove_path(path: Path) -> None:
@@ -2338,7 +2430,7 @@ def _resolve_workspace_path(raw_path: str, *, root_dir: Path = ROOT_DIR) -> Path
 
 
 _UNSET_SENTINEL: Any = object()
-_JSON_CACHE: dict[str, tuple[tuple[int, int], Any]] = {}
+_JSON_CACHE = BoundedLRU(maxsize=1024)
 
 
 def _file_signature(*paths: Path) -> str:
@@ -2479,7 +2571,7 @@ def _index_manifest_stats(
     return {}
 
 
-_MARKDOWN_QUALITY_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+_MARKDOWN_QUALITY_CACHE = BoundedLRU(maxsize=2048)
 
 
 def _markdown_quality(processed_markdown_path: str, *, root_dir: Path = ROOT_DIR) -> dict[str, Any]:
@@ -3403,8 +3495,16 @@ def health(request: Request):
     index_exists = store.exists()
     if index_exists:
         try:
-            with INDEX_LOCK:
-                record_count = store.count()
+            # Read-only count: no INDEX_LOCK. The store's _table() re-stats the
+            # version-hint file on every call and re-opens the handle after a
+            # publish, so this is consistent with the (lock-free) chat read
+            # path. A race with the staged-index publish swap is absorbed by
+            # the except clause below. Holding INDEX_LOCK here would serialize
+            # the health poll against an in-progress index mutation -- the UI
+            # polls health every few seconds during a long ingest, so dropping
+            # the lock keeps the dashboard responsive without sacrificing
+            # correctness (a transient error just reports count=0).
+            record_count = store.count()
         except Exception:
             record_count = 0
     payload = {
@@ -3447,9 +3547,12 @@ def metrics(request: Request):
     index_bytes = 0
     if index_exists:
         try:
-            with INDEX_LOCK:
-                record_count = store.count()
-                index_bytes = store._on_disk_bytes()
+            # Read-only count + on-disk size: no INDEX_LOCK (same reasoning as
+            # /api/health). This endpoint exists to be polled by a dashboard
+            # during a multi-day ingest; serializing it on the index-write lock
+            # would stall the dashboard whenever a mutation is in flight.
+            record_count = store.count()
+            index_bytes = store._on_disk_bytes()
         except Exception:
             record_count = 0
             index_bytes = 0
@@ -3470,6 +3573,10 @@ def metrics(request: Request):
     # so this is None until a chat has occurred. Kept as a hook so a future
     # engine-singleton can populate it without changing the endpoint shape.
     cache_stats: dict[str, Any] | None = None
+    # Effective embedding config so an operator can see at a glance how the
+    # dominant cost at corpus scale is configured (batch size, replica count,
+    # concurrency, native vs Ollama). This is the primary scale-out lever.
+    embedding_config = _embedding_config_snapshot()
     payload = {
         "ok": True,
         "index_exists": index_exists,
@@ -3479,10 +3586,60 @@ def metrics(request: Request):
         "reused_records": reused_records,
         "index_bytes": index_bytes,
         "embedding_cache": cache_stats,
+        "embedding_config": embedding_config,
         "queue": job_queue.summary(),
         "ollama": _ollama_status_snapshot(),
     }
     return _etagged_json(request, payload, _file_signature(_index_store().table_version_hint_path()))
+
+
+def _embedding_config_snapshot() -> dict[str, Any]:
+    """Effective embedding configuration for the metrics endpoint.
+
+    Reports the resolved batch size, timeout, replica count, concurrency, and
+    backend (native vs Ollama) so an operator monitoring a multi-day ingest can
+    see how the throughput-critical knobs are set without reading the config
+    file. Reads only the [embeddings]/[models] config and env vars; never
+    constructs an EmbeddingEngine (which would load the model).
+    """
+    try:
+        from src.config import load_config
+
+        cfg = load_config()
+        emb = cfg.embeddings
+        models = cfg.models
+        # The same precedence logic as EmbeddingEngine.__init__ (env > config).
+        batch_size = _positive_int_or(
+            os.environ.get("OLLAMA_EMBED_BATCH_SIZE"), emb.batch_size
+        )
+        hosts_env = os.environ.get("OLLAMA_EMBED_HOSTS", "").strip()
+        hosts = (
+            [h.strip() for h in hosts_env.split(",") if h.strip()]
+            if hosts_env
+            else list(emb.hosts or [])
+        )
+        concurrency = _positive_int_or(
+            os.environ.get("OLLAMA_EMBED_CONCURRENCY"), emb.concurrency
+        )
+        return {
+            "backend": "native" if models.native_embeddings else "ollama",
+            "model": models.embedding_model,
+            "batch_size": batch_size,
+            "timeout_seconds": emb.timeout_seconds,
+            "retries": emb.retries,
+            "cache_max_entries": emb.cache_max_entries,
+            "replica_count": max(1, len(hosts)) if hosts else 1,
+            "concurrency": concurrency,
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _positive_int_or(value: Any, default: int) -> int:
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 def _ollama_status_snapshot() -> dict[str, Any]:
@@ -3781,7 +3938,7 @@ def _path_is_relative_to(path: Path, root: Path) -> bool:
         return False
 
 
-_PDF_HASH_CACHE: dict[str, tuple[tuple[int, int], str]] = {}
+_PDF_HASH_CACHE = BoundedLRU(maxsize=8192)
 
 
 def _cached_pdf_hash(path: Path) -> str:
@@ -4546,6 +4703,24 @@ def rebuild_vector_index(request: Request):
     if blocker:
         raise HTTPException(status_code=409, detail=blocker)
     job = job_queue.enqueue_rebuild_vector_index()
+    return job.to_dict()
+
+
+@app.post("/api/index/compact")
+def compact_index(request: Request):
+    """Compact the live LanceDB table to reclaim space from reindex cycles.
+
+    Each incremental ``reindex_source`` leaves tombstoned (deleted) rows that
+    accumulate on disk until a compaction merges fragments and drops them. At
+    100GB scale, many incremental updates can leave the index bloated relative
+    to its live row count. This triggers LanceDB's ``optimize`` under the index
+    lock and reports bytes reclaimed. Safe to run periodically; the only cost is
+    brief query blocking while the compaction runs.
+    """
+    blocker = _index_mutation_blocker()
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
+    job = job_queue.enqueue_compact()
     return job.to_dict()
 
 

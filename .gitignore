@@ -77,3 +77,4 @@ model_cache/
 .DS_Store
 Thumbs.db
 desktop.ini
+/.zcode

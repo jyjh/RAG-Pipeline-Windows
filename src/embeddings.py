@@ -138,13 +138,38 @@ class EmbeddingEngine:
         max_cache_entries: int | None = None,
     ):
         self.model_name = model_name
+
+        # Load the [embeddings] config once. Precedence for every knob below is:
+        # explicit constructor arg > env var (OLLAMA_EMBED_*) > [embeddings]
+        # config value > hardcoded default. The env vars remain the escape hatch
+        # for ad-hoc overrides; surfacing them in config makes the dominant cost
+        # at corpus scale (embedding throughput) discoverable and tunable.
+        from src.config import load_config
+
+        emb_cfg = load_config().embeddings
+
         self.ollama_batch_size = _positive_int(
-            ollama_batch_size or os.environ.get("OLLAMA_EMBED_BATCH_SIZE"),
-            64,
+            ollama_batch_size
+            if ollama_batch_size is not None
+            else os.environ.get("OLLAMA_EMBED_BATCH_SIZE"),
+            emb_cfg.batch_size,
         )
-        self.ollama_timeout = _positive_float(
-            ollama_timeout or os.environ.get("OLLAMA_EMBED_TIMEOUT"),
-            30.0,
+        self._ollama_timeout_base = _positive_float(
+            ollama_timeout
+            if ollama_timeout is not None
+            else os.environ.get("OLLAMA_EMBED_TIMEOUT"),
+            emb_cfg.timeout_seconds,
+        )
+        # Batch-size-aware timeout. The configured ``timeout_seconds`` is
+        # measured at ``timeout_batch_baseline`` batch size; larger batches get a
+        # proportionally longer deadline (capped) so they don't silently trip
+        # the retry loop on a slow GPU. With defaults (30s/128) this is a no-op
+        # for batch_size<=128; batch_size=512 gets 120s. ``ollama_timeout`` is
+        # the effective value used per request (read by ``_ollama_api``).
+        baseline = max(1, int(emb_cfg.timeout_batch_baseline))
+        scale = max(1.0, float(self.ollama_batch_size) / float(baseline))
+        self.ollama_timeout = min(
+            self._ollama_timeout_base * scale, float(emb_cfg.timeout_max_seconds)
         )
         # Bounded retry with exponential backoff for transient Ollama hiccups
         # (timeouts, brief connection resets). A single blip otherwise aborts an
@@ -152,8 +177,10 @@ class EmbeddingEngine:
         # failure. Final-attempt failure still raises so callers can skip the
         # file (per-file isolation) rather than the whole corpus.
         self.ollama_retries = _positive_int(
-            ollama_retries if ollama_retries is not None else os.environ.get("OLLAMA_EMBED_RETRIES"),
-            3,
+            ollama_retries
+            if ollama_retries is not None
+            else os.environ.get("OLLAMA_EMBED_RETRIES"),
+            emb_cfg.retries,
         )
         # Bounded LRU cache. At 100GB-scale cold indexing almost every chunk is
         # unique, so an unbounded dict would grow to hold every embedding for
@@ -162,13 +189,25 @@ class EmbeddingEngine:
         # repeat cases (re-index reuse, repeated queries). Default 50k entries ≈
         # ~150MB at 768 float32 each; env-overridable.
         self.max_cache_entries = _positive_int(
-            max_cache_entries if max_cache_entries is not None
+            max_cache_entries
+            if max_cache_entries is not None
             else os.environ.get("OLLAMA_EMBED_CACHE_MAX"),
-            50_000,
+            emb_cfg.cache_max_entries,
         )
         self._cache: OrderedDict[tuple[int, int, str], Any] = OrderedDict()
 
-        from src.config import load_config
+        # Persist the config-sourced hosts/concurrency so multi-replica
+        # embedding is configurable without env vars. ``_resolve_ollama_hosts``
+        # and ``_resolve_embed_concurrency`` still honor their env vars; we seed
+        # the env from config only when the env var is unset, preserving the
+        # explicit-arg > env > config > default precedence.
+        if emb_cfg.hosts and not os.environ.get("OLLAMA_EMBED_HOSTS"):
+            os.environ["OLLAMA_EMBED_HOSTS"] = ",".join(emb_cfg.hosts)
+        if emb_cfg.concurrency and emb_cfg.concurrency != 1 and not os.environ.get(
+            "OLLAMA_EMBED_CONCURRENCY"
+        ):
+            os.environ["OLLAMA_EMBED_CONCURRENCY"] = str(int(emb_cfg.concurrency))
+
         self.native_embeddings = load_config().models.native_embeddings
         self._native_model = None
 
@@ -453,6 +492,16 @@ class EmbeddingEngine:
                     break
                 # Exponential backoff: 0.5s, 1s, 2s, ... plus up to 25% jitter.
                 backoff = (0.5 * (2 ** (attempt - 1))) * (1 + random.random() * 0.25)
+                # Surface the retry in the server log (not just stderr) so a
+                # slow-Ollama-induced retry storm is visible in logs/server.log
+                # during a long ingest. The first retry of each batch warns.
+                logger.warning(
+                    "Ollama embedding retry %d/%d after %.2fs backoff: %s",
+                    attempt,
+                    attempts,
+                    backoff,
+                    exc,
+                )
                 _status(
                     f"Ollama request failed (attempt {attempt}/{attempts}); "
                     f"retrying in {backoff:.2f}s. Error: {exc}"

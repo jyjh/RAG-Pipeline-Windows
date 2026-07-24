@@ -387,3 +387,56 @@ def test_compact_on_missing_table_returns_not_compacted():
         assert result["reason"] == "table_missing"
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_apply_indexing_config_overrides_ann_constants():
+    """apply_indexing_config writes [indexing] values onto the module constants.
+
+    create_vector_index() defaults and _apply_ann_search_params both read these
+    module globals, so this is the wiring that makes config.toml's [indexing]
+    section actually take effect. Save/restore so the test is order-independent.
+    """
+    import src.vector_store as vs
+
+    original = (vs.ANN_MIN_ROWS, vs.ANN_NPROBES, vs.ANN_REFINE_FACTOR, vs.ANN_RETRAIN_THRESHOLD)
+    try:
+        vs.apply_indexing_config(
+            {
+                "ann_min_rows": 12345,
+                "ann_nprobes": 7,
+                "ann_refine_factor": 11,
+                "ann_retrain_threshold": 0.05,
+            }
+        )
+        assert vs.ANN_MIN_ROWS == 12345
+        assert vs.ANN_NPROBES == 7
+        assert vs.ANN_REFINE_FACTOR == 11
+        assert vs.ANN_RETRAIN_THRESHOLD == 0.05
+    finally:
+        vs.ANN_MIN_ROWS, vs.ANN_NPROBES, vs.ANN_REFINE_FACTOR, vs.ANN_RETRAIN_THRESHOLD = original
+
+
+def test_apply_indexing_config_is_safe_noop_on_empty_or_invalid():
+    """Empty/None/partial/invalid configs leave the hardcoded defaults intact."""
+    import src.vector_store as vs
+
+    original = (vs.ANN_MIN_ROWS, vs.ANN_NPROBES, vs.ANN_REFINE_FACTOR, vs.ANN_RETRAIN_THRESHOLD)
+    try:
+        # None and empty dict must be no-ops.
+        vs.apply_indexing_config(None)
+        assert (vs.ANN_MIN_ROWS, vs.ANN_NPROBES, vs.ANN_REFINE_FACTOR, vs.ANN_RETRAIN_THRESHOLD) == original
+        vs.apply_indexing_config({})
+        assert (vs.ANN_MIN_ROWS, vs.ANN_NPROBES, vs.ANN_REFINE_FACTOR, vs.ANN_RETRAIN_THRESHOLD) == original
+
+        # Invalid types must not raise and must not mutate.
+        vs.apply_indexing_config({"ann_nprobes": "not-a-number", "ann_min_rows": None})
+        assert (vs.ANN_MIN_ROWS, vs.ANN_NPROBES, vs.ANN_REFINE_FACTOR, vs.ANN_RETRAIN_THRESHOLD) == original
+
+        # Partial config applies only the valid keys.
+        vs.apply_indexing_config({"ann_nprobes": 99, "ann_min_rows": "bad"})
+        assert vs.ANN_NPROBES == 99
+        assert vs.ANN_MIN_ROWS == original[0]  # unchanged by the bad value
+        assert vs.ANN_REFINE_FACTOR == original[2]
+        assert vs.ANN_RETRAIN_THRESHOLD == original[3]
+    finally:
+        vs.ANN_MIN_ROWS, vs.ANN_NPROBES, vs.ANN_REFINE_FACTOR, vs.ANN_RETRAIN_THRESHOLD = original
