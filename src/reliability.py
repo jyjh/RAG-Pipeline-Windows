@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 from pathlib import Path
 from typing import Any
 
@@ -75,7 +78,10 @@ def load_source_group_map(path: str | Path | None) -> dict[str, dict[str, Any]]:
         return {}
     try:
         payload = json.loads(trust_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except json.JSONDecodeError as exc:
+        logger.error("Failed to parse trust map %s: %s", trust_path, exc)
+        return {}
+    except OSError:
         return {}
     documents = payload.get("documents", {}) if isinstance(payload, dict) else {}
     if not isinstance(documents, dict):

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from src.config import PipelineConfig
 from src.embedding_backends import EmbeddingProvider
 from src.schema import Citation, RetrievedBlock
-from src.store import SQLiteBlockStore
+from src.store import SQLiteBlockStore, _terms
 from src.vector_index import VectorIndex
 
 logger = logging.getLogger(__name__)
@@ -107,7 +107,7 @@ class LocalReranker:
             q = set(_terms(question))
             for c in candidates:
                 c["score"] = float(c.get("score", 0.0)) + len(q & set(_terms(c.get("text", "")))) / max(1, len(q))
-        return sorted(candidates, key=lambda x: x["score"], reverse=True)
+        return sorted(candidates, key=lambda x: (x["score"], x.get("chunk_id", "")), reverse=True)
 
 
 def reciprocal_rank_fusion(result_sets: list[list[dict]], rrf_k: int = 60) -> list[dict]:
@@ -119,13 +119,10 @@ def reciprocal_rank_fusion(result_sets: list[list[dict]], rrf_k: int = 60) -> li
             scores[cid] = scores.get(cid, 0.0) + 1.0 / (rrf_k + rank)
             rows.setdefault(cid, row)
     fused = [{**rows[cid], "score": score} for cid, score in scores.items()]
-    return sorted(fused, key=lambda x: x["score"], reverse=True)
+    return sorted(fused, key=lambda x: (x["score"], x.get("chunk_id", "")), reverse=True)
 
 
 def _filter(rows: list[dict], docs: list[str] | None) -> list[dict]:
     return rows if not docs else [r for r in rows if r.get("doc_id") in set(docs)]
 
-
-def _terms(text: str) -> list[str]:
-    return [t.lower() for t in re.findall(r"[A-Za-z0-9_]{2,}", text or "")]
 

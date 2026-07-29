@@ -541,6 +541,9 @@ def _load_chat_config(config_path: Path | None = None) -> dict[str, Any]:
     retrieval_config = payload.get("retrieval", {}) if isinstance(payload.get("retrieval"), dict) else {}
     ollama_config = payload.get("ollama", {}) if isinstance(payload.get("ollama"), dict) else {}
 
+    raw_hosts = ollama_config.get("hosts", [])
+    hosts = [str(h) for h in raw_hosts] if isinstance(raw_hosts, list) else []
+
     return {
         "system_prompt": str(chat_config.get("system_prompt") or DEFAULT_SYSTEM_PROMPT),
         "context_window": _positive_int(
@@ -555,6 +558,9 @@ def _load_chat_config(config_path: Path | None = None) -> dict[str, Any]:
             retrieval_config.get("min_relevance_score"),
             DEFAULT_RETRIEVAL_MIN_SCORE,
         ),
+        "ollama_host": str(ollama_config.get("host") or "http://127.0.0.1:11434"),
+        "ollama_hosts": hosts,
+        "ollama_fallback_enabled": _bool_value(ollama_config.get("fallback_enabled"), True),
         "ollama_health_check_interval": _positive_float(
             ollama_config.get("chat_health_check_interval_seconds"),
             DEFAULT_OLLAMA_CHAT_HEALTH_CHECK_INTERVAL,
@@ -652,16 +658,18 @@ ASSET_DIR = _resolve_root_path(INGESTION_CONFIG["asset_dir"], default=DEFAULT_AS
 
 
 _INDEX_STORE_CACHE: dict = {}
+_INDEX_CACHE_LOCK = threading.Lock()
 _INDEX_RECORDS_SNAPSHOT_CACHE: dict[str, tuple[str, tuple[list[dict[str, Any]], str, int]]] = {}
 
 
 def _index_store(db_dir: Path | None = None):
-    resolved = str(db_dir or DB_DIR)
-    store = _INDEX_STORE_CACHE.get(resolved)
-    if store is None:
-        store = default_store(resolved)
-        _INDEX_STORE_CACHE[resolved] = store
-    return store
+    with _INDEX_CACHE_LOCK:
+        resolved = str(db_dir or DB_DIR)
+        store = _INDEX_STORE_CACHE.get(resolved)
+        if store is None:
+            store = default_store(resolved)
+            _INDEX_STORE_CACHE[resolved] = store
+        return store
 
 
 def _background_worker_threads() -> int:
@@ -1048,10 +1056,12 @@ def _backup_size_bytes(backup_dir: Path) -> int:
 
 def _invalidate_index_caches(db_dir: str | Path) -> None:
     resolved = str(Path(db_dir).resolve())
-    _INDEX_RECORDS_SNAPSHOT_CACHE.pop(resolved, None)
-    store = _INDEX_STORE_CACHE.get(resolved)
+    with _INDEX_CACHE_LOCK:
+        _INDEX_RECORDS_SNAPSHOT_CACHE.pop(resolved, None)
+        store = _INDEX_STORE_CACHE.get(resolved)
     if store is not None:
         store._invalidate_table()
+
 
 
 def _snapshot_sort_key(path: Path) -> tuple[int, str]:
@@ -1738,10 +1748,11 @@ def _index_records_snapshot(db_dir: Path | None = None) -> tuple[list[dict[str, 
         resolved_db_dir / INDEX_MANIFEST_FILENAME,
         index_overrides_path(resolved_db_dir),
     )
-    cached = _INDEX_RECORDS_SNAPSHOT_CACHE.get(cache_key)
-    if cached is not None and cached[0] == signature:
-        rows, model, dim = cached[1]
-        return [dict(row) for row in rows], model, dim
+    with _INDEX_CACHE_LOCK:
+        cached = _INDEX_RECORDS_SNAPSHOT_CACHE.get(cache_key)
+        if cached is not None and cached[0] == signature:
+            rows, model, dim = cached[1]
+            return [dict(row) for row in rows], model, dim
     count = store.count()
     # Guard the whole-index materialization. Above the cap this would hold
     # every row (including full chunk text) in process memory and OOM at scale.
@@ -1751,7 +1762,8 @@ def _index_records_snapshot(db_dir: Path | None = None) -> tuple[list[dict[str, 
     if count <= 0:
         model, dim = store.metadata()
         result = ([], model, dim)
-        _INDEX_RECORDS_SNAPSHOT_CACHE[cache_key] = (signature, result)
+        with _INDEX_CACHE_LOCK:
+            _INDEX_RECORDS_SNAPSHOT_CACHE[cache_key] = (signature, result)
         return result
     payload = store.list_records(offset=0, limit=count, search="")
     result = (
@@ -1759,7 +1771,8 @@ def _index_records_snapshot(db_dir: Path | None = None) -> tuple[list[dict[str, 
         str(payload.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
         int(payload.get("embedding_dim") or 768),
     )
-    _INDEX_RECORDS_SNAPSHOT_CACHE[cache_key] = (signature, result)
+    with _INDEX_CACHE_LOCK:
+        _INDEX_RECORDS_SNAPSHOT_CACHE[cache_key] = (signature, result)
     return [dict(row) for row in result[0]], result[1], result[2]
 
 
@@ -3465,7 +3478,7 @@ async def _enforce_api_token(request: Request, call_next):
     # /api/chat/stream as read-only (it only reads the index, never mutates).
     if request.method in _MUTATING_METHODS and path not in {"/api/chat/stream", "/api/render"}:
         supplied = request.headers.get("X-API-Token") or request.query_params.get("token") or ""
-        if supplied != token:
+        if not hmac.compare_digest(supplied, token):
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Invalid or missing API token."},
@@ -3507,6 +3520,7 @@ def health(request: Request):
             record_count = store.count()
         except Exception:
             record_count = 0
+    ollama_snap = _ollama_status_snapshot()
     payload = {
         "ok": True,
         "paths": {
@@ -3526,6 +3540,9 @@ def health(request: Request):
             "retrieval_min_score": CHAT_CONFIG["retrieval_min_score"],
         },
         "queue": job_queue.summary(),
+        "ollama_active_host": ollama_snap.get("ollama_active_host"),
+        "ollama_candidate_hosts": ollama_snap.get("ollama_candidate_hosts"),
+        "ollama_reachability": ollama_snap.get("ollama_reachability"),
     }
     seed = _payload_signature(payload, _file_signature(_index_store().table_version_hint_path(), DB_DIR / INDEX_MANIFEST_FILENAME))
     return _conditional_json(request, payload, seed)
@@ -3577,6 +3594,7 @@ def metrics(request: Request):
     # dominant cost at corpus scale is configured (batch size, replica count,
     # concurrency, native vs Ollama). This is the primary scale-out lever.
     embedding_config = _embedding_config_snapshot()
+    ollama_snap = _ollama_status_snapshot()
     payload = {
         "ok": True,
         "index_exists": index_exists,
@@ -3588,7 +3606,10 @@ def metrics(request: Request):
         "embedding_cache": cache_stats,
         "embedding_config": embedding_config,
         "queue": job_queue.summary(),
-        "ollama": _ollama_status_snapshot(),
+        "ollama": ollama_snap,
+        "ollama_active_host": ollama_snap.get("ollama_active_host"),
+        "ollama_candidate_hosts": ollama_snap.get("ollama_candidate_hosts"),
+        "ollama_reachability": ollama_snap.get("ollama_reachability"),
     }
     return _etagged_json(request, payload, _file_signature(_index_store().table_version_hint_path()))
 
@@ -3643,13 +3664,34 @@ def _positive_int_or(value: Any, default: int) -> int:
 
 
 def _ollama_status_snapshot() -> dict[str, Any]:
-    """Best-effort Ollama reachability snapshot for the metrics endpoint."""
+    """Best-effort Ollama reachability snapshot for health and metrics endpoints."""
     try:
-        from src.local_rag import _ollama_server_healthy
+        from src.local_rag import (
+            _ollama_host,
+            _get_ollama_candidate_hosts,
+            _ollama_server_healthy,
+        )
 
-        return {"reachable": bool(_ollama_server_healthy())}
-    except Exception:
-        return {"reachable": None}
+        active_host = _ollama_host()
+        candidate_hosts = _get_ollama_candidate_hosts()
+        reachability: dict[str, bool] = {}
+        for h in candidate_hosts:
+            reachability[h] = bool(_ollama_server_healthy(h, timeout=1.5))
+
+        return {
+            "reachable": reachability.get(active_host, False),
+            "ollama_active_host": active_host,
+            "ollama_candidate_hosts": candidate_hosts,
+            "ollama_reachability": reachability,
+        }
+    except Exception as exc:
+        return {
+            "reachable": False,
+            "ollama_active_host": "http://127.0.0.1:11434",
+            "ollama_candidate_hosts": ["http://127.0.0.1:11434"],
+            "ollama_reachability": {"http://127.0.0.1:11434": False},
+            "error": str(exc),
+        }
 
 
 @app.get("/api/update/status")
@@ -4444,6 +4486,45 @@ async def upload_files_direct(request: Request):
 
 _CHUNK_UPLOADS: dict[str, dict[str, Any]] = {}
 _CHUNK_UPLOADS_LOCK = threading.Lock()
+
+
+def _prune_abandoned_uploads(max_age_seconds: float = 86400.0) -> int:
+    """Remove chunked upload state and .part files older than *max_age_seconds*."""
+    now = datetime.now(timezone.utc)
+    pruned = 0
+    with _CHUNK_UPLOADS_LOCK:
+        expired = [
+            uid for uid, meta in _CHUNK_UPLOADS.items()
+            if (now - datetime.fromisoformat(meta.get("started_at", now.isoformat()))).total_seconds() > max_age_seconds
+        ]
+        for uid in expired:
+            _CHUNK_UPLOADS.pop(uid, None)
+            part = _chunk_part_path(uid)
+            try:
+                if part.exists():
+                    part.unlink()
+                if part.parent.exists() and not any(part.parent.iterdir()):
+                    part.parent.rmdir()
+            except OSError:
+                pass
+            pruned += 1
+    return pruned
+
+
+def _upload_cleanup_loop(interval: float = 3600.0) -> None:
+    """Background daemon that prunes abandoned chunked uploads hourly."""
+    while True:
+        import time as _time
+        _time.sleep(interval)
+        try:
+            count = _prune_abandoned_uploads()
+            if count:
+                logger.info("Pruned %d abandoned chunked upload(s)", count)
+        except Exception:  # noqa: BLE001 - daemon must not crash
+            pass
+
+
+threading.Thread(target=_upload_cleanup_loop, daemon=True, name="upload-cleanup").start()
 
 
 def _chunk_part_path(upload_id: str) -> Path:

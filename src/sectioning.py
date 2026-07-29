@@ -390,7 +390,8 @@ def read_pages_sidecar(markdown_path: Path) -> list[str] | None:
     if not sidecar.exists():
         return None
     try:
-        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        with sidecar.open(encoding="utf-8") as f:
+            payload = json.load(f)
     except (OSError, ValueError):
         return None
     if not isinstance(payload, dict):

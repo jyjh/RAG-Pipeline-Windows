@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from src._class_module_support import bind_module_namespace, finalize_split_class
 import src.vector_store as _source_module
 
@@ -30,6 +32,7 @@ class LanceDBVectorStore:
         # reused for the lifetime of the instance.
         self._db_conn = None
         self._table_obj = None
+        self._table_lock = threading.Lock()
         self._table_signature: tuple[int, int] | None = None
         self._exists_cache: tuple[tuple[int, int] | None, bool] | None = None
 
@@ -142,7 +145,7 @@ class LanceDBVectorStore:
         embedding_model: str,
         embedding_dim: int,
     ) -> dict[str, Any]:
-        """Atomically replace one source's rows with ``records``.
+        """Replace one source's rows with ``records``. (Warning: non-atomic)
 
         A delete-then-add of a single source within one logical operation, so
         re-indexing one file is idempotent and never touches other files' rows.
@@ -561,13 +564,14 @@ class LanceDBVectorStore:
             return 0
 
     def _table(self):
-        signature = self._read_table_signature()
-        if self._table_obj is not None and self._table_signature == signature:
-            return self._table_obj
-        table = self._db().open_table(TABLE_NAME)
-        self._table_obj = table
-        self._table_signature = signature
-        return table
+        with self._table_lock:
+            signature = self._read_table_signature()
+            if self._table_obj is not None and self._table_signature == signature:
+                return self._table_obj
+            table = self._db().open_table(TABLE_NAME)
+            self._table_obj = table
+            self._table_signature = signature
+            return table
 
     def _table_names(self, db=None) -> list[str]:
         db = db or self._db()

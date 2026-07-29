@@ -121,6 +121,9 @@ timeout_seconds = 8.0
 max_results = 5
 
 [ollama]
+host = "http://127.0.0.1:11434"
+hosts = []
+fallback_enabled = true
 chat_health_check_interval_seconds = 5.0
 chat_max_lost_health_checks = 5
 

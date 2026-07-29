@@ -33,7 +33,10 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_tqdm",
     "_iter_with_progress",
     "_ollama_pull_command",
+    "_normalize_ollama_host",
     "_ollama_host",
+    "_get_ollama_candidate_hosts",
+    "probe_ollama_endpoints",
     "_ollama_chat",
     "_ollama_chat_request",
     "_ollama_health_request",
@@ -122,10 +125,6 @@ DEFAULT_QUERY_SYSTEM_PROMPT = (
     "factual claim with source IDs exactly as provided, such as [S1] or [W1]. "
     "If the available sources are insufficient, say what is missing."
 )
-# Variant used when the eager planner has already retrieved local context and
-# injected it as a completed search_local_context tool call before the model's
-# first turn. The model should answer from that pre-fetched context and only
-# call tools again if the evidence is insufficient.
 DEFAULT_EAGER_QUERY_SYSTEM_PROMPT = (
     "You are a retrieval-augmented assistant. Relevant local context has already "
     "been retrieved for you and is provided in the search_local_context tool "
@@ -137,9 +136,6 @@ DEFAULT_EAGER_QUERY_SYSTEM_PROMPT = (
     "as provided, such as [S1] or [W1]. If the available sources are insufficient, "
     "say what is missing."
 )
-# Short directive appended to a user-supplied custom system_prompt when eager
-# retrieval is active, so a customized prompt still steers the model to treat the
-# pre-fetched tool result as already-provided context.
 EAGER_CONTEXT_SUFFIX = (
     "\n\nNote: relevant local context has already been retrieved and is provided "
     "in the search_local_context tool result. Answer directly from it; only call "
@@ -194,13 +190,93 @@ def _ollama_pull_command(model: str) -> str:
     return f"{executable} pull {model}"
 
 
-def _ollama_host() -> str:
-    host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").strip()
+_ACTIVE_OLLAMA_HOST: str | None = None
+
+
+def _normalize_ollama_host(raw: str) -> str:
+    host = (raw or "").strip()
     if not host:
         return "http://127.0.0.1:11434"
     if host.startswith(("http://", "https://")):
         return host.rstrip("/")
     return f"http://{host.rstrip('/')}"
+
+
+def _ollama_host() -> str:
+    env_host = os.environ.get("OLLAMA_HOST", "").strip()
+    if env_host:
+        return _normalize_ollama_host(env_host)
+
+    global _ACTIVE_OLLAMA_HOST
+    if _ACTIVE_OLLAMA_HOST:
+        return _normalize_ollama_host(_ACTIVE_OLLAMA_HOST)
+
+    try:
+        from src.config import load_config
+
+        cfg = load_config()
+        if cfg.ollama and cfg.ollama.host:
+            return _normalize_ollama_host(cfg.ollama.host)
+    except Exception:
+        pass
+
+    return "http://127.0.0.1:11434"
+
+
+def _get_ollama_candidate_hosts() -> list[str]:
+    candidates: list[str] = []
+
+    env_host = os.environ.get("OLLAMA_HOST", "").strip()
+
+    toml_host = "http://127.0.0.1:11434"
+    toml_hosts: list[str] = []
+    fallback_enabled = True
+
+    try:
+        from src.config import load_config
+
+        cfg = load_config()
+        if cfg.ollama:
+            if cfg.ollama.host:
+                toml_host = cfg.ollama.host
+            toml_hosts = list(cfg.ollama.hosts or [])
+            fallback_enabled = bool(cfg.ollama.fallback_enabled)
+    except Exception:
+        pass
+
+    primary = env_host or toml_host or "http://127.0.0.1:11434"
+    candidates.append(_normalize_ollama_host(primary))
+
+    if fallback_enabled:
+        env_hosts = os.environ.get("OLLAMA_HOSTS", "").strip()
+        if env_hosts:
+            for piece in env_hosts.split(","):
+                if piece.strip():
+                    candidates.append(_normalize_ollama_host(piece.strip()))
+        for h in toml_hosts:
+            if h and h.strip():
+                candidates.append(_normalize_ollama_host(h.strip()))
+        candidates.append("http://127.0.0.1:11434")
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for h in candidates:
+        if h not in seen:
+            seen.add(h)
+            result.append(h)
+    return result
+
+
+def probe_ollama_endpoints(hosts: list[str], timeout: float = 3.0) -> str | None:
+    if not hosts:
+        return None
+    for raw_host in hosts:
+        if not raw_host or not raw_host.strip():
+            continue
+        normalized = _normalize_ollama_host(raw_host)
+        if _ollama_server_healthy(normalized, timeout=timeout):
+            return normalized
+    return None
 
 
 def _ollama_chat(
@@ -247,13 +323,14 @@ def _ollama_chat_request(payload: dict[str, Any]):
     )
 
 
-def _ollama_health_request():
-    return urllib.request.Request(f"{_ollama_host()}/api/version", method="GET")
+def _ollama_health_request(host: str | None = None):
+    target = _normalize_ollama_host(host) if host else _ollama_host()
+    return urllib.request.Request(f"{target}/api/version", method="GET")
 
 
-def _ollama_server_healthy(*, timeout: float) -> bool:
+def _ollama_server_healthy(host: str | None = None, *, timeout: float = 3.0) -> bool:
     try:
-        with urllib.request.urlopen(_ollama_health_request(), timeout=timeout) as response:
+        with urllib.request.urlopen(_ollama_health_request(host), timeout=timeout) as response:
             return int(getattr(response, "status", 200) or 200) < 500
     except Exception:
         return False
@@ -261,15 +338,24 @@ def _ollama_server_healthy(*, timeout: float) -> bool:
 
 def _wait_for_ollama_recovery(
     *,
-    health_check_interval: float,
-    max_lost_health_checks: int,
+    health_check_interval: float = DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL,
+    max_lost_health_checks: int = DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
+    candidate_hosts: list[str] | None = None,
 ) -> bool:
     interval = max(0.1, float(health_check_interval))
     cycles = max(1, int(max_lost_health_checks))
     health_timeout = min(max(interval, 0.1), 10.0)
+    hosts_to_probe = candidate_hosts or _get_ollama_candidate_hosts()
     for _ in range(cycles):
         time.sleep(interval)
-        if _ollama_server_healthy(timeout=health_timeout):
+        healthy_host = probe_ollama_endpoints(hosts_to_probe, timeout=health_timeout)
+        if healthy_host:
+            global _ACTIVE_OLLAMA_HOST
+            if _ACTIVE_OLLAMA_HOST != healthy_host:
+                _status(f"Ollama dynamic failover: active host updated to {healthy_host}")
+                _ACTIVE_OLLAMA_HOST = healthy_host
+            if "OLLAMA_HOST" in os.environ:
+                os.environ["OLLAMA_HOST"] = healthy_host
             return True
     return False
 

@@ -280,7 +280,20 @@ async function requestJson(path, options = {}) {
       headers.set("If-None-Match", cached.etag);
     }
   }
-  const response = await fetch(path, { ...options, headers });
+  const controller = new AbortController();
+  const timeoutMs = options.timeoutMs || 30000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(path, { ...options, headers, signal: controller.signal });
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === "AbortError") {
+      throw new Error(`Request to ${path} timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  }
+  clearTimeout(timer);
   if (response.status === 304 && cacheable) {
     const cached = getJsonCache.get(path);
     if (cached) {
@@ -293,6 +306,10 @@ async function requestJson(path, options = {}) {
   const data = await response.json();
   const etag = response.headers.get("ETag");
   if (cacheable && etag) {
+    if (getJsonCache.size >= 100) {
+      const oldest = getJsonCache.keys().next().value;
+      getJsonCache.delete(oldest);
+    }
     getJsonCache.set(path, { etag, data });
   }
   return data;
@@ -1245,7 +1262,9 @@ function patchTableRows(tbody, items, options) {
       changed = true;
     }
   }
-  tbody.replaceChildren(fragment);
+  if (changed) {
+    tbody.replaceChildren(fragment);
+  }
   return changed;
 }
 

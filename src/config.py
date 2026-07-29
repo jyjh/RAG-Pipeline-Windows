@@ -94,6 +94,15 @@ class EmbeddingsConfig:
 
 
 @dataclass
+class OllamaConfig:
+    host: str = "http://127.0.0.1:11434"
+    hosts: list[str] = field(default_factory=list)
+    fallback_enabled: bool = True
+    chat_health_check_interval_seconds: float = 5.0
+    chat_max_lost_health_checks: int = 5
+
+
+@dataclass
 class PipelineConfig:
     paths: PathsConfig = field(default_factory=PathsConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
@@ -102,6 +111,7 @@ class PipelineConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
+    ollama: OllamaConfig = field(default_factory=OllamaConfig)
 
     def ensure_dirs(self) -> None:
         for value in (self.paths.data_dir, self.paths.processed_dir, self.paths.db_dir, self.paths.asset_dir):
@@ -143,4 +153,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> PipelineConfig:
         _merge_dataclass(cfg, _load_mapping(Path(chosen)))
     cfg.ensure_dirs()
     return cfg
+
+
+load_pipeline_config = load_config
+
 

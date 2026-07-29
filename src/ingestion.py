@@ -35,7 +35,7 @@ from src.defaults import (
 )
 
 from src._class_module_support import import_split_class
-from src.atomic_io import write_json_atomic
+from src.atomic_io import write_json_atomic, write_text_atomic
 from src.job_logging import RunTimer, log_event, write_run_summary
 
 INGEST_RESULT_FILENAME = ".ingest_result.json"
@@ -175,7 +175,11 @@ def _png_bytes_for_vision(image, fallback_bytes: bytes | None = None) -> bytes:
             Image.LANCZOS,
         )
     buffered = io.BytesIO()
-    target.save(buffered, format="PNG")
+    # JPEG is ~4× smaller and faster to encode than PNG; quality=85
+    # is indistinguishable to vision models at the downscaled resolution.
+    if target.mode in ("RGBA", "P", "LA"):
+        target = target.convert("RGB")
+    target.save(buffered, format="JPEG", quality=85)
     return buffered.getvalue()
 
 
@@ -422,7 +426,7 @@ def _iter_pdf_paths(input_path: str) -> list[Path]:
         return [path] if path.suffix.lower() == ".pdf" else []
     # Corpus directories are commonly organized by year/project. Walk nested
     # directories so discovery does not silently omit most of a corpus.
-    return sorted(p for p in path.rglob("*") if p.is_file() and p.suffix.lower() == ".pdf")
+    return sorted(p for p in path.rglob("*.pdf") if p.is_file())
 
 
 def _markdown_name_for_pdf(
@@ -575,8 +579,7 @@ def _ingest_one_pdf(
                 f"Ingestion produced empty Markdown for {file_name}. "
                 "Check OCR dependencies or enable vision-based scanned-page fallback."
             )
-        with output_path.open("w", encoding="utf-8") as handle:
-            handle.write(md_content)
+        write_text_atomic(output_path, md_content)
         # Persist normalized per-page text next to the Markdown so the indexing
         # pass can skip re-running pypdf's extract_text() over every page. This
         # single extraction at ingest time replaces the per-file re-extraction
@@ -721,7 +724,7 @@ def _run_parallel_ingestion(
                 completed += 1
                 input_path = futures[future]
                 try:
-                    result = future.result()
+                    result = future.result(timeout=1800)  # 30 min hard limit per PDF
                 except Exception as exc:  # noqa: BLE001 - worker-level isolation
                     file_name = input_path.name
                     failed.append({"file": file_name, "hash": "", "error": str(exc)})

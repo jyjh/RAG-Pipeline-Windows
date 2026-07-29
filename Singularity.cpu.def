@@ -1,0 +1,60 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%labels
+    Maintainer FSAE RAG Pipeline Team
+    Version 1.0.0-cpu
+    Description Singularity container recipe for CPU-only document ingestion, LanceDB indexing, and Ollama LLM inference. Use on clusters with no GPU allocation; pair with `python -m src.hpc --cpu`.
+
+%environment
+    export OLLAMA_HOST=127.0.0.1:11434
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PATH=/usr/local/bin:$PATH
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        libgl1 \
+        libglib2.0-0 \
+        poppler-utils \
+        tesseract-ocr \
+        curl \
+        git \
+        ca-certificates \
+        && rm -rf /var/lib/apt/lists/*
+
+    python3 -m pip install --upgrade pip setuptools wheel
+    # CPU-only PyTorch wheels. This avoids pulling the multi-GB CUDA runtime
+    # that the GPU image (Singularity.def) requires, keeping the image small.
+    pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+    pip install --no-cache-dir \
+        "docling~=2.105.0" \
+        "lancedb~=0.33.0" \
+        "pylance~=7.0.0" \
+        "ollama~=0.6.2" \
+        "onnxruntime~=1.27.0" \
+        "fastapi~=0.138.0" \
+        "uvicorn[standard]~=0.49.0" \
+        "pypdf~=6.14.0" \
+        "numpy~=2.4.6" \
+        "pydantic~=2.13.4" \
+        "tqdm~=4.68.3" \
+        "pyarrow~=24.0.0" \
+        "portalocker~=3.2.0" \
+        "requests~=2.34.2" \
+        "urllib3~=2.5.0" \
+        "pillow~=12.2.0" \
+        "einops~=0.8.2" \
+        "python-dotenv~=1.2.2"
+
+    curl -fsSL https://ollama.com/install.sh | sh || (
+        curl -fsSL https://ollama.com/download/ollama-linux-amd64.tar.gz | tar -xz -C /usr/local
+    )
+    chmod +x /usr/local/bin/ollama || true
+
+%runscript
+    exec "$@"

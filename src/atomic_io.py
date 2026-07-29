@@ -15,9 +15,28 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import tempfile
+import time as _time
 from pathlib import Path
 from typing import Any
+
+
+def _replace_with_retry(src: Path, dst: Path, *, attempts: int = 3, delay: float = 0.1) -> None:
+    """``os.replace`` with retry for Windows transient locks.
+
+    On Windows, antivirus scanners and the Search Indexer occasionally hold a
+    brief lock on the target file, causing ``PermissionError``.  A short retry
+    loop absorbs these without failing the write.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt >= attempts or platform.system() != "Windows":
+                raise
+            _time.sleep(delay * attempt)
 
 
 def write_text_atomic(path: str | Path, data: str, *, encoding: str = "utf-8") -> None:
@@ -38,7 +57,7 @@ def write_text_atomic(path: str | Path, data: str, *, encoding: str = "utf-8") -
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_path, target)
+        _replace_with_retry(tmp_path, target)
     except BaseException:
         # Best-effort cleanup of the temp file; never raise over the real error.
         try:
@@ -61,7 +80,7 @@ def write_bytes_atomic(path: str | Path, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_path, target)
+        _replace_with_retry(tmp_path, target)
     except BaseException:
         try:
             tmp_path.unlink()

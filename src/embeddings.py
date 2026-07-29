@@ -10,8 +10,15 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import urllib3
 from collections import OrderedDict
 from typing import Any
+
+_OLLAMA_POOL = urllib3.PoolManager(
+    num_pools=4,
+    maxsize=10,
+    retries=False,  # we handle retries ourselves
+)
 
 logger = logging.getLogger(__name__)
 
@@ -453,20 +460,25 @@ class EmbeddingEngine:
         base = host if host is not None else _ollama_host()
         url = f"{base}{path}"
         body = json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(request, timeout=self.ollama_timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except (TimeoutError, socket.timeout) as exc:
+            response = _OLLAMA_POOL.request(
+                "POST",
+                url,
+                body=body,
+                headers={"Content-Type": "application/json"},
+                timeout=urllib3.Timeout(total=self.ollama_timeout),
+            )
+            if response.status >= 400:
+                raise RuntimeError(
+                    f"Ollama request returned HTTP {response.status} at {url}: "
+                    f"{response.data[:200].decode('utf-8', errors='replace')}"
+                )
+            return json.loads(response.data.decode("utf-8"))
+        except (TimeoutError, socket.timeout, urllib3.exceptions.TimeoutError) as exc:
             raise RuntimeError(
                 f"Ollama request timed out after {self.ollama_timeout:g}s at {url}."
             ) from exc
-        except urllib.error.URLError as exc:
+        except urllib3.exceptions.HTTPError as exc:
             raise RuntimeError(f"Ollama request failed at {url}: {exc}") from exc
 
     def _ollama_api_with_retry(

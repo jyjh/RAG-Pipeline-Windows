@@ -20,7 +20,7 @@ def test_run_indexing_uses_local_vector_indexer(monkeypatch):
             def __init__(self, **kwargs):
                 calls["init"] = kwargs
 
-            def index_markdown(self, markdown_dir):
+            def index_markdown(self, markdown_dir, **kwargs):
                 calls["markdown_dir"] = markdown_dir
 
         monkeypatch.setattr("src.local_rag.LocalVectorIndexer", FakeLocalVectorIndexer)

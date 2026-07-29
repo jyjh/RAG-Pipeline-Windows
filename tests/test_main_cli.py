@@ -138,6 +138,7 @@ def test_main_index_dispatches_to_current_indexing(monkeypatch):
         summary_mode,
         chunk_target_tokens,
         chunk_overlap_tokens,
+        **kwargs,
     ):
         calls["md_dir"] = md_dir
         calls["db_dir"] = db_dir

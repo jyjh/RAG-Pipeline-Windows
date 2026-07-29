@@ -31,7 +31,10 @@ class HybridPdfParser:
         # list[str] of every page). For a born-digital PDF the sample passes the
         # usability check and we proceed to the (unchanged) full extraction; the
         # reader is cached so the probe adds no extra parse cost there.
-        sample = self.manual_parser.extract_sampled_page_texts(file_path)
+        if hasattr(self.manual_parser, "extract_sampled_page_texts"):
+            sample = self.manual_parser.extract_sampled_page_texts(file_path)
+        else:
+            sample = self.manual_parser.extract_page_texts(file_path)
         if not self.manual_parser.is_text_usable(sample):
             logger.info(
                 "Sampled text probe indicates a scanned/low-quality PDF; using Docling parsing: %s",

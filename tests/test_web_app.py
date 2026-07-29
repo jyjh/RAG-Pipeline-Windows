@@ -9,6 +9,10 @@ import time
 import uuid
 from pathlib import Path
 
+import gc
+import logging
+import time as _time
+
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -20,6 +24,22 @@ from src.asset_store import ImageAssetStore, image_asset_marker
 from src.index_overrides import load_index_overrides, persist_index_deletions, persist_index_edit
 from src.pdf_registry import load_source_map, write_source_entry
 from src.vector_store import LanceDBVectorStore
+
+
+_cleanup_log = logging.getLogger(__name__)
+
+def _rmtree_with_retry(path, *, attempts=4, delay=0.5):
+    """Remove a directory tree, retrying on Windows file-lock errors."""
+    for attempt in range(1, attempts + 1):
+        gc.collect()
+        try:
+            shutil.rmtree(path)
+            return
+        except (PermissionError, OSError):
+            if attempt >= attempts:
+                _cleanup_log.warning("Could not remove temp dir %s after %d attempts", path, attempts)
+                return
+            _time.sleep(delay * attempt)
 
 
 def _completed(args, *, stdout="", stderr="", returncode=0):
@@ -93,7 +113,7 @@ def workspace_tmp():
     try:
         yield path
     finally:
-        shutil.rmtree(path, ignore_errors=True)
+        _rmtree_with_retry(path)
 
 
 @pytest.fixture
@@ -103,7 +123,7 @@ def lancedb_tmp():
     try:
         yield path
     finally:
-        shutil.rmtree(path, ignore_errors=True)
+        _rmtree_with_retry(path)
 
 
 def _write_index(db_dir: Path):
@@ -950,6 +970,9 @@ def test_chat_config_reads_prompt_retrieval_and_ollama_health_settings(workspace
         "planner_enabled": False,
         "planner_max_queries": 5,
         "retrieval_min_score": 0.62,
+        "ollama_host": "http://127.0.0.1:11434",
+        "ollama_hosts": [],
+        "ollama_fallback_enabled": True,
         "ollama_health_check_interval": 3.5,
         "ollama_max_lost_health_checks": 9,
     }

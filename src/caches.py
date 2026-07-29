@@ -14,17 +14,15 @@ plus the usual dict methods for forward safety. It mirrors the eviction
 strategy already used by ``EmbeddingEngine._cache`` (an ``OrderedDict`` with
 ``move_to_end`` on hit + ``popitem(last=False)`` on overflow).
 
-Thread-safety: callers hold their own coarse locks (e.g. ``job_ledger._LOCK``)
-around read-modify-write sequences. This class is NOT internally locked -- the
-existing per-module locks cover the compound operations. A single
-``__setitem__`` or ``pop`` is not atomic on its own, but every call site that
-depends on atomicity already serializes via the module lock, so preserving
-that contract (no internal lock) avoids a double-lock and keeps the hot path
-lock-free for the read-only ``.get()`` path.
+Thread-safety: This class is internally locked. Callers no longer need external
+locks for basic operations (``get``, ``__getitem__``, ``__setitem__``, ``pop``).
+Compound operations may still require external synchronization if they span
+multiple method calls, but individual operations are thread-safe.
 """
 
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict
 from typing import Any, Hashable, Iterator
 
@@ -40,12 +38,13 @@ class BoundedLRU:
     and updates evict the least-recently-used entry when over capacity.
     """
 
-    __slots__ = ("_data", "_maxsize")
+    __slots__ = ("_data", "_maxsize", "_lock")
 
     def __init__(self, maxsize: int = 1024) -> None:
         if maxsize < 1:
             raise ValueError("maxsize must be >= 1")
         self._maxsize = int(maxsize)
+        self._lock = threading.Lock()
         self._data: OrderedDict[Hashable, Any] = OrderedDict()
 
     def _bump(self, key: Hashable) -> None:
@@ -60,18 +59,20 @@ class BoundedLRU:
     # --- dict-compatible API ------------------------------------------------
 
     def __getitem__(self, key: Hashable) -> Any:
-        value = self._data[key]  # raises KeyError on miss (matches dict)
-        self._bump(key)
-        return value
+        with self._lock:
+            value = self._data[key]  # raises KeyError on miss (matches dict)
+            self._bump(key)
+            return value
 
     def __setitem__(self, key: Hashable, value: Any) -> None:
         # An update to an existing key must also bump its recency.
-        if key in self._data:
-            self._data[key] = value
-            self._bump(key)
-        else:
-            self._data[key] = value
-            self._evict_if_needed()
+        with self._lock:
+            if key in self._data:
+                self._data[key] = value
+                self._bump(key)
+            else:
+                self._data[key] = value
+                self._evict_if_needed()
 
     def __contains__(self, key: object) -> bool:
         return key in self._data
@@ -94,11 +95,12 @@ class BoundedLRU:
         Matches ``dict.get`` semantics exactly, including the recency bump on
         hit so frequently-accessed paths survive eviction.
         """
-        if key in self._data:
-            value = self._data[key]
-            self._bump(key)
-            return value
-        return default
+        with self._lock:
+            if key in self._data:
+                value = self._data[key]
+                self._bump(key)
+                return value
+            return default
 
     def pop(self, key: Hashable, default: Any = None) -> Any:
         """Remove and return ``key``'s value, or ``default`` if absent.
@@ -106,10 +108,11 @@ class BoundedLRU:
         Matches ``dict.pop`` semantics used by the write-through invalidation
         paths (``cache.pop(str(path), None)`` after an atomic JSON write).
         """
-        try:
-            return self._data.pop(key)
-        except KeyError:
-            return default
+        with self._lock:
+            try:
+                return self._data.pop(key)
+            except KeyError:
+                return default
 
     def clear(self) -> None:
         self._data.clear()

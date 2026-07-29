@@ -18,7 +18,11 @@ import sqlite3
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
+
 from src.schema import AssetRecord, BlockRecord, ChunkRecord, DocumentRecord, PageRecord, json_dumps, json_loads
+
+_RE_TERMS = re.compile(r"[A-Za-z0-9_]{2,}")
 
 
 class SQLiteBlockStore:
@@ -290,15 +294,19 @@ class SQLiteBlockStore:
 
 
 def _terms(text: str) -> list[str]:
-    return [t.lower() for t in re.findall(r"[A-Za-z0-9_]{2,}", text or "")]
+    return [t.lower() for t in _RE_TERMS.findall(text or "")]
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
-    n = min(len(a), len(b))
+    va = np.asarray(a, dtype=np.float32)
+    vb = np.asarray(b, dtype=np.float32)
+    n = min(len(va), len(vb))
     if n == 0:
         return 0.0
-    dot = sum(a[i] * b[i] for i in range(n))
-    na = math.sqrt(sum(a[i] * a[i] for i in range(n)))
-    nb = math.sqrt(sum(b[i] * b[i] for i in range(n)))
-    return 0.0 if na == 0.0 or nb == 0.0 else dot / (na * nb)
+    va, vb = va[:n], vb[:n]
+    na = np.linalg.norm(va)
+    nb = np.linalg.norm(vb)
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return float(np.dot(va, vb) / (na * nb))
 

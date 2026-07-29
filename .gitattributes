@@ -1,0 +1,13 @@
+# Enforce deterministic line endings. The HPC job scripts (*.sh, *.pbs, *.def)
+# are executed as-is on Linux compute nodes where CRLF breaks /bin/bash parsing,
+# and the test suite strictly asserts LF-only bytes on them. Force LF so a
+# Windows checkout/commit can never silently CRLF them.
+*.sh  text eol=lf
+*.pbs text eol=lf
+*.def text eol=lf
+
+# Python source: LF everywhere (consistent with the rest of the project).
+*.py  text eol=lf
+
+# PowerShell is Windows-native: keep CRLF for editor friendliness.
+*.ps1 text eol=crlf
