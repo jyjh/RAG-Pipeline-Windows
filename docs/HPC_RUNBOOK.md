@@ -1,46 +1,38 @@
 # NUS HPC Runbook
 
-End-to-end recipe for running the FSAE RAG pipeline on the NUS HPC compute
-cluster: build the LanceDB index on a GPU node, then chat through the web app
-on your laptop while Ollama runs on a cluster GPU.
+Build the FSAE RAG index on NUS HPC, then chat through the web app on your
+laptop. Two clusters are available, so pick a path:
 
-This is the topology this runbook targets:
+- **GPU cluster (paid by the hour):** Path A.
+- **CPU-only cluster (free, unlimited):** Path B.
 
-```
- ┌─────────────┐    SSH (2-hop, -J)     ┌──────────┐                ┌──────────────────┐
- │  Laptop     │ ─────────────────────▶ │ login    │ ─── private ─▶ │ GPU compute node │
- │ web_app.py  │   127.0.0.1:11434 ───▶ │ node     │    network     │ ollama serve     │
- │ reads db/   │                        │ (jump)   │                │ (PBS serve job)  │
- │ locally     │ ◀───────────────────── │          │ ◀───────────── │                  │
- └─────────────┘                        └──────────┘                └──────────────────┘
-        ▲
-        │ db/ copied home via rsync after the ingest job
-        │
-  built on HPC by nus_hpc_ingest_index.pbs
+For a web-server instance, the recommended entry point is the guided setup from
+the repository root:
+
+```powershell
+.\setup.cmd
 ```
 
-Two PBS jobs do the work:
+On Linux/macOS use `./setup.sh`. It writes the two-cluster `[hpc]`
+configuration, creates/updates both aliases in `~/.ssh/config`, records each
+repo path relative to the SSH login directory, checks SSH/PBS/images, and can
+start the GPU tunnel plus web server. The manual steps below remain useful for
+cluster preparation and troubleshooting.
 
-| Job | Script | Lifetime | Purpose |
-|-----|--------|----------|---------|
-| Ingest+index | `scripts/nus_hpc_ingest_index.pbs` | Runs to completion, exits | OCR/embed/index PDFs → writes `db/` |
-| Ollama serving | `scripts/nus_hpc_serve.pbs` | Long-lived (until walltime) | Keeps `ollama serve` alive on a GPU; publishes its hostname |
+The wizard generates a dedicated Ed25519 key for each alias and installs the
+public keys remotely. Expect one password/MFA prompt per cluster on the first
+run. If the site disables password-based key bootstrap, use
+`--skip-key-install` and ask the cluster administrator to install the generated
+`.pub` files.
 
-> **Fallback (simpler) topology.** If you discover NUS lets you run a persistent
-> `ollama serve` on a **login or dev node** (no PBS needed), skip the serving
-> job entirely and run the tunnel daemon in single-hop mode straight at that
-> host. Today's `tunnel_daemon` default already does this. This runbook assumes
-> the general case (GPUs only on compute nodes allocated via PBS).
+## Prerequisites (one-time)
 
----
-
-## Prerequisites (one-time, on your laptop)
-
-1. **SSH access** to NUS HPC, key-based. Add an alias to `~/.ssh/config`:
+1. **SSH access** to NUS HPC. The guided setup creates the keys and aliases.
+   For manual setup, add an alias to `~/.ssh/config`:
 
    ```sshconfig
    Host nus_hpc
-       HostName <nus-login-hostname>     # e.g. aspsus.nus.edu.sg — ask your cluster admin
+       HostName <nus-login-hostname>
        User <your-nus-username>
        IdentityFile ~/.ssh/id_ed25519
        ServerAliveInterval 15
@@ -48,41 +40,94 @@ Two PBS jobs do the work:
    ```
 
 2. **A Linux box with root/fakeroot** to build the Singularity image (a Linux
-   workstation, a VM, or WSL2). You cannot build SIFs on the NUS login node
-   (no root) and not on Windows directly.
+   workstation, VM, or WSL2). You can't build SIFs on the login node or on Windows.
 
-3. **Project checked out** on the cluster (in your home dir or project storage)
-   so the PBS scripts and `scripts/bulk_ingest.py` are available there. The
-   `.pbs` scripts bind-mount `${PWD}:/app`, so `qsub` them from the repo root.
+3. **Project checked out** on the cluster. The PBS scripts bind-mount `${PWD}:/app`,
+   so `qsub` them from the repo root.
 
-4. **Ollama models known to your config.** Open `config.toml` and confirm the
-   `[models]` tags match what the PBS jobs will `ollama pull`:
-   `nomic-embed-text`, `qwen2.5vl:7b`, `gemma4`, `qwen2.5:1.5b`. If `gemma4` is
-   a custom alias you made with `ollama create`, create it in the model store
-   once (Phase 2) before the first ingest — otherwise the pull step will fail.
+4. **Ollama models known to your config.** Confirm the `[models]` tags in
+   `config.toml` match what the PBS jobs `ollama pull` (`nomic-embed-text`,
+   `qwen2.5vl:7b`, `gemma4`, `qwen2.5:1.5b`). If `gemma4` is a custom alias, create
+   it with `ollama create` in the model store before your first run.
 
 ---
 
-## CPU-only clusters — read this if you have no GPU allocation
+## Path A — GPU cluster (paid)
 
-The phases below assume GPU nodes (the CUDA container, the `gpu` queue, Ollama on
-a GPU). If your allocation is **CPU-only**, the same artifacts work — you build a
-different image, pass `--cpu` to the generator, and shift your scale-out strategy
-from "one fast GPU" to "many CPU nodes sharding embeddings." The honest caveat:
-**interactive chat against a cluster-hosted 7B LLM on CPU is too slow to be worth
-it**, so on CPU the cluster is for *building the index*, not for serving chat.
+### A1. Build the image (once)
 
-### What changes
+```bash
+sudo singularity build rag_pipeline.sif Singularity.def
+#  -- or, with fakeroot configured --
+singularity build --fakeroot rag_pipeline.sif Singularity.def
+rsync -P rag_pipeline.sif nus_hpc:~/rag_pipeline.sif
+```
 
-| | GPU (phases below) | CPU-only |
-|---|---|---|
-| Image | `Singularity.def` → `rag_pipeline.sif` | `Singularity.cpu.def` → `rag_pipeline_cpu.sif` (ubuntu base, CPU torch; ~3–5 GB smaller, no CUDA) |
-| Job script | `qsub scripts/nus_hpc_ingest_index.pbs` (hardcoded GPU) | `python -m src.hpc --cpu -o myjob.pbs && qsub myjob.pbs` (0 GPUs, `cpu` queue, more cores) |
-| Config | `config.toml` (`accelerator = "auto"`) | `config.cpu.toml` (`accelerator = "cpu"`, `vision_enabled = false`) — see below |
-| Chat | Cluster GPU via serving job + tunnel | **Run the LLM locally** after copying `db/` home |
-| Embedding throughput | One GPU (fast per-host) | **Multi-node sharding** — N Ollama replicas across N nodes (the real CPU lever) |
+The scripts find the SIF at `${CONTAINER_SIF:-rag_pipeline.sif}` in the working
+directory, falling back to `/hpctmp2/$USER/rag_pipeline.sif`.
 
-### 1. Build the CPU image
+### A2. Seed the model store (once)
+
+Models must live on **persistent, shared** storage (default `${HOME}/ollama_models`).
+The first ingest job pre-pulls them; there is no separate seed job, so the
+easiest check is to let A3 pull on its first run (it fails fast on a bad model
+tag).
+
+```bash
+qsub scripts/nus_hpc_ingest_index.pbs   # first run pre-pulls the models
+```
+
+### A3. Ingest + index
+
+From the repo root:
+
+```bash
+# Option A: the checked-in script.
+qsub scripts/nus_hpc_ingest_index.pbs
+
+# Option B: a tuned variant (more GPUs/CPU, longer walltime, ...).
+python -m src.hpc --ngpus 1 --mem 32gb --walltime 12:00:00 -o myjob.pbs
+qsub myjob.pbs
+```
+
+Useful `qsub -v` overrides: `INPUT_DATA_DIR`, `OLLAMA_MODELS_DIR`,
+`OLLAMA_MODELS_TO_PULL`, `CONTAINER_SIF`. Monitor with `qstat -u $USER` and
+`cat rag_ingest_index.o<jobid>`. Output lands in `db/` per `config.toml [paths]`.
+
+### A4. Serve Ollama on a GPU + tunnel from your laptop
+
+Chat uses the cluster GPU. Submit the long-lived serving job (it publishes its
+compute-node hostname so the tunnel can find it):
+
+```bash
+qsub scripts/nus_hpc_serve.pbs
+# wait until the discovery file is populated:
+watch -n 5 'cat ~/.rag_ollama_serving_host 2>/dev/null && echo'
+```
+
+Then from your laptop, start the 2-hop tunnel (laptop → login → compute node):
+
+```bash
+./scripts/tunnel_daemon.sh --jump-host nus_hpc --host-file '~/.rag_ollama_serving_host'
+# verify:
+curl -s http://127.0.0.1:11434/api/version
+```
+
+Stop serving early with `qdel <jobid>`.
+
+### A5. Run the web app
+
+See [Copy the index home & run the web app](#copy-the-index-home--run-the-web-app).
+
+---
+
+## Path B — CPU-only cluster (free)
+
+Do all bulk work on the free cluster. Chat is the one thing that genuinely wants
+a GPU (a 7B LLM on CPU is too slow for back-and-forth), so on CPU you build the
+index on the cluster and run the chat LLM locally.
+
+### B1. Build the image (once)
 
 ```bash
 sudo singularity build rag_pipeline_cpu.sif Singularity.cpu.def
@@ -91,310 +136,110 @@ singularity build --fakeroot rag_pipeline_cpu.sif Singularity.cpu.def
 rsync -P rag_pipeline_cpu.sif nus_hpc:~/rag_pipeline_cpu.sif
 ```
 
-### 2. CPU config (`config.cpu.toml`)
+### B2. CPU config
 
 The PBS script can't set `accelerator` or `vision_enabled` — those are read from
-`config.toml` by the pipeline, not the job script. So keep a CPU-specific config
-and point the pipeline at it:
+`config.toml`. Keep a CPU-specific config:
 
 ```bash
 cp config.example.toml config.cpu.toml
 ```
 
-Then edit `config.cpu.toml`:
+Edit `config.cpu.toml`:
 
 ```toml
 [ingestion]
-accelerator = "cpu"          # avoid CUDA-detection churn; you have no GPU
+accelerator = "cpu"          # no CUDA on this cluster
 vision_enabled = false        # qwen2.5-vl crawls on CPU; disable for batch ingest
-ingestion_workers = 4         # CPU nodes are core-rich; raise to use them
+ingestion_workers = 4
 
 [embeddings]
-# THE CPU scale-out lever: list one Ollama replica per node you're sharding
-# across. See "Multi-node embedding sharding" below.
+# Multi-node scale-out: list one Ollama replica per node you shard across.
+# N replicas ~= N x throughput. This is the primary CPU scale-out lever.
 hosts = ["http://node-a:11434", "http://node-b:11434", "http://node-c:11434"]
-concurrency = 2               # in-flight batches per host; tune to core count
+concurrency = 2
 ```
 
-Run the ingest job pointed at this config:
+### B3. Ingest + index
 
 ```bash
+python -m src.hpc --cpu -o myjob.pbs && qsub myjob.pbs
+# point the pipeline at the CPU config:
 RAG_PIPELINE_CONFIG=config.cpu.toml qsub myjob.pbs
-# (or export RAG_PIPELINE_CONFIG in your shell before qsub -v)
 ```
 
-### 3. Multi-node embedding sharding (the real CPU win)
+### B4. Copy the index home & run the web app
 
-A single CPU Ollama replica is slow. The config comment in `config.example.toml`
-calls `[embeddings] hosts` "the PRIMARY scale-out lever — N replicas ≈ N×
-throughput." On a CPU cluster the way to realize this is:
+See [Copy the index home & run the web app](#copy-the-index-home--run-the-web-app).
 
-1. Submit N serving jobs (`python -m src.hpc --cpu --serve ...`), one per node,
-   each listening on `127.0.0.1:11434` on its own node.
-2. Either run one ingest job whose `config.cpu.toml` lists all N replicas in
-   `[embeddings] hosts` (requires the nodes to be networked so the indexer can
-   reach each replica — typical within a job array / co-scheduled allocation), **or**
-3. Split your corpus into N shards and run N independent ingest jobs, one per
-   node, each building a `db/` fragment you merge afterward.
+### B5. Do you ever need GPU? Measure it.
 
-> **Native embeddings vs Ollama replicas:** `config.example.toml` notes that
-> `[models].native_embeddings = true` (SentenceTransformers on the local CPU) is
-> 2–5× faster than the Ollama HTTP path *per host* — but it shards less cleanly
-> across nodes. For a single-node CPU build, prefer native embeddings; for a
-> multi-node build, prefer Ollama replicas via `[embeddings] hosts`.
+The config's "weeks of embedding work" warning is a *single-host* number. Native
+embeddings are 2–5× faster, and the corpus shards across N free nodes. Measure
+the real rate on your corpus:
 
-### 4. After the build: copy `db/` home and chat locally
+```bash
+# size the job first (no models/network):
+python scripts/estimate_embed_throughput.py --count --sample-dir processed_docs/
+# measure native-CPU rate on one node, project across node counts:
+python scripts/estimate_embed_throughput.py --native --sample-dir processed_docs/ --num-nodes 1,4,8,16
+# scale a small sample up to your real corpus:
+python scripts/estimate_embed_throughput.py --native --sample-dir processed_docs/sample/ --scale 50 --num-nodes 16
+```
+
+If the free-CPU projection is acceptable (hours), you never need the paid GPU
+cluster for bulk work. If your corpus is heavily scanned and vision dominates, a
+*vision-only* GPU pass could be worth building — ask.
+
+---
+
+## Copy the index home & run the web app
+
+Both paths end here. Bring the built `db/` to your laptop:
 
 ```bash
 rsync -P --delete nus_hpc:~/<path-to-repo>/db/ ./db/
-python -m src.web_app      # local Ollama (CPU or whatever you have) for chat
 ```
 
-On CPU you generally **skip Phases 5–6** (the serving job + 2-hop tunnel) — that
-topology exists to put a *fast GPU* behind the chat path, which isn't the case
-on CPU. Build on the cluster, copy the index home, chat locally.
-
----
-
-## Phase 1 — Build the Singularity image (once)
-
-On your Linux build box:
+Run the web app locally (it reads local `db/`, talks to Ollama at
+`127.0.0.1:11434`):
 
 ```bash
-# fakeroot avoids needing real root; run once to set up the namespace mapping:
-singularity shell --fakeroot /dev/null  # priming step on some systems
-
-# Build (this takes 15-40 min and pulls several GB):
-sudo singularity build rag_pipeline.sif Singularity.def
-#  -- or, with fakeroot already configured --
-singularity build --fakeroot rag_pipeline.sif Singularity.def
+python -m src.web_app    # serves on 127.0.0.1:8000
 ```
 
-Copy the resulting image to NUS shared storage (home is visible to all compute
-nodes):
-
-```bash
-rsync -P rag_pipeline.sif nus_hpc:~/rag_pipeline.sif
-```
-
-> The `.pbs` scripts find the SIF at `${CONTAINER_SIF:-rag_pipeline.sif}` in the
-> working directory, falling back to `/hpctmp2/$USER/rag_pipeline.sif`. Putting
-> it in your home/repo root satisfies the first lookup.
-
----
-
-## Phase 2 — Seed the model store (once)
-
-Pick a **persistent, shared** location for the Ollama model registry. The
-default is `${HOME}/ollama_models` — home is shared across compute nodes, which
-is what you want. Only override this if home has a tight quota (then point it at
-shared `/hpctmp2/$USER/ollama_models`).
-
-The first ingest job (Phase 3) pre-pulls these models automatically, so you can
-skip this phase and let Phase 3 do it. But running it standalone first is a good
-way to fail fast on a bad model tag before committing to a long ingest:
-
-```bash
-# Quick one-off: a tiny PBS job that just pulls, then exits.
-cat > /tmp/seed_models.pbs <<'EOF'
-#PBS -N rag_seed_models
-#PBS -l select=1:ncpus=2:mem=8gb:ngpus=1
-#PBS -l walltime=01:00:00
-#PBS -q gpu
-#PBS -j oe
-set -e
-module load singularity
-HOME="${HOME:-$(eval echo ~${USER:-$(whoami)})}"
-OLLAMA_MODELS_DIR="${OLLAMA_MODELS_DIR:-${HOME}/ollama_models}"
-mkdir -p "${OLLAMA_MODELS_DIR}"
-CONTAINER_SIF="${CONTAINER_SIF:-rag_pipeline.sif}"
-BIND="-B ${HOME}:/srv/home -B ${PWD}:/app -B ${OLLAMA_MODELS_DIR}:/srv/ollama_models"
-export OLLAMA_MODELS=/srv/ollama_models
-singularity exec --nv ${BIND} "${CONTAINER_SIF}" ollama serve > /tmp/ollama.log 2>&1 &
-PID=$!
-for i in $(seq 1 30); do
-  singularity exec ${BIND} "${CONTAINER_SIF}" curl -sf http://127.0.0.1:11434/api/version >/dev/null 2>&1 && break
-  sleep 2
-done
-for m in nomic-embed-text qwen2.5vl:7b gemma4 qwen2.5:1.5b; do
-  singularity exec ${BIND} "${CONTAINER_SIF}" ollama pull "$m"
-done
-kill $PID
-EOF
-qsub -v CONTAINER_SIF=rag_pipeline.sif /tmp/seed_models.pbs
-```
-
-Watch `qstat -f <jobid>`; if a pull fails, fix the tag in `config.toml` and
-re-submit.
-
----
-
-## Phase 3 — Ingest + index (the build)
-
-From the repo root on the login node (the working dir becomes `/app` inside the
-container):
-
-```bash
-# Option A: submit the checked-in script directly.
-qsub scripts/nus_hpc_ingest_index.pbs
-
-# Option B: generate a tuned variant (more CPUs/GPUs, longer walltime, ...).
-python -m src.hpc --ngpus 1 --ncpus 8 --mem 32gb --walltime 12:00:00 -o myjob.pbs
-qsub myjob.pbs
-```
-
-Useful `qsub` overrides (pass with `-v`):
-
-| Variable | Meaning |
-|----------|---------|
-| `INPUT_DATA_DIR` | Where PDFs live (default `data`, i.e. `${PWD}/data`) |
-| `OLLAMA_MODELS_DIR` | Persistent model store (default `${HOME}/ollama_models`) |
-| `OLLAMA_MODELS_TO_PULL` | Space-separated tags (defaults to the 4 above) |
-| `CONTAINER_SIF` | Path to the image (default `rag_pipeline.sif`) |
-
-Monitor:
-
-```bash
-qstat -u $USER                 # status
-cat rag_ingest_index.o<jobid>  # stdout/stderr (PBS -j oe)
-```
-
-The job writes `processed_docs/` and `db/` (per `config.toml [paths]`) into the
-working directory on shared storage. The streaming indexer checkpoints every
-250 files / 15 min, so a killed job can be cheaply resumed by re-`qsub`-ing
-(chunking is idempotent per file).
-
-> **Embedding throughput is the bottleneck.** For a large cold corpus, consider
-> the multi-host/native-GPU scale-out levers in `[embeddings]` and
-> `[models].native_embeddings` (documented in `config.example.toml`). That work
-> is out of scope for this runbook but is where the real time savings are.
-
----
-
-## Phase 4 — Copy the built index home
-
-The web app reads `db/` locally, so bring it to your laptop:
-
-```bash
-# From your laptop:
-rsync -P --delete nus_hpc:~/<path-to-repo>/db/ ./db/
-```
-
-(`--delete` keeps the local copy in sync if you re-run Phase 3 later.)
-
----
-
-## Phase 5 — Serve Ollama on a GPU (long-lived)
-
-Submit the serving job; it stays alive until its walltime, publishing its
-compute-node hostname to `~/.rag_ollama_serving_host`:
-
-```bash
-# From the login node, repo root:
-qsub scripts/nus_hpc_serve.pbs
-
-# Or a tuned variant:
-python -m src.hpc --serve --walltime 08:00:00 -o serve.pbs && qsub serve.pbs
-```
-
-Wait until the discovery file is populated (a few seconds after the job starts
-running):
-
-```bash
-# On the login node:
-watch -n 5 'cat ~/.rag_ollama_serving_host 2>/dev/null && echo'
-```
-
-When it prints a hostname, Ollama is reachable on that node at port 11434. Check
-job status with `qstat -u $USER`. To stop serving early: `qdel <jobid>` — the
-job's cleanup trap removes the discovery file.
-
----
-
-## Phase 6 — Start the 2-hop tunnel (from your laptop)
-
-The tunnel forwards your local `127.0.0.1:11434` to Ollama on the compute node,
-hopping through the login host. It re-reads the discovery file on every
-reconnect, so a rescheduled serving job is picked up automatically.
-
-**Bash (Linux/macOS/WSL):**
-
-```bash
-./scripts/tunnel_daemon.sh \
-  --jump-host nus_hpc \
-  --host-file '~/.rag_ollama_serving_host'
-```
-
-**PowerShell (Windows):**
-
-```powershell
-.\scripts\tunnel_daemon.ps1 `
-  -JumpHost nus_hpc `
-  -HostFile "$HOME\.rag_ollama_serving_host"
-```
-
-Leave this running in a terminal. Verify the forward from another shell:
-
-```bash
-curl -s http://127.0.0.1:11434/api/version    # should return {"version":"..."}
-```
-
-> The `--host-file` path is interpreted **on the jump host**, so the `~` is the
-> cluster user's home. The daemon `ssh nus_hpc "cat <file>"` to read it.
-
----
-
-## Phase 7 — Run the web app (laptop)
-
-```bash
-python -m src.web_app
-# serves on 127.0.0.1:8000 per config.toml [server]
-```
-
-It reads the local `db/` and sends embedding/chat traffic to
-`http://127.0.0.1:11434` — which is now your tunnel to the cluster GPU.
-
-Open the UI in a browser, then verify the wiring end-to-end:
+Verify the Ollama wiring:
 
 ```bash
 curl -s http://127.0.0.1:8000/api/health | python -m json.tool
+# expect: "ollama_reachability": { "http://127.0.0.1:11434": true }
 ```
 
-Expect (the M4 failover surface in `web_app.py`):
-
-```json
-{
-  "ollama_active_host": "http://127.0.0.1:11434",
-  "ollama_candidate_hosts": ["http://127.0.0.1:11434"],
-  "ollama_reachability": { "http://127.0.0.1:11434": true }
-}
-```
-
-`ollama_reachability` being `true` confirms the tunnel is live. If it's `false`,
-check the tunnel daemon's output and the serving job (`qstat -f`).
+On the GPU path, `127.0.0.1:11434` is your tunnel to the cluster. On the CPU
+path, run a local Ollama for chat (the cluster is for building, not serving).
 
 ---
 
 ## Day-2 operations
 
-- **Resume a killed ingest**: just `qsub` it again. Per-file idempotency in the
-  ingestion path and the indexer checkpoint make this cheap.
-- **Update models**: edit `OLLAMA_MODELS_TO_PULL` (or `config.toml [models]`)
-  and re-submit either job; the pull step will fetch the new tags into the
-  persistent store.
-- **Serve for longer**: regenerate with a longer walltime, or chain a second
-  serving job before the first expires.
-- **Run ingest and serve concurrently**: fine — they use independent scratch
-  dirs and share only the (read-mostly) model store.
+- **Resume a killed ingest:** just `qsub` it again — per-file idempotency plus the
+  indexer checkpoint make this cheap.
+- **Update models:** edit `OLLAMA_MODELS_TO_PULL` (or `config.toml [models]`) and
+  re-submit either job.
+- **Serve longer:** regenerate with a longer walltime, or chain a second serving
+  job before the first expires.
 
 ## Troubleshooting
 
-| Symptom | Likely cause / fix |
-|--------|--------------------|
-| `qsub` job dies within seconds | Walltime too short, or SIF path wrong. Check `rag_ingest_index.o<jobid>`. |
-| `ollama pull failed for 'gemma4'` | `gemma4` is an alias, not a published tag. `ollama create` it in the model store once (Phase 2). |
-| Models re-download every job | `OLLAMA_MODELS_DIR` is resolving to per-job scratch. Ensure it points at shared storage (home or `/hpctmp2/$USER`). |
-| Tunnel: `discovery file is empty or missing` | Serving job isn't running yet, or the path differs from `OLLAMA_HOST_FILE`. `cat ~/.rag_ollama_serving_host` on the login node to confirm. |
-| `/api/health` shows `ollama_reachability: false` | Tunnel is down. Check `tunnel_daemon` output; confirm `qstat` shows the serve job is R(un). |
-| `singularity: FATAL: could not open image` | SIF not at expected path. `ls -l rag_pipeline.sif` from the `qsub` working dir, or pass `-v CONTAINER_SIF=/full/path`. |
-| CRLF errors (`/bin/bash^M: bad interpreter`) | Someone edited a `.pbs`/`.sh` on Windows without `.gitattributes`. `git add --renormalize .` and re-commit. |
+| Symptom | Fix |
+|--------|-----|
+| Job dies within seconds | Walltime too short, or SIF path wrong. Check `rag_ingest_index.o<jobid>`. |
+| `ollama pull failed for 'gemma4'` | `gemma4` is an alias, not a published tag. `ollama create` it in the model store once. |
+| Models re-download every job | `OLLAMA_MODELS_DIR` resolves to per-job scratch. Point it at shared storage (home or `/hpctmp2/$USER`). |
+| Tunnel: `discovery file is empty or missing` | Serving job isn't running yet. `cat ~/.rag_ollama_serving_host` on the login node. |
+| `/api/health` shows `ollama_reachability: false` | Tunnel down, or serve job not `R(un)`. Check `tunnel_daemon` output and `qstat`. |
+| `singularity: FATAL: could not open image` | SIF not at expected path. `ls -l rag_pipeline.sif` from the `qsub` dir, or pass `-v CONTAINER_SIF=/full/path`. |
+| `/bin/bash^M: bad interpreter` | Someone edited a `.pbs`/`.sh` on Windows. `git add --renormalize .` and re-commit. |
+| `install.sh` fails with `requires zstd`, or `ollama-linux-amd64.tar.gz` returns 404 | The Ollama installer now ships a `.tar.zst` (zstd-compressed), and the old gzip `ollama.com/download/...tar.gz` URL is gone. The `.def` files apt-install `zstd` and the fallback uses the current asset `github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64.tar.zst` extracted with `tar --zstd -xf`. If it still fails, `sudo apt-get install -y zstd` on the build host. |
+| `pip ... from versions: ... max X` for a package you know is newer (e.g. onnxruntime caps at 1.23.2) | The build host is hitting a **stale PyPI mirror/proxy**, not the real PyPI. The `.def` files force pypi.org as primary (`--index-url https://pypi.org/simple`), so a clean rebuild usually fixes it. If it persists, build with `PIP_INDEX_URL=https://pypi.org/simple singularity build ...`. Don't lower the pin — the version exists on real PyPI with a matching wheel. |
+| `requires-python >=3.11` / `max 1.23.2` specifically for **onnxruntime or numpy** during the build | The container was building on Python 3.10 (ubuntu:22.04 / cuda base) — those two pins need ≥3.11 and have no cp310 wheel. The `.def` files now build on **Python 3.14** (CPU image: `python:3.14-slim` base; GPU image: deadsnakes `python3.14` on the CUDA base, all `pip` routed through `python3.14 -m pip`). This also matches the local dev Python, so what you test locally is what the container runs. |

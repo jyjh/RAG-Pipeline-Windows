@@ -15,8 +15,7 @@ From: nvidia/cuda:12.1.1-devel-ubuntu22.04
 %post
     export DEBIAN_FRONTEND=noninteractive
     apt-get update && apt-get install -y --no-install-recommends \
-        python3 \
-        python3-pip \
+        software-properties-common \
         libgl1 \
         libglib2.0-0 \
         poppler-utils \
@@ -24,12 +23,39 @@ From: nvidia/cuda:12.1.1-devel-ubuntu22.04
         curl \
         git \
         ca-certificates \
+        zstd \
         && rm -rf /var/lib/apt/lists/*
 
-    python3 -m pip install --upgrade pip setuptools wheel
-    pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+    # The CUDA 12.1.1 base is ubuntu:22.04, which ships Python 3.10. Two pinned
+    # deps (onnxruntime~=1.27.0, numpy~=2.4.6) require Python >=3.11 and have NO
+    # cp310 wheel -- building against 3.10 fails with "from versions: max 1.23.2".
+    # CUDA 12.1.1 has no ubuntu24.04 base, so we can't get a newer Python by
+    # bumping the base. Instead install Python 3.14 from the deadsnakes PPA
+    # (kept alongside the system 3.10) and route ALL pip installs through 3.14.
+    # This also matches the local dev env (Python 3.14) exactly.
+    add-apt-repository -y ppa:deadsnakes/ppa
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3.14 \
+        python3.14-venv \
+        python3.14-dev \
+        build-essential \
+        && rm -rf /var/lib/apt/lists/*
+    # Bootstrap pip for 3.14 (deadsnakes ships the interpreter + venv, not pip).
+    python3.14 -m ensurepip --upgrade
 
-    pip install --no-cache-dir \
+    # Force the REAL public PyPI as the primary index. Some HPC build hosts sit
+    # behind a stale pip mirror/proxy (PIP_INDEX_URL / /etc/pip.conf) that lags
+    # PyPI by weeks. The torch wheel index is a SUPPLEMENT (--extra-index-url) so
+    # PyPI stays the source of truth for every other pin. Upgrade pip first so
+    # the resolver understands recent manylinux/cp314 wheel metadata.
+    # Everything resolves against Python 3.14, NOT the system 3.10.
+    python3.14 -m pip install --upgrade "pip>=24.2" setuptools wheel \
+        --index-url https://pypi.org/simple
+    python3.14 -m pip install --no-cache-dir torch torchvision torchaudio \
+        --index-url https://pypi.org/simple \
+        --extra-index-url https://download.pytorch.org/whl/cu121
+
+    python3.14 -m pip install --no-cache-dir \
         "docling~=2.105.0" \
         "lancedb~=0.33.0" \
         "pylance~=7.0.0" \
@@ -48,8 +74,17 @@ From: nvidia/cuda:12.1.1-devel-ubuntu22.04
         "einops~=0.8.2" \
         "python-dotenv~=1.2.2"
 
+    # The runscript invokes `python3`. Point it at 3.14 so bulk_ingest.py / the
+    # web app use the interpreter the deps were installed against.
+    ln -sf /usr/bin/python3.14 /usr/local/bin/python3
+
+    # Install Ollama. The install script extracts a .tar.zst, so zstd must be
+    # present (apt-installed above). The fallback uses the current release asset
+    # -- ollama-linux-amd64.tar.zst on GitHub releases; the old
+    # ollama.com/download/ollama-linux-amd64.tar.gz 404s and was gzip, not zstd.
     curl -fsSL https://ollama.com/install.sh | sh || (
-        curl -fsSL https://ollama.com/download/ollama-linux-amd64.tar.gz | tar -xz -C /usr/local
+        curl -fsSL https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64.tar.zst \
+            | tar --zstd -xf - -C /usr/local
     )
     chmod +x /usr/local/bin/ollama || true
 

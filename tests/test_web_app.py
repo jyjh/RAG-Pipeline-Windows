@@ -863,6 +863,7 @@ def test_server_config_defaults_to_minute_when_missing(workspace_tmp):
         "update_branch": "main",
         "disk_safety_factor": web_app.DEFAULT_DISK_SAFETY_FACTOR,
         "job_workers": web_app.DEFAULT_JOB_WORKERS,
+        "query_wait_timeout_seconds": web_app.DEFAULT_QUERY_WAIT_TIMEOUT_SECONDS,
         "api_token": "",
     }
 
@@ -897,6 +898,7 @@ def test_server_config_reads_polling_intervals(workspace_tmp):
         "update_branch": "web-ui",
         "disk_safety_factor": web_app.DEFAULT_DISK_SAFETY_FACTOR,
         "job_workers": web_app.DEFAULT_JOB_WORKERS,
+        "query_wait_timeout_seconds": web_app.DEFAULT_QUERY_WAIT_TIMEOUT_SECONDS,
         "api_token": "",
     }
 
@@ -1206,10 +1208,12 @@ def test_update_apply_requires_local_request(monkeypatch):
 
 def test_update_apply_accepts_configured_bind_address(monkeypatch):
     _set_update_config(monkeypatch)
-    monkeypatch.setitem(web_app.SERVER_CONFIG, "host", "100.87.142.5")
+    # Use an RFC 5737 documentation address (TEST-NET-1) rather than a real
+    # deployment IP. The test only needs a non-loopback configured bind host.
+    monkeypatch.setitem(web_app.SERVER_CONFIG, "host", "192.0.2.10")
 
-    assert web_app._is_local_update_host("100.87.142.5") is True
-    assert web_app._is_local_update_host("100.87.142.6") is False
+    assert web_app._is_local_update_host("192.0.2.10") is True
+    assert web_app._is_local_update_host("192.0.2.11") is False
 
 
 def test_update_apply_does_not_accept_wildcard_bind_address(monkeypatch):
@@ -1250,6 +1254,74 @@ def test_queue_pauses_new_work_while_query_is_active(workspace_tmp):
 
     assert calls == [("ingest", job.id, "processed"), ("index", "processed", "db")]
     assert (workspace_tmp / "uploads" / job.id / "doc.pdf").exists()
+
+
+def test_queue_aborts_index_job_when_query_watched_too_long(workspace_tmp):
+    """A leaked active_query_count must not block indexing forever. The watchdog
+    (query_wait_timeout_seconds) aborts the job instead of wedging the write lock."""
+    indexed = []
+
+    def fake_index(md_dir, db_dir, **kwargs):
+        indexed.append(True)
+
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=workspace_tmp / "db",
+        run_indexing_func=fake_index,
+        query_wait_timeout_seconds=0.5,  # short so the test is fast
+    )
+    staging = workspace_tmp / "staging"
+    staging.mkdir()
+    staging.joinpath("doc.pdf").write_bytes(b"%PDF-1.4")
+
+    # Simulate a leaked query counter (e.g. a chat generator whose finally-block
+    # never ran after a client disconnect + hung model).
+    queue.begin_query()
+    job = queue.enqueue_upload(staging_dir=staging, filenames=["doc.pdf"])
+
+    # The job pauses for the query, then the watchdog fires and it fails.
+    _wait_for(lambda: queue.get_job(job.id)["status"] == "paused_for_queries")
+    _wait_for(lambda: queue.get_job(job.id)["status"] == "failed", timeout=5.0)
+
+    assert indexed == [], "indexing must not have run while the query was held"
+    payload = queue.get_job(job.id)
+    assert "query_wait_timeout_seconds" in payload["error"] or "active query" in payload["error"], \
+        f"error should mention the query-wait timeout; got: {payload['error']!r}"
+
+    # Releasing the leaked counter lets a subsequent job proceed normally.
+    queue.finish_query()
+
+
+def test_queue_proceeds_when_query_releases_before_watchdog(workspace_tmp):
+    """The watchdog must not fire if the query finishes in time."""
+    calls = []
+
+    def fake_ingest(input_dir, output_dir, **kwargs):
+        calls.append(("ingest", Path(input_dir).name, Path(output_dir).name))
+
+    def fake_index(md_dir, db_dir, **kwargs):
+        calls.append(("index", Path(md_dir).name, Path(db_dir).name))
+
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=workspace_tmp / "db",
+        run_ingestion_func=fake_ingest,
+        run_indexing_func=fake_index,
+        query_wait_timeout_seconds=10.0,
+    )
+    staging = workspace_tmp / "staging"
+    staging.mkdir()
+    staging.joinpath("doc.pdf").write_bytes(b"%PDF-1.4")
+
+    queue.begin_query()
+    job = queue.enqueue_upload(staging_dir=staging, filenames=["doc.pdf"])
+    _wait_for(lambda: queue.get_job(job.id)["status"] == "paused_for_queries")
+    # Release well within the watchdog window.
+    queue.finish_query()
+    _wait_for(lambda: queue.get_job(job.id)["status"] == "done", timeout=5.0)
+    assert ("index", "processed", "db") in calls
 
 
 def test_queue_upload_batch_runs_one_final_index(workspace_tmp):

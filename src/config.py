@@ -63,6 +63,28 @@ class ServerConfig:
 
 
 @dataclass
+class ApiKeysConfig:
+    """Per-user API-key auth, rate limiting, and usage tracking.
+
+    This layers on top of the single shared ``[server] api_token`` (which stays
+    available as an admin/owner master bypass). When ``enabled`` is true and at
+    least one API key exists in the store (or a master token is set), mutating
+    ``/api/*`` requests require a valid credential. The store is empty by
+    default, so a fresh deployment stays fully open (zero-config).
+
+    Rate limiting is a per-key (or per-master-token) sliding 60s window; the
+    global default applies unless a key carries its own override. Usage counters
+    are persisted to disk every ``usage_persist_interval`` increments and on
+    shutdown to avoid hitting the store on every request.
+    """
+
+    enabled: bool = True
+    rate_limit_per_minute: int = 60
+    usage_persist_interval: int = 50
+    key_prefix: str = "rag_"
+
+
+@dataclass
 class EmbeddingsConfig:
     """Embedding-engine tuning. These are the dominant cost at corpus scale
     (a 100GB cold index is weeks of embedding work on a single host), so they
@@ -103,6 +125,74 @@ class OllamaConfig:
 
 
 @dataclass
+class HpcClusterConfig:
+    """Connection + job settings for ONE HPC cluster login node.
+
+    The CPU and GPU clusters are physically separate machines with separate
+    login nodes, so they get independent ``[hpc.cpu]`` / ``[hpc.gpu]`` sections.
+    Build work (ingest/index) routes to ``cpu``; the Ollama serving job routes
+    to ``gpu``.
+    """
+
+    # SSH alias for THIS cluster's login node (configured in ~/.ssh/config).
+    ssh_host: str = ""
+    # Path relative to the SSH login directory where the repo + scripts live.
+    # Example: "RAG-Pipeline-Windows" resolves beneath the remote account's
+    # default directory without assuming /home, /users, or another site layout.
+    remote_repo_dir: str = ""
+    # Singularity image filename the PBS job execs on this cluster.
+    # CPU cluster -> rag_pipeline_cpu.sif; GPU cluster -> rag_pipeline.sif.
+    container_sif: str = "rag_pipeline_cpu.sif"
+    # Resource overrides merged into generate_pbs_script() /
+    # generate_serve_pbs_script(): ncpus/mem/ngpus/queue/walltime/...
+    # Empty = generator defaults. Sensible per-cluster defaults are set on the
+    # HpcConfig.cpu / .gpu factories below (cpu: ngpus=0/queue=cpu;
+    # gpu: ngpus=1/queue=gpu).
+    pbs_overrides: dict = field(default_factory=dict)
+
+
+def _default_cpu_overrides() -> dict:
+    return {"ngpus": 0, "queue": "cpu", "container_sif": "rag_pipeline_cpu.sif"}
+
+
+def _default_gpu_overrides() -> dict:
+    return {"ngpus": 1, "queue": "gpu", "container_sif": "rag_pipeline.sif"}
+
+
+@dataclass
+class HpcConfig:
+    """Delegation of bulk ingestion/indexing to HPC clusters over SSH.
+
+    When ``enabled`` is False (the default), the web app runs ingestion/indexing
+    as local ``main.py`` subprocesses exactly as before -- this section is a
+    no-op. When enabled, the job queue submits a PBS ingest/index job to the
+    free CPU cluster via ``ssh cpu.ssh_host qsub ...``, relays its progress, and
+    rsyncs the built ``db/`` back. The chat-serving Ollama job goes to the GPU
+    cluster via ``gpu.ssh_host``. See ``docs/HPC_DELEGATION.md`` and
+    ``src/hpc_backend.py``.
+
+    Two clusters are configured independently under ``[hpc.cpu]`` and
+    ``[hpc.gpu]`` because they are separate machines with separate login nodes.
+    """
+
+    # Master switch. Default False = existing local-subprocess behavior untouched.
+    enabled: bool = False
+    # The CPU cluster (free) runs ingest/index. The pre-staged corpus lives here.
+    cpu: HpcClusterConfig = field(default_factory=lambda: HpcClusterConfig(
+        container_sif="rag_pipeline_cpu.sif", pbs_overrides=_default_cpu_overrides()))
+    # The GPU cluster (paid) runs the long-lived Ollama serving job for chat.
+    gpu: HpcClusterConfig = field(default_factory=lambda: HpcClusterConfig(
+        container_sif="rag_pipeline.sif", pbs_overrides=_default_gpu_overrides()))
+    # Where the pre-staged corpus lives on the CPU cluster (PBS --input-dir).
+    remote_data_dir: str = "data"
+    # Where the PBS job writes the index (relative to remote_repo_dir unless
+    # absolute). bulk_ingest.py writes db/ to its cwd by default.
+    remote_db_dir: str = "db"
+    # Seconds between qstat polls while waiting for a PBS job to finish.
+    poll_interval_seconds: float = 15.0
+
+
+@dataclass
 class PipelineConfig:
     paths: PathsConfig = field(default_factory=PathsConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
@@ -110,8 +200,10 @@ class PipelineConfig:
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    api_keys: ApiKeysConfig = field(default_factory=ApiKeysConfig)
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    hpc: HpcConfig = field(default_factory=HpcConfig)
 
     def ensure_dirs(self) -> None:
         for value in (self.paths.data_dir, self.paths.processed_dir, self.paths.db_dir, self.paths.asset_dir):
@@ -156,5 +248,4 @@ def load_config(path: str | os.PathLike[str] | None = None) -> PipelineConfig:
 
 
 load_pipeline_config = load_config
-
 

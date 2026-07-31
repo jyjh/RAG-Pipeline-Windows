@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: ubuntu:22.04
+From: python:3.14-slim
 
 %labels
     Maintainer FSAE RAG Pipeline Team
@@ -14,9 +14,15 @@ From: ubuntu:22.04
 
 %post
     export DEBIAN_FRONTEND=noninteractive
+    # NOTE: the base is python:3.14-slim, so Python 3.14 + pip ship in the image
+    # already -- we do NOT apt-install python3/python3-pip (that would pull the
+    # distro's 3.x and shadow 3.14). Two pinned deps (onnxruntime~=1.27.0,
+    # numpy~=2.4.6) require Python >=3.11 and have NO cp310 wheel; building on
+    # an ubuntu:22.04 base (Py 3.10) fails with "from versions: ... max 1.23.2".
+    # build-essential is needed so pip can build any transitive dep that lacks a
+    # cp314 wheel from source (3.14 is new).
     apt-get update && apt-get install -y --no-install-recommends \
-        python3 \
-        python3-pip \
+        build-essential \
         libgl1 \
         libglib2.0-0 \
         poppler-utils \
@@ -24,12 +30,21 @@ From: ubuntu:22.04
         curl \
         git \
         ca-certificates \
+        zstd \
         && rm -rf /var/lib/apt/lists/*
 
-    python3 -m pip install --upgrade pip setuptools wheel
-    # CPU-only PyTorch wheels. This avoids pulling the multi-GB CUDA runtime
-    # that the GPU image (Singularity.def) requires, keeping the image small.
-    pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+    # Force the REAL public PyPI as the primary index. Some HPC build hosts sit
+    # behind a stale pip mirror/proxy (PIP_INDEX_URL / /etc/pip.conf) that lags
+    # PyPI by weeks. The torch wheel index is a SUPPLEMENT (--extra-index-url) so
+    # PyPI stays the source of truth for every other pin. Upgrade pip first so
+    # the resolver understands recent manylinux/cp314 wheel metadata.
+    python3 -m pip install --upgrade "pip>=24.2" setuptools wheel \
+        --index-url https://pypi.org/simple
+    # CPU-only PyTorch wheels. Avoids pulling the multi-GB CUDA runtime the GPU
+    # image (Singularity.def) requires, keeping this image small.
+    pip install --no-cache-dir torch torchvision torchaudio \
+        --index-url https://pypi.org/simple \
+        --extra-index-url https://download.pytorch.org/whl/cpu
 
     pip install --no-cache-dir \
         "docling~=2.105.0" \
@@ -51,8 +66,13 @@ From: ubuntu:22.04
         "einops~=0.8.2" \
         "python-dotenv~=1.2.2"
 
+    # Install Ollama. The install script extracts a .tar.zst, so zstd must be
+    # present (apt-installed above). The fallback uses the current release asset
+    # -- ollama-linux-amd64.tar.zst on GitHub releases; the old
+    # ollama.com/download/ollama-linux-amd64.tar.gz 404s and was gzip, not zstd.
     curl -fsSL https://ollama.com/install.sh | sh || (
-        curl -fsSL https://ollama.com/download/ollama-linux-amd64.tar.gz | tar -xz -C /usr/local
+        curl -fsSL https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64.tar.zst \
+            | tar --zstd -xf - -C /usr/local
     )
     chmod +x /usr/local/bin/ollama || true
 

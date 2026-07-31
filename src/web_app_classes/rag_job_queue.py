@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import time
+
 from src._class_module_support import bind_module_namespace, finalize_split_class
 import src.web_app as _source_module
 
@@ -8,6 +11,16 @@ bind_module_namespace(
     globals(),
     proxy_functions=_source_module._CLASS_MODULE_PROXY_FUNCTIONS,
 )
+
+logger = logging.getLogger(__name__)
+
+# Default max time an index-mutating job will wait for active chats/queries to
+# release before aborting. Without a cap, a leaked active_query_count (a chat
+# generator whose finally-block never ran -- e.g. a client disconnect plus a hung
+# Ollama/stream) blocks every reindex/rebuild/backup forever inside the index
+# write lock. 30 min is generous for a legitimately long generation; tunable via
+# [server] query_wait_timeout_seconds.
+DEFAULT_QUERY_WAIT_TIMEOUT_SECONDS = 1800.0
 
 
 def _human_bytes(value: int | float | None) -> str:
@@ -30,20 +43,30 @@ class RagJobQueue:
         processed_dir: Path = PROCESSED_DIR,
         db_dir: Path = DB_DIR,
         registry_path: Path = PDF_REGISTRY_PATH,
-        job_ledger_path: Path = JOB_LEDGER_PATH,
+        job_ledger_path: Path | None = None,
         run_ingestion_func=None,
         run_indexing_func=None,
         max_workers: int = 1,
+        query_wait_timeout_seconds: float = DEFAULT_QUERY_WAIT_TIMEOUT_SECONDS,
     ):
         self.upload_root = Path(upload_root)
         self.processed_dir = Path(processed_dir)
         self.db_dir = Path(db_dir)
+        registry_path = Path(registry_path)
         self.registry = PdfRegistry(registry_path)
         # Durable ledger for non-upload jobs (reindex/rebuild/backup/restore).
         # Upload jobs recover via the PDF registry; the ledger covers the rest.
         from src.job_ledger import JobLedger
 
-        self.ledger = JobLedger(job_ledger_path)
+        # Keep custom/test queue state isolated. For the normal application,
+        # PDF_REGISTRY_PATH.parent is DATA_DIR, so this still resolves to the
+        # existing data/.job_ledger.json location.
+        resolved_ledger_path = (
+            Path(job_ledger_path)
+            if job_ledger_path is not None
+            else registry_path.parent / JOB_LEDGER_PATH.name
+        )
+        self.ledger = JobLedger(resolved_ledger_path)
         self._run_ingestion_func = run_ingestion_func
         self._run_indexing_func = run_indexing_func
         self._condition = threading.Condition(threading.RLock())
@@ -62,6 +85,9 @@ class RagJobQueue:
         # PDFs into processed_docs/) do NOT take this lock, so they overlap.
         self._index_write_lock = threading.Lock()
         self.active_query_count = 0
+        # Watchdog: an index-mutating job will not wait longer than this for
+        # active chats to drain. See DEFAULT_QUERY_WAIT_TIMEOUT_SECONDS.
+        self.query_wait_timeout_seconds = max(0.0, float(query_wait_timeout_seconds))
 
     def begin_query(self) -> None:
         with self._condition:
@@ -599,6 +625,15 @@ class RagJobQueue:
             self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="indexed")
 
     def _wait_for_no_queries(self, job: QueueJob, phase: str) -> None:
+        # Watchdog: bound how long we wait for active chats to drain. A leaked
+        # active_query_count (a chat generator whose finally-block never ran --
+        # e.g. client disconnect + hung Ollama/stream) would otherwise block
+        # every index-mutating job forever inside the index write lock. On
+        # timeout we abort the job (-> failed) so the problem surfaces instead
+        # of silently wedging all reindex/rebuild/backup work.
+        timeout = self.query_wait_timeout_seconds
+        deadline = time.monotonic() + timeout if timeout > 0 else None
+        last_warn = 0.0
         with self._condition:
             self._raise_if_cancelled(job)
             job.phase = phase
@@ -607,6 +642,28 @@ class RagJobQueue:
                 job.status = "paused_for_queries"
                 job.phase = phase
                 self._condition.notify_all()
+                if deadline is not None and time.monotonic() >= deadline:
+                    logger.error(
+                        "Job %s aborting in phase '%s': timed out after %.0fs waiting "
+                        "for active queries to release (possible stuck chat/stream); "
+                        "see [server] query_wait_timeout_seconds.",
+                        job.id, phase, timeout,
+                    )
+                    raise RuntimeError(
+                        f"Aborted after {timeout:.0f}s waiting for an active query to "
+                        f"release during '{phase}'. A chat/stream may be stuck; if this "
+                        f"recurs, increase [server] query_wait_timeout_seconds."
+                    )
+                # Emit an info line roughly once a minute so a legitimately slow
+                # generation is visible without spamming the log every 0.2s.
+                now = time.monotonic()
+                if now - last_warn >= 60.0:
+                    remaining = "no deadline" if deadline is None else f"{deadline - now:.0f}s left"
+                    logger.info(
+                        "Job %s paused in phase '%s' for active queries (%s).",
+                        job.id, phase, remaining,
+                    )
+                    last_warn = now
                 self._condition.wait(timeout=0.2)
             self._raise_if_cancelled(job)
             job.status = "running"

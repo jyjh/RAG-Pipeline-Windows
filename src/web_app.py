@@ -30,6 +30,13 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from src.atomic_io import write_json_atomic
+from src.api_key_auth import (
+    MASTER_KEY_ID,
+    RATE_WINDOW_SECONDS,
+    ApiKeyAuthenticator,
+    RateLimitExceeded,
+    create_default_authenticator,
+)
 from src.caches import BoundedLRU
 from src.disk_space import DiskSpaceError, check_disk_space, estimate_dir_bytes
 from src.file_lock import acquire_index_lock
@@ -288,6 +295,13 @@ DEFAULT_JOBS_POLL_INTERVAL_MS = 60_000
 DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_BIND_ALL_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8000
+# Per-user API-key auth defaults. See src/api_key_auth.py and [api_keys] in
+# config.toml. The store is empty by default, so these are inert until an admin
+# creates a key (or [server] api_token is set).
+DEFAULT_API_KEYS_ENABLED = True
+DEFAULT_API_KEYS_RATE_LIMIT = 60
+DEFAULT_API_KEYS_PERSIST_INTERVAL = 50
+DEFAULT_API_KEYS_PREFIX = "rag_"
 DEFAULT_BACKGROUND_WORKER_THREADS = min(4, max(1, (os.cpu_count() or 2) // 2))
 DEFAULT_UPDATE_REMOTE = "origin"
 DEFAULT_UPDATE_BRANCH = "main"
@@ -297,6 +311,10 @@ DEFAULT_DISK_SAFETY_FACTOR = 1.15
 # mutating phases are serialized via an internal lock. Cap conservatively
 # since each worker's ingestion subprocess loads its own parser models.
 DEFAULT_JOB_WORKERS = 1
+# Max seconds an index-mutating job waits for active chats/queries to release
+# before aborting. Guards against a leaked active_query_count wedging all
+# reindex/rebuild/backup work forever. See rag_job_queue._wait_for_no_queries.
+DEFAULT_QUERY_WAIT_TIMEOUT_SECONDS = 1800.0
 JOB_LOG_TAIL_LINES = 200
 GIT_TIMEOUT_SECONDS = 30.0
 GIT_PULL_TIMEOUT_SECONDS = 300.0
@@ -455,6 +473,14 @@ def _string_list(value: Any, default: tuple[str, ...]) -> list[str]:
 _TOML_CONFIG_CACHE = BoundedLRU(maxsize=128)
 
 
+def _default_config_path() -> Path:
+    configured = os.environ.get("RAG_PIPELINE_CONFIG")
+    if configured:
+        path = Path(configured)
+        return path if path.is_absolute() else ROOT_DIR / path
+    return ROOT_DIR / "config.toml"
+
+
 def _load_toml_config(config_path: Path) -> dict[str, Any]:
     cache_key = str(config_path)
     cached = _TOML_CONFIG_CACHE.get(cache_key)
@@ -494,7 +520,7 @@ def _server_bind_all_enabled(server_config: dict[str, Any], host: str) -> bool:
 
 
 def _load_server_config(config_path: Path | None = None) -> dict[str, Any]:
-    config_path = config_path or (ROOT_DIR / "config.toml")
+    config_path = config_path or _default_config_path()
     payload = _load_toml_config(config_path)
     server_config = payload.get("server", {}) if isinstance(payload.get("server"), dict) else {}
     bind_all_requested = _bool_value(
@@ -530,12 +556,38 @@ def _load_server_config(config_path: Path | None = None) -> dict[str, Any]:
             server_config.get("job_workers"),
             DEFAULT_JOB_WORKERS,
         ),
+        "query_wait_timeout_seconds": _positive_float(
+            server_config.get("query_wait_timeout_seconds"),
+            DEFAULT_QUERY_WAIT_TIMEOUT_SECONDS,
+        ),
         "api_token": str(server_config.get("api_token") or ""),
     }
 
 
+def _load_api_keys_config(config_path: Path | None = None) -> dict[str, Any]:
+    """Load the ``[api_keys]`` section (per-user keys, rate limiting, usage).
+
+    Empty/missing section yields the safe defaults: enabled, 60 req/min, flush
+    every 50 increments, ``rag_`` key prefix. The master ``[server] api_token``
+    is loaded separately and acts as an admin/owner bypass.
+    """
+    config_path = config_path or _default_config_path()
+    payload = _load_toml_config(config_path)
+    api_keys = payload.get("api_keys", {}) if isinstance(payload.get("api_keys"), dict) else {}
+    return {
+        "enabled": _bool_value(api_keys.get("enabled"), DEFAULT_API_KEYS_ENABLED),
+        "rate_limit_per_minute": _positive_int(
+            api_keys.get("rate_limit_per_minute"), DEFAULT_API_KEYS_RATE_LIMIT
+        ),
+        "usage_persist_interval": _positive_int(
+            api_keys.get("usage_persist_interval"), DEFAULT_API_KEYS_PERSIST_INTERVAL
+        ),
+        "key_prefix": _nonempty_str(api_keys.get("key_prefix"), DEFAULT_API_KEYS_PREFIX),
+    }
+
+
 def _load_chat_config(config_path: Path | None = None) -> dict[str, Any]:
-    config_path = config_path or (ROOT_DIR / "config.toml")
+    config_path = config_path or _default_config_path()
     payload = _load_toml_config(config_path)
     chat_config = payload.get("chat", {}) if isinstance(payload.get("chat"), dict) else {}
     retrieval_config = payload.get("retrieval", {}) if isinstance(payload.get("retrieval"), dict) else {}
@@ -579,7 +631,7 @@ def _load_chat_config(config_path: Path | None = None) -> dict[str, Any]:
 
 
 def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
-    config_path = config_path or (ROOT_DIR / "config.toml")
+    config_path = config_path or _default_config_path()
     payload = _load_toml_config(config_path)
     ingestion = payload.get("ingestion", {}) if isinstance(payload.get("ingestion"), dict) else {}
     models = payload.get("models", {}) if isinstance(payload.get("models"), dict) else {}
@@ -617,7 +669,7 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
 
 
 def _load_uploads_config(config_path: Path | None = None) -> dict[str, Any]:
-    config_path = config_path or (ROOT_DIR / "config.toml")
+    config_path = config_path or _default_config_path()
     payload = _load_toml_config(config_path)
     uploads = payload.get("uploads", {}) if isinstance(payload.get("uploads"), dict) else {}
     return {
@@ -636,13 +688,14 @@ def _load_indexing_config(config_path: Path | None = None) -> dict[str, Any]:
     ``_apply_ann_search_params`` honor them. Returns the raw section dict;
     normalization (int coercion, fallbacks) happens in ``apply_indexing_config``.
     """
-    config_path = config_path or (ROOT_DIR / "config.toml")
+    config_path = config_path or _default_config_path()
     payload = _load_toml_config(config_path)
     indexing = payload.get("indexing", {})
     return indexing if isinstance(indexing, dict) else {}
 
 
 SERVER_CONFIG = _load_server_config()
+API_KEYS_CONFIG = _load_api_keys_config()
 CHAT_CONFIG = _load_chat_config()
 INGESTION_CONFIG = _load_ingestion_config()
 UPLOADS_CONFIG = _load_uploads_config()
@@ -3428,7 +3481,12 @@ def render_markdown_text(text: str) -> str:
     return rendered
 
 
-job_queue = RagJobQueue(max_workers=SERVER_CONFIG.get("job_workers", DEFAULT_JOB_WORKERS))
+job_queue = RagJobQueue(
+    max_workers=SERVER_CONFIG.get("job_workers", DEFAULT_JOB_WORKERS),
+    query_wait_timeout_seconds=SERVER_CONFIG.get(
+        "query_wait_timeout_seconds", DEFAULT_QUERY_WAIT_TIMEOUT_SECONDS
+    ),
+)
 
 
 def recover_pending_upload_jobs_on_startup() -> dict[str, Any]:
@@ -3446,43 +3504,135 @@ async def lifespan(app: FastAPI):
         pass
     recover_pending_upload_jobs_on_startup()
     yield
+    # Persist any in-flight API-key usage counters so a restart does not lose
+    # the tail of usage accounting (the tracker only flushes on a throttle).
+    authenticator = globals().get("api_authenticator")
+    if authenticator is not None:
+        try:
+            authenticator.usage.flush()
+        except Exception:
+            pass
 
 
 app = FastAPI(title="Local FSAE RAG Pipeline", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 
-# API-token auth middleware. When [server] api_token is set (non-empty), all
-# state-changing requests (POST/PUT/DELETE/PATCH) to /api/* must carry it via
-# the ``X-API-Token`` header or ``?token=`` query param. GET requests and the
-# root/static paths stay open so the UI loads and health/poll endpoints work.
-# When api_token is empty (the default), this is a no-op -- zero behavior change
-# for the common single-user / Tailscale-only deployment.
+# API-token / API-key auth middleware.
+#
+# Two credential types, same transport (``X-API-Token`` header or ``?token=``
+# query param):
+#   1. The legacy single shared ``[server] api_token`` -- still honored as an
+#      admin/owner *master bypass* (no per-key identity needed). Kept as the
+#      ``_API_TOKEN`` module global so existing tests can monkeypatch it.
+#   2. Per-user API keys issued by ``scripts/manage_api_keys.py`` and validated
+#      against the hashed-key store (``data/.api_keys.json``) via the
+#      ``api_authenticator`` module global.
+#
+# Gating matches the prior behavior: only state-changing requests
+# (POST/PUT/DELETE/PATCH) to /api/* are gated; all GETs and the root/static
+# paths stay open so the UI loads and health/poll endpoints work. The only GET
+# that requires auth is the admin endpoint ``GET /api/admin/api-keys``, which is
+# gated explicitly inside its handler. ``/api/chat/stream`` + ``/api/render``
+# stay exempt (they are POST but read-only, and the browser can't easily inject
+# headers into the SSE stream).
+#
+# Fresh-deploy no-op: when ``[server] api_token`` is empty AND the key store has
+# no keys, ``api_authenticator.authenticate`` returns ``(None, None)`` and the
+# middleware passes everything through -- zero behavior change for the common
+# single-user / Tailscale-only deployment.
 _API_TOKEN = str(SERVER_CONFIG.get("api_token") or "").strip()
 _MUTATING_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
+# POST routes treated as read-only (chat streaming + Markdown render). They read
+# the index and never mutate server state, and the browser fetch path can't
+# easily attach headers to the SSE stream -- so they stay ungated.
+_NON_MUTATING_POST_PATHS = {"/api/chat/stream", "/api/render"}
+# GET routes that exfiltrate bulk data or server internals and so must be gated
+# when auth is configured. Most GETs (document lists, health, jobs, index rows)
+# stay open so the UI loads without a token; these stream the entire index or
+# expose filesystem paths/config and are full-corpus or server-recon surfaces.
+# Like mutating requests, the no-op path (no master token AND empty key store)
+# still passes them through, so a fresh single-user deployment is unchanged.
+_SENSITIVE_GET_PATHS = {"/api/index/stream", "/api/metrics"}
+
+api_authenticator: ApiKeyAuthenticator | None = (
+    create_default_authenticator(
+        DATA_DIR,
+        default_rate_limit=API_KEYS_CONFIG["rate_limit_per_minute"],
+        persist_interval=API_KEYS_CONFIG["usage_persist_interval"],
+        window_seconds=RATE_WINDOW_SECONDS,
+    )
+    if API_KEYS_CONFIG["enabled"]
+    else None
+)
+
+
+def _client_ip(request: Request) -> str | None:
+    """Best-effort client IP for usage attribution. Trusts X-Forwarded-For."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip() or None
+    if request.client:
+        return request.client.host
+    return None
+
+
+def _resolve_api_credential(request: Request) -> str:
+    """Extract the supplied credential from the header or ``?token=`` query."""
+    return (
+        request.headers.get("X-API-Token")
+        or request.query_params.get("token")
+        or ""
+    )
 
 
 @app.middleware("http")
 async def _enforce_api_token(request: Request, call_next):
-    # Read the token dynamically (not via closure) so tests can patch it.
-    token = (globals().get("_API_TOKEN") or "").strip()
-    if not token:
-        return await call_next(request)
-    # Only /api/* mutating routes are gated; static assets, the root page, and
-    # all GET reads (health, listings, chat stream via POST is below) are open.
     path = request.url.path
+    # Only /api/* is gated; static assets and the root page are always open.
     if not path.startswith("/api/"):
         return await call_next(request)
-    # Chat streaming is POST but must stay usable by the browser UI which cannot
-    # easily inject headers into an SSE/fetch stream without code changes. Treat
-    # /api/chat/stream as read-only (it only reads the index, never mutates).
-    if request.method in _MUTATING_METHODS and path not in {"/api/chat/stream", "/api/render"}:
-        supplied = request.headers.get("X-API-Token") or request.query_params.get("token") or ""
-        if not hmac.compare_digest(supplied, token):
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Invalid or missing API token."},
-            )
+    # Gate state-changing methods plus sensitive GETs (full-corpus index stream,
+    # server-internal metrics). Other GETs and read-only POSTs (chat stream,
+    # render) stay open so the UI loads without a credential. The admin GET
+    # /api/admin/api-keys is gated inside its own handler (role-restricted).
+    is_mutating = request.method in _MUTATING_METHODS and path not in _NON_MUTATING_POST_PATHS
+    is_sensitive_get = request.method == "GET" and path in _SENSITIVE_GET_PATHS
+    if not (is_mutating or is_sensitive_get):
+        return await call_next(request)
+
+    # Read the master token dynamically (not via closure) so tests can patch it.
+    master_token = (globals().get("_API_TOKEN") or "").strip()
+    authenticator = globals().get("api_authenticator")
+    if authenticator is None:
+        # Auth disabled (e.g. config [api_keys] enabled=false and no master).
+        # Still honor a bare master-token check for the legacy single-token case.
+        if master_token:
+            supplied = _resolve_api_credential(request)
+            if not hmac.compare_digest(supplied, master_token):
+                return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token."})
+        return await call_next(request)
+
+    supplied = _resolve_api_credential(request)
+    try:
+        result, rejection = authenticator.authenticate(
+            supplied, master_token=master_token, client_ip=_client_ip(request)
+        )
+    except RateLimitExceeded as exc:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded. Try again shortly."},
+            headers={"Retry-After": str(exc.retry_after)},
+        )
+    if rejection is not None:
+        # Auth is active but this credential is invalid/expired/disabled.
+        return JSONResponse(status_code=rejection.status_code, content={"detail": rejection.detail})
+    if result is None:
+        # No-op path: neither master nor any key configured. Pass through.
+        return await call_next(request)
+    # Authenticated (master bypass or a valid API key). Stash the identity for
+    # downstream handlers that care (admin endpoint, future audit logging).
+    request.state.api_identity = result
     return await call_next(request)
 
 
@@ -3498,6 +3648,82 @@ def root():
     text = text.replace('/static/vendor/fflate.min.js"', f'/static/vendor/fflate.min.js?v={version}"')
     text = text.replace('/static/app.js"', f'/static/app.js?v={version}"')
     return Response(content=text, media_type="text/html; charset=utf-8")
+
+
+def _require_admin(request: Request) -> JSONResponse | None:
+    """Auth gate for admin endpoints. Returns an error response or ``None``.
+
+    This is the single GET that requires auth (the middleware only gates
+    mutating methods). Only the master token or an ``admin``-role API key may
+    list live key usage. When auth is fully disabled (no master token, empty
+    key store) the endpoint is openly readable -- there is nothing sensitive to
+    protect in that zero-config state.
+    """
+    master_token = (globals().get("_API_TOKEN") or "").strip()
+    authenticator = globals().get("api_authenticator")
+    # Zero-config state: no master token and no key store -> nothing to gate.
+    if not master_token and (authenticator is None or not authenticator.store.has_any_key()):
+        return None
+    supplied = _resolve_api_credential(request)
+    if authenticator is not None:
+        try:
+            result, rejection = authenticator.authenticate(
+                supplied, master_token=master_token, client_ip=_client_ip(request), track=False
+            )
+        except RateLimitExceeded as exc:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded. Try again shortly."},
+                headers={"Retry-After": str(exc.retry_after)},
+            )
+        if rejection is not None:
+            return JSONResponse(status_code=rejection.status_code, content={"detail": rejection.detail})
+        if result is not None and result.role == "admin":
+            return None
+        if result is not None:
+            return JSONResponse(status_code=403, content={"detail": "Admin role required."})
+    elif master_token:
+        if hmac.compare_digest(supplied, master_token):
+            return None
+        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token."})
+    return JSONResponse(status_code=401, content={"detail": "Admin authentication required."})
+
+
+@app.get("/api/admin/api-keys")
+def admin_list_api_keys(request: Request):
+    """List API keys and live usage (admin/master only).
+
+    Returns the non-secret store records (prefix, label, role, status, expiry,
+    usage counts). The plaintext secret is never stored or returned -- identify
+    keys by their ``prefix``. This is the in-app complement to
+    ``scripts/manage_api_keys.py list``.
+    """
+    denied = _require_admin(request)
+    if denied is not None:
+        return denied
+    authenticator = globals().get("api_authenticator")
+    keys: list[dict[str, Any]] = []
+    if authenticator is not None:
+        # Flush pending usage so the listing reflects the latest counts.
+        try:
+            authenticator.usage.flush()
+        except Exception:
+            pass
+        for record in authenticator.store.list_keys():
+            # Drop the internal key_id hash from the public view.
+            keys.append(
+                {
+                    "prefix": record.get("prefix", ""),
+                    "label": record.get("label", ""),
+                    "role": record.get("role", "user"),
+                    "status": record.get("status", "active"),
+                    "created_at": record.get("created_at"),
+                    "expires_at": record.get("expires_at"),
+                    "rate_limit_per_minute": record.get("rate_limit_per_minute"),
+                    "usage": record.get("usage", {}),
+                }
+            )
+    return {"keys": keys, "master_configured": bool((globals().get("_API_TOKEN") or "").strip())}
 
 
 @app.get("/api/health")

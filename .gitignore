@@ -15,6 +15,12 @@ ENV/
 
 # Local configuration and secrets
 config.toml
+# Backup/scratch variants written by scripts/setup_instance.py (config.toml.bak,
+# config.toml.tmp, ~/.ssh/config.rag-setup.bak, etc.). config.toml.* matches any
+# suffix while keeping the main config.toml rule above intact.
+config.toml.*
+*.bak
+*.tmp
 *.local.toml
 *.secret.toml
 
@@ -38,6 +44,10 @@ site/
 .eggs/
 pip-wheel-metadata/
 src/__pycache__/
+
+# Singularity images -- can be multi-GB; never commit.
+*.sif
+*.sif.*
 
 # RAG pipeline runtime/build outputs
 db/

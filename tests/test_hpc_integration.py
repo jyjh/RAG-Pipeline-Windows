@@ -48,7 +48,6 @@ def test_singularity_def_exists_and_valid():
     
     # Post section dependency assertions
     assert "python3" in content
-    assert "python3-pip" in content
     assert "libgl1" in content
     assert "libglib2.0-0" in content
     assert "poppler-utils" in content
@@ -57,6 +56,14 @@ def test_singularity_def_exists_and_valid():
     assert "git" in content
     assert "ca-certificates" in content
     assert "https://download.pytorch.org/whl/cu121" in content
+    # The CUDA 12.1.1 base is ubuntu:22.04 (Python 3.10), but the pinned deps
+    # (onnxruntime~=1.27.0, numpy~=2.4.6) require >=3.11. The image must install
+    # Python 3.14 via deadsnakes AND route the app-stack install through it, or
+    # the build fails with "from versions: max 1.23.2" for onnxruntime.
+    assert "ppa:deadsnakes/ppa" in content, "GPU image must add deadsnakes PPA for Python 3.14"
+    assert "python3.14" in content, "GPU image must install python3.14"
+    assert "python3.14 -m pip install --no-cache-dir torch" in content, \
+        "GPU app-stack pip must run under python3.14, not the system 3.10"
     
     # Python package assertions
     assert "docling~=2.105.0" in content
@@ -67,9 +74,15 @@ def test_singularity_def_exists_and_valid():
     assert "fastapi~=0.138.0" in content
     assert "uvicorn[standard]~=0.49.0" in content
     
-    # Ollama standalone binary installation assertion
+    # Ollama standalone binary installation assertion. The installer extracts a
+    # .tar.zst, so zstd must be apt-installed; the fallback URL is the current
+    # GitHub release asset (the old ollama.com/download/...tar.gz 404s).
     assert "ollama" in content.lower()
-    assert "install.sh" in content or "ollama-linux-amd64.tar.gz" in content
+    assert "zstd" in content, "image must apt-install zstd (ollama installer needs it)"
+    assert "install.sh" in content
+    assert "ollama-linux-amd64.tar.zst" in content, \
+        "fallback must be the current .tar.zst asset, not the dead .tar.gz URL"
+    assert "tar --zstd -xf" in content, "fallback must extract with zstd, not gzip"
 
 
 def test_nus_hpc_pbs_script_exists_and_valid():
@@ -562,12 +575,21 @@ def test_singularity_cpu_def_exists_and_valid():
 
     content = raw.decode("utf-8")
     assert "Bootstrap: docker" in content
-    # CPU base, NOT the CUDA devel image the GPU recipe uses.
-    assert "From: ubuntu:22.04" in content
+    # CPU base is the official python image (Python 3.14), NOT ubuntu:22.04
+    # (Py 3.10) and NOT the CUDA image. ubuntu:22.04's Python 3.10 can't install
+    # the pinned onnxruntime~=1.27.0 / numpy~=2.4.6 (both require >=3.11).
+    assert "From: python:3.14-slim" in content
     # Must not pull the CUDA base image or the CUDA torch wheel index. (The word
     # "cuda" may legitimately appear in a comment; assert the load-bearing lines.)
     assert "nvidia/cuda" not in content
     assert "whl/cu121" not in content and "whl/cu" not in content
+    # build-essential so pip can build any cp314-less transitive dep from source.
+    assert "build-essential" in content
+    # The python:3.14-slim base ships python3 + pip already, so the apt block
+    # must NOT apt-install python3-pip (which would pull the distro's 3.x and
+    # shadow 3.14). Check the apt-install block, not comments that mention it.
+    apt_block = content.split("apt-get install -y --no-install-recommends")[1].split("rm -rf /var/lib/apt/lists")[0]
+    assert "python3-pip" not in apt_block, "CPU image must not apt-install python3-pip (base provides pip for 3.14)"
 
     # Same %sections as the GPU recipe.
     for section in ("%labels", "%environment", "%post", "%runscript"):
@@ -580,8 +602,12 @@ def test_singularity_cpu_def_exists_and_valid():
     for dep in ("docling~=2.105.0", "lancedb~=0.33.0", "ollama~=0.6.2",
                 "onnxruntime~=1.27.0", "fastapi~=0.138.0", "python3"):
         assert dep in content, f"CPU recipe missing {dep}"
-    # OCR/PDF system deps identical to GPU recipe.
-    for pkg in ("poppler-utils", "tesseract-ocr", "libgl1", "libglib2.0-0"):
+    # OCR/PDF system deps identical to GPU recipe, plus zstd (the Ollama
+    # installer needs it to extract its .tar.zst).
+    for pkg in ("poppler-utils", "tesseract-ocr", "libgl1", "libglib2.0-0", "zstd"):
         assert pkg in content
-    # Ollama standalone binary install present.
-    assert "install.sh" in content or "ollama-linux-amd64.tar.gz" in content
+    # Ollama standalone binary install: install.sh primary, .tar.zst fallback.
+    assert "install.sh" in content
+    assert "ollama-linux-amd64.tar.zst" in content, \
+        "fallback must be the current .tar.zst asset, not the dead .tar.gz URL"
+    assert "tar --zstd -xf" in content

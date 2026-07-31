@@ -154,3 +154,63 @@ disk_safety_factor = 1.15
 # phases (indexing, backup, restore, rebuild) are serialized internally so only
 # one writes to db/ at a time. Each ingestion worker loads its own parser models.
 job_workers = 1
+# Max seconds an index-mutating job (indexing/backup/restore/rebuild) will pause
+# and wait for active chats/queries to finish before aborting. Index jobs wait for
+# in-flight queries so a rebuild doesn't swap the index out from under a running
+# chat. Without a cap, a leaked query counter (e.g. a chat stream whose cleanup
+# never ran after a client disconnect + hung model) would block ALL index work
+# forever. The job fails loudly instead; 1800s (30 min) is generous for a long
+# but legitimate generation. Set to 0 to disable the watchdog (not recommended).
+query_wait_timeout_seconds = 1800
+
+# Per-user API-key auth, rate limiting, and usage tracking. Layers on top of the
+# single shared [server] api_token above, which stays available as an admin/
+# owner master bypass. Keys are issued offline by scripts/manage_api_keys.py and
+# stored hashed in data/.api_keys.json. INERT BY DEFAULT: until an admin creates
+# at least one key (or sets [server] api_token), all requests pass through open.
+[api_keys]
+enabled = true
+# Default requests/minute per key (sliding 60s window). Override per key with
+# --rate-limit when issuing a key.
+rate_limit_per_minute = 60
+# How often (in requests) accumulated usage counters are flushed to disk. The
+# hot path only touches in-memory counters, so this bounds disk write frequency.
+usage_persist_interval = 50
+# Prefix on plaintext key strings, e.g. "rag_..." -- purely a label so admins
+# can recognize key material at a glance.
+key_prefix = "rag_"
+
+# Optional web-server -> HPC delegation. Run `setup.cmd` on Windows or
+# `./setup.sh` on Linux/macOS for the guided configuration and connection test.
+# CPU and GPU are separate clusters: CPU builds the index; GPU serves Ollama.
+[hpc]
+enabled = false
+remote_data_dir = "data"
+remote_db_dir = "db"
+poll_interval_seconds = 15.0
+
+[hpc.cpu]
+ssh_host = ""
+# Relative to the directory entered immediately after `ssh <ssh_host>`.
+remote_repo_dir = ""
+container_sif = "rag_pipeline_cpu.sif"
+
+[hpc.cpu.pbs_overrides]
+ngpus = 0
+queue = "cpu"
+ncpus = 16
+mem = "32gb"
+walltime = "12:00:00"
+
+[hpc.gpu]
+ssh_host = ""
+# Relative to the directory entered immediately after `ssh <ssh_host>`.
+remote_repo_dir = ""
+container_sif = "rag_pipeline.sif"
+
+[hpc.gpu.pbs_overrides]
+ngpus = 1
+queue = "gpu"
+ncpus = 4
+mem = "16gb"
+walltime = "08:00:00"

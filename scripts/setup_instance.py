@@ -1,0 +1,982 @@
+"""Guided, one-command setup for the web server and HPC connections.
+
+Run interactively with ``python scripts/setup_instance.py``.  The command uses
+only the Python standard library, so it can configure and diagnose a fresh
+checkout before the project's optional runtime dependencies are installed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = ROOT / "config.toml"
+EXAMPLE_CONFIG = ROOT / "config.example.toml"
+DEFAULT_SSH_CONFIG = Path.home() / ".ssh" / "config"
+_SECTION_RE = re.compile(r"^\s*\[([^\]]+)]\s*(?:#.*)?$")
+_KEY_RE = re.compile(r"^(\s*)([A-Za-z0-9_-]+)\s*=")
+_SSH_ALIAS_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_SSH_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+_SSH_USER_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+@dataclass
+class SetupValues:
+    mode: str
+    server_host: str
+    server_port: int
+    manage_ssh_aliases: bool = False
+    cpu_host: str = ""
+    cpu_hostname: str = ""
+    cpu_user: str = ""
+    cpu_identity_file: str = ""
+    cpu_repo: str = ""
+    gpu_host: str = ""
+    gpu_hostname: str = ""
+    gpu_user: str = ""
+    gpu_identity_file: str = ""
+    gpu_repo: str = ""
+    local_ollama_port: int = 11434
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def update_toml_sections(path: Path, updates: dict[str, dict[str, Any]]) -> None:
+    """Update selected TOML keys while preserving every unrelated setting."""
+    if path.exists():
+        text = path.read_text(encoding="utf-8")
+    elif EXAMPLE_CONFIG.exists():
+        text = EXAMPLE_CONFIG.read_text(encoding="utf-8")
+    else:
+        text = ""
+
+    lines = text.splitlines()
+    section_ranges: dict[str, tuple[int, int]] = {}
+    starts: list[tuple[str, int]] = []
+    for index, line in enumerate(lines):
+        match = _SECTION_RE.match(line)
+        if match:
+            starts.append((match.group(1).strip(), index))
+    for offset, (name, start) in enumerate(starts):
+        end = starts[offset + 1][1] if offset + 1 < len(starts) else len(lines)
+        section_ranges[name] = (start, end)
+
+    for section, values in updates.items():
+        if section not in section_ranges:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(f"[{section}]")
+            lines.extend(f"{key} = {_toml_value(value)}" for key, value in values.items())
+            # Rebuild ranges because this new section may be followed by more
+            # sections added during the same call.
+            section_ranges[section] = (len(lines) - len(values) - 1, len(lines))
+            continue
+
+        start, end = section_ranges[section]
+        existing: dict[str, int] = {}
+        for index in range(start + 1, end):
+            match = _KEY_RE.match(lines[index])
+            if match:
+                existing[match.group(2)] = index
+        insert_at = end
+        added = 0
+        for key, value in values.items():
+            rendered = f"{key} = {_toml_value(value)}"
+            if key in existing:
+                lines[existing[key]] = rendered
+            else:
+                lines.insert(insert_at + added, rendered)
+                added += 1
+        if added:
+            for name, (other_start, other_end) in list(section_ranges.items()):
+                if other_start >= end and name != section:
+                    section_ranges[name] = (other_start + added, other_end + added)
+            section_ranges[section] = (start, end + added)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        backup = path.with_suffix(path.suffix + ".bak")
+        shutil.copy2(path, backup)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8", newline="\n")
+    os.replace(temporary, path)
+
+
+def _ssh_host_block(lines: list[str], alias: str) -> tuple[int, int] | None:
+    """Return the exact ``Host alias`` block, ignoring wildcard/group blocks."""
+    for start, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.lower().startswith("host "):
+            continue
+        patterns = stripped.split()[1:]
+        if patterns != [alias]:
+            continue
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            candidate = lines[index].strip().lower()
+            if candidate.startswith("host ") or candidate == "match" or candidate.startswith("match "):
+                end = index
+                break
+        return start, end
+    return None
+
+
+def read_ssh_alias(path: Path, alias: str) -> dict[str, str]:
+    """Read fields from an exact SSH Host block, if one exists."""
+    if not alias or not path.exists():
+        return {}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    bounds = _ssh_host_block(lines, alias)
+    if bounds is None:
+        return {}
+    start, end = bounds
+    result: dict[str, str] = {}
+    for line in lines[start + 1:end]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split(None, 1)
+        if len(parts) == 2:
+            result[parts[0].lower()] = parts[1].strip().strip('"')
+    return result
+
+
+def _ssh_config_value(value: str) -> str:
+    if any(character.isspace() for character in value):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return value
+
+
+def upsert_ssh_alias(
+    path: Path,
+    *,
+    alias: str,
+    hostname: str,
+    user: str,
+    identity_file: str = "",
+    create_backup: bool = True,
+) -> None:
+    """Create or safely update one exact SSH alias, retaining extra options."""
+    if not _SSH_ALIAS_RE.fullmatch(alias):
+        raise ValueError(f"invalid SSH alias: {alias!r}")
+    if not _SSH_HOSTNAME_RE.fullmatch(hostname):
+        raise ValueError(f"invalid SSH hostname for {alias!r}")
+    if not _SSH_USER_RE.fullmatch(user):
+        raise ValueError(f"invalid SSH user for {alias!r}")
+
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    desired = {
+        "hostname": ("HostName", hostname),
+        "user": ("User", user),
+        "serveraliveinterval": ("ServerAliveInterval", "15"),
+        "serveralivecountmax": ("ServerAliveCountMax", "3"),
+    }
+    if identity_file:
+        desired["identityfile"] = ("IdentityFile", identity_file)
+
+    bounds = _ssh_host_block(lines, alias)
+    if bounds is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(f"Host {alias}")
+        lines.extend(
+            f"    {key} {_ssh_config_value(value)}"
+            for key, value in desired.values()
+        )
+    else:
+        start, end = bounds
+        found: set[str] = set()
+        rewritten = [lines[start]]
+        for line in lines[start + 1:end]:
+            stripped = line.strip()
+            parts = stripped.split(None, 1)
+            normalized = parts[0].lower() if parts else ""
+            if normalized in desired:
+                if normalized not in found:
+                    key, value = desired[normalized]
+                    rewritten.append(f"    {key} {_ssh_config_value(value)}")
+                    found.add(normalized)
+                continue
+            rewritten.append(line)
+        for normalized, (key, value) in desired.items():
+            if normalized not in found:
+                rewritten.append(f"    {key} {_ssh_config_value(value)}")
+        lines[start:end] = rewritten
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        path.parent.chmod(0o700)
+    if path.exists() and create_backup:
+        shutil.copy2(path, path.with_name(path.name + ".rag-setup.bak"))
+    temporary = path.with_name(path.name + ".rag-setup.tmp")
+    temporary.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8", newline="\n")
+    os.replace(temporary, path)
+    if os.name != "nt":
+        path.chmod(0o600)
+
+
+def configure_ssh_aliases(path: Path, values: SetupValues) -> None:
+    if values.mode != "hpc" or not values.manage_ssh_aliases:
+        return
+    if path.exists():
+        shutil.copy2(path, path.with_name(path.name + ".rag-setup.bak"))
+    upsert_ssh_alias(
+        path,
+        alias=values.cpu_host,
+        hostname=values.cpu_hostname,
+        user=values.cpu_user,
+        identity_file=values.cpu_identity_file,
+        create_backup=False,
+    )
+    upsert_ssh_alias(
+        path,
+        alias=values.gpu_host,
+        hostname=values.gpu_hostname,
+        user=values.gpu_user,
+        identity_file=values.gpu_identity_file,
+        create_backup=False,
+    )
+
+
+def _private_key_path(raw_path: str) -> Path:
+    return Path(os.path.expandvars(raw_path)).expanduser().resolve()
+
+
+def ensure_ssh_private_key(raw_path: str, alias: str) -> tuple[Path, Path]:
+    """Create a dedicated Ed25519 key, or recover its missing public key."""
+    private_key = _private_key_path(raw_path)
+    public_key = Path(str(private_key) + ".pub")
+    ssh_keygen = shutil.which("ssh-keygen")
+    if not ssh_keygen:
+        raise RuntimeError(
+            "ssh-keygen was not found. Install the Windows OpenSSH Client or "
+            "your platform's OpenSSH package."
+        )
+    private_key.parent.mkdir(parents=True, exist_ok=True)
+    if not private_key.exists():
+        if public_key.exists():
+            raise RuntimeError(
+                f"Public key exists but its private key is missing: {public_key}"
+            )
+        result = subprocess.run(
+            [
+                ssh_keygen,
+                "-t", "ed25519",
+                "-a", "64",
+                "-f", str(private_key),
+                "-N", "",
+                "-C", f"rag-pipeline-{alias}",
+            ],
+            check=False,
+        )
+        if result.returncode != 0 or not private_key.exists() or not public_key.exists():
+            raise RuntimeError(f"failed to generate SSH key {private_key}")
+        print(f"Generated SSH key: {private_key}")
+    elif not public_key.exists():
+        result = subprocess.run(
+            [ssh_keygen, "-y", "-f", str(private_key)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            raise RuntimeError(
+                f"could not derive public key from {private_key}: {result.stderr.strip()}"
+            )
+        temporary = public_key.with_name(public_key.name + ".tmp")
+        temporary.write_text(result.stdout.strip() + "\n", encoding="utf-8", newline="\n")
+        os.replace(temporary, public_key)
+        print(f"Recovered public key: {public_key}")
+    if os.name != "nt":
+        private_key.chmod(0o600)
+        public_key.chmod(0o644)
+    return private_key, public_key
+
+
+def install_ssh_public_key(
+    *,
+    hostname: str,
+    user: str,
+    private_key: Path,
+    public_key: Path,
+) -> None:
+    """Install one public key remotely, prompting for password/MFA if needed."""
+    ssh = shutil.which("ssh")
+    if not ssh:
+        raise RuntimeError(
+            "ssh was not found. Install the Windows OpenSSH Client or your "
+            "platform's OpenSSH package."
+        )
+    key_text = public_key.read_text(encoding="utf-8").strip()
+    if not key_text.startswith(("ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-")):
+        raise RuntimeError(f"unsupported or malformed SSH public key: {public_key}")
+    quoted_key = shlex.quote(key_text)
+    remote_command = (
+        'umask 077; mkdir -p "$HOME/.ssh"; '
+        'touch "$HOME/.ssh/authorized_keys"; '
+        f'grep -qxF {quoted_key} "$HOME/.ssh/authorized_keys" '
+        f"|| printf '%s\\n' {quoted_key} >> \"$HOME/.ssh/authorized_keys\"; "
+        'chmod 700 "$HOME/.ssh"; chmod 600 "$HOME/.ssh/authorized_keys"'
+    )
+    target = f"{user}@{hostname}"
+    print(f"Installing public key on {target} (password/MFA may be requested)...")
+    result = subprocess.run(
+        [
+            ssh,
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "IdentitiesOnly=no",
+            "-i", str(private_key),
+            target,
+            remote_command,
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"could not install the SSH public key on {target}. Confirm password/"
+            "MFA login is allowed, or ask the cluster administrator to install "
+            f"{public_key}."
+        )
+
+    verify = subprocess.run(
+        [
+            ssh,
+            "-o", "BatchMode=yes",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-i", str(private_key),
+            target,
+            "printf RAG_SSH_KEY_OK",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if verify.returncode != 0 or "RAG_SSH_KEY_OK" not in verify.stdout:
+        raise RuntimeError(f"SSH key verification failed for {target}: {verify.stderr.strip()}")
+
+
+def setup_ssh_credentials(values: SetupValues, *, install_public_keys: bool) -> None:
+    """Generate and optionally authorize the dedicated keys for both clusters."""
+    if values.mode != "hpc" or not values.manage_ssh_aliases:
+        return
+    clusters = (
+        (
+            values.cpu_host,
+            values.cpu_hostname,
+            values.cpu_user,
+            values.cpu_identity_file,
+        ),
+        (
+            values.gpu_host,
+            values.gpu_hostname,
+            values.gpu_user,
+            values.gpu_identity_file,
+        ),
+    )
+    for alias, hostname, user, raw_key in clusters:
+        private_key, public_key = ensure_ssh_private_key(raw_key, alias)
+        if install_public_keys:
+            install_ssh_public_key(
+                hostname=hostname,
+                user=user,
+                private_key=private_key,
+                public_key=public_key,
+            )
+
+
+def _load(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("rb") as handle:
+        value = tomllib.load(handle)
+    return value if isinstance(value, dict) else {}
+
+
+def _nested(mapping: dict[str, Any], *keys: str, default: Any = "") -> Any:
+    current: Any = mapping
+    for key in keys:
+        if not isinstance(current, dict):
+            return default
+        current = current.get(key)
+    return default if current is None else current
+
+
+def _configured_ollama_port(config: dict[str, Any]) -> int:
+    raw = str(_nested(config, "ollama", "host", default="http://127.0.0.1:11434"))
+    try:
+        return int(urllib.parse.urlparse(raw).port or 11434)
+    except (TypeError, ValueError):
+        return 11434
+
+
+def _login_relative_repo_default(raw: str, user: str) -> str:
+    """Convert a legacy absolute home path into a login-relative default."""
+    value = str(raw or "").strip().replace("\\", "/")
+    if value and not value.startswith("/"):
+        return value
+    for prefix in (f"/home/{user}/", f"/users/{user}/"):
+        if user and value.startswith(prefix):
+            return value[len(prefix):]
+    if value:
+        return PurePosixPath(value).name
+    return "RAG-Pipeline-Windows"
+
+
+def _validate_relative_repo(value: str, label: str) -> None:
+    path = PurePosixPath(value)
+    if (
+        not value
+        or path.is_absolute()
+        or value.startswith("~")
+        or ".." in path.parts
+        or any(character.isspace() for character in value)
+    ):
+        raise ValueError(
+            f"{label} remote repo must be a safe path relative to the SSH login "
+            "directory (for example, RAG-Pipeline-Windows)"
+        )
+
+
+def _prompt(label: str, default: str = "", *, required: bool = False) -> str:
+    suffix = f" [{default}]" if default else ""
+    while True:
+        value = input(f"{label}{suffix}: ").strip() or default
+        if value or not required:
+            return value
+        print("  A value is required.")
+
+
+def _prompt_yes_no(label: str, default: bool = True) -> bool:
+    hint = "Y/n" if default else "y/N"
+    value = input(f"{label} [{hint}]: ").strip().lower()
+    if not value:
+        return default
+    return value in {"y", "yes"}
+
+
+def _validate(values: SetupValues) -> None:
+    if values.mode not in {"local", "hpc"}:
+        raise ValueError("mode must be 'local' or 'hpc'")
+    if not (1 <= values.server_port <= 65535):
+        raise ValueError("server port must be between 1 and 65535")
+    if not (1 <= values.local_ollama_port <= 65535):
+        raise ValueError("local Ollama tunnel port must be between 1 and 65535")
+    if values.mode == "hpc":
+        for label, host, hostname, user, repo in (
+            ("CPU", values.cpu_host, values.cpu_hostname, values.cpu_user, values.cpu_repo),
+            ("GPU", values.gpu_host, values.gpu_hostname, values.gpu_user, values.gpu_repo),
+        ):
+            if not host:
+                raise ValueError(f"{label} SSH alias/host is required")
+            if not _SSH_ALIAS_RE.fullmatch(host):
+                raise ValueError(f"{label} SSH alias contains unsupported characters")
+            if values.manage_ssh_aliases and not hostname:
+                raise ValueError(f"{label} SSH hostname is required")
+            if values.manage_ssh_aliases and not user:
+                raise ValueError(f"{label} SSH username is required")
+            identity = (
+                values.cpu_identity_file if label == "CPU" else values.gpu_identity_file
+            )
+            if values.manage_ssh_aliases and not identity:
+                raise ValueError(f"{label} SSH private-key path is required")
+            _validate_relative_repo(repo, label)
+        if values.cpu_host == values.gpu_host:
+            raise ValueError("CPU and GPU clusters must use different SSH aliases")
+
+
+def _collect_interactive(config: dict[str, Any], args: argparse.Namespace) -> SetupValues:
+    existing_hpc = bool(_nested(config, "hpc", "enabled", default=False))
+    default_mode = args.mode or ("hpc" if existing_hpc else "local")
+    print("\nRAG Pipeline guided setup")
+    print("-------------------------")
+    mode = _prompt("Mode (local/hpc)", default_mode, required=True).lower()
+    server_host = _prompt(
+        "Web server bind host",
+        args.server_host or str(_nested(config, "server", "host", default="127.0.0.1")),
+        required=True,
+    )
+    server_port = int(_prompt(
+        "Web server port",
+        str(args.server_port or _nested(config, "server", "port", default=8000)),
+        required=True,
+    ))
+    values = SetupValues(mode=mode, server_host=server_host, server_port=server_port)
+    values.local_ollama_port = args.ollama_port or _configured_ollama_port(config)
+    if mode == "hpc":
+        values.manage_ssh_aliases = True
+        values.cpu_host = _prompt(
+            "CPU cluster SSH alias",
+            args.cpu_host or str(_nested(config, "hpc", "cpu", "ssh_host")),
+            required=True,
+        )
+        existing_cpu_alias = read_ssh_alias(args.ssh_config, values.cpu_host)
+        values.cpu_hostname = _prompt(
+            "CPU cluster login hostname",
+            args.cpu_hostname or existing_cpu_alias.get("hostname", ""),
+            required=True,
+        )
+        values.cpu_user = _prompt(
+            "CPU cluster SSH username",
+            args.cpu_user or existing_cpu_alias.get("user", ""),
+            required=True,
+        )
+        values.cpu_identity_file = _prompt(
+            "CPU SSH private key (created automatically if missing)",
+            args.cpu_key
+            or existing_cpu_alias.get("identityfile", "")
+            or f"~/.ssh/rag_{values.cpu_host}_ed25519",
+            required=True,
+        )
+        values.cpu_repo = _prompt(
+            "CPU repo path relative to SSH login directory",
+            args.cpu_repo
+            or _login_relative_repo_default(
+                str(_nested(config, "hpc", "cpu", "remote_repo_dir")),
+                values.cpu_user,
+            ),
+            required=True,
+        )
+        values.gpu_host = _prompt(
+            "GPU cluster SSH alias",
+            args.gpu_host or str(_nested(config, "hpc", "gpu", "ssh_host")),
+            required=True,
+        )
+        existing_gpu_alias = read_ssh_alias(args.ssh_config, values.gpu_host)
+        values.gpu_hostname = _prompt(
+            "GPU cluster login hostname",
+            args.gpu_hostname or existing_gpu_alias.get("hostname", ""),
+            required=True,
+        )
+        values.gpu_user = _prompt(
+            "GPU cluster SSH username",
+            args.gpu_user or existing_gpu_alias.get("user", values.cpu_user),
+            required=True,
+        )
+        values.gpu_identity_file = _prompt(
+            "GPU SSH private key (created automatically if missing)",
+            args.gpu_key
+            or existing_gpu_alias.get("identityfile", "")
+            or f"~/.ssh/rag_{values.gpu_host}_ed25519",
+            required=True,
+        )
+        values.gpu_repo = _prompt(
+            "GPU repo path relative to SSH login directory",
+            args.gpu_repo
+            or _login_relative_repo_default(
+                str(_nested(config, "hpc", "gpu", "remote_repo_dir")),
+                values.gpu_user,
+            ),
+            required=True,
+        )
+        values.local_ollama_port = int(_prompt(
+            "Local Ollama tunnel port",
+            str(args.ollama_port or _configured_ollama_port(config)),
+            required=True,
+        ))
+    return values
+
+
+def _collect_non_interactive(config: dict[str, Any], args: argparse.Namespace) -> SetupValues:
+    mode = args.mode or ("hpc" if _nested(config, "hpc", "enabled", default=False) else "local")
+    manage_ssh = bool(args.setup_ssh or args.cpu_hostname or args.gpu_hostname)
+    cpu_alias = args.cpu_host or str(_nested(config, "hpc", "cpu", "ssh_host"))
+    gpu_alias = args.gpu_host or str(_nested(config, "hpc", "gpu", "ssh_host"))
+    return SetupValues(
+        mode=mode,
+        server_host=args.server_host or str(_nested(config, "server", "host", default="127.0.0.1")),
+        server_port=args.server_port or int(_nested(config, "server", "port", default=8000)),
+        manage_ssh_aliases=manage_ssh,
+        cpu_host=cpu_alias,
+        cpu_hostname=args.cpu_hostname or "",
+        cpu_user=args.cpu_user or "",
+        cpu_identity_file=(
+            args.cpu_key or (f"~/.ssh/rag_{cpu_alias}_ed25519" if manage_ssh and cpu_alias else "")
+        ),
+        cpu_repo=args.cpu_repo or str(_nested(config, "hpc", "cpu", "remote_repo_dir")),
+        gpu_host=gpu_alias,
+        gpu_hostname=args.gpu_hostname or "",
+        gpu_user=args.gpu_user or "",
+        gpu_identity_file=(
+            args.gpu_key or (f"~/.ssh/rag_{gpu_alias}_ed25519" if manage_ssh and gpu_alias else "")
+        ),
+        gpu_repo=args.gpu_repo or str(_nested(config, "hpc", "gpu", "remote_repo_dir")),
+        local_ollama_port=args.ollama_port or _configured_ollama_port(config),
+    )
+
+
+def configure(path: Path, values: SetupValues) -> None:
+    updates = {
+        "server": {
+            "host": values.server_host,
+            "port": values.server_port,
+            "bind_all": values.server_host in {"0.0.0.0", "::"},
+        },
+        "ollama": {"host": f"http://127.0.0.1:{values.local_ollama_port}"},
+        "hpc": {
+            "enabled": values.mode == "hpc",
+            "remote_data_dir": "data",
+            "remote_db_dir": "db",
+            "poll_interval_seconds": 15.0,
+        },
+    }
+    if values.mode == "hpc":
+        updates.update({
+            "hpc.cpu": {
+                "ssh_host": values.cpu_host,
+                "remote_repo_dir": values.cpu_repo,
+                "container_sif": "rag_pipeline_cpu.sif",
+            },
+            "hpc.gpu": {
+                "ssh_host": values.gpu_host,
+                "remote_repo_dir": values.gpu_repo,
+                "container_sif": "rag_pipeline.sif",
+            },
+        })
+    update_toml_sections(path, updates)
+
+
+def _command_check(name: str) -> tuple[bool, str]:
+    path = shutil.which(name)
+    return (bool(path), path or "not found")
+
+
+def _runtime_python() -> Path:
+    candidate = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    return candidate if candidate.exists() else Path(sys.executable)
+
+
+def _runtime_dependencies_ready(python: Path | None = None) -> bool:
+    python = python or _runtime_python()
+    command = [
+        str(python),
+        "-c",
+        "import fastapi, uvicorn, lancedb, pydantic",
+    ]
+    return subprocess.run(command, capture_output=True, text=True, check=False).returncode == 0
+
+
+def install_dependencies() -> None:
+    """Create a project-local venv and install the pinned requirements."""
+    venv_dir = ROOT / ".venv"
+    python = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if not python.exists():
+        print("Creating .venv...")
+        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+    print("Installing runtime dependencies (this can take several minutes)...")
+    subprocess.run(
+        [str(python), "-m", "pip", "install", "-r", str(ROOT / "requirements.txt")],
+        cwd=ROOT,
+        check=True,
+    )
+
+
+def _http_ready(url: str, timeout: float = 2.0) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return 200 <= response.status < 500
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def run_checks(path: Path, values: SetupValues) -> bool:
+    print("\nPreflight checks")
+    print("----------------")
+    checks: list[tuple[str, bool, str]] = []
+    checks.append(("Python 3.11+", sys.version_info >= (3, 11), sys.version.split()[0]))
+    runtime = _runtime_python()
+    checks.append((
+        "Python dependencies",
+        _runtime_dependencies_ready(runtime),
+        str(runtime),
+    ))
+    try:
+        with socket.socket() as probe:
+            probe.bind((values.server_host, values.server_port))
+        checks.append(("Web port", True, f"{values.server_host}:{values.server_port} available"))
+    except OSError as exc:
+        already_running = _http_ready(f"http://127.0.0.1:{values.server_port}/api/health")
+        checks.append((
+            "Web port",
+            already_running,
+            "RAG web server already running" if already_running else str(exc),
+        ))
+
+    if values.mode == "local":
+        ready = _http_ready(f"http://127.0.0.1:{values.local_ollama_port}/api/version")
+        checks.append(("Local Ollama", ready, "ready" if ready else "not reachable"))
+    else:
+        ok, detail = _command_check("ssh")
+        checks.append(("ssh", ok, detail))
+        for label, raw_key in (
+            ("CPU SSH key", values.cpu_identity_file),
+            ("GPU SSH key", values.gpu_identity_file),
+        ):
+            if raw_key:
+                key_path = Path(os.path.expandvars(raw_key)).expanduser()
+                checks.append((label, key_path.is_file(), str(key_path)))
+        rsync_ok, rsync_detail = _command_check("rsync")
+        scp_ok, scp_detail = _command_check("scp")
+        checks.append((
+            "file transfer",
+            rsync_ok or scp_ok,
+            rsync_detail if rsync_ok else scp_detail,
+        ))
+        # Import only after configuration is written and ROOT is importable.
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        old_config = os.environ.get("RAG_PIPELINE_CONFIG")
+        os.environ["RAG_PIPELINE_CONFIG"] = str(path)
+        try:
+            from src.config import load_config
+            from src.hpc_backend import HpcBackend
+
+            remote = HpcBackend(load_config(path).hpc).check_connections()
+            for name in ("cpu", "gpu"):
+                outcome = remote[name]
+                checks.append((
+                    f"{name.upper()} cluster",
+                    bool(outcome["ok"]),
+                    str(outcome["detail"]),
+                ))
+        finally:
+            if old_config is None:
+                os.environ.pop("RAG_PIPELINE_CONFIG", None)
+            else:
+                os.environ["RAG_PIPELINE_CONFIG"] = old_config
+
+    for label, ok, detail in checks:
+        print(f"  {'OK' if ok else 'FAIL':4}  {label}: {detail}")
+    return all(ok for _, ok, _ in checks)
+
+
+def _start_tunnel(values: SetupValues) -> subprocess.Popen[str]:
+    if os.name == "nt":
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if not powershell:
+            raise RuntimeError("PowerShell was not found; cannot start the tunnel")
+        command = [
+            powershell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", str(ROOT / "scripts" / "tunnel_daemon.ps1"),
+            "-JumpHost", values.gpu_host,
+            "-HostFile", "~/.rag_ollama_serving_host",
+            "-LocalPort", str(values.local_ollama_port),
+        ]
+    else:
+        command = [
+            "bash", str(ROOT / "scripts" / "tunnel_daemon.sh"),
+            "--jump-host", values.gpu_host,
+            "--host-file", "~/.rag_ollama_serving_host",
+            "--local-port", str(values.local_ollama_port),
+        ]
+    return subprocess.Popen(command, cwd=ROOT, text=True)
+
+
+def _submit_gpu_job(path: Path) -> str:
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from src.config import load_config
+    from src.hpc_backend import HpcBackend
+
+    return HpcBackend(load_config(path).hpc).submit_serve_job()
+
+
+def start_instance(path: Path, values: SetupValues, *, submit_gpu: bool) -> int:
+    children: list[subprocess.Popen[str]] = []
+    environment = dict(os.environ)
+    environment["RAG_PIPELINE_CONFIG"] = str(path)
+    try:
+        if values.mode == "hpc":
+            if submit_gpu:
+                job_id = _submit_gpu_job(path)
+                print(f"Submitted GPU Ollama serving job: {job_id}")
+            print("Starting auto-reconnecting HPC tunnel...")
+            children.append(_start_tunnel(values))
+            deadline = time.monotonic() + 45
+            url = f"http://127.0.0.1:{values.local_ollama_port}/api/version"
+            while time.monotonic() < deadline and not _http_ready(url):
+                if children[-1].poll() is not None:
+                    raise RuntimeError("SSH tunnel exited before Ollama became reachable")
+                time.sleep(1)
+            if not _http_ready(url):
+                raise RuntimeError(
+                    "Ollama did not become reachable through the tunnel within 45s. "
+                    "Confirm the GPU serving job is running."
+                )
+
+        print(f"Starting web server: http://{values.server_host}:{values.server_port}")
+        children.append(subprocess.Popen(
+            [str(_runtime_python()), "-m", "src.web_app"],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+        ))
+        return children[-1].wait()
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        for child in reversed(children):
+            if child.poll() is None:
+                child.terminate()
+        for child in reversed(children):
+            if child.poll() is None:
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Configure, verify, and launch one RAG web + HPC instance."
+    )
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--mode", choices=("local", "hpc"))
+    parser.add_argument("--server-host")
+    parser.add_argument("--server-port", type=int)
+    parser.add_argument("--ssh-config", type=Path, default=DEFAULT_SSH_CONFIG)
+    parser.add_argument("--setup-ssh", action="store_true")
+    parser.add_argument("--cpu-host", help="CPU cluster SSH alias")
+    parser.add_argument("--cpu-hostname", help="CPU cluster login hostname")
+    parser.add_argument("--cpu-user", help="CPU cluster SSH username")
+    parser.add_argument("--cpu-key", help="CPU cluster SSH private-key path")
+    parser.add_argument("--cpu-repo")
+    parser.add_argument("--gpu-host", help="GPU cluster SSH alias")
+    parser.add_argument("--gpu-hostname", help="GPU cluster login hostname")
+    parser.add_argument("--gpu-user", help="GPU cluster SSH username")
+    parser.add_argument("--gpu-key", help="GPU cluster SSH private-key path")
+    parser.add_argument("--gpu-repo")
+    parser.add_argument(
+        "--skip-key-install",
+        action="store_true",
+        help="Generate/configure keys but do not add public keys remotely.",
+    )
+    parser.add_argument("--ollama-port", type=int)
+    parser.add_argument("--non-interactive", action="store_true")
+    parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--configure-only", action="store_true")
+    parser.add_argument("--start", action="store_true")
+    parser.add_argument(
+        "--submit-gpu-job",
+        action="store_true",
+        help="Submit the paid GPU Ollama PBS job before launching the tunnel.",
+    )
+    parser.add_argument("--skip-checks", action="store_true")
+    parser.add_argument(
+        "--install-deps",
+        action="store_true",
+        help="Create .venv and install requirements.txt before checking/starting.",
+    )
+    parser.add_argument(
+        "--no-install-deps",
+        action="store_true",
+        help="Do not offer to install missing dependencies in interactive mode.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    args.ssh_config = args.ssh_config.expanduser().resolve()
+    path = args.config.resolve()
+    existing = _load(path)
+    values = (
+        _collect_non_interactive(existing, args)
+        if args.non_interactive
+        else _collect_interactive(existing, args)
+    )
+    try:
+        _validate(values)
+    except ValueError as exc:
+        print(f"Setup error: {exc}", file=sys.stderr)
+        return 2
+
+    if not args.check_only:
+        try:
+            setup_ssh_credentials(
+                values,
+                install_public_keys=not args.skip_key_install,
+            )
+            configure_ssh_aliases(args.ssh_config, values)
+            configure(path, values)
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Configuration failed: {exc}", file=sys.stderr)
+            return 1
+        if values.manage_ssh_aliases:
+            print(f"\nSSH aliases saved to {args.ssh_config}")
+            ssh_backup = args.ssh_config.with_name(args.ssh_config.name + ".rag-setup.bak")
+            if ssh_backup.exists():
+                print(f"Previous SSH configuration backed up to {ssh_backup}")
+        print(f"\nConfiguration saved to {path}")
+        if path.with_suffix(path.suffix + ".bak").exists():
+            print(f"Previous configuration backed up to {path}.bak")
+
+    dependencies_ready = _runtime_dependencies_ready()
+    should_install = args.install_deps
+    if (
+        not dependencies_ready
+        and not args.non_interactive
+        and not args.check_only
+        and not args.no_install_deps
+        and not should_install
+    ):
+        should_install = _prompt_yes_no(
+            "Runtime dependencies are missing. Create .venv and install them?",
+            True,
+        )
+    if should_install:
+        try:
+            install_dependencies()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(f"Dependency installation failed: {exc}", file=sys.stderr)
+            return 1
+
+    checks_ok = True
+    if not args.skip_checks:
+        checks_ok = run_checks(path, values)
+    if not checks_ok:
+        print("\nPreflight failed; fix the items above and rerun setup.", file=sys.stderr)
+        return 1
+    if args.configure_only or args.check_only:
+        return 0
+
+    should_start = args.start
+    submit_gpu = args.submit_gpu_job
+    if not args.non_interactive and not args.start:
+        should_start = _prompt_yes_no("Start the instance now?", True)
+        if should_start and values.mode == "hpc" and not submit_gpu:
+            submit_gpu = _prompt_yes_no(
+                "Submit a paid GPU serving job now? (No if one is already running)",
+                False,
+            )
+    if not should_start:
+        print("Ready. Start later with setup.cmd --non-interactive --start")
+        return 0
+    return start_instance(path, values, submit_gpu=submit_gpu)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

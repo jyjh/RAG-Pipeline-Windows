@@ -1461,3 +1461,31 @@ input[type="file"] {
   gap: 6px;
   flex-shrink: 0;
 }
+
+/* API-key settings field (Documents panel) and 401 prompt modal. */
+.api-key-settings .hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 4px 0 0;
+}
+
+.api-key-toolbar {
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+}
+
+.api-key-toolbar input {
+  flex: 1;
+  min-width: 0;
+}
+
+.api-key-prompt-status {
+  min-height: 0;
+  margin: 6px 0;
+}
+
+#apiKeyPromptInput {
+  width: 100%;
+  box-sizing: border-box;
+}

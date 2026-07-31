@@ -67,6 +67,9 @@ const INDEX_CHILD_BATCH_SIZE = 100;
 const CHAT_AUTO_SCROLL_THRESHOLD = 120;
 const CHAT_STORAGE_KEY = "rag.chatHistory.v1";
 const CHAT_UI_STORAGE_KEY = "rag.chatUi.v1";
+// API key for authenticated mutations. localStorage (not a cookie): it is a
+// long-lived secret, and there is no reason to send it on every static GET.
+const API_KEY_STORAGE_KEY = "rag.apiKey.v1";
 const CHAT_HISTORY_LIMIT = 30;
 const CHAT_MESSAGE_LIMIT = 120;
 const TUTORIAL_SEEN_COOKIE = "rag_tutorial_seen";
@@ -171,6 +174,14 @@ const els = {
   cachePromptText: document.getElementById("cachePromptText"),
   cachePromptReloadButton: document.getElementById("cachePromptReloadButton"),
   cachePromptDoneButton: document.getElementById("cachePromptDoneButton"),
+  apiKeyPromptOverlay: document.getElementById("apiKeyPromptOverlay"),
+  apiKeyPromptInput: document.getElementById("apiKeyPromptInput"),
+  apiKeyPromptStatus: document.getElementById("apiKeyPromptStatus"),
+  apiKeyPromptSaveButton: document.getElementById("apiKeyPromptSaveButton"),
+  apiKeyPromptCancelButton: document.getElementById("apiKeyPromptCancelButton"),
+  apiKeyInput: document.getElementById("apiKeyInput"),
+  apiKeyStatus: document.getElementById("apiKeyStatus"),
+  apiKeyClearButton: document.getElementById("apiKeyClearButton"),
   sourceGroupPromptOverlay: document.getElementById("sourceGroupPromptOverlay"),
   sourceGroupPromptCancelButton: document.getElementById("sourceGroupPromptCancelButton"),
   pdfSelectAllCheckbox: document.getElementById("pdfSelectAllCheckbox"),
@@ -274,6 +285,7 @@ async function requestJson(path, options = {}) {
   const method = String(options.method || "GET").toUpperCase();
   const cacheable = method === "GET" && !options.body;
   const headers = new Headers(options.headers || {});
+  applyApiKeyHeaders(headers, { method });
   if (cacheable) {
     const cached = getJsonCache.get(path);
     if (cached && cached.etag) {
@@ -300,6 +312,15 @@ async function requestJson(path, options = {}) {
       return { ...cached.data, notModified: true };
     }
   }
+  // A mutating request failed auth: offer to (re-)enter the API key, then retry
+  // once. Surfaced here so every requestJson caller benefits without per-call
+  // handling. GETs never hit this (they carry no key and are not gated).
+  if (response.status === 401 && method !== "GET" && !options.__apiKeyRetried) {
+    const key = await promptForApiKey();
+    if (key) {
+      return requestJson(path, { ...options, __apiKeyRetried: true });
+    }
+  }
   if (!response.ok) {
     throw await errorFromResponse(response);
   }
@@ -320,8 +341,23 @@ function uploadFormData(path, body, options = {}) {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
     request.open("POST", path);
+    const apiKey = getApiKey();
+    if (apiKey) {
+      request.setRequestHeader("X-API-Token", apiKey);
+    }
     request.addEventListener("load", () => {
       const text = request.responseText || "";
+      if (request.status === 401 && !options.__apiKeyRetried) {
+        resolvedWithAuthRetry = true;
+        promptForApiKey().then((key) => {
+          if (key) {
+            uploadFormData(path, body, { ...options, __apiKeyRetried: true }).then(resolve, reject);
+          } else {
+            reject(errorFromText(request.status, request.statusText, text));
+          }
+        });
+        return;
+      }
       if (request.status >= 200 && request.status < 300) {
         try {
           resolve(JSON.parse(text || "{}"));
@@ -518,6 +554,108 @@ function setCookie(name, value, maxAgeSeconds = COOKIE_MAX_AGE_SECONDS) {
   document.cookie = `${encodedName}=${encodedValue}; Max-Age=${maxAgeSeconds}; Path=/; SameSite=Lax`;
 }
 
+// The API key authenticates mutating requests (upload, reindex, delete, edit)
+// when the deployment has keys configured. It is optional and inert on a fresh
+// single-user deploy. Stored locally so the user enters it once; cleared from
+// here to log out.
+function getApiKey() {
+  try {
+    return localStorage.getItem(API_KEY_STORAGE_KEY) || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function setApiKey(value) {
+  const trimmed = String(value || "").trim();
+  try {
+    if (trimmed) {
+      localStorage.setItem(API_KEY_STORAGE_KEY, trimmed);
+    } else {
+      localStorage.removeItem(API_KEY_STORAGE_KEY);
+    }
+  } catch (_) {
+    // Private mode / disabled storage: fall back to carrying nothing; the
+    // server will 401 and the user can re-enter the key in the prompt.
+  }
+  if (els.apiKeyInput) {
+    els.apiKeyInput.value = trimmed;
+  }
+  if (els.apiKeyStatus) {
+    els.apiKeyStatus.textContent = trimmed ? "API key saved" : "No API key set";
+  }
+  return trimmed;
+}
+
+function clearApiKey() {
+  return setApiKey("");
+}
+
+// Apply the stored API key to a Headers object in place. Mutating requests get
+// the X-API-Token header (same name the legacy single-token middleware used);
+// GET reads stay header-free so an empty store / fresh deploy keeps working.
+function applyApiKeyHeaders(headers, { method }) {
+  const key = getApiKey();
+  if (key && String(method || "GET").toUpperCase() !== "GET") {
+    headers.set("X-API-Token", key);
+  }
+  return headers;
+}
+
+// Show the API-key prompt and resolve to the entered key (saved) or null
+// (cancelled). Only one prompt is shown at a time; concurrent callers await the
+// same in-flight promise so a burst of 401s produces a single dialog.
+let apiKeyPromptInFlight = null;
+function promptForApiKey() {
+  if (apiKeyPromptInFlight) {
+    return apiKeyPromptInFlight;
+  }
+  const overlay = els.apiKeyPromptOverlay;
+  const input = els.apiKeyPromptInput;
+  const status = els.apiKeyPromptStatus;
+  if (!overlay || !input) {
+    return Promise.resolve(null);
+  }
+  input.value = getApiKey();
+  if (status) {
+    status.textContent = "";
+  }
+  overlay.hidden = false;
+  setTimeout(() => input.focus(), 0);
+  apiKeyPromptInFlight = new Promise((resolve) => {
+    const cleanup = () => {
+      overlay.hidden = true;
+      apiKeyPromptInFlight = null;
+      els.apiKeyPromptSaveButton.removeEventListener("click", onSave);
+      els.apiKeyPromptCancelButton.removeEventListener("click", onCancel);
+      input.removeEventListener("keydown", onKey);
+    };
+    const onSave = () => {
+      const value = String(input.value || "").trim();
+      cleanup();
+      setApiKey(value);
+      resolve(value || null);
+    };
+    const onCancel = () => {
+      cleanup();
+      resolve(null);
+    };
+    const onKey = (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        onSave();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        onCancel();
+      }
+    };
+    els.apiKeyPromptSaveButton.addEventListener("click", onSave);
+    els.apiKeyPromptCancelButton.addEventListener("click", onCancel);
+    input.addEventListener("keydown", onKey);
+  });
+  return apiKeyPromptInFlight;
+}
+
 function normalizeReviewerName(value) {
   return String(value || "").trim().replace(/\s+/g, " ").slice(0, 80);
 }
@@ -535,6 +673,17 @@ function saveReviewerName(value) {
 
 function loadReviewerName() {
   saveReviewerName(getCookie(REVIEWER_NAME_COOKIE));
+}
+
+function loadApiKey() {
+  // Hydrate the settings field/status from storage without changing the value.
+  const key = getApiKey();
+  if (els.apiKeyInput) {
+    els.apiKeyInput.value = key;
+  }
+  if (els.apiKeyStatus) {
+    els.apiKeyStatus.textContent = key ? "API key saved" : "No API key set";
+  }
 }
 
 function ensureReviewerName() {
@@ -4434,6 +4583,25 @@ els.reviewerNameInput.addEventListener("keydown", (event) => {
     els.reviewerNameInput.blur();
   }
 });
+if (els.apiKeyInput) {
+  const saveApiKeyField = () => {
+    setApiKey(els.apiKeyInput.value);
+  };
+  els.apiKeyInput.addEventListener("change", saveApiKeyField);
+  els.apiKeyInput.addEventListener("blur", saveApiKeyField);
+  els.apiKeyInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      saveApiKeyField();
+      els.apiKeyInput.blur();
+    }
+  });
+}
+if (els.apiKeyClearButton) {
+  els.apiKeyClearButton.addEventListener("click", () => {
+    clearApiKey();
+  });
+}
 els.pdfsBody.addEventListener("click", handlePdfAction);
 els.pdfsBody.addEventListener("change", (event) => {
   const checkbox = event.target.closest("input.pdf-row-select[data-pdf-select]");
@@ -4584,6 +4752,7 @@ els.chatMessages.addEventListener("click", (event) => {
 });
 
 loadReviewerName();
+loadApiKey();
 loadChatState();
 setChatSidebarCollapsed(state.chatSidebarCollapsed);
 renderSavedChats();

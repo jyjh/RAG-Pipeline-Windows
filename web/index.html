@@ -65,6 +65,15 @@
             <input id="reviewerNameInput" type="text" autocomplete="name" placeholder="Your name" />
           </label>
         </div>
+        <details class="advanced-settings api-key-settings">
+          <summary>API key</summary>
+          <div class="toolbar api-key-toolbar">
+            <input id="apiKeyInput" type="password" autocomplete="off" placeholder="rag_... (leave blank if your deployment is open)" aria-label="API key" />
+            <button id="apiKeyClearButton" type="button">Clear</button>
+          </div>
+          <p id="apiKeyStatus" class="status">No API key set</p>
+          <p class="hint">Required only when an administrator has issued API keys or set a master token. Stored on this browser only.</p>
+        </details>
         <div class="toolbar table-pager">
           <strong>PDFs</strong>
           <label class="inline-select-label">
@@ -329,6 +338,22 @@
         <div class="modal-actions">
           <button id="cachePromptReloadButton" type="button">Clear cache + reload</button>
           <button id="cachePromptDoneButton" type="button">I already refreshed</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="apiKeyPromptOverlay" class="modal-overlay" hidden>
+      <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="apiKeyPromptTitle">
+        <h2 id="apiKeyPromptTitle">API key required</h2>
+        <p>
+          This action needs an API key. Enter the key your administrator gave you; it will be saved on
+          this browser for future requests.
+        </p>
+        <input id="apiKeyPromptInput" type="password" autocomplete="off" placeholder="rag_..." aria-label="API key" />
+        <p id="apiKeyPromptStatus" class="status api-key-prompt-status"></p>
+        <div class="modal-actions">
+          <button id="apiKeyPromptSaveButton" type="button">Save</button>
+          <button id="apiKeyPromptCancelButton" type="button">Cancel</button>
         </div>
       </div>
     </div>

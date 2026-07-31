@@ -176,6 +176,61 @@ Run the local browser UI:
 python -m src.web_app
 ```
 
+### Guided one-command server + HPC setup
+
+On Windows, double-click `setup.cmd` (or run it from PowerShell). On Linux or
+macOS, run `./setup.sh`. The wizard:
+
+- preserves the rest of `config.toml` and writes `config.toml.bak`;
+- creates or updates exact CPU/GPU aliases in `~/.ssh/config`, preserving
+  unrelated hosts and writing `config.rag-setup.bak`;
+- creates dedicated Ed25519 keys when missing, installs each public key without
+  duplicating `authorized_keys` entries, and verifies key-only login;
+- configures the web bind address and local Ollama endpoint;
+- collects each cluster's login hostname, username, private key, and repository
+  path relative to the directory entered immediately after SSH;
+- verifies Python dependencies, the web port, SSH, file transfer, `qsub`, the
+  remote repositories, and both Singularity images;
+- optionally creates `.venv` and installs `requirements.txt`;
+- optionally submits the GPU serving job, starts the reconnecting SSH tunnel,
+  and starts the web server.
+
+The paid GPU job is never submitted without an explicit yes/flag. Useful
+non-interactive forms:
+
+```powershell
+# Re-check an existing configuration without changing it.
+.\setup.cmd --non-interactive --check-only
+
+# Configure a service instance in automation.
+.\setup.cmd --non-interactive --mode hpc --server-host 0.0.0.0 `
+  --setup-ssh `
+  --cpu-host nus_hpc_cpu --cpu-hostname cpu-login.example.edu `
+  --cpu-user me --cpu-repo rag-cpu `
+  --gpu-host nus_hpc_gpu --gpu-hostname gpu-login.example.edu `
+  --gpu-user me --gpu-repo rag-gpu `
+  --configure-only
+
+# Start against an already-running GPU serving job.
+.\setup.cmd --non-interactive --start
+
+# Explicitly submit a new paid GPU job, then tunnel and start the web server.
+.\setup.cmd --non-interactive --start --submit-gpu-job
+```
+
+With `--setup-ssh`, missing keys default to
+`~/.ssh/rag_<alias>_ed25519` and are generated without a passphrase so the web
+service can reconnect unattended. Initial public-key installation may request
+the cluster password or MFA once. Use `--skip-key-install` when an administrator
+must install the generated `.pub` files instead.
+
+The interactive wizard creates the SSH aliases for you. Existing exact alias
+blocks are updated in place; wildcard/group blocks and unrelated hosts are left
+untouched. It also creates and authorizes the private keys for both aliases.
+Windows OpenSSH `scp` is supported when `rsync` is unavailable.
+Press Ctrl+C to stop the local server and tunnel; a submitted PBS serving job
+continues until its walltime or `qdel`.
+
 The browser UI reads server host, port, polling intervals, and update target from `config.toml` under `[server]`.
 Use `bind_all = true` to listen on all IPv4 interfaces (`0.0.0.0`) instead of only loopback. If you start
 with `uvicorn` directly, pass the same bind explicitly, for example `uvicorn src.web_app:app --host 0.0.0.0 --port 8000`.
