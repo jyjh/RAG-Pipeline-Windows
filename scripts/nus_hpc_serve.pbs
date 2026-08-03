@@ -32,7 +32,7 @@ USER="${USER:-$(whoami)}"
 PBS_JOBID="${PBS_JOBID:-local_job}"
 HOME="${HOME:-$(eval echo ~${USER})}"
 
-SCRATCH_DIR="/hpctmp2/${USER}/rag_serve_scratch_${PBS_JOBID}"
+SCRATCH_DIR="/scratch/${USER}/rag_serve_scratch_${PBS_JOBID}"
 OLLAMA_MODELS_DIR="${OLLAMA_MODELS_DIR:-${HOME}/ollama_models}"
 OLLAMA_HOST_FILE="${OLLAMA_HOST_FILE:-${HOME}/.rag_ollama_serving_host}"
 
@@ -61,11 +61,11 @@ cleanup() {
 trap cleanup EXIT
 
 CONTAINER_SIF="${CONTAINER_SIF:-rag_pipeline.sif}"
-if [ ! -f "${CONTAINER_SIF}" ] && [ -f "/hpctmp2/${USER}/rag_pipeline.sif" ]; then
-    CONTAINER_SIF="/hpctmp2/${USER}/rag_pipeline.sif"
+if [ ! -f "${CONTAINER_SIF}" ] && [ -f "/scratch/${USER}/rag_pipeline.sif" ]; then
+    CONTAINER_SIF="/scratch/${USER}/rag_pipeline.sif"
 fi
 
-BIND_MOUNTS="-B /hpctmp2/${USER}:/hpctmp2/${USER} -B ${HOME}:/srv/home -B ${PWD}:/app -B ${OLLAMA_MODELS_DIR}:/srv/ollama_models"
+BIND_MOUNTS="-B /scratch/${USER}:/scratch/${USER} -B ${HOME}:/srv/home -B ${PWD}:/app -B ${OLLAMA_MODELS_DIR}:/srv/ollama_models"
 
 export OLLAMA_MODELS="/srv/ollama_models"
 export TMPDIR="${SCRATCH_DIR}/tmp"

@@ -10,15 +10,15 @@ set -e
 # Load Singularity module on NUS HPC
 module load singularity
 
-# Set scratch directory under /hpctmp2/${USER}/rag_scratch_${PBS_JOBID}
+# Set scratch directory under /hpctmp/${USER}/rag_scratch_${PBS_JOBID}
 USER="${USER:-$(whoami)}"
 PBS_JOBID="${PBS_JOBID:-local_job}"
-SCRATCH_DIR="/hpctmp2/${USER}/rag_scratch_${PBS_JOBID}"
+SCRATCH_DIR="/hpctmp/${USER}/rag_scratch_${PBS_JOBID}"
 HOME="${HOME:-$(eval echo ~${USER})}"
 
 # Ollama model store MUST live on shared storage visible to every compute node
 # (NOT under the per-job scratch, which is wiped on exit). The default is the
-# home directory; override OLLAMA_MODELS_DIR to point it at shared /hpctmp2
+# home directory; override OLLAMA_MODELS_DIR to point it at shared /hpctmp
 # space if your home has a tight quota. Models survive across jobs only if this
 # path persists.
 OLLAMA_MODELS_DIR="${OLLAMA_MODELS_DIR:-${HOME}/ollama_models}"
@@ -44,14 +44,14 @@ trap cleanup EXIT
 
 # Container SIF image location
 CONTAINER_SIF="${CONTAINER_SIF:-rag_pipeline.sif}"
-if [ ! -f "${CONTAINER_SIF}" ] && [ -f "/hpctmp2/${USER}/rag_pipeline.sif" ]; then
-    CONTAINER_SIF="/hpctmp2/${USER}/rag_pipeline.sif"
+if [ ! -f "${CONTAINER_SIF}" ] && [ -f "/hpctmp/${USER}/rag_pipeline.sif" ]; then
+    CONTAINER_SIF="/hpctmp/${USER}/rag_pipeline.sif"
 fi
 
 # Set bind mounts for HPC storage access. Bind both the scratch tree and the
 # persistent model store (which may be ${HOME} or a custom dir) so the
 # containerized Ollama can write to OLLAMA_MODELS.
-BIND_MOUNTS="-B /hpctmp2/${USER}:/hpctmp2/${USER} -B ${HOME}:/srv/home -B ${PWD}:/app -B ${OLLAMA_MODELS_DIR}:/srv/ollama_models"
+BIND_MOUNTS="-B /hpctmp/${USER}:/hpctmp/${USER} -B ${HOME}:/srv/home -B ${PWD}:/app -B ${OLLAMA_MODELS_DIR}:/srv/ollama_models"
 
 # Configure Ollama models (persistent) and temp paths (high-speed scratch).
 export OLLAMA_MODELS="/srv/ollama_models"

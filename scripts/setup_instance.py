@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import argparse
 import os
+import posixpath
 import re
+import secrets
 import shlex
 import shutil
 import socket
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 import tomllib
 import urllib.error
@@ -34,6 +38,17 @@ _KEY_RE = re.compile(r"^(\s*)([A-Za-z0-9_-]+)\s*=")
 _SSH_ALIAS_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SSH_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _SSH_USER_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_REPO_ARCHIVE_EXCLUDED_NAMES = {
+    ".git",
+    ".venv",
+    ".zcode",
+    "__pycache__",
+    "data",
+    "db",
+    "db_out",
+    "logs",
+    "processed_docs",
+}
 
 
 @dataclass
@@ -47,11 +62,13 @@ class SetupValues:
     cpu_user: str = ""
     cpu_identity_file: str = ""
     cpu_repo: str = ""
+    cpu_storage_root: str = ""
     gpu_host: str = ""
     gpu_hostname: str = ""
     gpu_user: str = ""
     gpu_identity_file: str = ""
     gpu_repo: str = ""
+    gpu_storage_root: str = ""
     local_ollama_port: int = 11434
 
 
@@ -408,6 +425,254 @@ def setup_ssh_credentials(values: SetupValues, *, install_public_keys: bool) -> 
             )
 
 
+def _repo_archive_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    parts = PurePosixPath(info.name).parts
+    if any(part in _REPO_ARCHIVE_EXCLUDED_NAMES for part in parts):
+        return None
+    if any(
+        part.startswith((".index_build_", ".tmp_test_", ".pytest_"))
+        for part in parts
+    ):
+        return None
+    if info.name.lower().endswith(".sif"):
+        return None
+    return info
+
+
+def create_repository_archive(destination: Path, source_root: Path = ROOT) -> Path:
+    """Package the exact working-tree source without local data/index artifacts."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(destination, "w:gz", compresslevel=6) as archive:
+        archive.add(source_root, arcname=".", filter=_repo_archive_filter)
+    return destination
+
+
+def _run_provision_ssh(
+    alias: str,
+    remote_command: str,
+    *,
+    timeout: float | None = 120.0,
+) -> None:
+    ssh = shutil.which("ssh")
+    if not ssh:
+        raise RuntimeError("ssh was not found; install the OpenSSH Client")
+    result = subprocess.run(
+        [
+            ssh,
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=20",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=6",
+            alias,
+            remote_command,
+        ],
+        check=False,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"remote provisioning command failed on {alias} "
+            f"(exit {result.returncode})"
+        )
+
+
+def _upload_provision_file(source: Path, alias: str, remote_path: str) -> None:
+    """Upload one file with rsync when available, otherwise OpenSSH scp."""
+    if shutil.which("rsync"):
+        command = [
+            "rsync",
+            "-e",
+            "ssh -o BatchMode=yes -o ConnectTimeout=20 "
+            "-o ServerAliveInterval=30 -o ServerAliveCountMax=6",
+            "--partial",
+            "--progress",
+            str(source),
+            f"{alias}:{remote_path}",
+        ]
+    else:
+        scp = shutil.which("scp")
+        if not scp:
+            raise RuntimeError("neither rsync nor scp was found")
+        command = [
+            scp,
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=20",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=6",
+            str(source),
+            f"{alias}:{remote_path}",
+        ]
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"failed to upload {source.name} to {alias}:{remote_path}")
+
+
+def _remote_container_build_command(
+    *,
+    repo_dir: str,
+    definition_name: str,
+    image_name: str,
+) -> str:
+    quoted_repo = shlex.quote(repo_dir)
+    quoted_definition = shlex.quote(definition_name)
+    quoted_image = shlex.quote(image_name)
+    return (
+        f"cd {quoted_repo} && "
+        "runtime=''; "
+        "if command -v apptainer >/dev/null 2>&1; then runtime=apptainer; "
+        "elif command -v singularity >/dev/null 2>&1; then runtime=singularity; "
+        "elif command -v module >/dev/null 2>&1; then "
+        "module load singularity >/dev/null 2>&1 || true; "
+        "command -v singularity >/dev/null 2>&1 && runtime=singularity; fi; "
+        "test -n \"$runtime\" || { echo 'Singularity/Apptainer is unavailable' >&2; exit 1; }; "
+        # Some HPC sites force a bind path (e.g. /app1) into EVERY Apptainer
+        # invocation via apptainer.conf or APPTAINER_BIND, including `build`.
+        # During build the %post runs under --writable, where a bind to a
+        # destination absent from the base image ("destination /app1 doesn't
+        # exist in container") is fatal and can't be auto-created. Our build
+        # only does apt/pip/ollama installs against the internet, so it needs
+        # NO site bind paths -- suppress them for this one command only.
+        "APPTAINER_NO_MOUNT=bind SINGULARITY_NO_MOUNT=bind "
+        f"\"$runtime\" build --fakeroot {quoted_image} {quoted_definition}"
+    )
+
+
+def provision_hpc_cluster(
+    *,
+    alias: str,
+    user: str,
+    storage_root: str,
+    relative_repo: str,
+    archive_path: Path,
+    image_name: str,
+    definition_name: str,
+    local_image: Path | None,
+) -> None:
+    """Stage and activate one complete repository + SIF under its cluster root."""
+    if not _SSH_ALIAS_RE.fullmatch(alias):
+        raise RuntimeError(f"invalid SSH alias for provisioning: {alias!r}")
+    if not _SSH_USER_RE.fullmatch(user):
+        raise RuntimeError(f"invalid SSH username for provisioning: {user!r}")
+    _validate_relative_repo(relative_repo, alias)
+    scratch_root = PurePosixPath(storage_root)
+    if not scratch_root.is_absolute() or ".." in scratch_root.parts:
+        raise RuntimeError(f"invalid storage root for {alias}: {storage_root!r}")
+    scratch_root = str(scratch_root)
+    storage_parent = str(PurePosixPath(scratch_root).parent)
+    target_repo = posixpath.join(scratch_root, relative_repo)
+    token = secrets.token_hex(6)
+    stage_root = posixpath.join(scratch_root, f".rag_setup_{token}")
+    staged_repo = posixpath.join(stage_root, "repo")
+    remote_archive = posixpath.join(stage_root, "repository.tar.gz")
+    login_link = f"$HOME/{relative_repo}"
+
+    print(f"\nProvisioning {alias} -> {target_repo}")
+    prepare = (
+        f"test -d {shlex.quote(storage_parent)} && mkdir -p {shlex.quote(scratch_root)} "
+        f"{shlex.quote(staged_repo)}"
+    )
+    _run_provision_ssh(alias, prepare)
+    try:
+        print(f"Uploading repository source to {alias}...")
+        _upload_provision_file(archive_path, alias, remote_archive)
+        extract = (
+            f"tar -xzf {shlex.quote(remote_archive)} "
+            f"-C {shlex.quote(staged_repo)} && rm -f {shlex.quote(remote_archive)}"
+        )
+        _run_provision_ssh(alias, extract, timeout=600)
+
+        if local_image is not None and local_image.is_file():
+            print(f"Uploading {image_name} to {alias} (large transfer)...")
+            _upload_provision_file(
+                local_image,
+                alias,
+                posixpath.join(staged_repo, image_name),
+            )
+        else:
+            print(f"Building {image_name} on {alias}...")
+            _run_provision_ssh(
+                alias,
+                _remote_container_build_command(
+                    repo_dir=staged_repo,
+                    definition_name=definition_name,
+                    image_name=image_name,
+                ),
+                timeout=4 * 60 * 60,
+            )
+
+        verify = (
+            f"test -s {shlex.quote(posixpath.join(staged_repo, image_name))} "
+            f"&& test -f {shlex.quote(posixpath.join(staged_repo, 'main.py'))}"
+        )
+        _run_provision_ssh(alias, verify)
+
+        target_parent = posixpath.dirname(target_repo)
+        link_parent = posixpath.dirname(login_link)
+        previous_repo = target_repo + ".rag-setup-previous"
+        activate = (
+            f"mkdir -p {shlex.quote(target_parent)} \"{link_parent}\"; "
+            f"if [ -e \"{login_link}\" ] && [ ! -L \"{login_link}\" ]; then "
+            f"echo 'Refusing to replace non-symlink {login_link}' >&2; exit 1; fi; "
+            f"rm -rf {shlex.quote(previous_repo)}; "
+            f"if [ -e {shlex.quote(target_repo)} ]; then "
+            f"mv {shlex.quote(target_repo)} {shlex.quote(previous_repo)}; fi; "
+            f"mv {shlex.quote(staged_repo)} {shlex.quote(target_repo)}; "
+            f"ln -sfn {shlex.quote(target_repo)} \"{login_link}\"; "
+            f"test -s {shlex.quote(posixpath.join(target_repo, image_name))}"
+        )
+        _run_provision_ssh(alias, activate, timeout=600)
+        print(f"Activated {alias}:{relative_repo} ({target_repo})")
+    finally:
+        try:
+            _run_provision_ssh(
+                alias,
+                f"rm -rf {shlex.quote(stage_root)}",
+                timeout=120,
+            )
+        except RuntimeError:
+            pass
+
+
+def provision_hpc_servers(values: SetupValues) -> None:
+    """Package once, then provision the CPU and GPU clusters."""
+    if values.mode != "hpc":
+        return
+    with tempfile.TemporaryDirectory(prefix="rag-hpc-setup-") as temp_dir:
+        archive_path = create_repository_archive(Path(temp_dir) / "repository.tar.gz")
+        provision_hpc_cluster(
+            alias=values.cpu_host,
+            user=values.cpu_user,
+            storage_root=_storage_root(
+                values.cpu_storage_root,
+                values.cpu_user,
+                "/hpctmp",
+            ),
+            relative_repo=values.cpu_repo,
+            archive_path=archive_path,
+            image_name="rag_pipeline_cpu.sif",
+            definition_name="Singularity.cpu.def",
+            local_image=ROOT / "rag_pipeline_cpu.sif",
+        )
+        provision_hpc_cluster(
+            alias=values.gpu_host,
+            user=values.gpu_user,
+            storage_root=_storage_root(
+                values.gpu_storage_root,
+                values.gpu_user,
+                "/scratch",
+            ),
+            relative_repo=values.gpu_repo,
+            archive_path=archive_path,
+            image_name="rag_pipeline.sif",
+            definition_name="Singularity.def",
+            local_image=(
+                ROOT / "rag_pipeline.sif"
+                if (ROOT / "rag_pipeline.sif").is_file()
+                else None
+            ),
+        )
+
+
 def _load(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -444,6 +709,19 @@ def _login_relative_repo_default(raw: str, user: str) -> str:
     if value:
         return PurePosixPath(value).name
     return "RAG-Pipeline-Windows"
+
+
+def _storage_root(raw: str, user: str, default_base: str) -> str:
+    value = str(raw or "").strip()
+    if not user:
+        return value or f"{default_base}/${{USER}}"
+    if not value:
+        return f"{default_base}/{user}"
+    return (
+        value.replace("${USER}", user)
+        .replace("$USER", user)
+        .replace("{username}", user)
+    )
 
 
 def _validate_relative_repo(value: str, label: str) -> None:
@@ -506,6 +784,11 @@ def _validate(values: SetupValues) -> None:
             _validate_relative_repo(repo, label)
         if values.cpu_host == values.gpu_host:
             raise ValueError("CPU and GPU clusters must use different SSH aliases")
+        if values.manage_ssh_aliases:
+            if values.cpu_storage_root != f"/hpctmp/{values.cpu_user}":
+                raise ValueError("Atlas9 CPU storage root must be /hpctmp/<username>")
+            if values.gpu_storage_root != f"/scratch/{values.gpu_user}":
+                raise ValueError("Vanda GPU storage root must be /scratch/<username>")
 
 
 def _collect_interactive(config: dict[str, Any], args: argparse.Namespace) -> SetupValues:
@@ -544,6 +827,7 @@ def _collect_interactive(config: dict[str, Any], args: argparse.Namespace) -> Se
             args.cpu_user or existing_cpu_alias.get("user", ""),
             required=True,
         )
+        values.cpu_storage_root = f"/hpctmp/{values.cpu_user}"
         values.cpu_identity_file = _prompt(
             "CPU SSH private key (created automatically if missing)",
             args.cpu_key
@@ -576,6 +860,7 @@ def _collect_interactive(config: dict[str, Any], args: argparse.Namespace) -> Se
             args.gpu_user or existing_gpu_alias.get("user", values.cpu_user),
             required=True,
         )
+        values.gpu_storage_root = f"/scratch/{values.gpu_user}"
         values.gpu_identity_file = _prompt(
             "GPU SSH private key (created automatically if missing)",
             args.gpu_key
@@ -605,6 +890,8 @@ def _collect_non_interactive(config: dict[str, Any], args: argparse.Namespace) -
     manage_ssh = bool(args.setup_ssh or args.cpu_hostname or args.gpu_hostname)
     cpu_alias = args.cpu_host or str(_nested(config, "hpc", "cpu", "ssh_host"))
     gpu_alias = args.gpu_host or str(_nested(config, "hpc", "gpu", "ssh_host"))
+    cpu_user = args.cpu_user or ""
+    gpu_user = args.gpu_user or ""
     return SetupValues(
         mode=mode,
         server_host=args.server_host or str(_nested(config, "server", "host", default="127.0.0.1")),
@@ -612,18 +899,28 @@ def _collect_non_interactive(config: dict[str, Any], args: argparse.Namespace) -
         manage_ssh_aliases=manage_ssh,
         cpu_host=cpu_alias,
         cpu_hostname=args.cpu_hostname or "",
-        cpu_user=args.cpu_user or "",
+        cpu_user=cpu_user,
         cpu_identity_file=(
             args.cpu_key or (f"~/.ssh/rag_{cpu_alias}_ed25519" if manage_ssh and cpu_alias else "")
         ),
         cpu_repo=args.cpu_repo or str(_nested(config, "hpc", "cpu", "remote_repo_dir")),
+        cpu_storage_root=_storage_root(
+            str(_nested(config, "hpc", "cpu", "storage_root")),
+            cpu_user,
+            "/hpctmp",
+        ),
         gpu_host=gpu_alias,
         gpu_hostname=args.gpu_hostname or "",
-        gpu_user=args.gpu_user or "",
+        gpu_user=gpu_user,
         gpu_identity_file=(
             args.gpu_key or (f"~/.ssh/rag_{gpu_alias}_ed25519" if manage_ssh and gpu_alias else "")
         ),
         gpu_repo=args.gpu_repo or str(_nested(config, "hpc", "gpu", "remote_repo_dir")),
+        gpu_storage_root=_storage_root(
+            str(_nested(config, "hpc", "gpu", "storage_root")),
+            gpu_user,
+            "/scratch",
+        ),
         local_ollama_port=args.ollama_port or _configured_ollama_port(config),
     )
 
@@ -649,11 +946,13 @@ def configure(path: Path, values: SetupValues) -> None:
                 "ssh_host": values.cpu_host,
                 "remote_repo_dir": values.cpu_repo,
                 "container_sif": "rag_pipeline_cpu.sif",
+                "storage_root": values.cpu_storage_root or "/hpctmp/${USER}",
             },
             "hpc.gpu": {
                 "ssh_host": values.gpu_host,
                 "remote_repo_dir": values.gpu_repo,
                 "container_sif": "rag_pipeline.sif",
+                "storage_root": values.gpu_storage_root or "/scratch/${USER}",
             },
         })
     update_toml_sections(path, updates)
@@ -874,6 +1173,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Generate/configure keys but do not add public keys remotely.",
     )
+    provision_group = parser.add_mutually_exclusive_group()
+    provision_group.add_argument(
+        "--provision-hpc",
+        action="store_true",
+        help="Upload the repository and provision CPU/GPU SIFs on both clusters.",
+    )
+    provision_group.add_argument(
+        "--skip-hpc-provision",
+        action="store_true",
+        help="Configure connections only; do not upload/build remote artifacts.",
+    )
     parser.add_argument("--ollama-port", type=int)
     parser.add_argument("--non-interactive", action="store_true")
     parser.add_argument("--check-only", action="store_true")
@@ -922,6 +1232,27 @@ def main(argv: list[str] | None = None) -> int:
             )
             configure_ssh_aliases(args.ssh_config, values)
             configure(path, values)
+            should_provision = (
+                values.mode == "hpc"
+                and not args.skip_hpc_provision
+                and (values.manage_ssh_aliases or args.provision_hpc)
+            )
+            if should_provision:
+                if not values.cpu_user:
+                    values.cpu_user = read_ssh_alias(
+                        args.ssh_config, values.cpu_host
+                    ).get("user", "")
+                if not values.gpu_user:
+                    values.gpu_user = read_ssh_alias(
+                        args.ssh_config, values.gpu_host
+                    ).get("user", "")
+                if not values.cpu_user or not values.gpu_user:
+                    raise RuntimeError(
+                        "CPU/GPU SSH usernames are required for remote provisioning"
+                    )
+                values.cpu_storage_root = f"/hpctmp/{values.cpu_user}"
+                values.gpu_storage_root = f"/scratch/{values.gpu_user}"
+                provision_hpc_servers(values)
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"Configuration failed: {exc}", file=sys.stderr)
             return 1

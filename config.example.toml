@@ -191,9 +191,11 @@ poll_interval_seconds = 15.0
 
 [hpc.cpu]
 ssh_host = ""
-# Relative to the directory entered immediately after `ssh <ssh_host>`.
+# Login-relative symlink created by setup; its target lives under
+# /hpctmp/<username>/<remote_repo_dir>.
 remote_repo_dir = ""
 container_sif = "rag_pipeline_cpu.sif"
+storage_root = "/hpctmp/${USER}"
 
 [hpc.cpu.pbs_overrides]
 ngpus = 0
@@ -204,9 +206,11 @@ walltime = "12:00:00"
 
 [hpc.gpu]
 ssh_host = ""
-# Relative to the directory entered immediately after `ssh <ssh_host>`.
+# Login-relative symlink created by setup; its target lives under
+# /scratch/<username>/<remote_repo_dir>.
 remote_repo_dir = ""
 container_sif = "rag_pipeline.sif"
+storage_root = "/scratch/${USER}"
 
 [hpc.gpu.pbs_overrides]
 ngpus = 1

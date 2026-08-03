@@ -33,12 +33,14 @@ BASE_CFG = HpcConfig(
         ssh_host="nus_hpc_cpu",            # free CPU cluster login node
         remote_repo_dir="rag-cpu",
         container_sif="rag_pipeline_cpu.sif",
+        storage_root="/hpctmp/me",
         pbs_overrides={"ngpus": 0, "queue": "cpu"},
     ),
     gpu=HpcClusterConfig(
         ssh_host="nus_hpc_gpu",            # paid GPU cluster login node (different host)
         remote_repo_dir="rag-gpu",
         container_sif="rag_pipeline.sif",
+        storage_root="/scratch/me",
         pbs_overrides={"ngpus": 1, "queue": "gpu"},
     ),
     remote_data_dir="data",
@@ -167,6 +169,7 @@ def test_build_pbs_script_is_cpu_shaped_from_overrides():
     script = b._build_pbs_script("data")
     assert "#PBS -q cpu" in script
     assert "rag_pipeline_cpu.sif" in script
+    assert 'STORAGE_ROOT="/hpctmp/me"' in script
     # CPU bundle: no :ngpus= clause, no --nv.
     assert ":ngpus=" not in script
     assert "--nv " not in script
@@ -175,8 +178,8 @@ def test_build_pbs_script_is_cpu_shaped_from_overrides():
 
 def test_build_pbs_script_input_dir_override():
     b = HpcBackend(BASE_CFG)
-    script = b._build_pbs_script("/hpctmp2/me/pdfs")
-    assert 'python3 scripts/bulk_ingest.py --input-dir "/hpctmp2/me/pdfs"' in script
+    script = b._build_pbs_script("/hpctmp/me/pdfs")
+    assert 'python3 scripts/bulk_ingest.py --input-dir "/hpctmp/me/pdfs"' in script
 
 
 # --- submit_ingest_index routes to the CPU cluster ---------------------------
@@ -409,6 +412,7 @@ def test_submit_serve_job_writes_and_qsubs_on_gpu_host(monkeypatch):
     assert "rag_ollama_serve" in write_call
     assert ".rag_ollama_serving_host" in write_call
     assert "rag_pipeline.sif" in write_call
+    assert 'STORAGE_ROOT="/scratch/me"' in write_call
 
 
 # --- config wiring: cfg.hpc exists, defaults off, two clusters ---------------
@@ -424,7 +428,9 @@ def test_pipeline_config_has_hpc_section_defaulting_disabled():
     assert cfg.hpc.cpu.ssh_host == ""
     assert cfg.hpc.gpu.ssh_host == ""
     assert cfg.hpc.cpu.container_sif == "rag_pipeline_cpu.sif"
+    assert cfg.hpc.cpu.storage_root == "/hpctmp/${USER}"
     assert cfg.hpc.gpu.container_sif == "rag_pipeline.sif"
+    assert cfg.hpc.gpu.storage_root == "/scratch/${USER}"
     assert cfg.hpc.cpu.pbs_overrides.get("ngpus") == 0
     assert cfg.hpc.cpu.pbs_overrides.get("queue") == "cpu"
     assert cfg.hpc.gpu.pbs_overrides.get("ngpus") == 1
@@ -445,11 +451,13 @@ poll_interval_seconds = 30.0
 [hpc.cpu]
 ssh_host = "cpu_login"
 remote_repo_dir = "rag_cpu"
+storage_root = "/hpctmp/u"
 
 [hpc.gpu]
 ssh_host = "gpu_login"
 remote_repo_dir = "rag_gpu"
 container_sif = "rag_pipeline.sif"
+storage_root = "/scratch/u"
 """
     p = tmp_path / "c.toml"
     p.write_text(toml, encoding="utf-8")
@@ -462,8 +470,10 @@ container_sif = "rag_pipeline.sif"
     # Each cluster picked up its own login node.
     assert cfg.hpc.cpu.ssh_host == "cpu_login"
     assert cfg.hpc.cpu.remote_repo_dir == "rag_cpu"
+    assert cfg.hpc.cpu.storage_root == "/hpctmp/u"
     assert cfg.hpc.gpu.ssh_host == "gpu_login"
     assert cfg.hpc.gpu.remote_repo_dir == "rag_gpu"
+    assert cfg.hpc.gpu.storage_root == "/scratch/u"
     assert cfg.hpc.gpu.container_sif == "rag_pipeline.sif"
 
 

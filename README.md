@@ -186,6 +186,11 @@ macOS, run `./setup.sh`. The wizard:
   unrelated hosts and writing `config.rag-setup.bak`;
 - creates dedicated Ed25519 keys when missing, installs each public key without
   duplicating `authorized_keys` entries, and verifies key-only login;
+- packages the current working-tree source, stages Atlas9 CPU under
+  `/hpctmp/<username>/<repo-path>` and Vanda GPU under
+  `/scratch/<username>/<repo-path>`, and creates each login-relative symlink;
+- uploads an existing matching SIF or builds it remotely with
+  Singularity/Apptainer `--fakeroot`, then verifies it before activation;
 - configures the web bind address and local Ollama endpoint;
 - collects each cluster's login hostname, username, private key, and repository
   path relative to the directory entered immediately after SSH;
@@ -223,6 +228,15 @@ With `--setup-ssh`, missing keys default to
 service can reconnect unattended. Initial public-key installation may request
 the cluster password or MFA once. Use `--skip-key-install` when an administrator
 must install the generated `.pub` files instead.
+
+Interactive HPC setup provisions both servers automatically. Atlas9 CPU uses
+`/hpctmp/<username>`; Vanda GPU uses `/scratch/<username>`. The CPU image is
+uploaded from `rag_pipeline_cpu.sif` when present; the GPU image is uploaded
+from `rag_pipeline.sif` when present, otherwise it is built remotely from
+`Singularity.def`. Repository activation retains the prior deployment as
+`<repo>.rag-setup-previous`. Use `--skip-hpc-provision` for connection-only
+configuration, or `--provision-hpc` to reprovision an existing non-interactive
+configuration.
 
 The interactive wizard creates the SSH aliases for you. Existing exact alias
 blocks are updated in place; wildcard/group blocks and unrelated hosts are left

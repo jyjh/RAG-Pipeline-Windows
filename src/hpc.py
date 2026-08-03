@@ -154,6 +154,7 @@ def generate_pbs_script(
     container_sif: str = "rag_pipeline.sif",
     walltime: str = "08:00:00",
     ollama_models_dir: str = "${HOME}/ollama_models",
+    storage_root: str = "/hpctmp/${USER}",
 ) -> str:
     """Generate the ingest+index PBS script template with validated overrides.
 
@@ -170,6 +171,7 @@ def generate_pbs_script(
     container_sif = _validate_path(container_sif, "container_sif")
     walltime = _validate_walltime(walltime)
     ollama_models_dir = _validate_path(ollama_models_dir, "ollama_models_dir")
+    storage_root = _validate_path(storage_root, "storage_root")
 
     select_clause = _select_clause(ncpus, mem, ngpus)
     nv = _nv_flag(ngpus)  # "--nv " on GPU, "" on CPU
@@ -188,7 +190,8 @@ module load singularity
 USER="${{USER:-$(whoami)}}"
 PBS_JOBID="${{PBS_JOBID:-local_job}}"
 HOME="${{HOME:-$(eval echo ~${{USER}})}}"
-SCRATCH_DIR="/hpctmp2/${{USER}}/rag_scratch_${{PBS_JOBID}}"
+STORAGE_ROOT="{storage_root}"
+SCRATCH_DIR="${{STORAGE_ROOT}}/rag_scratch_${{PBS_JOBID}}"
 OLLAMA_MODELS_DIR="${{OLLAMA_MODELS_DIR:-{ollama_models_dir}}}"
 
 mkdir -p "${{SCRATCH_DIR}}"
@@ -207,11 +210,11 @@ cleanup() {{
 trap cleanup EXIT
 
 CONTAINER_SIF="${{CONTAINER_SIF:-{container_sif}}}"
-if [ ! -f "${{CONTAINER_SIF}}" ] && [ -f "/hpctmp2/${{USER}}/{container_sif}" ]; then
-    CONTAINER_SIF="/hpctmp2/${{USER}}/{container_sif}"
+if [ ! -f "${{CONTAINER_SIF}}" ] && [ -f "${{STORAGE_ROOT}}/{container_sif}" ]; then
+    CONTAINER_SIF="${{STORAGE_ROOT}}/{container_sif}"
 fi
 
-BIND_MOUNTS="-B /hpctmp2/${{USER}}:/hpctmp2/${{USER}} -B ${{HOME}}:/srv/home -B ${{PWD}}:/app -B ${{OLLAMA_MODELS_DIR}}:/srv/ollama_models"
+BIND_MOUNTS="-B ${{STORAGE_ROOT}}:${{STORAGE_ROOT}} -B ${{HOME}}:/srv/home -B ${{PWD}}:/app -B ${{OLLAMA_MODELS_DIR}}:/srv/ollama_models"
 
 export OLLAMA_MODELS="/srv/ollama_models"
 export TMPDIR="${{SCRATCH_DIR}}/tmp"
@@ -267,6 +270,7 @@ def generate_serve_pbs_script(
     container_sif: str = "rag_pipeline.sif",
     ollama_models_dir: str = "${HOME}/ollama_models",
     ollama_host_file: str = "${HOME}/.rag_ollama_serving_host",
+    storage_root: str = "/scratch/${USER}",
 ) -> str:
     """Generate the long-lived Ollama *serving* PBS script.
 
@@ -284,6 +288,7 @@ def generate_serve_pbs_script(
     container_sif = _validate_path(container_sif, "container_sif")
     ollama_models_dir = _validate_path(ollama_models_dir, "ollama_models_dir")
     ollama_host_file = _validate_path(ollama_host_file, "ollama_host_file")
+    storage_root = _validate_path(storage_root, "storage_root")
 
     select_clause = _select_clause(ncpus, mem, ngpus)
     nv = _nv_flag(ngpus)  # "--nv " on GPU, "" on CPU
@@ -302,7 +307,8 @@ module load singularity
 USER="${{USER:-$(whoami)}}"
 PBS_JOBID="${{PBS_JOBID:-local_job}}"
 HOME="${{HOME:-$(eval echo ~${{USER}})}}"
-SCRATCH_DIR="/hpctmp2/${{USER}}/rag_serve_scratch_${{PBS_JOBID}}"
+STORAGE_ROOT="{storage_root}"
+SCRATCH_DIR="${{STORAGE_ROOT}}/rag_serve_scratch_${{PBS_JOBID}}"
 OLLAMA_MODELS_DIR="${{OLLAMA_MODELS_DIR:-{ollama_models_dir}}}"
 OLLAMA_HOST_FILE="${{OLLAMA_HOST_FILE:-{ollama_host_file}}}"
 
@@ -323,11 +329,11 @@ cleanup() {{
 trap cleanup EXIT
 
 CONTAINER_SIF="${{CONTAINER_SIF:-{container_sif}}}"
-if [ ! -f "${{CONTAINER_SIF}}" ] && [ -f "/hpctmp2/${{USER}}/{container_sif}" ]; then
-    CONTAINER_SIF="/hpctmp2/${{USER}}/{container_sif}"
+if [ ! -f "${{CONTAINER_SIF}}" ] && [ -f "${{STORAGE_ROOT}}/{container_sif}" ]; then
+    CONTAINER_SIF="${{STORAGE_ROOT}}/{container_sif}"
 fi
 
-BIND_MOUNTS="-B /hpctmp2/${{USER}}:/hpctmp2/${{USER}} -B ${{HOME}}:/srv/home -B ${{PWD}}:/app -B ${{OLLAMA_MODELS_DIR}}:/srv/ollama_models"
+BIND_MOUNTS="-B ${{STORAGE_ROOT}}:${{STORAGE_ROOT}} -B ${{HOME}}:/srv/home -B ${{PWD}}:/app -B ${{OLLAMA_MODELS_DIR}}:/srv/ollama_models"
 
 export OLLAMA_MODELS="/srv/ollama_models"
 export TMPDIR="${{SCRATCH_DIR}}/tmp"
@@ -393,6 +399,7 @@ def parse_hpc_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--walltime", default=None, help="Job walltime HH:MM:SS (default: 08:00:00).")
     parser.add_argument("--container-sif", default=None, help="Singularity image filename (default: rag_pipeline.sif; rag_pipeline_cpu.sif under --cpu).")
     parser.add_argument("--ollama-models-dir", default=None, help="Persistent Ollama model store path (default: $HOME/ollama_models).")
+    parser.add_argument("--storage-root", default=None, help="Per-cluster scratch/storage root (CPU default: /hpctmp/$USER; GPU serve default: /scratch/$USER).")
     parser.add_argument("--ollama-host-file", dest="ollama_host_file", default=None, help="Serving discovery file (serving job only; default: $HOME/.rag_ollama_serving_host).")
     parser.add_argument("--input-data-dir", default=None, help="Ingest input directory (ingest job only; default: data).")
     parser.add_argument("-o", "--output", default=None, help="Write the generated script to this file (default: stdout).")
@@ -438,6 +445,7 @@ def _build_script_from_args(args: argparse.Namespace) -> str:
             container_sif=bundle["container_sif"],
             ollama_models_dir=args.ollama_models_dir or "${HOME}/ollama_models",
             ollama_host_file=args.ollama_host_file or "${HOME}/.rag_ollama_serving_host",
+            storage_root=args.storage_root or "/scratch/${USER}",
         )
     return generate_pbs_script(
         job_name=args.job_name or "rag_ingest_index",
@@ -449,6 +457,7 @@ def _build_script_from_args(args: argparse.Namespace) -> str:
         container_sif=bundle["container_sif"],
         ollama_models_dir=args.ollama_models_dir or "${HOME}/ollama_models",
         input_data_dir=args.input_data_dir or "data",
+        storage_root=args.storage_root or "/hpctmp/${USER}",
     )
 
 

@@ -104,12 +104,12 @@ def test_nus_hpc_pbs_script_exists_and_valid():
     
     # Execution Logic assertions
     assert "module load singularity" in content
-    assert "/hpctmp2/" in content
+    assert "/hpctmp/" in content
     assert "rag_scratch_" in content
     assert "trap" in content
     assert "singularity exec" in content
     assert "--nv" in content
-    assert "-B /hpctmp2/${USER}:/hpctmp2/${USER}" in content
+    assert "-B /hpctmp/${USER}:/hpctmp/${USER}" in content
     assert "ollama serve" in content
     assert "/api/version" in content
     assert "scripts/bulk_ingest.py" in content
@@ -372,6 +372,8 @@ def test_nus_hpc_serve_pbs_script_exists_and_valid():
     assert "ollama serve" in content
     assert "/api/version" in content
     assert "ollama pull" in content
+    assert "/scratch/${USER}" in content
+    assert "/hpctmp/${USER}" not in content
 
     # The keep-alive loop is what distinguishes a serving job from the ingest
     # job (which exits after bulk_ingest.py). There must be a blocking sleep.
@@ -409,6 +411,7 @@ def test_hpc_generators_reject_injection_and_invalid_inputs():
         # Bad walltime.
         {"walltime": "99"},
         {"walltime": "99:99"},
+        {"storage_root": "/scratch/user;touch_bad"},
     ]
     for kw in bad_inputs:
         with pytest.raises(ValueError):
@@ -418,7 +421,7 @@ def test_hpc_generators_reject_injection_and_invalid_inputs():
 def test_hpc_generators_accept_legitimate_values():
     """Sanity: the validation must not reject values the runbook actually uses,
     including shell-variable expansion like ${HOME}/ollama_models and
-    /hpctmp2/${USER}/... paths."""
+    /hpctmp/${USER}/... paths."""
     ok = generate_pbs_script(
         job_name="my_index",
         ncpus=16,
@@ -426,14 +429,14 @@ def test_hpc_generators_accept_legitimate_values():
         ngpus=2,
         queue="gpu",
         walltime="12:00:00",
-        input_data_dir="/hpctmp2/${USER}/pdfs",
+        input_data_dir="/hpctmp/${USER}/pdfs",
         container_sif="rag_pipeline.sif",
         ollama_models_dir="${HOME}/ollama_models",
     )
     assert "#PBS -N my_index" in ok
     assert "#PBS -l select=1:ncpus=16:mem=64gb:ngpus=2" in ok
     assert "#PBS -l walltime=12:00:00" in ok
-    assert "/hpctmp2/${USER}/pdfs" in ok
+    assert "/hpctmp/${USER}/pdfs" in ok
     assert "${HOME}/ollama_models" in ok
 
     serve_ok = generate_serve_pbs_script(
@@ -441,6 +444,7 @@ def test_hpc_generators_accept_legitimate_values():
     )
     assert "rag_ollama_serve" in serve_ok
     assert "${HOME}/.rag_ollama_serving_host" in serve_ok
+    assert 'STORAGE_ROOT="/scratch/${USER}"' in serve_ok
 
 
 def test_hpc_module_has_runnable_main():

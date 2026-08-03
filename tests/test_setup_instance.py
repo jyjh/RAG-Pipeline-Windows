@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import tarfile
 from pathlib import Path
 
 from scripts.setup_instance import (
@@ -8,9 +9,12 @@ from scripts.setup_instance import (
     _validate,
     configure,
     configure_ssh_aliases,
+    create_repository_archive,
     ensure_ssh_private_key,
     install_ssh_public_key,
     _login_relative_repo_default,
+    _remote_container_build_command,
+    provision_hpc_cluster,
     read_ssh_alias,
     update_toml_sections,
 )
@@ -172,6 +176,118 @@ def test_install_ssh_public_key_installs_and_verifies(safe_tmp_path, monkeypatch
     assert "BatchMode=yes" in calls[1]
 
 
+def test_repository_archive_excludes_local_data_indexes_and_sifs(safe_tmp_path):
+    source = safe_tmp_path / "source"
+    source.mkdir()
+    (source / "main.py").write_text("print('ok')", encoding="utf-8")
+    (source / "config.toml").write_text("[server]\n", encoding="utf-8")
+    (source / "data").mkdir()
+    (source / "data" / "private.pdf").write_bytes(b"pdf")
+    (source / "db").mkdir()
+    (source / "db" / "index.bin").write_bytes(b"index")
+    (source / ".git").mkdir()
+    (source / ".git" / "config").write_text("secret", encoding="utf-8")
+    (source / "rag_pipeline_cpu.sif").write_bytes(b"large")
+    destination = safe_tmp_path / "repository.tar.gz"
+
+    create_repository_archive(destination, source)
+    with tarfile.open(destination, "r:gz") as archive:
+        names = set(archive.getnames())
+    assert "./main.py" in names
+    assert "./config.toml" in names
+    assert not any(name.startswith("./data") for name in names)
+    assert not any(name.startswith("./db") for name in names)
+    assert not any(name.startswith("./.git") for name in names)
+    assert not any(name.endswith(".sif") for name in names)
+
+
+def test_remote_container_build_uses_fakeroot_and_selected_definition():
+    command = _remote_container_build_command(
+        repo_dir="/scratch/student/rag-gpu",
+        definition_name="Singularity.def",
+        image_name="rag_pipeline.sif",
+    )
+    assert "apptainer" in command
+    assert "singularity" in command
+    assert "build --fakeroot rag_pipeline.sif Singularity.def" in command
+
+
+def test_provision_cluster_stages_under_hpctmp_and_activates_login_link(
+    safe_tmp_path,
+    monkeypatch,
+):
+    archive = safe_tmp_path / "repository.tar.gz"
+    archive.write_bytes(b"archive")
+    image = safe_tmp_path / "rag_pipeline_cpu.sif"
+    image.write_bytes(b"image")
+    remote_commands = []
+    uploads = []
+    monkeypatch.setattr(
+        "scripts.setup_instance._run_provision_ssh",
+        lambda alias, command, **kwargs: remote_commands.append((alias, command)),
+    )
+    monkeypatch.setattr(
+        "scripts.setup_instance._upload_provision_file",
+        lambda source, alias, remote: uploads.append((Path(source), alias, remote)),
+    )
+    monkeypatch.setattr("scripts.setup_instance.secrets.token_hex", lambda size: "abc123")
+
+    provision_hpc_cluster(
+        alias="cpu-login",
+        user="student",
+        storage_root="/hpctmp/student",
+        relative_repo="rag-cpu",
+        archive_path=archive,
+        image_name="rag_pipeline_cpu.sif",
+        definition_name="Singularity.cpu.def",
+        local_image=image,
+    )
+
+    assert uploads[0] == (
+        archive,
+        "cpu-login",
+        "/hpctmp/student/.rag_setup_abc123/repository.tar.gz",
+    )
+    assert uploads[1][0] == image
+    assert uploads[1][2].endswith("/repo/rag_pipeline_cpu.sif")
+    joined = "\n".join(command for _, command in remote_commands)
+    assert "/hpctmp/student/rag-cpu" in joined
+    assert "$HOME/rag-cpu" in joined
+    assert "ln -sfn" in joined
+
+
+def test_provision_gpu_cluster_uses_vanda_scratch_root(safe_tmp_path, monkeypatch):
+    archive = safe_tmp_path / "repository.tar.gz"
+    archive.write_bytes(b"archive")
+    remote_commands = []
+    monkeypatch.setattr(
+        "scripts.setup_instance._run_provision_ssh",
+        lambda alias, command, **kwargs: remote_commands.append(command),
+    )
+    monkeypatch.setattr(
+        "scripts.setup_instance._upload_provision_file",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr("scripts.setup_instance.secrets.token_hex", lambda size: "gpu123")
+
+    provision_hpc_cluster(
+        alias="gpu-login",
+        user="student",
+        storage_root="/scratch/student",
+        relative_repo="rag-gpu",
+        archive_path=archive,
+        image_name="rag_pipeline.sif",
+        definition_name="Singularity.def",
+        local_image=None,
+    )
+
+    joined = "\n".join(remote_commands)
+    assert "test -d /scratch" in joined
+    assert "/scratch/student/rag-gpu" in joined
+    assert "build --fakeroot rag_pipeline.sif Singularity.def" in joined
+    assert "/hpctmp/student" not in joined
+
+
 def test_setup_cli_help_runs():
     result = subprocess.run(
         ["python", "scripts/setup_instance.py", "--help"],
@@ -185,3 +301,5 @@ def test_setup_cli_help_runs():
     assert "--cpu-hostname" in result.stdout
     assert "--gpu-hostname" in result.stdout
     assert "--skip-key-install" in result.stdout
+    assert "--provision-hpc" in result.stdout
+    assert "--skip-hpc-provision" in result.stdout

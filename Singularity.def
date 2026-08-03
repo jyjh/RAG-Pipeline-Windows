@@ -12,6 +12,17 @@ From: nvidia/cuda:12.1.1-devel-ubuntu22.04
     export LANG=C.UTF-8
     export PATH=/usr/local/bin:$PATH
 
+%setup
+    # Vanda (and some other HPC sites) inject a bind path like /app1 into EVERY
+    # Apptainer invocation via apptainer.conf or APPTAINER_BIND -- including
+    # `build`. During build the %post runs under --writable, where a bind to a
+    # destination absent from the base image is fatal: "destination /app1 doesn't
+    # exist in container", and Apptainer refuses to auto-create it. %post never
+    # runs because the writable session fails to come up first, so the directory
+    # MUST be created here in %setup, which runs against the host rootfs BEFORE
+    # the bind is applied. $SINGULARITY_ROOTFS is honored by Apptainer too.
+    mkdir -p "${SINGULARITY_ROOTFS}/app1"
+
 %post
     export DEBIAN_FRONTEND=noninteractive
     apt-get update && apt-get install -y --no-install-recommends \

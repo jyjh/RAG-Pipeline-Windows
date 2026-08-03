@@ -454,9 +454,10 @@ class HpcBackend:
         overrides = dict(self.cfg.cpu.pbs_overrides)
         overrides.setdefault("input_data_dir", input_dir)
         overrides.setdefault("container_sif", self.cfg.cpu.container_sif)
+        overrides.setdefault("storage_root", self.cfg.cpu.storage_root)
         accepted = {
             "job_name", "ncpus", "mem", "ngpus", "queue", "input_data_dir",
-            "container_sif", "walltime", "ollama_models_dir",
+            "container_sif", "walltime", "ollama_models_dir", "storage_root",
         }
         kwargs = {k: v for k, v in overrides.items() if k in accepted}
         return generate_pbs_script(**kwargs)
@@ -465,9 +466,14 @@ class HpcBackend:
     def _serve_overrides(gpu: HpcClusterConfig) -> dict:
         """Extract generate_serve_pbs_script kwargs from gpu.pbs_overrides."""
         accepted = {"job_name", "ncpus", "mem", "ngpus", "queue", "walltime",
-                    "container_sif", "ollama_models_dir", "ollama_host_file"}
-        return {k: v for k, v in gpu.pbs_overrides.items()
-                if k in accepted and k != "container_sif"}
+                    "container_sif", "ollama_models_dir", "ollama_host_file",
+                    "storage_root"}
+        overrides = {
+            k: v for k, v in gpu.pbs_overrides.items()
+            if k in accepted and k != "container_sif"
+        }
+        overrides.setdefault("storage_root", gpu.storage_root)
+        return overrides
 
     def _remote_pbs_path(self, cluster: HpcClusterConfig, kind: str = "ingest") -> str:
         return posixpath.join(

@@ -25,6 +25,14 @@ run. If the site disables password-based key bootstrap, use
 `--skip-key-install` and ask the cluster administrator to install the generated
 `.pub` files.
 
+It also provisions the current repository and its matching container beneath
+`/hpctmp/<username>/<repo-path>` on Atlas9 CPU and
+`/scratch/<username>/<repo-path>` on Vanda GPU. A login-directory symlink keeps
+each configured repo path short (for example `rag-cpu`). Existing local SIFs
+are uploaded; a missing SIF is built remotely with Singularity/Apptainer
+`--fakeroot`. Use `--skip-hpc-provision` only when managing those artifacts
+separately.
+
 ## Prerequisites (one-time)
 
 1. **SSH access** to NUS HPC. The guided setup creates the keys and aliases.
@@ -64,7 +72,7 @@ rsync -P rag_pipeline.sif nus_hpc:~/rag_pipeline.sif
 ```
 
 The scripts find the SIF at `${CONTAINER_SIF:-rag_pipeline.sif}` in the working
-directory, falling back to `/hpctmp2/$USER/rag_pipeline.sif`.
+directory, falling back to `/scratch/$USER/rag_pipeline.sif` on Vanda.
 
 ### A2. Seed the model store (once)
 
@@ -235,7 +243,7 @@ path, run a local Ollama for chat (the cluster is for building, not serving).
 |--------|-----|
 | Job dies within seconds | Walltime too short, or SIF path wrong. Check `rag_ingest_index.o<jobid>`. |
 | `ollama pull failed for 'gemma4'` | `gemma4` is an alias, not a published tag. `ollama create` it in the model store once. |
-| Models re-download every job | `OLLAMA_MODELS_DIR` resolves to per-job scratch. Point it at shared storage (home or `/hpctmp2/$USER`). |
+| Models re-download every job | `OLLAMA_MODELS_DIR` resolves to per-job scratch. Point it at shared storage (home, Atlas9 `/hpctmp/$USER`, or Vanda `/scratch/$USER`). |
 | Tunnel: `discovery file is empty or missing` | Serving job isn't running yet. `cat ~/.rag_ollama_serving_host` on the login node. |
 | `/api/health` shows `ollama_reachability: false` | Tunnel down, or serve job not `R(un)`. Check `tunnel_daemon` output and `qstat`. |
 | `singularity: FATAL: could not open image` | SIF not at expected path. `ls -l rag_pipeline.sif` from the `qsub` dir, or pass `-v CONTAINER_SIF=/full/path`. |

@@ -143,6 +143,9 @@ class HpcClusterConfig:
     # Singularity image filename the PBS job execs on this cluster.
     # CPU cluster -> rag_pipeline_cpu.sif; GPU cluster -> rag_pipeline.sif.
     container_sif: str = "rag_pipeline_cpu.sif"
+    # Absolute per-user storage root used for deployment, job scratch and binds.
+    # Atlas9 CPU: /hpctmp/<username>; Vanda GPU: /scratch/<username>.
+    storage_root: str = "/hpctmp/${USER}"
     # Resource overrides merged into generate_pbs_script() /
     # generate_serve_pbs_script(): ncpus/mem/ngpus/queue/walltime/...
     # Empty = generator defaults. Sensible per-cluster defaults are set on the
@@ -179,10 +182,14 @@ class HpcConfig:
     enabled: bool = False
     # The CPU cluster (free) runs ingest/index. The pre-staged corpus lives here.
     cpu: HpcClusterConfig = field(default_factory=lambda: HpcClusterConfig(
-        container_sif="rag_pipeline_cpu.sif", pbs_overrides=_default_cpu_overrides()))
+        container_sif="rag_pipeline_cpu.sif",
+        storage_root="/hpctmp/${USER}",
+        pbs_overrides=_default_cpu_overrides()))
     # The GPU cluster (paid) runs the long-lived Ollama serving job for chat.
     gpu: HpcClusterConfig = field(default_factory=lambda: HpcClusterConfig(
-        container_sif="rag_pipeline.sif", pbs_overrides=_default_gpu_overrides()))
+        container_sif="rag_pipeline.sif",
+        storage_root="/scratch/${USER}",
+        pbs_overrides=_default_gpu_overrides()))
     # Where the pre-staged corpus lives on the CPU cluster (PBS --input-dir).
     remote_data_dir: str = "data"
     # Where the PBS job writes the index (relative to remote_repo_dir unless
@@ -248,4 +255,3 @@ def load_config(path: str | os.PathLike[str] | None = None) -> PipelineConfig:
 
 
 load_pipeline_config = load_config
-
