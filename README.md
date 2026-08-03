@@ -55,7 +55,7 @@ Generated databases, assets, caches, and model artifacts should not be committed
 Create an environment:
 
 ```bash
-conda create -n ragpipeline python=3.11 -y
+conda create -n ragpipeline python=3.14 -y
 conda activate ragpipeline
 ```
 

@@ -940,6 +940,63 @@ def test_server_config_lan_alias_binds_all(workspace_tmp):
     assert config["bind_all"] is True
 
 
+def test_run_server_does_not_pass_invalid_uvicorn_kwarg(monkeypatch):
+    """Regression: run_server() once passed `limit_max_request_bytes` to
+    uvicorn.run(), which is not a real uvicorn option and crashed startup with
+    TypeError. Body-size capping now lives in _enforce_request_body_limit
+    middleware; uvicorn.run() must only receive supported kwargs.
+    """
+    captured = {}
+
+    class _FakeUvicorn:
+        @staticmethod
+        def run(app, **kwargs):
+            captured["app"] = app
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(web_app, "SERVER_CONFIG", {"host": "127.0.0.1", "port": 8000})
+    # uvicorn is imported lazily inside run_server(); inject the fake via sys.modules
+    # so the local `import uvicorn` binds to it.
+    import sys
+    monkeypatch.setitem(sys.modules, "uvicorn", _FakeUvicorn)
+
+    web_app.run_server()
+
+    assert captured["app"] == "src.web_app:app"
+    assert captured["kwargs"]["host"] == "127.0.0.1"
+    assert captured["kwargs"]["port"] == 8000
+    # The kwarg that crashed startup must never reappear.
+    assert "limit_max_request_bytes" not in captured["kwargs"]
+
+
+def test_request_body_limit_rejects_oversized_post(monkeypatch):
+    """The body-size middleware returns 413 for an oversized POST without
+    buffering the full body into memory."""
+    monkeypatch.setattr(web_app, "MAX_REQUEST_BYTES", 100)
+    client = TestClient(web_app.app)
+    response = client.post("/api/uploads", content=b"x" * 5000)
+    assert response.status_code == 413
+
+
+def test_request_body_limit_passes_small_post(monkeypatch):
+    """Requests under the cap are unaffected (still 401/422/etc. from the real
+    handler/auth, NOT 413 from the size middleware)."""
+    monkeypatch.setattr(web_app, "MAX_REQUEST_BYTES", 100 << 20)  # 100 MiB
+    client = TestClient(web_app.app)
+    # A tiny body to a mutating endpoint: auth rejects with 401 (or 422 if the
+    # handler reaches it). Either way, NOT the middleware's 413.
+    response = client.post("/api/uploads", content=b"x")
+    assert response.status_code != 413
+
+
+def test_request_body_limit_disabled_when_zero(monkeypatch):
+    """A cap of 0 disables the limit entirely (operator override)."""
+    monkeypatch.setattr(web_app, "MAX_REQUEST_BYTES", 0)
+    client = TestClient(web_app.app)
+    response = client.post("/api/uploads", content=b"x" * 5000)
+    assert response.status_code != 413
+
+
 def test_chat_config_reads_prompt_retrieval_and_ollama_health_settings(workspace_tmp):
     config_path = workspace_tmp / "config.toml"
     config_path.write_text(

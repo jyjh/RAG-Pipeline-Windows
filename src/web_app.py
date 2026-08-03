@@ -340,6 +340,21 @@ DEFAULT_MAX_CORPUS_BYTES = 0
 # Default per-chunk size for the chunked-upload endpoint (16 MiB). Large enough
 # to amortize HTTP overhead, small enough that a dropped chunk is cheap to retry.
 DEFAULT_UPLOAD_CHUNK_BYTES = 16 * 1024 * 1024
+# Cap on the body size of a SINGLE HTTP request, enforced at the middleware
+# layer so an oversized multipart upload is rejected with 413 BEFORE Starlette
+# streams the whole body into memory. Sized to the configured upload chunk
+# (default 16 MiB) plus headroom for multipart metadata, since the chunked
+# endpoint is the robust path for large files -- a direct single-shot multipart
+# upload above this cap is rejected and clients must use the chunked endpoint.
+# Overridable at runtime by mutating this global (tests do so).
+def _default_max_request_bytes() -> int:
+    chunk = int(UPLOADS_CONFIG.get("chunk_bytes") or DEFAULT_UPLOAD_CHUNK_BYTES)
+    return chunk * 2 + 2 * 1024 * 1024
+# Operator override for the per-request body cap. None = derive from the upload
+# chunk config via _default_max_request_bytes(); 0 = disable the cap entirely;
+# a positive int = use that exact byte limit. Set via tests or a future
+# [server] max_request_bytes config key.
+MAX_REQUEST_BYTES: int | None = None
 # Cap on the number of PDF entries extracted from a single uploaded zip. Guards
 # against a zip-bomb of tiny entries exhausting the staging dir.
 MAX_ZIP_ENTRIES = 10_000
@@ -3636,6 +3651,65 @@ async def _enforce_api_token(request: Request, call_next):
     return await call_next(request)
 
 
+# Request body-size cap middleware.
+#
+# uvicorn has no `limit_max_request_bytes` option (that kwarg crashes startup).
+# Starlette has no built-in body limit either, so we enforce it here: any
+# request whose declared Content-Length exceeds the cap -- or whose streamed
+# body exceeds it when Content-Length is absent -- is rejected with 413 before
+# the handler buffers the full body into memory. GETs and other bodyless
+# methods pass through. This protects the multipart upload endpoints; the
+# chunked-upload endpoint additionally enforces its own app-level cap.
+@app.middleware("http")
+async def _enforce_request_body_limit(request: Request, call_next):
+    method = request.method.upper()
+    if method in {"GET", "HEAD", "OPTIONS"}:
+        return await call_next(request)
+    configured = globals().get("MAX_REQUEST_BYTES")
+    max_bytes = _default_max_request_bytes() if configured is None else int(configured)
+    if max_bytes <= 0:  # 0 (or negative) disables the cap entirely
+        return await call_next(request)
+
+    # Fast path: reject up front when the client declared an oversized body.
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except (TypeError, ValueError):
+        declared = 0
+    if declared and declared > max_bytes:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"Request body exceeds limit ({declared} > {max_bytes} bytes)."},
+        )
+
+    # Slow path: no Content-Length (chunked transfer). Wrap the receive callable
+    # so we accumulate body size as it streams and abort once it exceeds.
+    received = request._receive
+    total = 0
+    oversize = False
+
+    async def sized_receive():
+        nonlocal total, oversize
+        message = await received()
+        if message.get("type") == "http.request":
+            body = message.get("body", b"") or b""
+            total += len(body)
+            if total > max_bytes:
+                oversize = True
+                # Drain the rest with an empty terminal message so the ASGI
+                # server doesn't keep the connection stuck mid-request.
+                return {"type": "http.request", "body": b"", "more_body": False}
+        return message
+
+    request._receive = sized_receive
+    response = await call_next(request)
+    if oversize:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"Request body exceeds limit ({total} > {max_bytes} bytes)."},
+        )
+    return response
+
+
 @app.get("/")
 def root():
     index_path = WEB_DIR / "index.html"
@@ -5477,18 +5551,12 @@ def chat_stream(payload: ChatRequest):
 def run_server() -> None:
     import uvicorn
 
-    # Cap the request body size so a single oversized multipart upload cannot
-    # exhaust memory/disk. Sized to the configured upload chunk (default 16 MiB)
-    # plus headroom for form metadata, since the chunked-upload endpoint is the
-    # robust path for large files. A direct single-shot multipart upload above
-    # this cap is rejected with 413 -- clients must use the chunked endpoint.
-    chunk_bytes = int(UPLOADS_CONFIG.get("chunk_bytes") or DEFAULT_UPLOAD_CHUNK_BYTES)
-    limit_max_request_bytes = chunk_bytes * 2 + 2 * 1024 * 1024
+    # Request body size is capped by the _enforce_request_body_limit middleware
+    # (see above); uvicorn has no equivalent option.
     uvicorn.run(
         "src.web_app:app",
         host=str(SERVER_CONFIG["host"]),
         port=int(SERVER_CONFIG["port"]),
-        limit_max_request_bytes=limit_max_request_bytes,
     )
 
 
