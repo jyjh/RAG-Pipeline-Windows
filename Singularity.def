@@ -13,15 +13,52 @@ From: nvidia/cuda:12.1.1-devel-ubuntu22.04
     export PATH=/usr/local/bin:$PATH
 
 %setup
-    # Vanda (and some other HPC sites) inject a bind path like /app1 into EVERY
-    # Apptainer invocation via apptainer.conf or APPTAINER_BIND -- including
-    # `build`. During build the %post runs under --writable, where a bind to a
-    # destination absent from the base image is fatal: "destination /app1 doesn't
-    # exist in container", and Apptainer refuses to auto-create it. %post never
-    # runs because the writable session fails to come up first, so the directory
-    # MUST be created here in %setup, which runs against the host rootfs BEFORE
-    # the bind is applied. $SINGULARITY_ROOTFS is honored by Apptainer too.
-    mkdir -p "${SINGULARITY_ROOTFS}/app1"
+    # HPC sites (e.g. Vanda) inject bind paths -- often a LIST of them -- into
+    # EVERY Apptainer invocation via apptainer.conf's "bind path =" directives
+    # and/or APPTAINER_BIND/SINGULARITY_BIND env vars. This includes `build`,
+    # where %post runs under --writable. Under --writable a bind to a path that
+    # is absent from the base image is fatal ("destination /X doesn't exist in
+    # container"); Apptainer refuses to auto-create it and %post never runs.
+    # APPTAINER_NO_MOUNT=bind does NOT suppress these on all versions (this site
+    # logs "Ignoring unknown mount type 'bind'"), so the robust fix is to
+    # PRE-CREATE every site bind destination in the rootfs here, in %setup,
+    # which runs against the host rootfs BEFORE any bind is applied. We stay
+    # strictly POSIX sh because Apptainer may run %setup via /bin/sh (dash).
+    ROOTFS="${SINGULARITY_ROOTFS}"
+    # Gather all bind specs (comma-joined) from *_BIND env vars and the
+    # "bind path" directives in apptainer/singularity site configs. A spec is
+    # "src[:dst[:opt]]" in env vars, or a bare path in conf files.
+    BINDS="${APPTAINER_BIND:-},${SINGULARITY_BIND:-}"
+    # NB: keep the for-list on a SINGLE line -- dash (used as /bin/sh on the
+    # HPC build host) mishandles a backslash-newline inside "for ... in".
+    for conf in /etc/apptainer/apptainer.conf /etc/singularity/singularity.conf "${HOME}/.apptainer/apptainer.conf" "${HOME}/.singularity/singularity.conf"; do
+        [ -f "$conf" ] || continue
+        # "bind path = /x" or "bindpath = /x" -> "/x"; also handle the
+        # "src:dst:opt" form if a site writes that on a bind path line.
+        line_binds=$(sed -nE 's/^[[:space:]]*bind[[:space:]]*path[[:space:]]*=[[:space:]]*//Ip' "$conf" 2>/dev/null)
+        [ -n "$line_binds" ] && BINDS="$BINDS,$(printf '%s\n' "$line_binds" | paste -sd, -)"
+    done
+    # Walk the comma list with IFS=','; whitespace inside a token is illegal for
+    # mount paths, so strip it defensively.
+    IFS_OLD=${IFS:-}; IFS=,
+    set -- $BINDS
+    IFS=$IFS_OLD
+    for _tok in "$@"; do
+        _tok=$(printf '%s' "$_tok" | tr -d '[:space:]')
+        [ -n "$_tok" ] || continue
+        # Split src[:dst[:opt]] on ':' using the parameter-expansion idiom.
+        _rest=${_tok#*:}
+        if [ "$_rest" = "$_tok" ]; then
+            _dst=$_tok            # no colon -> src is the destination
+        else
+            _dst=${_rest%%:*}     # take the field right after the first colon
+            [ -z "$_dst" ] && _dst=${_tok%%:*}
+        fi
+        case "$_dst" in
+            /*) mkdir -p "$ROOTFS$_dst" 2>/dev/null || true ;;
+        esac
+    done
+    unset _tok _rest _dst IFS_OLD
 
 %post
     export DEBIAN_FRONTEND=noninteractive
