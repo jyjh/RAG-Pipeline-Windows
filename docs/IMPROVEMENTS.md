@@ -168,6 +168,5 @@ Status legend: ✅ done · ⬜ open
 - ⬜ **Tracked sample PDFs in `data/`.** `data/*.pdf` are tracked despite `data/`
   being gitignored (committed before the rule). If not intended as fixtures,
   `git rm --cached data/*.pdf`. `data/`
-- ⬜ **`_filter.py` stray scratch script.** A 6-line stdin filter at repo root,
-  untracked, easy to accidentally commit. Delete or move under a scratch dir.
-  `_filter.py`
+- ✅ **`_filter.py` stray scratch script.** A 6-line stdin filter at repo root,
+  easy to accidentally commit. Deleted.

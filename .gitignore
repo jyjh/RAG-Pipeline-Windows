@@ -51,8 +51,11 @@ src/__pycache__/
 
 # RAG pipeline runtime/build outputs
 db/
+db_out/
 processed_docs/
 data/
+# Staged index builds created at runtime by web_app.py (.index_build_<uuid>/).
+.index_build_*/
 .tmp_smoke/
 .tmp_test_*/
 logs/
