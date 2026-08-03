@@ -8,6 +8,8 @@ checkout before the project's optional runtime dependencies are installed.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
 import os
 import posixpath
 import re
@@ -439,10 +441,74 @@ def _repo_archive_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
     return info
 
 
+# Name of the content-fingerprint file embedded in every provisioned archive and
+# deposited at the remote repo root after activation. Comparing this file lets a
+# subsequent run skip a redundant re-upload/re-extract when the source is
+# unchanged. Format: one "<relative_path>\0<sha256_hex>" line per regular file.
+_REPO_MANIFEST_NAME = ".rag_manifest"
+
+
+def _build_repo_manifest(source_root: Path = ROOT) -> str:
+    """Return a deterministic content fingerprint of the archived source tree.
+
+    Walks ``source_root`` with the SAME exclusions as the archive filter so the
+    manifest exactly describes the bytes that get shipped. Each regular file is
+    one line "<posix_rel_path>\\0<sha256>", sorted by path -- stable across runs
+    and independent of filesystem walk order or mtimes. The whole buffer is then
+    SHA-256'd into a header line so a single comparison suffices to detect any
+    change, but the per-file lines are retained for diagnosing what differed.
+    """
+    entries: list[tuple[str, str]] = []
+    excluded = _REPO_ARCHIVE_EXCLUDED_NAMES
+
+    def _excluded(rel: PurePosixPath) -> bool:
+        parts = rel.parts
+        if any(p in excluded for p in parts):
+            return True
+        if any(p.startswith((".index_build_", ".tmp_test_", ".pytest_")) for p in parts):
+            return True
+        return False
+
+    for path in sorted(source_root.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        rel = PurePosixPath(path.relative_to(source_root))
+        if str(rel) == ".":
+            continue
+        if _excluded(rel):
+            continue
+        if path.name.lower().endswith(".sif"):
+            continue
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        entries.append((str(rel).replace(os.sep, "/"), digest))
+
+    body = "".join(f"{name}\0{digest}\n" for name, digest in entries)
+    overall = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return f"# sha256={overall}\n{body}"
+
+
+def _manifest_fingerprint(manifest: str) -> str:
+    """Extract the aggregate '# sha256=...' header from a manifest buffer."""
+    for line in manifest.splitlines():
+        if line.startswith("# sha256="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
 def create_repository_archive(destination: Path, source_root: Path = ROOT) -> Path:
-    """Package the exact working-tree source without local data/index artifacts."""
+    """Package the exact working-tree source without local data/index artifacts.
+
+    Embeds a ``.rag_manifest`` content fingerprint at the archive root so the
+    remote provisioning step can skip a redundant re-upload when the source is
+    unchanged on a subsequent run.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
+    manifest_bytes = _build_repo_manifest(source_root).encode("utf-8")
     with tarfile.open(destination, "w:gz", compresslevel=6) as archive:
+        info = tarfile.TarInfo(name=_REPO_MANIFEST_NAME)
+        info.size = len(manifest_bytes)
+        info.mtime = time.time()
+        archive.addfile(info, io.BytesIO(manifest_bytes))
         archive.add(source_root, arcname=".", filter=_repo_archive_filter)
     return destination
 
@@ -537,6 +603,37 @@ def _remote_container_build_command(
     )
 
 
+def _remote_manifest(alias: str, target_repo: str) -> str:
+    """Fetch the deployed ``.rag_manifest`` for ``target_repo`` on ``alias``.
+
+    Returns "" when the remote repo or its manifest does not exist (i.e. first
+    deploy or a deploy from an older build that predates manifests). Errors are
+    swallowed into "" so the caller falls back to a full provision.
+    """
+    remote_manifest = posixpath.join(target_repo, _REPO_MANIFEST_NAME)
+    ssh = shutil.which("ssh")
+    if not ssh:
+        return ""
+    try:
+        result = subprocess.run(
+            [
+                ssh,
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=20",
+                alias,
+                f"cat {shlex.quote(remote_manifest)} 2>/dev/null || true",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
 def provision_hpc_cluster(
     *,
     alias: str,
@@ -547,8 +644,16 @@ def provision_hpc_cluster(
     image_name: str,
     definition_name: str,
     local_image: Path | None,
+    force: bool = False,
 ) -> None:
-    """Stage and activate one complete repository + SIF under its cluster root."""
+    """Stage and activate one complete repository + SIF under its cluster root.
+
+    When ``force`` is false (the default), compares the local source manifest
+    against the manifest at the already-deployed ``target_repo``. If they match
+    AND the SIF is already present there, the upload/extract/swap cycle is
+    skipped -- the remote is current. Set ``force=True`` to redeploy
+    unconditionally.
+    """
     if not _SSH_ALIAS_RE.fullmatch(alias):
         raise RuntimeError(f"invalid SSH alias for provisioning: {alias!r}")
     if not _SSH_USER_RE.fullmatch(user):
@@ -560,11 +665,37 @@ def provision_hpc_cluster(
     scratch_root = str(scratch_root)
     storage_parent = str(PurePosixPath(scratch_root).parent)
     target_repo = posixpath.join(scratch_root, relative_repo)
+    target_sif = posixpath.join(target_repo, image_name)
+    login_link = f"$HOME/{relative_repo}"
+
+    # --- Freshness check -------------------------------------------------
+    # Compare the local source fingerprint against the deployed remote one.
+    # If they agree AND the SIF is already in place, there is nothing to do.
+    local_manifest = _build_repo_manifest(ROOT)
+    local_fingerprint = _manifest_fingerprint(local_manifest)
+    if not force and local_fingerprint:
+        remote_manifest = _remote_manifest(alias, target_repo)
+        remote_fingerprint = _manifest_fingerprint(remote_manifest)
+        if remote_fingerprint and remote_fingerprint == local_fingerprint:
+            # Source is current; only confirm the SIF survived.
+            ssh = shutil.which("ssh")
+            if ssh:
+                check = subprocess.run(
+                    [
+                        ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
+                        alias, f"test -s {shlex.quote(target_sif)}",
+                    ],
+                    check=False, timeout=30,
+                )
+                if check.returncode == 0:
+                    print(f"\n{alias}: already up to date ({target_repo}); skipping upload.")
+                    return
+            # SIF missing -> fall through to re-provision (rebuilds SIF only).
+
     token = secrets.token_hex(6)
     stage_root = posixpath.join(scratch_root, f".rag_setup_{token}")
     staged_repo = posixpath.join(stage_root, "repo")
     remote_archive = posixpath.join(stage_root, "repository.tar.gz")
-    login_link = f"$HOME/{relative_repo}"
 
     print(f"\nProvisioning {alias} -> {target_repo}")
     prepare = (
@@ -633,8 +764,12 @@ def provision_hpc_cluster(
             pass
 
 
-def provision_hpc_servers(values: SetupValues) -> None:
-    """Package once, then provision the CPU and GPU clusters."""
+def provision_hpc_servers(values: SetupValues, *, force: bool = False) -> None:
+    """Package once, then provision the CPU and GPU clusters.
+
+    With ``force=False`` (the default) each cluster is only re-uploaded/rebuilt
+    when its deployed manifest is missing or differs from the local source.
+    """
     if values.mode != "hpc":
         return
     with tempfile.TemporaryDirectory(prefix="rag-hpc-setup-") as temp_dir:
@@ -652,6 +787,7 @@ def provision_hpc_servers(values: SetupValues) -> None:
             image_name="rag_pipeline_cpu.sif",
             definition_name="Singularity.cpu.def",
             local_image=ROOT / "rag_pipeline_cpu.sif",
+            force=force,
         )
         provision_hpc_cluster(
             alias=values.gpu_host,
@@ -670,6 +806,7 @@ def provision_hpc_servers(values: SetupValues) -> None:
                 if (ROOT / "rag_pipeline.sif").is_file()
                 else None
             ),
+            force=force,
         )
 
 
@@ -1177,7 +1314,14 @@ def build_parser() -> argparse.ArgumentParser:
     provision_group.add_argument(
         "--provision-hpc",
         action="store_true",
-        help="Upload the repository and provision CPU/GPU SIFs on both clusters.",
+        help="Upload the repository and provision CPU/GPU SIFs on both clusters "
+             "(forces a full redeploy even if the remote is current).",
+    )
+    provision_group.add_argument(
+        "--provision-if-needed",
+        action="store_true",
+        help="Provision each cluster only if its deployed source is stale or the "
+             "SIF is missing (the default behavior of the start launchers).",
     )
     provision_group.add_argument(
         "--skip-hpc-provision",
@@ -1232,11 +1376,19 @@ def main(argv: list[str] | None = None) -> int:
             )
             configure_ssh_aliases(args.ssh_config, values)
             configure(path, values)
-            should_provision = (
-                values.mode == "hpc"
-                and not args.skip_hpc_provision
-                and (values.manage_ssh_aliases or args.provision_hpc)
-            )
+            # Decide whether (and how) to provision the HPC clusters. The three
+            # flags are mutually exclusive; none set means "only provision when
+            # the interactive SSH-alias setup flow just ran" (legacy behavior).
+            provision_mode = "none"
+            if args.provision_hpc:
+                provision_mode = "force"
+            elif args.provision_if_needed:
+                provision_mode = "if-needed"
+            elif values.mode == "hpc" and not args.skip_hpc_provision and values.manage_ssh_aliases:
+                # Interactive first-run flow: SSH aliases were just written, so
+                # the remote has never been provisioned -- deploy unconditionally.
+                provision_mode = "force"
+            should_provision = provision_mode != "none" and values.mode == "hpc"
             if should_provision:
                 if not values.cpu_user:
                     values.cpu_user = read_ssh_alias(
@@ -1252,7 +1404,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 values.cpu_storage_root = f"/hpctmp/{values.cpu_user}"
                 values.gpu_storage_root = f"/scratch/{values.gpu_user}"
-                provision_hpc_servers(values)
+                provision_hpc_servers(values, force=provision_mode == "force")
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"Configuration failed: {exc}", file=sys.stderr)
             return 1

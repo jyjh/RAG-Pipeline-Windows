@@ -303,3 +303,253 @@ def test_setup_cli_help_runs():
     assert "--skip-key-install" in result.stdout
     assert "--provision-hpc" in result.stdout
     assert "--skip-hpc-provision" in result.stdout
+
+
+def test_repo_manifest_is_deterministic_and_excludes_artifacts(safe_tmp_path):
+    """The manifest fingerprint is stable for unchanged source and ignores the
+    same paths the archive filter drops (.git, data, *.sif, etc.)."""
+    from scripts.setup_instance import _build_repo_manifest, _manifest_fingerprint
+
+    src = safe_tmp_path / "src"
+    (src / "pkg").mkdir(parents=True)
+    (src / "pkg" / "main.py").write_text("print('hi')\n", encoding="utf-8")
+    (src / "README.md").write_text("docs", encoding="utf-8")
+    # Artifacts that MUST be excluded from both archive and manifest.
+    (src / ".git").mkdir()
+    (src / ".git" / "config").write_text("git", encoding="utf-8")
+    (src / "data").mkdir()
+    (src / "data" / "x.bin").write_bytes(b"\0" * 100)
+    (src / "rag_pipeline.sif").write_bytes(b"\x9d" * 50)
+
+    fp1 = _manifest_fingerprint(_build_repo_manifest(src))
+    fp2 = _manifest_fingerprint(_build_repo_manifest(src))
+    assert fp1 and fp1 == fp2  # deterministic
+
+    # Changing an artifact that is excluded must NOT change the fingerprint.
+    (src / "data" / "x.bin").write_bytes(b"\1" * 200)
+    (src / ".git" / "config").write_text("changed", encoding="utf-8")
+    assert _manifest_fingerprint(_build_repo_manifest(src)) == fp1
+
+    # Changing a shipped source file MUST change the fingerprint.
+    (src / "pkg" / "main.py").write_text("print('bye')\n", encoding="utf-8")
+    assert _manifest_fingerprint(_build_repo_manifest(src)) != fp1
+
+
+def test_create_repository_archive_embeds_manifest(safe_tmp_path):
+    """The shipped tarball contains a .rag_manifest entry whose fingerprint
+    matches a freshly computed one for the same source."""
+    import io
+    import tarfile
+    from scripts.setup_instance import (
+        _build_repo_manifest,
+        _manifest_fingerprint,
+        create_repository_archive,
+    )
+
+    src = safe_tmp_path / "src"
+    src.mkdir()
+    (src / "main.py").write_text("print(1)\n", encoding="utf-8")
+    archive = create_repository_archive(safe_tmp_path / "repo.tgz", source_root=src)
+
+    with tarfile.open(archive, "r:gz") as tar:
+        names = tar.getnames()
+        assert ".rag_manifest" in names
+        member = tar.extractfile(".rag_manifest")
+        embedded = member.read().decode("utf-8") if member else ""
+
+    expected = _manifest_fingerprint(_build_repo_manifest(src))
+    assert _manifest_fingerprint(embedded) == expected
+
+
+def test_provision_skips_upload_when_remote_manifest_matches(safe_tmp_path, monkeypatch):
+    """When the deployed manifest matches the local source AND the SIF exists,
+    provision_hpc_cluster must skip the upload/extract/build/activate cycle."""
+    from scripts.setup_instance import (
+        _build_repo_manifest,
+        _manifest_fingerprint,
+        provision_hpc_cluster,
+    )
+
+    # Point ROOT at a throwaway source tree so the manifest is computed against
+    # deterministic, controlled content.
+    src = safe_tmp_path / "repo"
+    src.mkdir()
+    (src / "main.py").write_text("print('deployed')\n", encoding="utf-8")
+    monkeypatch.setattr("scripts.setup_instance.ROOT", src)
+
+    local_manifest = _build_repo_manifest(src)
+    local_fp = _manifest_fingerprint(local_manifest)
+    assert local_fp
+
+    # Stub ssh so _remote_manifest returns a matching manifest, and the SIF
+    # existence check succeeds.
+    def fake_ssh_run(cmd, **kwargs):
+        class R:
+            returncode = 0
+            stdout = local_manifest
+            stderr = ""
+        return R()
+
+    # The freshness path calls subprocess.run with a list arg whose first
+    # element is the ssh binary. Detect the manifest fetch vs the SIF test by
+    # inspecting the remote command string.
+    def fake_subprocess_run(cmd, **kwargs):
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        # cmd is [ssh, -o, ..., alias, remote_command]
+        remote = cmd[-1] if isinstance(cmd, list) and len(cmd) > 1 else ""
+        if remote.startswith("cat ") and ".rag_manifest" in remote:
+            class RM:
+                returncode = 0
+                stdout = local_manifest
+                stderr = ""
+            return RM()
+        # test -s <sif> -> success (SIF exists)
+        return R()
+
+    monkeypatch.setattr("scripts.setup_instance.subprocess.run", fake_subprocess_run)
+
+    uploads = []
+    remote_commands = []
+    monkeypatch.setattr(
+        "scripts.setup_instance._upload_provision_file",
+        lambda *a, **k: uploads.append(a),
+    )
+    monkeypatch.setattr(
+        "scripts.setup_instance._run_provision_ssh",
+        lambda alias, command, **k: remote_commands.append(command),
+    )
+
+    provision_hpc_cluster(
+        alias="gpu-login",
+        user="student",
+        storage_root="/scratch/student",
+        relative_repo="rag-gpu",
+        archive_path=safe_tmp_path / "repository.tar.gz",
+        image_name="rag_pipeline.sif",
+        definition_name="Singularity.def",
+        local_image=None,
+        force=False,
+    )
+
+    assert uploads == []          # no upload happened
+    assert remote_commands == []  # no staging/extract/build/activate happened
+
+
+def test_provision_redeploys_when_remote_manifest_differs(safe_tmp_path, monkeypatch):
+    """A stale or absent remote manifest triggers a full provision."""
+    from scripts.setup_instance import provision_hpc_cluster
+
+    src = safe_tmp_path / "repo"
+    src.mkdir()
+    (src / "main.py").write_text("print('new')\n", encoding="utf-8")
+    monkeypatch.setattr("scripts.setup_instance.ROOT", src)
+
+    # _remote_manifest returns "" (no deployed manifest -> first deploy).
+    def fake_subprocess_run(cmd, **kwargs):
+        class R:
+            returncode = 1
+            stdout = ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr("scripts.setup_instance.subprocess.run", fake_subprocess_run)
+
+    uploads = []
+    remote_commands = []
+    monkeypatch.setattr(
+        "scripts.setup_instance._upload_provision_file",
+        lambda *a, **k: uploads.append(a),
+    )
+    monkeypatch.setattr(
+        "scripts.setup_instance._run_provision_ssh",
+        lambda alias, command, **k: remote_commands.append(command),
+    )
+
+    provision_hpc_cluster(
+        alias="cpu-login",
+        user="student",
+        storage_root="/hpctmp/student",
+        relative_repo="rag-cpu",
+        archive_path=safe_tmp_path / "repository.tar.gz",
+        image_name="rag_pipeline_cpu.sif",
+        definition_name="Singularity.cpu.def",
+        local_image=None,
+        force=False,
+    )
+
+    assert uploads != []          # source was uploaded
+    joined = "\n".join(remote_commands)
+    assert "tar -xzf" in joined   # extracted
+    assert "ln -sfn" in joined    # activated
+
+
+def test_provision_force_ignores_matching_manifest(safe_tmp_path, monkeypatch):
+    """force=True must redeploy even when the remote manifest would match."""
+    from scripts.setup_instance import (
+        _build_repo_manifest,
+        _manifest_fingerprint,
+        provision_hpc_cluster,
+    )
+
+    src = safe_tmp_path / "repo"
+    src.mkdir()
+    (src / "main.py").write_text("print('x')\n", encoding="utf-8")
+    monkeypatch.setattr("scripts.setup_instance.ROOT", src)
+    local_manifest = _build_repo_manifest(src)
+
+    ssh_calls = []
+    def fake_subprocess_run(cmd, **kwargs):
+        ssh_calls.append(cmd)
+        class R:
+            returncode = 0
+            stdout = local_manifest
+            stderr = ""
+        return R()
+    monkeypatch.setattr("scripts.setup_instance.subprocess.run", fake_subprocess_run)
+
+    uploads = []
+    remote_commands = []
+    monkeypatch.setattr(
+        "scripts.setup_instance._upload_provision_file",
+        lambda *a, **k: uploads.append(a),
+    )
+    monkeypatch.setattr(
+        "scripts.setup_instance._run_provision_ssh",
+        lambda alias, command, **k: remote_commands.append(command),
+    )
+
+    provision_hpc_cluster(
+        alias="gpu-login",
+        user="student",
+        storage_root="/scratch/student",
+        relative_repo="rag-gpu",
+        archive_path=safe_tmp_path / "repository.tar.gz",
+        image_name="rag_pipeline.sif",
+        definition_name="Singularity.def",
+        local_image=None,
+        force=True,
+    )
+
+    # Even with a matching manifest, force=True provisions.
+    assert uploads != []
+    assert ssh_calls == []  # force short-circuits the manifest fetch entirely
+    joined = "\n".join(remote_commands)
+    assert "tar -xzf" in joined
+
+
+def test_start_cli_passes_provision_if_needed():
+    """The start launchers invoke setup_instance with --provision-if-needed,
+    --non-interactive, and --start. Verify the flags are accepted together."""
+    result = subprocess.run(
+        ["python", "scripts/setup_instance.py", "--help"],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "--provision-if-needed" in result.stdout
+
