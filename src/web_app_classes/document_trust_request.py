@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pydantic import BaseModel
+
 from src._class_module_support import bind_module_namespace, finalize_split_class
 import src.web_app as _source_module
 

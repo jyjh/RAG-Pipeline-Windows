@@ -7,10 +7,40 @@ from typing import Any
 
 
 class _PendingSplitInstance:
+    """Sentinel returned when a split class could not be resolved at import.
+
+    A real instance of this (rather than the intended class) means the split
+    module failed to define/attribute its class -- usually a NameError during
+    the module body under a circular-import timing edge. Attribute access is
+    intercepted so the failure surfaces at the point of use with an actionable
+    message, instead of a cryptic downstream ``AttributeError``.
+    """
+
     def __init__(self, class_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]):
-        self.class_name = class_name
-        self.args = args
-        self.kwargs = kwargs
+        object.__setattr__(self, "_pending_class_name", class_name)
+        object.__setattr__(self, "_pending_args", args)
+        object.__setattr__(self, "_pending_kwargs", kwargs)
+
+    @property
+    def class_name(self) -> str:
+        return object.__getattribute__(self, "_pending_class_name")
+
+    @property
+    def args(self) -> tuple[Any, ...]:
+        return object.__getattribute__(self, "_pending_args")
+
+    @property
+    def kwargs(self) -> dict[str, Any]:
+        return object.__getattribute__(self, "_pending_kwargs")
+
+    def __getattr__(self, name: str) -> Any:
+        raise AttributeError(
+            f"'{type(self).__name__}' for class "
+            f"'{object.__getattribute__(self, '_pending_class_name')!r}' is a "
+            f"pending split-class stub: the real class was never finalized into "
+            f"its module (the split module likely raised during import). "
+            f"Accessed attribute {name!r}."
+        )
 
 
 def _pending_split_class(class_name: str):

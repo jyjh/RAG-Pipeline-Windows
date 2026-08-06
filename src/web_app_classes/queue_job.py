@@ -1,7 +1,21 @@
 from __future__ import annotations
 
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
 from src._class_module_support import bind_module_namespace, finalize_split_class
 import src.web_app as _source_module
+
+
+def _utcnow() -> str:
+    """ISO-8601 UTC timestamp. Local copy so this module's @dataclass can
+    resolve its default_factory without depending on borrowed web_app globals
+    (which are only injected by bind_module_namespace below and may not be
+    present yet under a circular-import timing edge on some platforms)."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
 
 bind_module_namespace(
     _source_module,
