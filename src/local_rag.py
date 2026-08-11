@@ -24,6 +24,7 @@ from src.sectioning import (
     build_section_records,
 )
 from src.vector_store import LanceDBVectorStore, default_store
+from src.electronics import analyze_circuit, compare_measurements
 
 from src._class_module_support import import_split_class
 
@@ -89,6 +90,8 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_write_content_hash_sidecar",
     "normalize_search_url",
     "web_search_duckduckgo_lite",
+    "analyze_circuit",
+    "compare_measurements",
 )
 
 QUERY_TEMPERATURE = 0.3
@@ -140,6 +143,19 @@ EAGER_CONTEXT_SUFFIX = (
     "\n\nNote: relevant local context has already been retrieved and is provided "
     "in the search_local_context tool result. Answer directly from it; only call "
     "search_local_context again (narrower query) or web_search if it is insufficient."
+)
+ELECTRONICS_QUERY_SYSTEM_PROMPT = (
+    "You are an interactive FSAE low-voltage electronics troubleshooter. Use analyze_circuit for circuit text "
+    "and compare_measurements when bench readings are available. Restate the understood circuit and symptom, "
+    "separate user observations, deterministic calculations, sourced facts, and assumptions, then rank fault "
+    "hypotheses without presenting them as confirmed. If evidence is insufficient, request exactly one safe, "
+    "high-information measurement. Prefer power-off inspection, resistance, and continuity checks. Do not advise "
+    "energized invasive probing until the supply classification, reference point, and safe access are clear. "
+    "Refuse mains, accumulator/high-voltage, bypassed-protection, or unclear-energy procedures and recommend a "
+    "qualified escalation. Use search_local_context for specifications, procedures, pinouts, ratings, team-specific "
+    "facts, or FSAE rules; cite those claims with the returned [S#] IDs. Pure deterministic calculations do not "
+    "require a document citation. {web_instruction} Never invent missing connections, values, polarities, switch "
+    "states, device models, or logic thresholds. Unsupported devices may be discussed structurally but not solved."
 )
 
 

@@ -33,6 +33,10 @@ class QueryEngine:
         planner_enabled: bool = True,
         planner_max_queries: int | None = None,
         progress_enabled: bool = True,
+        assistant_mode: str = "rag",
+        history: list[dict[str, str]] | None = None,
+        electronics_max_live_dc_voltage: float = 60.0,
+        electronics_measurement_tolerance_percent: float = 5.0,
     ):
         from src.local_rag import LocalQueryEngine
 
@@ -63,6 +67,10 @@ class QueryEngine:
             planner_enabled=planner_enabled,
             planner_max_queries=planner_max_queries,
             progress_enabled=progress_enabled,
+            assistant_mode=assistant_mode,
+            history=history,
+            electronics_max_live_dc_voltage=electronics_max_live_dc_voltage,
+            electronics_measurement_tolerance_percent=electronics_measurement_tolerance_percent,
         )
 
     def ask(self, question: str):

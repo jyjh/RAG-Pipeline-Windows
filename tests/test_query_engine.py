@@ -70,6 +70,10 @@ def test_query_engine_delegates_to_local_query_engine(monkeypatch):
             "planner_enabled": False,
             "planner_max_queries": 4,
             "progress_enabled": False,
+            "assistant_mode": "rag",
+            "history": None,
+            "electronics_max_live_dc_voltage": 60.0,
+            "electronics_measurement_tolerance_percent": 5.0,
         },
         "question": "What is aero balance?",
     }

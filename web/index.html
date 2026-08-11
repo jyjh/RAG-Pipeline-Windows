@@ -197,6 +197,21 @@
             </div>
             <div id="chatMessages" class="chat-messages" aria-live="polite"></div>
             <form id="chatForm" class="chat-form">
+              <div class="assistant-mode-row">
+                <label>
+                  Assistant
+                  <select id="assistantModeSelect">
+                    <option value="rag">General RAG</option>
+                    <option value="electronics">Electronics Troubleshooter</option>
+                  </select>
+                </label>
+                <div id="electronicsExamples" class="electronics-examples" hidden>
+                  <strong>Circuit text examples</strong>
+                  <code>V1 vin 0 12<br />R1 vin out 1k<br />R2 out 0 1k</code>
+                  <span>or</span>
+                  <code>R1: vin -&gt; out, 1k</code>
+                </div>
+              </div>
               <details class="advanced-settings chat-advanced-settings">
                 <summary>Advanced answer settings</summary>
                 <div class="sampler-settings" aria-label="Sampler settings">

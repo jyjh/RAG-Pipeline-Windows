@@ -234,9 +234,12 @@ Interactive HPC setup provisions both servers automatically. Atlas9 CPU uses
 uploaded from `rag_pipeline_cpu.sif` when present; the GPU image is uploaded
 from `rag_pipeline.sif` when present, otherwise it is built remotely from
 `Singularity.def`. Repository activation retains the prior deployment as
-`<repo>.rag-setup-previous`. Use `--skip-hpc-provision` for connection-only
-configuration, or `--provision-hpc` to reprovision an existing non-interactive
-configuration.
+`<repo>.rag-setup-previous`. Provisioning is selected by three mutually
+exclusive flags: `--provision-if-needed` uploads and rebuilds only when the
+deployed source is stale or the SIF is missing (the default of the
+`start.cmd` / `start.sh` launchers), `--provision-hpc` forces a full redeploy
+even when the remote is current, and `--skip-hpc-provision` does
+connection-only configuration.
 
 The interactive wizard creates the SSH aliases for you. Existing exact alias
 blocks are updated in place; wildcard/group blocks and unrelated hosts are left
@@ -262,6 +265,50 @@ jobs_poll_interval_ms = 60000
 ```
 
 Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/indexing work in the background, lets users inspect/edit/delete index records, and streams chat answers as Ollama produces them. Uploaded and indexed PDFs are searchable by title/hash and listed with quality badges, chunk counts, trust status, visible trust notes, approve/stale review actions, targeted re-run actions, and download links for source verification. Trust metadata is stored in `data/.document_trust.json`; unreviewed, rejected, stale, expired, missing, or poorly extracted sources are flagged before users rely on them. The top-right update button checks the configured remote branch, pulls fast-forward updates when available, and restarts the uvicorn server. It blocks updates if tracked files are dirty, the server is not running the configured branch, Git history diverged, or chat/indexing work is active. The Index page defaults to 20 rows, can show 50 or 100 rows per page, and can load all matching rows in 100-row HTTP batches. The chat panel saves conversations in the browser's `localStorage` and includes a collapsible saved-chat sidebar with rename/delete controls. Uploads are tracked by PDF SHA-256 hash across queued and ingested files; duplicate uploads are rejected unless the browser confirmation prompt is accepted for a forced re-upload. Forced re-upload cleanup waits until the job reaches ingestion, then removes existing indexed records for that parent PDF before fresh ingestion/indexing. The PDF table's `Re-run` action stages only the selected source PDF, re-runs ingestion for that source, then reindexes the corpus. The chat panel exposes sampler controls for temperature, top-k (`Max K`), context window, relevance floor, maximum output tokens, and web-search enablement. When Ollama returns model thinking, the chat UI shows it in a collapsible block above the answer and reports clearly if the model stops before producing final answer text. Chat output is rendered as Markdown with local LaTeX-to-MathML formatting and includes a Sources panel populated from retrieved chunks and web results. Local sources include an `Open page` link to the cited PDF page when page metadata is available, plus a download link for the full PDF. Queued ingestion/indexing waits before expensive phases while chat queries are active; a phase already running is not forcibly interrupted.
+
+### Electronics Troubleshooter
+
+Choose **Electronics Troubleshooter** from the Assistant selector to use the
+interactive low-voltage diagnostic mode. Chats remain browser-local, but the
+latest 24 user/assistant messages are sent with each request so follow-up
+measurements can refine the diagnosis.
+
+The deterministic circuit tools support resistors, independent DC voltage and
+current sources, wires, ground, and fixed open/closed switches. They accept a
+SPICE-like subset:
+
+```text
+V1 vin 0 DC 12
+R1 vin out 1k
+R2 out 0 1k
+```
+
+or a simple text form:
+
+```text
+Voltage V1: VIN -> GND, 12V
+Resistor R1: VIN -> OUT, 1k
+R2: OUT -> GND, 1k
+```
+
+The solver reports topology validation, node voltages, branch currents, power,
+and measurement residuals. Unsupported devices remain visible in the topology
+but are never assigned invented numerical behavior. The assistant retrieves
+local documents when it needs specifications, pinouts, procedures, ratings, or
+FSAE rules; pure circuit calculations do not force a RAG lookup.
+
+Configure the advisory boundary and default measurement tolerance in
+`config.toml`:
+
+```toml
+[electronics]
+max_live_dc_voltage = 60.0
+measurement_tolerance_percent = 5.0
+```
+
+This mode is advisory and read-only. It does not control instruments or cover
+mains, accumulator/high-voltage work, AC/transient analysis, or semiconductor
+device simulation.
 
 ## Architecture
 

@@ -61,6 +61,70 @@ def _fake_local_tool_chat(calls, *, final_events=None):
     return fake_chat
 
 
+def test_electronics_mode_exposes_domain_tools_without_eager_retrieval(monkeypatch, safe_tmp_path):
+    calls = []
+
+    def fake_chat(**kwargs):
+        calls.append(kwargs)
+        if kwargs["stream"]:
+            return iter([{"message": {"content": "Calculated output is 6 V."}}])
+        if not any(message.get("role") == "tool" for message in kwargs["messages"]):
+            return {
+                "message": {
+                    "tool_calls": [
+                        _tool_call(
+                            "analyze_circuit",
+                            {"circuit_text": "V1 vin 0 12\nR1 vin out 1k\nR2 out 0 1k", "format": "spice"},
+                        )
+                    ]
+                }
+            }
+        return {"message": {"content": ""}}
+
+    monkeypatch.setattr(local_rag, "_ollama_chat", fake_chat)
+    engine = local_rag.LocalQueryEngine(
+        working_dir=str(safe_tmp_path), assistant_mode="electronics", progress_enabled=False
+    )
+    engine.record_count = 10
+
+    events = list(engine.ask_stream_events("Analyze this divider."))
+
+    tools = {tool["function"]["name"] for tool in calls[0]["tools"]}
+    assert {"search_local_context", "analyze_circuit", "compare_measurements"} <= tools
+    tool_events = [event for event in events if event.get("type") == "tool_result"]
+    assert [event["tool"] for event in tool_events] == ["analyze_circuit"]
+    assert tool_events[0]["result"]["analysis"]["node_voltages"]["out"] == pytest.approx(6.0)
+    assert not any(event.get("tool") == "search_local_context" for event in events)
+
+
+def test_electronics_history_is_sanitized_bounded_and_included(safe_tmp_path):
+    history = [
+        {"role": "user" if index % 2 == 0 else "assistant", "text": f"message {index}"}
+        for index in range(30)
+    ]
+    history.extend([{"role": "tool", "text": "secret tool output"}, {"role": "user", "text": ""}])
+    engine = local_rag.LocalQueryEngine(
+        working_dir=str(safe_tmp_path),
+        assistant_mode="electronics",
+        history=history,
+        progress_enabled=False,
+    )
+
+    messages = engine._tool_messages("new symptom")
+
+    assert len(engine.history) == 22  # invalid entries fall within the final 24 input slots and are discarded
+    assert all(message["role"] in {"user", "assistant"} for message in engine.history)
+    assert messages[-1] == {"role": "user", "content": "new symptom"}
+    assert "secret tool output" not in json.dumps(messages)
+    assert "interactive FSAE low-voltage" in messages[0]["content"]
+
+
+def test_rag_mode_does_not_expose_electronics_tools(safe_tmp_path):
+    engine = local_rag.LocalQueryEngine(working_dir=str(safe_tmp_path), progress_enabled=False)
+    names = {tool["function"]["name"] for tool in engine._tool_definitions(include_web_search=False)}
+    assert names == {"search_local_context"}
+
+
 def test_chunk_markdown_splits_long_text_without_empty_chunks():
     text = "alpha\n\n" + ("beta " * 1000)
 

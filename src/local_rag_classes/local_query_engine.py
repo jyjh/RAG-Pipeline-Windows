@@ -51,6 +51,10 @@ class LocalQueryEngine:
         planner_model: str | None = None,
         planner_enabled: bool = True,
         planner_max_queries: int | None = None,
+        assistant_mode: str = "rag",
+        history: list[dict[str, str]] | None = None,
+        electronics_max_live_dc_voltage: float = 60.0,
+        electronics_measurement_tolerance_percent: float = 5.0,
     ):
         from src.embeddings import EmbeddingEngine
         from src.asset_store import ImageAssetStore
@@ -63,6 +67,15 @@ class LocalQueryEngine:
         self.source_group_by_hash = load_source_group_map(self.trust_path)
         self.asset_store = ImageAssetStore(self.asset_dir)
         self.model = model
+        normalized_mode = str(assistant_mode or "rag").strip().lower()
+        if normalized_mode not in {"rag", "electronics"}:
+            raise ValueError("assistant_mode must be 'rag' or 'electronics'.")
+        self.assistant_mode = normalized_mode
+        self.history = self._sanitize_history(history)
+        self.electronics_max_live_dc_voltage = _positive_float(electronics_max_live_dc_voltage, 60.0)
+        self.electronics_measurement_tolerance_percent = _positive_float(
+            electronics_measurement_tolerance_percent, 5.0
+        )
         self.progress_enabled = progress_enabled
         self.top_k = _positive_int(top_k, 5) if top_k is not None else 5
         self.num_predict = _positive_int(
@@ -202,7 +215,19 @@ class LocalQueryEngine:
         and the local index non-empty. Used to select the system prompt that
         tells the model the context is already fetched.
         """
-        return bool(self.planner_enabled and self.record_count)
+        return bool(self.assistant_mode == "rag" and self.planner_enabled and self.record_count)
+
+    @staticmethod
+    def _sanitize_history(history: list[dict[str, str]] | None) -> list[dict[str, str]]:
+        clean: list[dict[str, str]] = []
+        for message in (history or [])[-24:]:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            text = str(message.get("text") or "").strip()
+            if role in {"user", "assistant"} and text:
+                clean.append({"role": role, "content": text[:8000]})
+        return clean
 
     def _tool_messages(self, question: str) -> list[dict[str, Any]]:
         web_instruction = (
@@ -212,7 +237,9 @@ class LocalQueryEngine:
             else "Do not use web_search; it is disabled for this request."
         )
         eager = self._eager_retrieval_active()
-        if self._custom_system_prompt:
+        if self.assistant_mode == "electronics":
+            system_prompt = ELECTRONICS_QUERY_SYSTEM_PROMPT
+        elif self._custom_system_prompt:
             # User/config-supplied prompt: use verbatim, but in eager mode append
             # the steering suffix so the model still treats pre-fetched context
             # as already provided.
@@ -227,13 +254,17 @@ class LocalQueryEngine:
             system_prompt = system_prompt.replace("{web_instruction}", web_instruction)
         else:
             system_prompt = f"{system_prompt}\n\n{web_instruction}"
-        return [
+        messages = [
             {
                 "role": "system",
                 "content": system_prompt,
             },
-            {"role": "user", "content": question},
         ]
+        messages.extend(self.history)
+        messages.append({"role": "user", "content": question})
+        while len(messages) > 2 and self._prompt_token_count(messages) > self._context_token_budget():
+            del messages[1]
+        return messages
 
     def _tool_definitions(self, *, include_web_search: bool | None = None) -> list[dict[str, Any]]:
         tools = [
@@ -291,7 +322,62 @@ class LocalQueryEngine:
                     },
                 }
             )
+        if self.assistant_mode == "electronics":
+            tools.extend(self._electronics_tool_definitions())
         return tools
+
+    @staticmethod
+    def _electronics_tool_definitions() -> list[dict[str, Any]]:
+        circuit_properties = {
+            "circuit_text": {"type": "string", "description": "The complete SPICE-like or simple text circuit."},
+            "format": {"type": "string", "enum": ["auto", "spice", "simple"], "description": "Input syntax."},
+        }
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "analyze_circuit",
+                    "description": "Parse and deterministically analyze a linear DC circuit. Never use it for AC/transient or unsupported-device claims.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": circuit_properties,
+                        "required": ["circuit_text"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "compare_measurements",
+                    "description": "Compare typed bench observations with a deterministic linear DC circuit analysis.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            **circuit_properties,
+                            "measurements": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["voltage", "current", "resistance", "continuity", "logic"]},
+                                        "value": {"anyOf": [{"type": "number"}, {"type": "string"}, {"type": "boolean"}], "description": "A number or unit-bearing string such as 4.8V, 12mA, or high."},
+                                        "positive_node": {"type": "string"},
+                                        "negative_node": {"type": "string"},
+                                        "node": {"type": "string"},
+                                        "component_id": {"type": "string"},
+                                        "tolerance_percent": {"type": "number"},
+                                        "tolerance_absolute": {"type": "number"},
+                                        "threshold_ohms": {"type": "number"},
+                                    },
+                                    "required": ["type", "value"],
+                                },
+                            },
+                        },
+                        "required": ["circuit_text", "measurements"],
+                    },
+                },
+            },
+        ]
 
     def _load_record_count(self) -> int:
         if not self.store.exists():
@@ -317,6 +403,12 @@ class LocalQueryEngine:
         return estimate_prompt_tokens(messages, tools=tools)
 
     def _final_answer_instruction(self) -> str:
+        if self.assistant_mode == "electronics":
+            return (
+                "Write the troubleshooting response now. Distinguish observations, calculations, sourced facts, "
+                "and assumptions. Cite document/web claims with source IDs, treat fault rankings as hypotheses, "
+                "and request exactly one safe next measurement when the diagnosis is not resolved."
+            )
         return (
             "Write the final answer now using only the tool results above. "
             "Cite every factual claim with the source IDs in square brackets. "
@@ -341,6 +433,39 @@ class LocalQueryEngine:
             return False
         tools_with_web = self._tool_definitions(include_web_search=True)
         return self._prompt_token_count(messages, tools=tools_with_web) <= self._context_token_budget()
+
+    def _fit_electronics_result(
+        self, result: dict[str, Any], messages: list[dict[str, Any]] | None
+    ) -> dict[str, Any]:
+        budget = self._tool_result_token_budget(messages)
+        fitted = json.loads(json.dumps(result, ensure_ascii=False))
+        if estimate_json_tokens(fitted) <= budget:
+            return fitted
+        for component in fitted.get("component_graph", []):
+            component.pop("raw", None)
+        fitted["context_truncated"] = True
+        lists = [fitted.get("component_graph"), fitted.get("measurements"), fitted.get("ranked_hypotheses")]
+        maps = []
+        analysis = fitted.get("analysis")
+        if isinstance(analysis, dict):
+            maps.extend(
+                analysis.get(key) for key in ("node_voltages", "branch_currents", "component_power", "node_aliases")
+            )
+        while estimate_json_tokens(fitted) > budget:
+            target = next((value for value in lists if isinstance(value, list) and value), None)
+            if target is not None:
+                target.pop()
+                continue
+            mapping = next((value for value in maps if isinstance(value, dict) and value), None)
+            if mapping is not None:
+                mapping.pop(next(reversed(mapping)))
+                continue
+            return {
+                "tool": str(result.get("tool") or "electronics"),
+                "error": "Electronics tool result did not fit within the prompt token budget.",
+                "context_truncated": True,
+            }
+        return fitted
 
     def _retrieve(
         self,
@@ -765,6 +890,44 @@ class LocalQueryEngine:
                 text = str(result["error"])
             return name, result, text
 
+        if name == "analyze_circuit" and self.assistant_mode == "electronics":
+            try:
+                result = analyze_circuit(
+                    str(arguments.get("circuit_text") or ""),
+                    str(arguments.get("format") or "auto"),
+                    max_live_dc_voltage=self.electronics_max_live_dc_voltage,
+                )
+                result = self._fit_electronics_result(result, messages)
+                if result.get("error") and not result.get("analysis"):
+                    text = str(result["error"])
+                else:
+                    text = f"Analyzed {result['summary']['component_count']} component(s): {result['analysis']['status']}."
+            except (TypeError, ValueError) as exc:
+                result = {"tool": name, "error": str(exc), "analysis": {"status": "invalid"}}
+                text = str(exc)
+            return name, result, text
+
+        if name == "compare_measurements" and self.assistant_mode == "electronics":
+            try:
+                raw_measurements = arguments.get("measurements")
+                result = compare_measurements(
+                    str(arguments.get("circuit_text") or ""),
+                    raw_measurements if isinstance(raw_measurements, list) else [],
+                    str(arguments.get("format") or "auto"),
+                    max_live_dc_voltage=self.electronics_max_live_dc_voltage,
+                    default_tolerance_percent=self.electronics_measurement_tolerance_percent,
+                )
+                result = self._fit_electronics_result(result, messages)
+                if result.get("error") and "measurements" not in result:
+                    text = str(result["error"])
+                else:
+                    mismatch_count = sum(1 for item in result["measurements"] if item.get("status") == "mismatch")
+                    text = f"Compared {len(result['measurements'])} measurement(s); {mismatch_count} mismatch(es)."
+            except (TypeError, ValueError) as exc:
+                result = {"tool": name, "error": str(exc), "measurements": []}
+                text = str(exc)
+            return name, result, text
+
         return name or "unknown", {"error": f"Unknown tool: {name or 'unknown'}"}, "Unknown tool call."
 
     def _append_tool_result(
@@ -899,7 +1062,7 @@ class LocalQueryEngine:
         # round already seeing evidence instead of spending a round deciding to
         # call search_local_context. Falls back to the loop's forced search if
         # disabled or the index is empty.
-        if self.planner_enabled and self.record_count:
+        if self._eager_retrieval_active():
             eager = self._eager_local_tool_call(
                 question=question,
                 citations=citations,
@@ -939,7 +1102,7 @@ class LocalQueryEngine:
 
             tool_calls = _ollama_tool_calls(response)
             if not tool_calls:
-                if not local_search_used:
+                if not local_search_used and self.assistant_mode == "rag":
                     yield {
                         "type": "notice",
                         "text": "The model did not call the required local search tool, so local context was retrieved before answering.",
@@ -991,7 +1154,7 @@ class LocalQueryEngine:
             if tool_calls_used >= self.tool_max_calls:
                 break
 
-        if not local_search_used:
+        if not local_search_used and self.assistant_mode == "rag":
             result, text = self._forced_local_tool_call(
                 messages,
                 question=question,
@@ -1021,8 +1184,10 @@ class LocalQueryEngine:
                 yield event["text"]
 
     def ask_stream_events(self, question: str):
-        if self.planner_enabled and self.record_count:
+        if self._eager_retrieval_active():
             yield {"type": "notice", "text": "Searching local context..."}
+        elif self.assistant_mode == "electronics":
+            yield {"type": "notice", "text": "Planning electronics diagnostic tool calls..."}
         else:
             yield {"type": "notice", "text": "Planning retrieval tool calls..."}
         try:

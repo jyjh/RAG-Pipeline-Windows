@@ -274,6 +274,8 @@ DEFAULT_OLLAMA_CHAT_MAX_LOST_HEALTH_CHECKS = DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHEC
 DEFAULT_PLANNER_MODEL = "qwen2.5:1.5b"
 DEFAULT_PLANNER_ENABLED = True
 DEFAULT_PLANNER_MAX_QUERIES = 3
+DEFAULT_ELECTRONICS_MAX_LIVE_DC_VOLTAGE = 60.0
+DEFAULT_ELECTRONICS_MEASUREMENT_TOLERANCE_PERCENT = 5.0
 DEFAULT_INDEX_BACKEND = "lancedb"
 DEFAULT_SUMMARY_MODE = "hybrid"
 DEFAULT_CHUNK_TARGET_TOKENS = 900
@@ -645,6 +647,21 @@ def _load_chat_config(config_path: Path | None = None) -> dict[str, Any]:
     }
 
 
+def _load_electronics_config(config_path: Path | None = None) -> dict[str, float]:
+    config_path = config_path or _default_config_path()
+    payload = _load_toml_config(config_path)
+    section = payload.get("electronics", {}) if isinstance(payload.get("electronics"), dict) else {}
+    return {
+        "max_live_dc_voltage": _positive_float(
+            section.get("max_live_dc_voltage"), DEFAULT_ELECTRONICS_MAX_LIVE_DC_VOLTAGE
+        ),
+        "measurement_tolerance_percent": _positive_float(
+            section.get("measurement_tolerance_percent"),
+            DEFAULT_ELECTRONICS_MEASUREMENT_TOLERANCE_PERCENT,
+        ),
+    }
+
+
 def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
     config_path = config_path or _default_config_path()
     payload = _load_toml_config(config_path)
@@ -712,6 +729,7 @@ def _load_indexing_config(config_path: Path | None = None) -> dict[str, Any]:
 SERVER_CONFIG = _load_server_config()
 API_KEYS_CONFIG = _load_api_keys_config()
 CHAT_CONFIG = _load_chat_config()
+ELECTRONICS_CONFIG = _load_electronics_config()
 INGESTION_CONFIG = _load_ingestion_config()
 UPLOADS_CONFIG = _load_uploads_config()
 INDEXING_CONFIG = _load_indexing_config()
@@ -5531,6 +5549,10 @@ def chat_stream(payload: ChatRequest):
                 planner_enabled=payload.planner_enabled,
                 planner_max_queries=payload.planner_max_queries,
                 progress_enabled=False,
+                assistant_mode=payload.assistant_mode,
+                history=[message.model_dump() for message in payload.history],
+                electronics_max_live_dc_voltage=ELECTRONICS_CONFIG["max_live_dc_voltage"],
+                electronics_measurement_tolerance_percent=ELECTRONICS_CONFIG["measurement_tolerance_percent"],
             )
             if hasattr(engine, "ask_stream_events"):
                 for event in engine.ask_stream_events(question):

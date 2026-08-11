@@ -135,6 +135,13 @@ planner_enabled = true
 planner_max_queries = 3
 system_prompt = """You are a retrieval-augmented assistant. Before answering, you must call search_local_context at least once. You may call search_local_context again with a narrower query when more evidence is needed. {web_instruction} Use only information returned by tools. In the final answer, cite every factual claim with source IDs exactly as provided, such as [S1] or [W1]. If the available sources are insufficient, say what is missing."""
 
+[electronics]
+# Advisory boundary for energized troubleshooting. Circuits above this value
+# remain parseable, but the assistant must not provide energized probing steps.
+max_live_dc_voltage = 60.0
+# Default comparison band for calculated voltage/current versus bench readings.
+measurement_tolerance_percent = 5.0
+
 [server]
 host = "127.0.0.1"
 port = 8000

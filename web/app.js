@@ -72,6 +72,7 @@ const CHAT_UI_STORAGE_KEY = "rag.chatUi.v1";
 const API_KEY_STORAGE_KEY = "rag.apiKey.v1";
 const CHAT_HISTORY_LIMIT = 30;
 const CHAT_MESSAGE_LIMIT = 120;
+const CHAT_REQUEST_HISTORY_LIMIT = 24;
 const TUTORIAL_SEEN_COOKIE = "rag_tutorial_seen";
 const SITE_VERSION_COOKIE = "rag_site_version";
 const REVIEWER_NAME_COOKIE = "rag_reviewer_name";
@@ -151,6 +152,8 @@ const els = {
   maxOutputInput: document.getElementById("maxOutputInput"),
   relevanceFloorInput: document.getElementById("relevanceFloorInput"),
   webSearchInput: document.getElementById("webSearchInput"),
+  assistantModeSelect: document.getElementById("assistantModeSelect"),
+  electronicsExamples: document.getElementById("electronicsExamples"),
   sendButton: document.getElementById("sendButton"),
   chatLayout: document.getElementById("chatLayout"),
   chatSidebar: document.getElementById("chatSidebar"),
@@ -1001,6 +1004,7 @@ function loadChatState() {
             customTitle: Boolean(chat.customTitle),
             createdAt: String(chat.createdAt || nowIso()),
             updatedAt: String(chat.updatedAt || nowIso()),
+            assistantMode: chat.assistantMode === "electronics" ? "electronics" : "rag",
             messages: Array.isArray(chat.messages) ? chat.messages : [],
           }))
       : [];
@@ -1064,6 +1068,7 @@ function createChat({ activate = true, persist = true } = {}) {
     customTitle: false,
     createdAt: nowIso(),
     updatedAt: nowIso(),
+    assistantMode: "rag",
     messages: [],
   };
   state.chats.unshift(chat);
@@ -1222,6 +1227,7 @@ function renderActiveChat() {
   if (!chat) {
     return;
   }
+  applyAssistantMode(chat.assistantMode || "rag");
   for (const message of chat.messages) {
     if (message.role === "assistant") {
       addSavedAssistantMessage(message);
@@ -1230,6 +1236,15 @@ function renderActiveChat() {
     }
   }
   scrollChatToBottom(true);
+}
+
+function applyAssistantMode(mode) {
+  const normalized = mode === "electronics" ? "electronics" : "rag";
+  els.assistantModeSelect.value = normalized;
+  els.electronicsExamples.hidden = normalized !== "electronics";
+  els.questionInput.placeholder = normalized === "electronics"
+    ? "Describe the symptom, circuit text, and any measurements"
+    : "Ask a question";
 }
 
 async function refreshHealth() {
@@ -4116,6 +4131,10 @@ async function sendQuestion(event) {
   state.streamingChatId = chat.id;
   const abortController = new AbortController();
   state.chatAbortController = abortController;
+  const requestHistory = chat.messages
+    .filter((message) => ["user", "assistant"].includes(message.role) && String(message.text || "").trim())
+    .slice(-CHAT_REQUEST_HISTORY_LIMIT)
+    .map((message) => ({ role: message.role, text: String(message.text).slice(0, 8000) }));
   addUserMessageToChat(chat, question);
   addMessage("You", question);
   const assistantParts = addAssistantMessage();
@@ -4136,6 +4155,8 @@ async function sendQuestion(event) {
         llm_num_predict: Math.trunc(numericSetting(els.maxOutputInput, 4096, 1)),
         retrieval_min_score: numericSetting(els.relevanceFloorInput, 0.5, 0),
         web_search_enabled: Boolean(els.webSearchInput.checked),
+        assistant_mode: chat.assistantMode === "electronics" ? "electronics" : "rag",
+        history: requestHistory,
       }),
     });
     if (!response.ok || !response.body) {
@@ -4730,6 +4751,21 @@ els.newChatButton.addEventListener("click", () => {
     return;
   }
   createChat({ activate: true });
+});
+els.assistantModeSelect.addEventListener("change", () => {
+  if (state.streamingChatId) {
+    applyAssistantMode(activeChat()?.assistantMode || "rag");
+    return;
+  }
+  const chat = activeChat();
+  if (!chat) {
+    return;
+  }
+  chat.assistantMode = els.assistantModeSelect.value === "electronics" ? "electronics" : "rag";
+  touchChat(chat);
+  applyAssistantMode(chat.assistantMode);
+  persistChatState();
+  renderSavedChats();
 });
 els.collapseChatSidebarButton.addEventListener("click", () => setChatSidebarCollapsed(true));
 els.expandChatSidebarButton.addEventListener("click", () => setChatSidebarCollapsed(false));

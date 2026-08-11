@@ -1037,6 +1037,19 @@ def test_chat_config_reads_prompt_retrieval_and_ollama_health_settings(workspace
     }
 
 
+def test_electronics_config_reads_advisory_scope_and_tolerance(workspace_tmp):
+    config_path = workspace_tmp / "config.toml"
+    config_path.write_text(
+        "[electronics]\nmax_live_dc_voltage = 48\nmeasurement_tolerance_percent = 2.5\n",
+        encoding="utf-8",
+    )
+
+    assert web_app._load_electronics_config(config_path) == {
+        "max_live_dc_voltage": 48.0,
+        "measurement_tolerance_percent": 2.5,
+    }
+
+
 def test_health_exposes_server_polling_config(monkeypatch):
     monkeypatch.setattr(
         web_app,
@@ -3656,6 +3669,11 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
             "llm_num_predict": 512,
             "web_search_enabled": False,
             "retrieval_min_score": 0.73,
+            "assistant_mode": "electronics",
+            "history": [
+                {"role": "user", "text": "The divider uses two 1k resistors."},
+                {"role": "assistant", "text": "What is the supply voltage?"},
+            ],
         },
     )
 
@@ -3689,6 +3707,12 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
     assert events[1][1]["llm_num_predict"] == 512
     assert events[1][1]["llm_timeout"] == 120.0
     assert events[1][1]["web_search_enabled"] is False
+    assert events[1][1]["assistant_mode"] == "electronics"
+    assert events[1][1]["history"] == [
+        {"role": "user", "text": "The divider uses two 1k resistors."},
+        {"role": "assistant", "text": "What is the supply voltage?"},
+    ]
+    assert events[1][1]["electronics_max_live_dc_voltage"] == 60.0
     assert events[1][1]["retrieval_candidate_k"] == 80
     assert events[1][1]["retrieval_min_score"] == 0.73
     assert events[1][1]["retrieval_relative_cutoff"] == 0.72

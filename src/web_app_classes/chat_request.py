@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from src._class_module_support import bind_module_namespace, finalize_split_class
@@ -10,6 +12,11 @@ bind_module_namespace(
     globals(),
     proxy_functions=_source_module._CLASS_MODULE_PROXY_FUNCTIONS,
 )
+
+
+class ChatHistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    text: str = Field(min_length=1, max_length=8000)
 
 
 class ChatRequest(BaseModel):
@@ -36,6 +43,8 @@ class ChatRequest(BaseModel):
     planner_model: str | None = CHAT_CONFIG["planner_model"]
     planner_enabled: bool = CHAT_CONFIG["planner_enabled"]
     planner_max_queries: int | None = Field(CHAT_CONFIG["planner_max_queries"], ge=0, le=20)
+    assistant_mode: Literal["rag", "electronics"] = "rag"
+    history: list[ChatHistoryMessage] = Field(default_factory=list, max_length=24)
 
 ChatRequest.__module__ = _source_module.__name__
 finalize_split_class(_source_module, ChatRequest)
