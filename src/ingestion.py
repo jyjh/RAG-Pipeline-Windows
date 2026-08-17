@@ -128,10 +128,48 @@ DisabledVisionDescriber = import_split_class("src.ingestion_classes.disabled_vis
 DisabledVisionDescriber.__module__ = __name__
 
 
+class _GenerateResponse:
+    """Minimal stand-in for ``ollama``'s ``GenerateResponse``.
+
+    Callers read ``.response`` (the generated text). The SoCLAaS vision path
+    returns one of these so the active describer code is unchanged.
+    """
+
+    def __init__(self, text: str = ""):
+        self.response = text or ""
+
+
 def _ollama_generate(*args, **kwargs):
+    """Dispatch a generate/vision call to the active backend.
+
+    SoCLAaS path (primary): vision via ``/v1/chat/completions`` ``image_url``
+    parts. Ollama path (dormant fallback): the ``ollama`` python client. Returns
+    an object exposing ``.response`` either way. ``keep_alive`` warm-up calls
+    are Ollama VRAM-management no-ops; against the hosted API (which loads
+    models server-side) they return an empty response without a network call.
+    """
+    from src import llm_api
+
+    if llm_api.is_soclaas():
+        return _soclaas_generate(**kwargs)
     import ollama
 
     return ollama.generate(*args, **kwargs)
+
+
+def _soclaas_generate(*, model, prompt=None, images=None, options=None, keep_alive=None, **_unused):
+    """SoCLAaS generate/vision adapter (OpenAI chat-completions image_url parts)."""
+    from src import llm_api
+
+    images = images or []
+    # Warm-up call (prompt like "Hello" with keep_alive): skip -- the hosted API
+    # pins models server-side, so there is nothing to pre-load locally.
+    if keep_alive is not None and not images:
+        return _GenerateResponse("")
+    text = llm_api.soclaas_vision(
+        model=model, prompt=prompt or "", images_b64=list(images), options=options
+    )
+    return _GenerateResponse(text)
 
 
 def _pdf_components():

@@ -110,29 +110,19 @@ def test_nus_hpc_pbs_script_exists_and_valid():
     assert "singularity exec" in content
     assert "--nv" in content
     assert "-B /hpctmp/${USER}:/hpctmp/${USER}" in content
-    assert "ollama serve" in content
-    assert "/api/version" in content
+    # The CPU ingest job embeds via the SoCLAaS API (bge-m3) -- it no longer runs
+    # `ollama serve`, pre-pulls models, or probes /api/version. Check the
+    # command forms (the on-disk file documents this in comments).
+    assert "ollama serve >" not in content
+    assert "ollama pull" not in content
+    assert "/api/version" not in content
     assert "scripts/bulk_ingest.py" in content
+    assert "SOCLAAS_API_KEY" in content
 
     # Walltime must be set (a cold index takes hours; the cluster default is
     # often too short and kills the job).
     assert re.search(r"#PBS -l walltime=\d{1,4}:\d{2}:\d{2}", content), \
         "ingest .pbs must declare a walltime"
-
-    # Model store must NOT live under the wiped per-job scratch. The cleanup
-    # trap does `rm -rf ${SCRATCH_DIR}`, so OLLAMA_MODELS must point elsewhere
-    # (a persistent shared path, here bind-mounted at /srv/ollama_models) or
-    # every job re-downloads multi-GB models.
-    assert "OLLAMA_MODELS=\"/srv/ollama_models\"" in content, \
-        "OLLAMA_MODELS must be bind-mounted to a persistent path, not scratch"
-    assert "OLLAMA_MODELS_DIR" in content, \
-        "ingest .pbs must read OLLAMA_MODELS_DIR (persistent store override)"
-
-    # Pre-pull step: the pipeline depends on these tags; a bogus tag should
-    # fail loudly here, not deep in the embedding loop.
-    assert "ollama pull" in content
-    assert "nomic-embed-text" in content
-    assert "gemma4" in content
 
 
 def test_tunnel_daemon_sh_exists_and_valid():
@@ -237,11 +227,13 @@ def test_hpc_cli_parsing_and_pbs_template_generation():
     assert "CONTAINER_SIF=\"${CONTAINER_SIF:-custom_rag.sif}\"" in overridden_pbs
     assert "python3 scripts/bulk_ingest.py --input-dir \"custom_data\"" in overridden_pbs
 
-    # The generator must mirror the persistence + walltime + pull fixes that
-    # the on-disk .pbs now carries, so regenerated jobs do not regress.
-    assert "OLLAMA_MODELS=\"/srv/ollama_models\"" in overridden_pbs
+    # The CPU ingest generator no longer runs Ollama: embeddings come from the
+    # SoCLAaS API. Regenerated jobs must carry the API-key step + walltime and
+    # must NOT regress to `ollama serve`/`ollama pull`.
+    assert "SOCLAAS_API_KEY" in overridden_pbs
     assert re.search(r"#PBS -l walltime=\d{1,4}:\d{2}:\d{2}", overridden_pbs)
-    assert "ollama pull" in overridden_pbs
+    assert "ollama pull" not in overridden_pbs
+    assert "ollama serve" not in overridden_pbs
 
     # New CLI surface: --serve, --walltime, -o/--output.
     serve_args = parse_hpc_args(["--serve", "--walltime", "04:00:00", "-o", "x.pbs"])
@@ -301,6 +293,9 @@ def test_probe_ollama_endpoints_and_recovery(monkeypatch):
 
 
 def test_web_app_health_and_metrics_endpoints_ollama_status(monkeypatch):
+    # Exercise the dormant Ollama branch of the status snapshot (the default
+    # SoCLAaS backend has its own coverage in tests/test_llm_api.py).
+    monkeypatch.setenv("LLM_BACKEND", "ollama")
     monkeypatch.setattr(
         local_rag,
         "_ollama_host",
@@ -437,7 +432,9 @@ def test_hpc_generators_accept_legitimate_values():
     assert "#PBS -l select=1:ncpus=16:mem=64gb:ngpus=2" in ok
     assert "#PBS -l walltime=12:00:00" in ok
     assert "/hpctmp/${USER}/pdfs" in ok
-    assert "${HOME}/ollama_models" in ok
+    # ollama_models_dir is accepted (validated) for backward compat even though
+    # the CPU template no longer interpolates it (embeddings now via SoCLAaS API).
+    assert "SOCLAAS_API_KEY" in ok
 
     serve_ok = generate_serve_pbs_script(
         ollama_host_file="${HOME}/.rag_ollama_serving_host",
@@ -602,16 +599,17 @@ def test_singularity_cpu_def_exists_and_valid():
     # CPU torch wheels (not the cu121 index the GPU recipe uses).
     assert "https://download.pytorch.org/whl/cpu" in content
 
-    # Same app stack as the GPU recipe so both images run the same pipeline.
-    for dep in ("docling~=2.105.0", "lancedb~=0.33.0", "ollama~=0.6.2",
-                "onnxruntime~=1.27.0", "fastapi~=0.138.0", "python3"):
+    # The CPU ingest job embeds via the SoCLAaS API (bge-m3) -- it does NOT need
+    # the `ollama` python package or the Ollama binary. urllib3 is the HTTP
+    # transport for the API client.
+    for dep in ("docling~=2.105.0", "lancedb~=0.33.0",
+                "onnxruntime~=1.27.0", "fastapi~=0.138.0", "urllib3~=2.5.0", "python3"):
         assert dep in content, f"CPU recipe missing {dep}"
-    # OCR/PDF system deps identical to GPU recipe, plus zstd (the Ollama
-    # installer needs it to extract its .tar.zst).
+    assert "ollama~=0.6.2" not in content, "CPU image no longer pins ollama (SoCLAaS API path)"
+    # OCR/PDF system deps. zstd is retained for Docling/general use.
     for pkg in ("poppler-utils", "tesseract-ocr", "libgl1", "libglib2.0-0", "zstd"):
         assert pkg in content
-    # Ollama standalone binary install: install.sh primary, .tar.zst fallback.
-    assert "install.sh" in content
-    assert "ollama-linux-amd64.tar.zst" in content, \
-        "fallback must be the current .tar.zst asset, not the dead .tar.gz URL"
-    assert "tar --zstd -xf" in content
+    # No Ollama binary install in the CPU image.
+    assert "install.sh" not in content
+    assert "ollama-linux-amd64.tar.zst" not in content
+    assert "export OLLAMA_HOST" not in content

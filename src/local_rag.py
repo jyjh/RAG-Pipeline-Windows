@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from src.atomic_io import write_json_atomic
+from src import llm_api
 from src.sectioning import (
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_CHUNK_TARGET_TOKENS,
@@ -38,6 +39,7 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_get_ollama_candidate_hosts",
     "probe_ollama_endpoints",
     "_ollama_chat",
+    "_llm_chat",
     "_ollama_chat_request",
     "_ollama_health_request",
     "_ollama_server_healthy",
@@ -109,7 +111,8 @@ DEFAULT_WEB_SEARCH_TIMEOUT = 8.0
 DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL = 5.0
 DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS = 5
-DEFAULT_PLANNER_MODEL = "qwen2.5:1.5b"
+# SoCLAaS exposes only three models, so the planner reuses the main chat model.
+DEFAULT_PLANNER_MODEL = "gemma4:26b"
 DEFAULT_PLANNER_MAX_QUERIES = 3
 DEFAULT_PLANNER_TIMEOUT = 30.0
 DEFAULT_PLANNER_TEMPERATURE = 0.0
@@ -313,6 +316,40 @@ def _ollama_chat(
     )
 
 
+def _llm_chat(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    options: dict[str, int | float],
+    stream: bool,
+    timeout: float | None = None,
+    health_check_interval: float = DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL,
+    max_lost_health_checks: int = DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
+    tools: list[dict[str, Any]] | None = None,
+):
+    """Dispatch a chat request to the active backend (SoCLAaS, or dormant Ollama).
+
+    Same contract as ``_ollama_chat``: dict for non-stream, iterator for stream.
+    The SoCLAaS path returns OpenAI-shaped dicts; the ``_ollama_response_*``
+    extractors are shape-agnostic so callers consume either uniformly.
+    """
+    if llm_api.is_soclaas():
+        if stream:
+            return llm_api.soclaas_chat_stream(
+                model=model, messages=messages, options=options,
+                tools=tools, timeout=timeout,
+            )
+        return llm_api.soclaas_chat_once(
+            model=model, messages=messages, options=options,
+            tools=tools, timeout=timeout,
+        )
+    return _ollama_chat(
+        model=model, messages=messages, options=options, stream=stream,
+        timeout=timeout, health_check_interval=health_check_interval,
+        max_lost_health_checks=max_lost_health_checks, tools=tools,
+    )
+
+
 def _ollama_chat_request(payload: dict[str, Any]):
     data = json.dumps(payload).encode("utf-8")
     return urllib.request.Request(
@@ -460,58 +497,72 @@ def _bounded_float(value: float | str | None, default: float, *, minimum: float 
     return min(maximum, max(minimum, _positive_float(value, default)))
 
 
-def _ollama_response_content(response: Any) -> str:
-    if isinstance(response, dict):
-        message = response.get("message") or {}
-        if isinstance(message, dict):
-            return message.get("content") or ""
-        return getattr(message, "content", "") or ""
+def _choice_part(response: Any) -> dict[str, Any] | None:
+    """OpenAI ``choices[0].message`` (non-stream) or ``.delta`` (stream); None if not OpenAI-shaped."""
+    if not isinstance(response, dict):
+        return None
+    choices = response.get("choices")
+    if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
+        return None
+    msg = choices[0]
+    part = msg.get("message") if isinstance(msg.get("message"), dict) else msg.get("delta")
+    return part if isinstance(part, dict) else None
 
-    message = getattr(response, "message", None)
+
+def _ollama_response_content(response: Any) -> str:
+    """Assistant text: OpenAI choices[0].message/.delta ``content``, else Ollama ``message.content``."""
+    part = _choice_part(response)
+    if part is not None:
+        return str(part.get("content") or "")
+    message = response.get("message") if isinstance(response, dict) else getattr(response, "message", None)
     if isinstance(message, dict):
         return message.get("content") or ""
     return getattr(message, "content", "") or ""
 
 
 def _ollama_response_thinking(response: Any) -> str:
+    """Reasoning text from thinking/reasoning/reasoning_content (Ollama or OpenAI shape)."""
     fields = ("thinking", "reasoning", "reasoning_content")
+    # OpenAI choices[0].message/.delta first, then Ollama message, then top-level
+    # (Ollama streams reasoning at the top level), then the object fallback.
+    part = _choice_part(response)
+    candidates = [p for p in [part] if p]
     if isinstance(response, dict):
-        message = response.get("message") or {}
-        if isinstance(message, dict):
-            for field in fields:
-                if message.get(field):
-                    return str(message[field])
+        msg = response.get("message")
+        if isinstance(msg, dict):
+            candidates.append(msg)
+        candidates.append(response)
+    for src in candidates:
         for field in fields:
-            if response.get(field):
-                return str(response[field])
-        return ""
-
-    message = getattr(response, "message", None)
-    if isinstance(message, dict):
+            if src.get(field):
+                return str(src[field])
+    for src in (getattr(response, "message", None), response):
         for field in fields:
-            if message.get(field):
-                return str(message[field])
-    else:
-        for field in fields:
-            value = getattr(message, field, None)
+            value = getattr(src, field, None) if src is not None else None
             if value:
                 return str(value)
-
-    for field in fields:
-        value = getattr(response, field, None)
-        if value:
-            return str(value)
     return ""
 
 
 def _ollama_done_reason(response: Any) -> str:
+    """Done reason: Ollama ``done_reason`` or OpenAI ``choices[0].finish_reason``."""
     if isinstance(response, dict):
-        return str(response.get("done_reason") or "")
+        if response.get("done_reason"):
+            return str(response["done_reason"])
+        choices = response.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            return str(choices[0].get("finish_reason") or "")
+        return ""
     return str(getattr(response, "done_reason", "") or "")
 
 
 def _ollama_response_message(response: Any) -> dict[str, Any]:
+    """Assistant message dict: Ollama ``message`` or OpenAI ``choices[0].message``."""
     if isinstance(response, dict):
+        choices = response.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            msg = choices[0].get("message")
+            return dict(msg) if isinstance(msg, dict) else {}
         message = response.get("message") or {}
         return dict(message) if isinstance(message, dict) else {}
     message = getattr(response, "message", None)
@@ -627,7 +678,7 @@ def generate_search_queries(
     ]
     options = {"temperature": temperature, "num_predict": DEFAULT_PLANNER_NUM_PREDICT}
     try:
-        response = _ollama_chat(
+        response = _llm_chat(
             model=model,
             messages=messages,
             options=options,

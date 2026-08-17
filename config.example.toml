@@ -5,11 +5,15 @@ db_dir = "db"
 asset_dir = "db/assets"
 
 [models]
-llm_model = "gemma4"
-vision_model = "qwen2.5vl:7b"
-embedding_model = "nomic-embed-text"
+# SoCLAaS API models (https://soclaas-api.comp.nus.edu.sg). All neural work --
+# chat, vision, embeddings -- is served by the hosted API; see [llm_api].
+llm_model = "gemma4:26b"
+vision_model = "qwen3-vl:32b"
+embedding_model = "bge-m3"
 reranker_model = ""
-embedding_dim = 768
+# bge-m3 dense dim. Changing model/dim invalidates an existing index (a full
+# re-index is required); the indexer's model+dim reuse guard enforces it.
+embedding_dim = 1024
 
 [ingestion]
 ocr_backend = "rapidocr"
@@ -120,6 +124,26 @@ provider = "duckduckgo_lite"
 timeout_seconds = 8.0
 max_results = 5
 
+# Hosted OpenAI-compatible LLM API (SoCLAaS). This is the PRIMARY backend for
+# chat (gemma4:26b), vision (qwen3-vl:32b, via chat-completions image parts),
+# and embeddings (bge-m3, 1024-d). Set backend = "ollama" to fall back to a
+# local Ollama server for fully-offline operation (the Ollama transport stays
+# in the tree for that).
+[llm_api]
+backend = "soclaas"
+base_url = "https://soclaas-api.comp.nus.edu.sg"
+api_key = ""
+# The key is read from api_key above, but the env var named in key_env
+# (default SOCLAAS_API_KEY; LLM_API_KEY is also honored) overrides it, so a
+# secret need not live in this file.
+chat_path = "/v1/chat/completions"
+embeddings_path = "/v1/embeddings"
+models_path = "/v1/models"
+request_timeout_seconds = 120.0
+retries = 3
+
+# DORMANT FALLBACK: only used when [llm_api].backend = "ollama". Points the
+# chat/vision/embedding transports at a local Ollama server for offline runs.
 [ollama]
 host = "http://127.0.0.1:11434"
 hosts = []
@@ -130,7 +154,8 @@ chat_max_lost_health_checks = 5
 [chat]
 context_window = 8192
 llm_num_predict = 4096
-planner_model = "qwen2.5:1.5b"
+# SoCLAaS exposes only three models, so the planner reuses the main chat model.
+planner_model = "gemma4:26b"
 planner_enabled = true
 planner_max_queries = 3
 system_prompt = """You are a retrieval-augmented assistant. Before answering, you must call search_local_context at least once. You may call search_local_context again with a narrower query when more evidence is needed. {web_instruction} Use only information returned by tools. In the final answer, cite every factual claim with source IDs exactly as provided, such as [S1] or [W1]. If the available sources are insufficient, say what is missing."""
@@ -204,6 +229,11 @@ ncpus = 16
 mem = "32gb"
 walltime = "12:00:00"
 
+# DEPRECATED: the GPU-cluster Ollama *serving* job is obsolete now that LLM
+# serving runs on the hosted SoCLAaS API ([llm_api]). This section, the
+# ``generate_serve_pbs_script`` / ``submit_serve_job`` code, and the SSH tunnel
+# daemon are retained for reference/revert only and are no longer wired by the
+# setup wizard. The CPU ingest/index cluster ([hpc.cpu]) stays in active use.
 [hpc.gpu]
 ssh_host = ""
 # Login-relative symlink created by setup; its target lives under

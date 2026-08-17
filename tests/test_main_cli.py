@@ -163,7 +163,7 @@ def test_main_index_dispatches_to_current_indexing(monkeypatch):
         "md_dir": "md_in",
         "db_dir": "db_out",
         "progress_enabled": True,
-        "embedding_model": "nomic-embed-text",
+        "embedding_model": "bge-m3",
         "embedding_batch_size": 128,
         "embedding_timeout": 30.0,
         "index_backend": "lancedb",
@@ -186,6 +186,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys, tmp_
             embedding_model,
             embedding_batch_size,
             embedding_timeout,
+            embedding_dim,
             llm_num_predict,
             llm_timeout,
             temperature,
@@ -212,6 +213,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys, tmp_
             calls["embedding_model"] = embedding_model
             calls["embedding_batch_size"] = embedding_batch_size
             calls["embedding_timeout"] = embedding_timeout
+            calls["embedding_dim"] = embedding_dim
             calls["llm_num_predict"] = llm_num_predict
             calls["llm_timeout"] = llm_timeout
             calls["temperature"] = temperature
@@ -257,9 +259,10 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys, tmp_
         "working_dir": "db_in",
         "asset_dir": "db/assets",
         "model": "custom-model",
-        "embedding_model": "nomic-embed-text",
+        "embedding_model": "bge-m3",
         "embedding_batch_size": 128,
         "embedding_timeout": 30.0,
+        "embedding_dim": 1024,
         "llm_num_predict": 4096,
         "llm_timeout": 120.0,
         "temperature": 0.3,
@@ -275,7 +278,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys, tmp_
         "ollama_health_check_interval": 5.0,
         "ollama_max_lost_health_checks": 5,
         "system_prompt": None,
-        "planner_model": "qwen2.5:1.5b",
+        "planner_model": "gemma4:26b",
         "planner_enabled": True,
         "planner_max_queries": 3,
         "progress_enabled": True,

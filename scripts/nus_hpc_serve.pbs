@@ -1,4 +1,8 @@
 #!/bin/bash
+# DEPRECATED: LLM serving now runs on the hosted SoCLAaS API ([llm_api] in
+# config.toml), so this long-lived Ollama GPU serving job + SSH tunnel flow is
+# obsolete. This file is retained for reference/revert; the setup wizard no
+# longer submits it. Do not use in new deployments.
 #PBS -N rag_ollama_serve
 #PBS -l select=1:ncpus=4:mem=16gb:ngpus=1
 #PBS -l walltime=08:00:00

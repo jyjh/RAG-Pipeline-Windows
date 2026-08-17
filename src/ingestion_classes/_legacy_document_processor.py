@@ -11,7 +11,7 @@ bind_module_namespace(
 
 
 class _LegacyDocumentProcessor:
-    def __init__(self, vision_model="qwen2.5vl:7b"):
+    def __init__(self, vision_model=DEFAULT_VISION_MODEL):
         self.vision_model = vision_model
         self._vision_model_loaded = False
 

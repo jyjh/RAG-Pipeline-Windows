@@ -149,6 +149,8 @@ chat_max_lost_health_checks = 4
 
 
 def test_health_and_metrics_endpoints_ollama_status(monkeypatch):
+    # Exercise the dormant Ollama branch of the status snapshot.
+    monkeypatch.setenv("LLM_BACKEND", "ollama")
     monkeypatch.setattr(
         local_rag,
         "_ollama_host",

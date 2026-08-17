@@ -51,6 +51,7 @@ def test_query_engine_delegates_to_local_query_engine(monkeypatch):
             "embedding_model": "nomic-embed-text",
             "embedding_batch_size": 4,
             "embedding_timeout": 12.0,
+            "embedding_dim": None,
             "num_predict": 256,
             "llm_timeout": 45.0,
             "temperature": 0.7,

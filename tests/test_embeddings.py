@@ -1,5 +1,15 @@
 import numpy as np
+import pytest
+
 from src.embeddings import EmbeddingEngine
+
+
+# These tests exercise the dormant local-Ollama embedding transport (they patch
+# the `_ollama_api` seam). Force that backend so the seam is on the active path;
+# the SoCLAaS API path has its own coverage in tests/test_llm_api.py.
+@pytest.fixture(autouse=True)
+def _force_ollama_backend(monkeypatch):
+    monkeypatch.setenv("LLM_BACKEND", "ollama")
 
 
 def test_ollama_embeddings_use_local_ollama_api(monkeypatch):

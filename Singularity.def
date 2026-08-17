@@ -1,3 +1,7 @@
+# DEPRECATED: this GPU image exists only to serve the obsolete Ollama GPU
+# serving job (scripts/nus_hpc_serve.pbs). LLM serving now runs on the hosted
+# SoCLAaS API ([llm_api] in config.toml). Retained for reference/revert; new
+# deployments should use Singularity.cpu.def (CPU ingest/index + SoCLAaS).
 Bootstrap: docker
 From: nvidia/cuda:12.1.1-devel-ubuntu22.04
 

@@ -17,16 +17,23 @@ bind_module_namespace(
 
 
 class LocalQueryEngine:
+    # Class-level fallbacks so instances built via ``__new__`` (e.g. unit tests
+    # that wire fakes directly, bypassing ``__init__``) still have sensible
+    # values. ``__init__`` overrides these with the configured values.
+    embedding_dim: int = 1024
+    query_prefix: str = ""
+
     def __init__(
         self,
         working_dir: str = "./db",
         *,
         asset_dir: str | Path | None = None,
         trust_path: str | Path | None = None,
-        model: str = "gemma4",
-        embedding_model: str = "nomic-embed-text",
+        model: str = "gemma4:26b",
+        embedding_model: str = "bge-m3",
         embedding_batch_size: int | None = None,
         embedding_timeout: float | None = None,
+        embedding_dim: int | None = None,
         progress_enabled: bool = True,
         top_k: int | None = None,
         num_predict: int | None = None,
@@ -171,8 +178,42 @@ class LocalQueryEngine:
             ollama_batch_size=embedding_batch_size,
             ollama_timeout=embedding_timeout,
         )
+        # bge-m3 is 1024-d (was 768 for nomic). Resolve the configured dim and
+        # the query prefix (instruction-free for bge-m3) once; a mismatch with
+        # an existing index is caught at query time (see _ensure_compatible_dim).
+        from src import llm_api as _llm_api
+        from src.config import load_config
+        from src.defaults import DEFAULT_EMBEDDING_DIM
+
+        self.embedding_model = embedding_model
+        if embedding_dim is None:
+            try:
+                embedding_dim = int(load_config().models.embedding_dim)
+            except Exception:
+                embedding_dim = DEFAULT_EMBEDDING_DIM
+        self.embedding_dim = max(1, int(embedding_dim))
+        self.query_prefix = _llm_api.resolve_embedding_prefix(embedding_model, "query")
         self.store = default_store(working_dir, prefer_lancedb=True)
         self.record_count = self._load_record_count()
+
+    def _ensure_compatible_dim(self) -> None:
+        """Raise a clear re-index error if the index dim != configured dim.
+
+        A 768-d query vector against a 1024-d index (or vice versa) would error
+        or return garbage; fail loudly with the remedy instead.
+        """
+        try:
+            _model, dim = self.store.metadata()
+        except Exception:
+            return
+        if dim and int(dim) != self.embedding_dim:
+            raise RuntimeError(
+                f"Index embedding dimension ({dim}) does not match the configured "
+                f"dimension ({self.embedding_dim}) for embedding model "
+                f"'{self.embedding_model}'. The index was built with a different "
+                "embedding model/dimension -- a full re-index is required "
+                "(delete db/ and rebuild, or re-run the index job)."
+            )
 
     def _reliability_details(self, record: dict[str, Any]) -> dict[str, Any]:
         explicit_group = str(record.get("source_group") or "").strip()
@@ -352,11 +393,12 @@ class LocalQueryEngine:
         if not self.record_count:
             return []
         exclude_ids = exclude_ids or set()
+        self._ensure_compatible_dim()
 
         query_vector = self.engine.get_mrl_embeddings(
             [question],
-            truncate_dim=768,
-            prefix="search_query: ",
+            truncate_dim=self.embedding_dim,
+            prefix=self.query_prefix,
         )[0]
         candidates = self.store.search(
             query_vector.tolist(),
@@ -923,7 +965,7 @@ class LocalQueryEngine:
 
         for _ in range(self.tool_max_rounds):
             tools = self._tool_definitions(include_web_search=self._web_search_allowed(messages))
-            response = _ollama_chat(
+            response = _llm_chat(
                 model=self.model,
                 messages=messages,
                 options=self._ollama_options(),
@@ -1044,7 +1086,7 @@ class LocalQueryEngine:
                 f"health_interval={self.ollama_health_check_interval:g}s)",
                 enabled=self.progress_enabled,
             )
-            stream = _ollama_chat(
+            stream = _llm_chat(
                 model=self.model,
                 messages=messages,
                 options=self._ollama_options(),

@@ -40,6 +40,7 @@ def test_run_indexing_uses_local_vector_indexer(monkeypatch):
                 "embedding_model": "nomic-embed-text",
                 "embedding_batch_size": 2,
                 "embedding_timeout": 15.0,
+                "embedding_dim": None,
                 "index_backend": "lancedb",
                 "reuse_db_dir": None,
                 "summary_mode": "hybrid",

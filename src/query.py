@@ -1,5 +1,5 @@
 import logging
-from src.defaults import DEFAULT_LLM_MODEL
+from src.defaults import DEFAULT_LLM_MODEL, DEFAULT_EMBEDDING_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -11,9 +11,10 @@ class QueryEngine:
         asset_dir: str | None = None,
         trust_path: str | None = None,
         model=DEFAULT_LLM_MODEL,
-        embedding_model: str = "nomic-embed-text",
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         embedding_batch_size: int | None = None,
         embedding_timeout: float | None = None,
+        embedding_dim: int | None = None,
         llm_num_predict: int | None = None,
         llm_timeout: float | None = None,
         temperature: float | None = None,
@@ -44,6 +45,7 @@ class QueryEngine:
             embedding_model=embedding_model,
             embedding_batch_size=embedding_batch_size,
             embedding_timeout=embedding_timeout,
+            embedding_dim=embedding_dim,
             num_predict=llm_num_predict,
             llm_timeout=llm_timeout,
             temperature=temperature,

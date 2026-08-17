@@ -36,9 +36,10 @@ class LocalVectorIndexer:
         self,
         working_dir: str = "./db",
         *,
-        embedding_model: str = "nomic-embed-text",
+        embedding_model: str = "bge-m3",
         embedding_batch_size: int | None = None,
         embedding_timeout: float | None = None,
+        embedding_dim: int | None = None,
         index_backend: str = "lancedb",
         reuse_db_dir: str | None = None,
         summary_mode: str = "hybrid",
@@ -47,6 +48,9 @@ class LocalVectorIndexer:
         progress_enabled: bool = True,
     ):
         from src.embeddings import EmbeddingEngine
+        from src import llm_api as _llm_api
+        from src.config import load_config
+        from src.defaults import DEFAULT_EMBEDDING_DIM
 
         self.working_dir = working_dir
         self.reuse_db_dir = reuse_db_dir
@@ -64,9 +68,22 @@ class LocalVectorIndexer:
             embedding_batch_size or os.environ.get("LOCAL_RAG_EMBED_BATCH_SIZE"),
             128,
         )
+        # bge-m3 is 1024-d (was 768 for nomic). Threading the dim from config
+        # keeps the index, reuse guards, and manifest consistent; a model/dim
+        # change invalidates an existing index (full re-index required).
+        if embedding_dim is None:
+            try:
+                embedding_dim = int(load_config().models.embedding_dim)
+            except Exception:
+                embedding_dim = DEFAULT_EMBEDDING_DIM
+        self.embedding_dim = max(1, int(embedding_dim))
+        # bge-m3 is instruction-free (no "search_document:" prefix); nomic/e5
+        # keep their prefixes. Resolved once, reused for every batch.
+        self.doc_prefix = _llm_api.resolve_embedding_prefix(self.embedding_model, "doc")
+        backend_label = "SoCLAaS API" if _llm_api.is_soclaas() else "Ollama"
         _status(
-            f"Local index: using Ollama embedding model {self.embedding_model} "
-            f"(batch_size={self.embedding_batch_size})",
+            f"Local index: using {backend_label} embedding model {self.embedding_model} "
+            f"(dim={self.embedding_dim}, batch_size={self.embedding_batch_size})",
             enabled=progress_enabled,
         )
         self.engine = EmbeddingEngine(
@@ -76,19 +93,27 @@ class LocalVectorIndexer:
         )
 
     def _preflight_embeddings(self) -> None:
-        _status("Local index: checking Ollama embedding endpoint...", enabled=self.progress_enabled)
+        from src import llm_api as _llm_api
+        backend_label = "SoCLAaS API" if _llm_api.is_soclaas() else "Ollama"
+        _status(
+            f"Local index: checking {backend_label} embedding endpoint...",
+            enabled=self.progress_enabled,
+        )
         try:
             self.engine.get_mrl_embeddings(
                 ["embedding health check"],
                 truncate_dim=8,
-                prefix="search_document: ",
+                prefix=self.doc_prefix,
             )
         except Exception as exc:
             raise RuntimeError(
-                "Ollama embedding preflight failed. Restart Ollama, then retry. "
-                f"Original error: {exc}"
+                f"{backend_label} embedding preflight failed. Verify the endpoint "
+                f"and credentials, then retry. Original error: {exc}"
             ) from exc
-        _status("Local index: Ollama embedding endpoint responded.", enabled=self.progress_enabled)
+        _status(
+            f"Local index: {backend_label} embedding endpoint responded.",
+            enabled=self.progress_enabled,
+        )
 
     def _embed_texts(self, texts: list[str], *, file_name: str):
         import numpy as np
@@ -109,8 +134,8 @@ class LocalVectorIndexer:
             )
             batch_vectors = self.engine.get_mrl_embeddings(
                 batch,
-                truncate_dim=768,
-                prefix="search_document: ",
+                truncate_dim=self.embedding_dim,
+                prefix=self.doc_prefix,
             )
             vectors.extend(batch_vectors)
         return np.asarray(vectors)
@@ -122,7 +147,7 @@ class LocalVectorIndexer:
         max_records: int = 100_000,
     ) -> dict[str, dict[str, Any]]:
         # Safety ceiling: loading the entire index into RAM (one Python dict
-        # entry per record, each holding a 768-float vector) is only safe for
+        # entry per record, each holding an embedding_dim-float vector) is only safe for
         # small corpora. At 100GB-scale this would hold gigabytes of vectors and
         # OOM the process. The streaming indexer uses
         # :meth:`_reuse_candidates_for_source` (one source at a time) instead;
@@ -141,7 +166,7 @@ class LocalVectorIndexer:
                 )
                 return {}
             model, dim = store.metadata()
-            if model != self.embedding_model or dim != 768:
+            if model != self.embedding_model or dim != self.embedding_dim:
                 return {}
             candidates: dict[str, dict[str, Any]] = {}
             for record in store.all_records():
@@ -149,7 +174,7 @@ class LocalVectorIndexer:
                 vector = record.get("vector")
                 if not record_id or vector is None:
                     continue
-                if len(vector) != 768:
+                if len(vector) != self.embedding_dim:
                     continue
                 candidates[record_id] = {
                     "content_hash": index_record_content_hash(record),
@@ -180,7 +205,7 @@ class LocalVectorIndexer:
             return {}
         try:
             model, dim = store.metadata()
-            if model != self.embedding_model or dim != 768:
+            if model != self.embedding_model or dim != self.embedding_dim:
                 return {}
             candidates: dict[str, dict[str, Any]] = {}
             for record in store.vectors_by_source_hash([source_hash]):
@@ -188,7 +213,7 @@ class LocalVectorIndexer:
                 vector = record.get("vector")
                 if not record_id or vector is None:
                     continue
-                if len(vector) != 768:
+                if len(vector) != self.embedding_dim:
                     continue
                 candidates[record_id] = {
                     "content_hash": index_record_content_hash(record),
@@ -343,13 +368,13 @@ class LocalVectorIndexer:
                     source_hash=source_hash,
                     records=source_records,
                     embedding_model=self.embedding_model,
-                    embedding_dim=768,
+                    embedding_dim=self.embedding_dim,
                 )
             else:
                 store.append_records(
                     source_records,
                     embedding_model=self.embedding_model,
-                    embedding_dim=768,
+                    embedding_dim=self.embedding_dim,
                 )
             _merge_records_into_manifest(manifest, source_records)
 
@@ -468,10 +493,10 @@ class LocalVectorIndexer:
         store.append_records(
             [],
             embedding_model=self.embedding_model,
-            embedding_dim=768,
+            embedding_dim=self.embedding_dim,
         )
 
-        manifest = _empty_manifest(self.embedding_model, 768)
+        manifest = _empty_manifest(self.embedding_model, self.embedding_dim)
         # Stash the working dir so _merge_records_into_manifest can write
         # per-source content-hash sidecars next to the manifest.
         manifest["_working_dir"] = str(self.working_dir)
@@ -902,7 +927,7 @@ class LocalVectorIndexer:
                 source_hash=source_hash,
                 records=records,
                 embedding_model=self.embedding_model,
-                embedding_dim=768,
+                embedding_dim=self.embedding_dim,
             )
             source_updates[source_hash] = records
             changed_rows += len(records)
@@ -922,7 +947,7 @@ class LocalVectorIndexer:
             self.working_dir,
             source_updates,
             embedding_model=self.embedding_model,
-            embedding_dim=768,
+            embedding_dim=self.embedding_dim,
         )
 
         if had_ann:

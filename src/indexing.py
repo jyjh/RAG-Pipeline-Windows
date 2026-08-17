@@ -2,6 +2,8 @@
 import os
 import sys
 
+from src.defaults import DEFAULT_EMBEDDING_MODEL
+
 logger = logging.getLogger(__name__)
 
 
@@ -15,9 +17,10 @@ def run_indexing(
     db_dir: str,
     *,
     progress_enabled: bool = True,
-    embedding_model: str = "nomic-embed-text",
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     embedding_batch_size: int | None = None,
     embedding_timeout: float | None = None,
+    embedding_dim: int | None = None,
     index_backend: str = "lancedb",
     reuse_db_dir: str | None = None,
     summary_mode: str = "hybrid",
@@ -26,7 +29,7 @@ def run_indexing(
     source_hashes: list[str] | set[str] | None = None,
     resume: bool = False,
 ):
-    _progress_status("Starting Ollama local indexing pipeline...", enabled=progress_enabled)
+    _progress_status("Starting local indexing pipeline...", enabled=progress_enabled)
     _progress_status(f"Checking Markdown directory: {md_dir}", enabled=progress_enabled)
     if not os.path.isdir(md_dir):
         logger.warning("Markdown directory does not exist: %s", md_dir)
@@ -46,6 +49,7 @@ def run_indexing(
         embedding_model=embedding_model,
         embedding_batch_size=embedding_batch_size,
         embedding_timeout=embedding_timeout,
+        embedding_dim=embedding_dim,
         index_backend=index_backend,
         reuse_db_dir=reuse_db_dir,
         summary_mode=summary_mode,

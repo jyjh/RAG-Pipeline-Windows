@@ -46,8 +46,11 @@ from src.defaults import (
     DEFAULT_ASSET_TRIGGERS,
     DEFAULT_CODE_ENRICHMENT,
     DEFAULT_DOCLING_ACCELERATOR,
+    DEFAULT_EMBEDDING_DIM,
+    DEFAULT_EMBEDDING_MODEL,
     DEFAULT_FORMULA_ENRICHMENT,
     DEFAULT_LLM_MODEL,
+    DEFAULT_PLANNER_MODEL,
     DEFAULT_OCR_BACKEND,
     DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
     DEFAULT_OCR_FORCE_FULL_PAGE,
@@ -248,8 +251,9 @@ def _resolve_root_path(raw_path: Any, *, default: str | Path | None = None) -> P
     return path if path.is_absolute() else ROOT_DIR / path
 
 
-DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
-# Texts per Ollama embedding request. Raised from 64 -> 128: nomic-embed-text
+# DEFAULT_EMBEDDING_MODEL (bge-m3) and DEFAULT_EMBEDDING_DIM (1024) are imported
+# from src.defaults above -- bge-m3 dense dim replaces nomic-embed-text's 768.
+# Texts per embedding request. Raised from 64 -> 128: a larger batch amortizes
 # (~137M params) fits comfortably on a 20GB GPU, and a larger batch amortizes
 # the per-request overhead that dominates cold indexing at 100GB scale. The
 # Pydantic request models cap this at 256 (ge=1, le=256); override via
@@ -271,7 +275,7 @@ DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 DEFAULT_SYSTEM_PROMPT = DEFAULT_QUERY_SYSTEM_PROMPT
 DEFAULT_OLLAMA_CHAT_HEALTH_CHECK_INTERVAL = DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL
 DEFAULT_OLLAMA_CHAT_MAX_LOST_HEALTH_CHECKS = DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS
-DEFAULT_PLANNER_MODEL = "qwen2.5:1.5b"
+# DEFAULT_PLANNER_MODEL (gemma4:26b) is imported from src.defaults above.
 DEFAULT_PLANNER_ENABLED = True
 DEFAULT_PLANNER_MAX_QUERIES = 3
 DEFAULT_INDEX_BACKEND = "lancedb"
@@ -1837,7 +1841,7 @@ def _index_records_snapshot(db_dir: Path | None = None) -> tuple[list[dict[str, 
     result = (
         list(payload.get("rows") or []),
         str(payload.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
-        int(payload.get("embedding_dim") or 768),
+        int(payload.get("embedding_dim") or DEFAULT_EMBEDDING_DIM),
     )
     with _INDEX_CACHE_LOCK:
         _INDEX_RECORDS_SNAPSHOT_CACHE[cache_key] = (signature, result)
@@ -2183,7 +2187,7 @@ def update_index_record(
         store = _index_store(resolved_db_dir)
         record = store.get_record(record_id)
     model = embedding_model or record.get("embedding_model") or DEFAULT_EMBEDDING_MODEL
-    embedding_dim = int(record.get("embedding_dim") or len(record.get("vector") or []) or 768)
+    embedding_dim = int(record.get("embedding_dim") or len(record.get("vector") or []) or DEFAULT_EMBEDDING_DIM)
 
     from src.embeddings import EmbeddingEngine
 
@@ -3820,7 +3824,7 @@ def health(request: Request):
             record_count = store.count()
         except Exception:
             record_count = 0
-    ollama_snap = _ollama_status_snapshot()
+    ollama_snap = _llm_status_snapshot()
     payload = {
         "ok": True,
         "paths": {
@@ -3840,6 +3844,10 @@ def health(request: Request):
             "retrieval_min_score": CHAT_CONFIG["retrieval_min_score"],
         },
         "queue": job_queue.summary(),
+        "llm_backend": ollama_snap.get("llm_backend"),
+        "llm_base_url": ollama_snap.get("llm_base_url"),
+        "llm_api_key_configured": ollama_snap.get("llm_api_key_configured"),
+        "llm_reachable": ollama_snap.get("reachable"),
         "ollama_active_host": ollama_snap.get("ollama_active_host"),
         "ollama_candidate_hosts": ollama_snap.get("ollama_candidate_hosts"),
         "ollama_reachability": ollama_snap.get("ollama_reachability"),
@@ -3963,9 +3971,33 @@ def _positive_int_or(value: Any, default: int) -> int:
         return default
 
 
-def _ollama_status_snapshot() -> dict[str, Any]:
-    """Best-effort Ollama reachability snapshot for health and metrics endpoints."""
+def _llm_status_snapshot() -> dict[str, Any]:
+    """Backend-aware LLM reachability snapshot for health and metrics endpoints.
+
+    SoCLAaS (primary): probes ``/v1/models`` with the bearer key. Ollama
+    (dormant fallback): probes ``/api/version`` across candidate hosts. The
+    ``ollama_*`` keys are always populated (with the live endpoint under
+    SoCLAaS) so the existing health/metrics contract and UI keep working; the
+    ``llm_*`` keys expose the active backend.
+    """
+    from src import llm_api
+
     try:
+        if llm_api.is_soclaas():
+            snap = llm_api.soclaas_status_snapshot(timeout=2.0)
+            base_url = snap["base_url"]
+            reachable = bool(snap["reachable"])
+            return {
+                "backend": "soclaas",
+                "reachable": reachable,
+                "llm_backend": "soclaas",
+                "llm_base_url": base_url,
+                "llm_api_key_configured": bool(snap["api_key_configured"]),
+                "llm_detail": snap["detail"],
+                "ollama_active_host": base_url,
+                "ollama_candidate_hosts": [base_url],
+                "ollama_reachability": {base_url: reachable},
+            }
         from src.local_rag import (
             _ollama_host,
             _get_ollama_candidate_hosts,
@@ -3977,21 +4009,35 @@ def _ollama_status_snapshot() -> dict[str, Any]:
         reachability: dict[str, bool] = {}
         for h in candidate_hosts:
             reachability[h] = bool(_ollama_server_healthy(h, timeout=1.5))
-
         return {
+            "backend": "ollama",
             "reachable": reachability.get(active_host, False),
+            "llm_backend": "ollama",
+            "llm_base_url": active_host,
+            "llm_api_key_configured": True,
+            "llm_detail": "ok" if reachability.get(active_host, False) else "unreachable",
             "ollama_active_host": active_host,
             "ollama_candidate_hosts": candidate_hosts,
             "ollama_reachability": reachability,
         }
     except Exception as exc:
+        try:
+            backend = llm_api.active_backend()
+        except Exception:
+            backend = "soclaas"
         return {
+            "backend": backend,
             "reachable": False,
-            "ollama_active_host": "http://127.0.0.1:11434",
-            "ollama_candidate_hosts": ["http://127.0.0.1:11434"],
-            "ollama_reachability": {"http://127.0.0.1:11434": False},
+            "llm_backend": backend,
+            "ollama_active_host": "",
+            "ollama_candidate_hosts": [],
+            "ollama_reachability": {},
             "error": str(exc),
         }
+
+
+# Backwards-compatible alias; older code/internal references may use this name.
+_ollama_status_snapshot = _llm_status_snapshot
 
 
 @app.get("/api/update/status")

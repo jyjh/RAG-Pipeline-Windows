@@ -17,13 +17,41 @@ class PathsConfig:
 
 @dataclass
 class ModelConfig:
-    llm_model: str = "deepseek-r1:32b"
-    vision_model: str = "qwen2.5vl:7b"
-    embedding_model: str = "nomic-ai/nomic-embed-text-v1.5"
+    llm_model: str = "gemma4:26b"
+    vision_model: str = "qwen3-vl:32b"
+    embedding_model: str = "bge-m3"
     reranker_model: str = ""
-    embedding_dim: int = 768
+    # bge-m3 dense dim. Changing model/dim invalidates an existing index
+    # (full re-index required); the indexer's reuse guard enforces it.
+    embedding_dim: int = 1024
     allow_hash_embeddings: bool = True
     native_embeddings: bool = False
+
+
+@dataclass
+class LlmApiConfig:
+    """Hosted OpenAI-compatible LLM API (SoCLAaS) used as the primary backend.
+
+    ``backend`` selects the live backend: ``"soclaas"`` (default, hosted API)
+    or ``"ollama"`` (dormant local fallback for offline operation -- the Ollama
+    transport code is retained for this). The SoCLAaS paths cover chat, vision
+    (via chat-completions image parts), and embeddings (bge-m3, 1024-d,
+    instruction-free).
+
+    The API key is read from ``api_key`` here but the env var named in
+    ``key_env`` (default ``SOCLAAS_API_KEY``; ``LLM_API_KEY`` is also honored)
+    overrides it, so secrets need not live in the config file.
+    """
+
+    backend: str = "soclaas"
+    base_url: str = "https://soclaas-api.comp.nus.edu.sg"
+    api_key: str = ""
+    chat_path: str = "/v1/chat/completions"
+    embeddings_path: str = "/v1/embeddings"
+    models_path: str = "/v1/models"
+    request_timeout_seconds: float = 120.0
+    retries: int = 3
+    key_env: str = "SOCLAAS_API_KEY"
 
 
 @dataclass
@@ -113,6 +141,13 @@ class EmbeddingsConfig:
     # In-flight embedding batches per host. Set >1 when the Ollama server runs
     # with ``OLLAMA_NUM_PARALLEL>1``. 1 = one batch per host at a time.
     concurrency: int = 1
+    # Instruction prefixes prepended to document/query texts before embedding.
+    # Empty string = use the model's natural behaviour. bge-m3 is
+    # instruction-free (empty); nomic-embed-text/e5 want
+    # "search_document: " / "search_query: ". Left empty, the runtime
+    # auto-resolves per model (see src.llm_api.resolve_embedding_prefix).
+    doc_prefix: str = ""
+    query_prefix: str = ""
 
 
 @dataclass
@@ -170,9 +205,15 @@ class HpcConfig:
     as local ``main.py`` subprocesses exactly as before -- this section is a
     no-op. When enabled, the job queue submits a PBS ingest/index job to the
     free CPU cluster via ``ssh cpu.ssh_host qsub ...``, relays its progress, and
-    rsyncs the built ``db/`` back. The chat-serving Ollama job goes to the GPU
-    cluster via ``gpu.ssh_host``. See ``docs/HPC_DELEGATION.md`` and
+    rsyncs the built ``db/`` back. See ``docs/HPC_DELEGATION.md`` and
     ``src/hpc_backend.py``.
+
+    DEPRECATED: the ``gpu`` cluster field and the long-lived Ollama *serving*
+    job (``submit_serve_job``) are obsolete now that LLM serving runs on the
+    hosted SoCLAaS API (``[llm_api]``). The GPU serving code + ``[hpc.gpu]``
+    config are retained for reference/revert only; the setup wizard no longer
+    wires them. The CPU ingest/index path (``cpu``) stays and now calls the
+    SoCLAaS embeddings endpoint instead of a local Ollama server.
 
     Two clusters are configured independently under ``[hpc.cpu]`` and
     ``[hpc.gpu]`` because they are separate machines with separate login nodes.
@@ -210,6 +251,7 @@ class PipelineConfig:
     api_keys: ApiKeysConfig = field(default_factory=ApiKeysConfig)
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    llm_api: LlmApiConfig = field(default_factory=LlmApiConfig)
     hpc: HpcConfig = field(default_factory=HpcConfig)
 
     def ensure_dirs(self) -> None:

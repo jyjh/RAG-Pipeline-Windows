@@ -14,6 +14,8 @@ import urllib3
 from collections import OrderedDict
 from typing import Any
 
+from src import llm_api
+
 _OLLAMA_POOL = urllib3.PoolManager(
     num_pools=4,
     maxsize=10,
@@ -223,15 +225,23 @@ class EmbeddingEngine:
             self.model_name = model_name
 
         if self.native_embeddings:
-            logger.info("Using Native embedding model (SentenceTransformers): %s", model_name)
-            _status(f"Using Native embedding model (SentenceTransformers): {model_name}")
             self._init_native_model()
-        else:
-            logger.info("Using Ollama embedding model: %s", model_name)
-            _status(
-                f"Using Ollama embedding model: {model_name} "
-                f"(batch_size={self.ollama_batch_size}, timeout={self.ollama_timeout:g}s)"
-            )
+        # Resolve the active backend once (native may fall back on load failure),
+        # so the per-batch hot path branches on a cached string instead of
+        # re-reading config/env for every batch.
+        self._backend = (
+            "native" if self.native_embeddings and self._native_model is not None
+            else "soclaas" if llm_api.is_soclaas()
+            else "ollama"
+        )
+        label = {"native": "Native (SentenceTransformers)",
+                 "soclaas": "SoCLAaS API",
+                 "ollama": "Ollama"}[self._backend]
+        logger.info("Using %s embedding model: %s", label, model_name)
+        _status(
+            f"Using {label} embedding model: {model_name} "
+            f"(batch_size={self.ollama_batch_size}, timeout={self.ollama_timeout:g}s)"
+        )
 
     def _init_native_model(self):
         try:
@@ -281,8 +291,10 @@ class EmbeddingEngine:
 
         if to_compute_texts:
             prefixed = [f"{prefix}{text}" for text in to_compute_texts]
-            if self.native_embeddings and self._native_model is not None:
+            if self._backend == "native":
                 truncated = self._native_embeddings(prefixed, truncate_dim)
+            elif self._backend == "soclaas":
+                truncated = self._soclaas_embeddings(prefixed, truncate_dim)
             else:
                 truncated = self._ollama_embeddings(prefixed, truncate_dim)
 
@@ -301,80 +313,66 @@ class EmbeddingEngine:
         import numpy as np
         if not texts:
             return np.empty((0, truncate_dim), dtype=np.float32)
-        
-        vectors = self._native_model.encode(texts, batch_size=self.ollama_batch_size, convert_to_numpy=True)
-        if vectors.ndim == 1:
-            vectors = vectors.reshape(1, -1)
-            
-        if vectors.shape[1] < truncate_dim:
-            padded = np.zeros((vectors.shape[0], truncate_dim), dtype=np.float32)
-            padded[:, : vectors.shape[1]] = vectors
-            vectors = padded
-        else:
-            vectors = vectors[:, :truncate_dim].copy()
-
-        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        norms = np.where(norms == 0, 1, norms)
-        return vectors / norms
+        raw = self._native_model.encode(
+            texts, batch_size=self.ollama_batch_size, convert_to_numpy=True
+        )
+        return self._postprocess_vectors(raw, truncate_dim)
 
     def _ollama_embeddings(self, texts: list[str], truncate_dim: int):
         import numpy as np
-
         if not texts:
             return np.empty((0, truncate_dim), dtype=np.float32)
-
-        batch_size = self.ollama_batch_size
-        total_batches = (len(texts) + batch_size - 1) // batch_size
-
-        # Build the list of (batch_number, batch_texts, target_host). Hosts are
-        # round-robined across replicas so a multi-replica deployment shares
-        # load evenly; with a single host every batch targets it (but may still
-        # run concurrently if OLLAMA_EMBED_CONCURRENCY > 1, see below).
+        # Multi-replica Ollama shards batches across hosts (round-robin, applied
+        # per batch in _embed_one_batch); parallelize at least len(hosts) ways.
         hosts = _resolve_ollama_hosts()
-        batches: list[tuple[int, list[str], str]] = []
-        for batch_number, start in enumerate(range(0, len(texts), batch_size), start=1):
-            batch = texts[start : start + batch_size]
-            host = hosts[(batch_number - 1) % len(hosts)]
-            batches.append((batch_number, batch, host))
-
-        # Decide concurrency. Default 1 = serial (preserves the historical
-        # single-host, single-batch-at-a-time behavior exactly). With multiple
-        # replicas we always parallelize at least len(hosts) ways; an explicit
-        # OLLAMA_EMBED_CONCURRENCY can push higher (e.g. OLLAMA_NUM_PARALLEL>1).
         requested = _resolve_embed_concurrency()
         max_workers = max(requested, len(hosts)) if len(hosts) > 1 else requested
-        use_pool = max_workers > 1 and len(batches) > 1
+        vectors = self._dispatch_embedding_batches(texts, max_workers, self._embed_one_batch)
+        return self._postprocess_vectors(vectors, truncate_dim)
 
-        # Ordered result slots filled by either the serial or the parallel path.
-        per_batch: list[list[list[float]] | None] = [None] * len(batches)
+    def _soclaas_embeddings(self, texts: list[str], truncate_dim: int):
+        import numpy as np
+        if not texts:
+            return np.empty((0, truncate_dim), dtype=np.float32)
+        max_workers = max(1, _resolve_embed_concurrency())
+        vectors = self._dispatch_embedding_batches(texts, max_workers, self._soclaas_embed_one_batch)
+        return self._postprocess_vectors(vectors, truncate_dim)
 
-        if use_pool:
+    def _dispatch_embedding_batches(self, texts, max_workers, batch_fn):
+        """Split ``texts`` into batch_size chunks and run
+        ``batch_fn(number, batch, total)`` serially or concurrently; return the
+        concatenated vectors (pre-normalize). Shared by the Ollama and SoCLAaS
+        backends. Fail-fast: the first failing batch raises and in-flight work
+        is cancelled on context exit.
+        """
+        batch_size = self.ollama_batch_size
+        total_batches = (len(texts) + batch_size - 1) // batch_size
+        batches = [
+            (n, texts[s:s + batch_size])
+            for n, s in enumerate(range(0, len(texts), batch_size), start=1)
+        ]
+        per_batch = [None] * len(batches)
+        if max_workers > 1 and len(batches) > 1:
             from concurrent.futures import ThreadPoolExecutor
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_index = {
-                    executor.submit(
-                        self._embed_one_batch,
-                        batch_number,
-                        batch,
-                        total_batches,
-                        host,
-                    ): index
-                    for index, (batch_number, batch, host) in enumerate(batches)
+                    executor.submit(batch_fn, n, b, total_batches): i
+                    for i, (n, b) in enumerate(batches)
                 }
-                # Reproduce the serial path's fail-fast semantics: the first
-                # failing batch raises RuntimeError out of result() and the
-                # remaining in-flight work is cancelled on context exit.
                 for future, index in future_to_index.items():
                     per_batch[index] = future.result()
         else:
-            for index, (batch_number, batch, host) in enumerate(batches):
-                per_batch[index] = self._embed_one_batch(batch_number, batch, total_batches, host)
-
-        embeddings: list[list[float]] = []
+            for index, (n, b) in enumerate(batches):
+                per_batch[index] = batch_fn(n, b, total_batches)
+        vectors: list[list[float]] = []
         for chunk in per_batch:
-            assert chunk is not None
-            embeddings.extend(chunk)
+            vectors.extend(chunk)
+        return vectors
+
+    def _postprocess_vectors(self, embeddings, truncate_dim: int):
+        """Truncate/pad to ``truncate_dim`` and L2-normalize (shared by all backends)."""
+        import numpy as np
 
         vectors = np.asarray(embeddings, dtype=np.float32)
         if vectors.ndim == 1:
@@ -391,26 +389,49 @@ class EmbeddingEngine:
         norms = np.where(norms == 0, 1, norms)
         return vectors / norms
 
+    def _soclaas_embed_one_batch(
+        self,
+        batch_number: int,
+        batch: list[str],
+        total_batches: int,
+    ) -> list[list[float]]:
+        """Embed one batch against the SoCLAaS ``/v1/embeddings`` endpoint."""
+        total_chars = sum(len(text) for text in batch)
+        _status(
+            f"Requesting embeddings from SoCLAaS model: {self.model_name} "
+            f"batch {batch_number}/{total_batches} "
+            f"({len(batch)} text(s), {total_chars} chars)"
+        )
+        try:
+            return llm_api.soclaas_embed(
+                model=self.model_name, input_texts=batch, timeout=self.ollama_timeout
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"SoCLAaS embedding failed for model '{self.model_name}' on "
+                f"batch {batch_number}/{total_batches}. Verify the API key "
+                f"(SOCLAAS_API_KEY) and base_url. Original error: {exc}"
+            ) from exc
+
     def _embed_one_batch(
         self,
         batch_number: int,
         batch: list[str],
         total_batches: int,
-        host: str,
     ) -> list[list[float]]:
-        """Embed one batch against ``host``.
+        """Embed one batch against the round-robin Ollama host for its number.
 
-        Encapsulates the primary ``/api/embed`` call plus the one-by-one
-        ``/api/embeddings`` fallback so the parallel dispatcher can submit
-        whole batches as independent units of work. Raises RuntimeError on
-        failure so the caller (serial loop or ``Future.result``) propagates it.
+        Tries ``/api/embed`` (batch), falling back to one-by-one ``/api/embeddings``.
+        Raises RuntimeError on failure so the dispatcher (serial or ``Future.result``)
+        propagates it.
         """
-        total_chars = sum(len(text) for text in batch)
+        hosts = _resolve_ollama_hosts()
+        host = hosts[(batch_number - 1) % len(hosts)]
         _status(
             f"Requesting embeddings from Ollama model: {self.model_name} "
             f"batch {batch_number}/{total_batches} "
-            f"({len(batch)} text(s), {total_chars} chars, timeout={self.ollama_timeout}s) "
-            f"-> {host}"
+            f"({len(batch)} text(s), {sum(len(t) for t in batch)} chars, "
+            f"timeout={self.ollama_timeout}s) -> {host}"
         )
         try:
             payload_input = batch[0] if len(batch) == 1 else batch

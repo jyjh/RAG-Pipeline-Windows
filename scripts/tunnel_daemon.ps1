@@ -1,5 +1,9 @@
 <#
 .SYNOPSIS
+    DEPRECATED: LLM serving now runs on the hosted SoCLAaS API, so this Ollama
+    SSH tunnel is obsolete (retained for reference/revert; the setup wizard no
+    longer starts it).
+
     Cross-platform auto-reconnecting SSH tunnel daemon for Ollama port forwarding.
 
 .DESCRIPTION

@@ -18,7 +18,10 @@ docling~=2.105.0
 pypdf~=6.14.0
 onnxruntime~=1.27.0
 
-# Local LLM/VLM serving
+# Dormant local-LLM fallback. Only used when [llm_api].backend = "ollama" for
+# fully-offline operation; the primary backend is the hosted SoCLAaS API
+# (https://soclaas-api.comp.nus.edu.sg), reached via stdlib urllib (no client
+# package needed). Keep this pin if you may run without the API.
 ollama~=0.6.2
 
 # Numeric/runtime support

@@ -158,9 +158,18 @@ def generate_pbs_script(
 ) -> str:
     """Generate the ingest+index PBS script template with validated overrides.
 
-    The emitted script mirrors ``scripts/nus_hpc_ingest_index.pbs``: it pins the
-    Ollama model store to a *persistent* shared path (not the wiped per-job
-    scratch), pre-pulls the pipeline's models, then runs ``bulk_ingest.py``.
+    The CPU ingest/index job does the heavy non-LLM work (Docling OCR/parsing,
+    chunking, LanceDB writes, ANN build) and calls the hosted SoCLAaS API
+    (``/v1/embeddings`` with bge-m3) for vectors. It no longer runs a local
+    ``ollama serve`` or pulls models. Provision the API key at
+    ``~/rag_soclaas_key`` on the login node (chmod 600), pass it via the qsub
+    environment, or set ``[llm_api].api_key`` in the staged ``config.toml`` so
+    the job can reach the embeddings endpoint.
+
+    ``ollama_models_dir`` is retained in the signature for backward
+    compatibility (validated but unused): the LLM-serving path moved to the
+    hosted SoCLAaS API, and the deprecated GPU serving job
+    (``generate_serve_pbs_script``) is the only remaining Ollama user.
     """
     job_name = _validate_name(job_name, "job_name")
     ncpus = _validate_int(ncpus, "ncpus", minimum=1)
@@ -192,18 +201,12 @@ PBS_JOBID="${{PBS_JOBID:-local_job}}"
 HOME="${{HOME:-$(eval echo ~${{USER}})}}"
 STORAGE_ROOT="{storage_root}"
 SCRATCH_DIR="${{STORAGE_ROOT}}/rag_scratch_${{PBS_JOBID}}"
-OLLAMA_MODELS_DIR="${{OLLAMA_MODELS_DIR:-{ollama_models_dir}}}"
 
 mkdir -p "${{SCRATCH_DIR}}"
 mkdir -p "${{SCRATCH_DIR}}/tmp"
-mkdir -p "${{OLLAMA_MODELS_DIR}}"
 
-OLLAMA_PID=""
 cleanup() {{
-    echo "Stopping background services and cleaning up scratch directory..."
-    if [ -n "${{OLLAMA_PID}}" ]; then
-        kill -9 "${{OLLAMA_PID}}" 2>/dev/null || true
-    fi
+    echo "Cleaning up scratch directory..."
     rm -rf "${{SCRATCH_DIR}}"
     echo "Cleanup complete."
 }}
@@ -214,42 +217,15 @@ if [ ! -f "${{CONTAINER_SIF}}" ] && [ -f "${{STORAGE_ROOT}}/{container_sif}" ]; 
     CONTAINER_SIF="${{STORAGE_ROOT}}/{container_sif}"
 fi
 
-BIND_MOUNTS="-B ${{STORAGE_ROOT}}:${{STORAGE_ROOT}} -B ${{HOME}}:/srv/home -B ${{PWD}}:/app -B ${{OLLAMA_MODELS_DIR}}:/srv/ollama_models"
+BIND_MOUNTS="-B ${{STORAGE_ROOT}}:${{STORAGE_ROOT}} -B ${{HOME}}:/srv/home -B ${{PWD}}:/app"
 
-export OLLAMA_MODELS="/srv/ollama_models"
 export TMPDIR="${{SCRATCH_DIR}}/tmp"
 
-singularity exec {nv}${{BIND_MOUNTS}} "${{CONTAINER_SIF}}" ollama serve > "${{SCRATCH_DIR}}/ollama.log" 2>&1 &
-OLLAMA_PID=$!
-
-MAX_ATTEMPTS=30
-ATTEMPT=0
-READY=0
-while [ ${{ATTEMPT}} -lt ${{MAX_ATTEMPTS}} ]; do
-    if singularity exec ${{BIND_MOUNTS}} "${{CONTAINER_SIF}}" curl -s -f http://127.0.0.1:11434/api/version > /dev/null 2>&1; then
-        READY=1
-        break
-    fi
-    ATTEMPT=$((ATTEMPT + 1))
-    sleep 2
-done
-if [ ${{READY}} -ne 1 ]; then
-    echo "ERROR: Ollama endpoint failed to become ready within timeout."
-    cat "${{SCRATCH_DIR}}/ollama.log" || true
-    exit 1
-fi
-
-DEFAULT_MODELS="{DEFAULT_MODELS_TO_PULL}"
-OLLAMA_MODELS_TO_PULL="${{OLLAMA_MODELS_TO_PULL:-${{DEFAULT_MODELS}}}}"
-PULL_FAIL=0
-for model in ${{OLLAMA_MODELS_TO_PULL}}; do
-    if ! singularity exec ${{BIND_MOUNTS}} "${{CONTAINER_SIF}}" ollama pull "${{model}}"; then
-        echo "ERROR: ollama pull failed for '${{model}}'"
-        PULL_FAIL=1
-    fi
-done
-if [ ${{PULL_FAIL}} -ne 0 ]; then
-    exit 1
+# SoCLAaS API key for the embeddings endpoint (bge-m3). Provision it at
+# ~/rag_soclaas_key on the login node (chmod 600), pass it via the qsub
+# environment, or set [llm_api].api_key in the staged config.toml.
+if [ -z "${{SOCLAAS_API_KEY:-}}" ] && [ -f "${{HOME}}/rag_soclaas_key" ]; then
+    export SOCLAAS_API_KEY="$(cat "${{HOME}}/rag_soclaas_key")"
 fi
 
 INPUT_DATA_DIR="${{INPUT_DATA_DIR:-{input_data_dir}}}"
@@ -273,6 +249,10 @@ def generate_serve_pbs_script(
     storage_root: str = "/scratch/${USER}",
 ) -> str:
     """Generate the long-lived Ollama *serving* PBS script.
+
+    DEPRECATED: LLM serving now runs on the hosted SoCLAaS API (``[llm_api]``),
+    so this GPU serving job + SSH tunnel flow is obsolete. The code is retained
+    for reference/revert; the setup wizard no longer submits it.
 
     Unlike the ingest job, this one does not run the pipeline: it keeps
     ``ollama serve`` alive on a GPU compute node, publishes that node's hostname

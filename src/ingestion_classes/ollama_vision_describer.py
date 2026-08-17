@@ -11,7 +11,7 @@ bind_module_namespace(
 
 
 class OllamaVisionDescriber:
-    def __init__(self, vision_model: str = "qwen2.5vl:7b"):
+    def __init__(self, vision_model: str = DEFAULT_VISION_MODEL):
         self.vision_model = vision_model
         self._loaded = False
 

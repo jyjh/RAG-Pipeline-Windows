@@ -1210,6 +1210,9 @@ def run_checks(path: Path, values: SetupValues) -> bool:
 
 
 def _start_tunnel(values: SetupValues) -> subprocess.Popen[str]:
+    # DEPRECATED: LLM serving now runs on the SoCLAaS API; this SSH tunnel for
+    # the GPU Ollama serving job is obsolete. Retained for reference; no longer
+    # called by start_instance().
     if os.name == "nt":
         powershell = shutil.which("pwsh") or shutil.which("powershell")
         if not powershell:
@@ -1232,6 +1235,9 @@ def _start_tunnel(values: SetupValues) -> subprocess.Popen[str]:
 
 
 def _submit_gpu_job(path: Path) -> str:
+    # DEPRECATED: the GPU Ollama serving job is obsolete (SoCLAaS API now serves
+    # LLM/vision/embeddings). Retained for reference; no longer called by
+    # start_instance().
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
     from src.config import load_config
@@ -1245,23 +1251,16 @@ def start_instance(path: Path, values: SetupValues, *, submit_gpu: bool) -> int:
     environment = dict(os.environ)
     environment["RAG_PIPELINE_CONFIG"] = str(path)
     try:
-        if values.mode == "hpc":
-            if submit_gpu:
-                job_id = _submit_gpu_job(path)
-                print(f"Submitted GPU Ollama serving job: {job_id}")
-            print("Starting auto-reconnecting HPC tunnel...")
-            children.append(_start_tunnel(values))
-            deadline = time.monotonic() + 45
-            url = f"http://127.0.0.1:{values.local_ollama_port}/api/version"
-            while time.monotonic() < deadline and not _http_ready(url):
-                if children[-1].poll() is not None:
-                    raise RuntimeError("SSH tunnel exited before Ollama became reachable")
-                time.sleep(1)
-            if not _http_ready(url):
-                raise RuntimeError(
-                    "Ollama did not become reachable through the tunnel within 45s. "
-                    "Confirm the GPU serving job is running."
-                )
+        if submit_gpu:
+            # DEPRECATED: kept for backward CLI compatibility, but it is a no-op.
+            # LLM/vision/embedding serving moved to the hosted SoCLAaS API
+            # ([llm_api] in config.toml); the GPU Ollama serving job + SSH tunnel
+            # are obsolete. The CPU ingest/index HPC path is unaffected.
+            print(
+                "NOTE: --submit-gpu-job is deprecated and ignored. LLM serving now "
+                "runs on the SoCLAaS API; the GPU Ollama serving job + SSH tunnel "
+                "are no longer started."
+            )
 
         print(f"Starting web server: http://{values.server_host}:{values.server_port}")
         children.append(subprocess.Popen(
@@ -1336,7 +1335,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--submit-gpu-job",
         action="store_true",
-        help="Submit the paid GPU Ollama PBS job before launching the tunnel.",
+        help="DEPRECATED no-op: LLM serving now runs on the SoCLAaS API; the GPU Ollama job is not submitted.",
     )
     parser.add_argument("--skip-checks", action="store_true")
     parser.add_argument(
@@ -1448,13 +1447,16 @@ def main(argv: list[str] | None = None) -> int:
 
     should_start = args.start
     submit_gpu = args.submit_gpu_job
+    if submit_gpu:
+        # Deprecated no-op flag; surface it once so the operator knows.
+        print(
+            "NOTE: --submit-gpu-job is deprecated and ignored. LLM serving now runs "
+            "on the SoCLAaS API; the GPU Ollama serving job is no longer submitted."
+        )
     if not args.non_interactive and not args.start:
         should_start = _prompt_yes_no("Start the instance now?", True)
-        if should_start and values.mode == "hpc" and not submit_gpu:
-            submit_gpu = _prompt_yes_no(
-                "Submit a paid GPU serving job now? (No if one is already running)",
-                False,
-            )
+        # The GPU Ollama serving job is DEPRECATED (SoCLAaS API now serves LLMs),
+        # so we no longer prompt to submit it.
     if not should_start:
         print("Ready. Start later with setup.cmd --non-interactive --start")
         return 0

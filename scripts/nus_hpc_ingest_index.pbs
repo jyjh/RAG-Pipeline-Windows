@@ -16,107 +16,56 @@ PBS_JOBID="${PBS_JOBID:-local_job}"
 SCRATCH_DIR="/hpctmp/${USER}/rag_scratch_${PBS_JOBID}"
 HOME="${HOME:-$(eval echo ~${USER})}"
 
-# Ollama model store MUST live on shared storage visible to every compute node
-# (NOT under the per-job scratch, which is wiped on exit). The default is the
-# home directory; override OLLAMA_MODELS_DIR to point it at shared /hpctmp
-# space if your home has a tight quota. Models survive across jobs only if this
-# path persists.
-OLLAMA_MODELS_DIR="${OLLAMA_MODELS_DIR:-${HOME}/ollama_models}"
-
 # Ensure scratch directory exists
 mkdir -p "${SCRATCH_DIR}"
 mkdir -p "${SCRATCH_DIR}/tmp"
-mkdir -p "${OLLAMA_MODELS_DIR}"
 
-# Cleanup trap for scratch directory and background processes.
-# NOTE: ${OLLAMA_MODELS_DIR} is intentionally NOT removed here -- it holds the
-# (multi-GB) model registry that is reused across jobs.
-OLLAMA_PID=""
+# Cleanup trap for scratch directory. (There are no background daemons to stop:
+# this CPU ingest/index job does only the heavy non-LLM work -- Docling
+# OCR/parsing, chunking, LanceDB writes, ANN build -- and calls the hosted
+# SoCLAaS API /v1/embeddings endpoint for vectors. It no longer runs a local
+# `ollama serve` or pulls models.)
 cleanup() {
-    echo "Stopping background services and cleaning up scratch directory..."
-    if [ -n "${OLLAMA_PID}" ]; then
-        kill -9 "${OLLAMA_PID}" 2>/dev/null || true
-    fi
+    echo "Cleaning up scratch directory..."
     rm -rf "${SCRATCH_DIR}"
     echo "Cleanup complete."
 }
 trap cleanup EXIT
 
 # Container SIF image location
-CONTAINER_SIF="${CONTAINER_SIF:-rag_pipeline.sif}"
-if [ ! -f "${CONTAINER_SIF}" ] && [ -f "/hpctmp/${USER}/rag_pipeline.sif" ]; then
-    CONTAINER_SIF="/hpctmp/${USER}/rag_pipeline.sif"
+CONTAINER_SIF="${CONTAINER_SIF:-rag_pipeline_cpu.sif}"
+if [ ! -f "${CONTAINER_SIF}" ] && [ -f "/hpctmp/${USER}/rag_pipeline_cpu.sif" ]; then
+    CONTAINER_SIF="/hpctmp/${USER}/rag_pipeline_cpu.sif"
 fi
 
-# Set bind mounts for HPC storage access. Bind both the scratch tree and the
-# persistent model store (which may be ${HOME} or a custom dir) so the
-# containerized Ollama can write to OLLAMA_MODELS.
-BIND_MOUNTS="-B /hpctmp/${USER}:/hpctmp/${USER} -B ${HOME}:/srv/home -B ${PWD}:/app -B ${OLLAMA_MODELS_DIR}:/srv/ollama_models"
+# Set bind mounts for HPC storage access.
+BIND_MOUNTS="-B /hpctmp/${USER}:/hpctmp/${USER} -B ${HOME}:/srv/home -B ${PWD}:/app"
 
-# Configure Ollama models (persistent) and temp paths (high-speed scratch).
-export OLLAMA_MODELS="/srv/ollama_models"
+# Temp paths on high-speed scratch.
 export TMPDIR="${SCRATCH_DIR}/tmp"
 
+# SoCLAaS API key for the embeddings endpoint (bge-m3, /v1/embeddings).
+# Provision it one of three ways:
+#   1. ~/rag_soclaas_key on the login node (chmod 600) -- read below.
+#   2. The qsub environment (export SOCLAAS_API_KEY=... before qsub, or -v).
+#   3. [llm_api].api_key in the staged config.toml (read by the pipeline).
+if [ -z "${SOCLAAS_API_KEY:-}" ] && [ -f "${HOME}/rag_soclaas_key" ]; then
+    export SOCLAAS_API_KEY="$(cat "${HOME}/rag_soclaas_key")"
+fi
+
 echo "========================================================"
-echo "NUS HPC RAG Bulk Ingest & Index Job"
+echo "NUS HPC RAG Bulk Ingest & Index Job (SoCLAaS embeddings)"
 echo "Job ID: ${PBS_JOBID}"
 echo "User: ${USER}"
 echo "Scratch Directory: ${SCRATCH_DIR}"
-echo "Ollama Models (persistent): ${OLLAMA_MODELS_DIR} -> /srv/ollama_models"
 echo "Container SIF: ${CONTAINER_SIF}"
 echo "Working Directory: ${PWD}"
+echo "SoCLAaS API key configured: $([ -n "${SOCLAAS_API_KEY:-}" ] && echo yes || echo 'NO (set ~/rag_soclaas_key or [llm_api].api_key)')"
 echo "========================================================"
 
-# Start background Ollama daemon inside container
-echo "Starting background Ollama daemon inside container..."
-singularity exec --nv ${BIND_MOUNTS} "${CONTAINER_SIF}" ollama serve > "${SCRATCH_DIR}/ollama.log" 2>&1 &
-OLLAMA_PID=$!
-
-# Await endpoint readiness (/api/version)
-echo "Awaiting Ollama API endpoint readiness (http://127.0.0.1:11434/api/version)..."
-MAX_ATTEMPTS=30
-ATTEMPT=0
-READY=0
-
-while [ ${ATTEMPT} -lt ${MAX_ATTEMPTS} ]; do
-    if singularity exec ${BIND_MOUNTS} "${CONTAINER_SIF}" curl -s -f http://127.0.0.1:11434/api/version > /dev/null 2>&1; then
-        READY=1
-        echo "Ollama daemon API endpoint is online and responsive!"
-        break
-    fi
-    ATTEMPT=$((ATTEMPT + 1))
-    sleep 2
-done
-
-if [ ${READY} -ne 1 ]; then
-    echo "ERROR: Ollama endpoint failed to become ready within timeout."
-    echo "--- Ollama Log Output ---"
-    cat "${SCRATCH_DIR}/ollama.log" || true
-    exit 1
-fi
-
-# Pre-pull the models the pipeline depends on so the registry is warm BEFORE
-# ingestion/indexing starts. A bogus tag fails loudly here instead of surfacing
-# as a 404 deep in the embedding loop. Override the list with
-# OLLAMA_MODELS_TO_PULL (space-separated, must match config.toml [models]/*).
-DEFAULT_MODELS="nomic-embed-text qwen2.5vl:7b gemma4 qwen2.5:1.5b"
-OLLAMA_MODELS_TO_PULL="${OLLAMA_MODELS_TO_PULL:-${DEFAULT_MODELS}}"
-echo "Pre-pulling Ollama models: ${OLLAMA_MODELS_TO_PULL}"
-PULL_FAIL=0
-for model in ${OLLAMA_MODELS_TO_PULL}; do
-    echo "--- ollama pull ${model} ---"
-    if ! singularity exec ${BIND_MOUNTS} "${CONTAINER_SIF}" ollama pull "${model}"; then
-        echo "ERROR: ollama pull failed for '${model}' -- aborting before the pipeline starts."
-        echo "Check the tag against config.toml; a common gotcha is a custom alias (e.g. 'gemma4')"
-        echo "that has not yet been created with 'ollama create' on this model store."
-        PULL_FAIL=1
-    fi
-done
-if [ ${PULL_FAIL} -ne 0 ]; then
-    exit 1
-fi
-
-# Execute document ingestion and indexing pipeline
+# Execute document ingestion and indexing pipeline.
+# Embeddings are served by the SoCLAaS API (bge-m3, 1024-d) -- the CPU node
+# only needs outbound HTTPS to soclaas-api.comp.nus.edu.sg plus the API key.
 echo "Starting bulk document ingestion and indexing..."
 INPUT_DATA_DIR="${INPUT_DATA_DIR:-data}"
 

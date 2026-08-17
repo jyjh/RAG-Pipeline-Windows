@@ -10,6 +10,29 @@ import pytest
 
 import src.local_rag as local_rag
 from src.asset_store import ImageAssetStore, image_asset_marker
+
+
+# Many tests here exercise the dormant local-Ollama chat/embedding seams (they
+# patch `local_rag._ollama_chat`). Force the Ollama backend so `_llm_chat`
+# routes to `_ollama_chat` and those patches take effect. SoCLAaS API coverage
+# lives in tests/test_llm_api.py.
+#
+# The retrieval/indexer unit tests use tiny 3-d fake vectors; align the
+# configured embedding_dim to 3 so the dim-mismatch guard and reuse logic see a
+# consistent dimension (the real 768<->1024 mismatch is covered elsewhere).
+@pytest.fixture(autouse=True)
+def _force_ollama_backend(monkeypatch):
+    monkeypatch.setenv("LLM_BACKEND", "ollama")
+    import src.config as _cfg
+
+    _real_load = _cfg.load_config
+
+    def _load(*args, **kwargs):
+        config = _real_load(*args, **kwargs)
+        config.models.embedding_dim = 3
+        return config
+
+    monkeypatch.setattr(_cfg, "load_config", _load)
 from src.index_overrides import load_index_overrides, persist_index_deletions, persist_index_edit
 from src.vector_store import LanceDBVectorStore
 
@@ -1403,7 +1426,7 @@ def test_local_indexer_reuses_unchanged_vectors(monkeypatch):
 
         monkeypatch.setattr(local_rag, "build_section_records", fake_build_section_records)
 
-        indexer = local_rag.LocalVectorIndexer(working_dir=str(db_dir), embedding_batch_size=8, progress_enabled=False)
+        indexer = local_rag.LocalVectorIndexer(working_dir=str(db_dir), embedding_model="nomic-embed-text", embedding_batch_size=8, embedding_dim=768, progress_enabled=False)
         indexer.index_markdown(str(md_dir))
 
         assert calls == [["embedding health check"], ["changed content", "new content"]]
@@ -1515,7 +1538,9 @@ def test_local_indexer_applies_persisted_overrides_when_reindexing(monkeypatch):
         indexer = local_rag.LocalVectorIndexer(
             working_dir=str(staged_db),
             reuse_db_dir=str(live_db),
+            embedding_model="nomic-embed-text",
             embedding_batch_size=8,
+            embedding_dim=768,
             progress_enabled=False,
         )
         indexer.index_markdown(str(md_dir))

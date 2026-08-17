@@ -1,4 +1,7 @@
 #!/bin/bash
+# DEPRECATED: LLM serving now runs on the hosted SoCLAaS API ([llm_api] in
+# config.toml), so this Ollama SSH tunnel is obsolete. Retained for
+# reference/revert; the setup wizard no longer starts it.
 # ==============================================================================
 # SSH Tunnel Daemon (Linux / Bash)
 # Maintains an auto-reconnecting SSH port-forwarding tunnel to NUS HPC for Ollama.

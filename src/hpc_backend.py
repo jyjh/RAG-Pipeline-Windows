@@ -421,6 +421,10 @@ class HpcBackend:
     def submit_serve_job(self, *, ollama_host_file_on_hpc: str | None = None) -> str:
         """Submit the long-lived Ollama serving PBS job to the GPU cluster.
 
+        DEPRECATED: LLM serving now runs on the hosted SoCLAaS API (``[llm_api]``),
+        so this GPU serving job is obsolete. Retained for reference/revert; the
+        setup wizard no longer calls it. New deployments should not submit it.
+
         Returns the job id. Non-blocking -- the serving job runs until its
         walltime. Caller then starts the tunnel daemon (pointed at the GPU
         login node via --jump-host) and points OLLAMA_HOST at the local tunnel

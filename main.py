@@ -12,6 +12,8 @@ from src.defaults import (
     DEFAULT_ASSET_TRIGGERS,
     DEFAULT_CODE_ENRICHMENT,
     DEFAULT_DOCLING_ACCELERATOR,
+    DEFAULT_EMBEDDING_DIM,
+    DEFAULT_EMBEDDING_MODEL,
     DEFAULT_FORMULA_ENRICHMENT,
     DEFAULT_OCR_BACKEND,
     DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
@@ -36,7 +38,7 @@ def default_llm_model() -> str:
     try:
         from src.defaults import DEFAULT_LLM_MODEL
     except Exception:
-        return "gemma4"
+        return "gemma4:26b"
     return DEFAULT_LLM_MODEL
 
 
@@ -44,7 +46,7 @@ def default_planner_model() -> str:
     try:
         from src.defaults import DEFAULT_PLANNER_MODEL
     except Exception:
-        return "qwen2.5:1.5b"
+        return "gemma4:26b"
     return DEFAULT_PLANNER_MODEL
 
 
@@ -202,7 +204,8 @@ def _load_query_config(config_path: Path | None = None) -> dict[str, Any]:
     ollama = payload.get("ollama", {}) if isinstance(payload.get("ollama"), dict) else {}
     return {
         "llm_model": str(models.get("llm_model") or default_llm_model()),
-        "embedding_model": str(models.get("embedding_model") or "nomic-embed-text"),
+        "embedding_model": str(models.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
+        "embedding_dim": _as_positive_int(models.get("embedding_dim"), DEFAULT_EMBEDDING_DIM),
         "llm_num_predict": _as_positive_int(chat.get("llm_num_predict"), 4096),
         "llm_timeout": _as_float(chat.get("llm_timeout"), 120.0),
         "temperature": _as_float(chat.get("temperature"), 0.3),
@@ -595,7 +598,7 @@ def main(argv: list[str] | None = None) -> int:
                     md_dir=args.md_dir,
                     db_dir=args.db_dir,
                     progress_enabled=not args.no_progress,
-                    embedding_model=args.embedding_model or "nomic-embed-text",
+                    embedding_model=args.embedding_model or DEFAULT_EMBEDDING_MODEL,
                     embedding_batch_size=args.embedding_batch_size or DEFAULT_EMBEDDING_BATCH_SIZE,
                     embedding_timeout=args.embedding_timeout or 30.0,
                     index_backend=args.index_backend,
@@ -622,6 +625,7 @@ def main(argv: list[str] | None = None) -> int:
                 embedding_model=args.embedding_model or query_config["embedding_model"],
                 embedding_batch_size=args.embedding_batch_size or DEFAULT_EMBEDDING_BATCH_SIZE,
                 embedding_timeout=args.embedding_timeout or 30.0,
+                embedding_dim=query_config["embedding_dim"],
                 llm_num_predict=args.llm_num_predict or query_config["llm_num_predict"],
                 llm_timeout=args.llm_timeout if args.llm_timeout is not None else query_config["llm_timeout"],
                 temperature=args.temperature if args.temperature is not None else query_config["temperature"],
