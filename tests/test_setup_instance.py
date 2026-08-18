@@ -34,7 +34,7 @@ def test_update_toml_sections_preserves_unrelated_values(safe_tmp_path):
     assert config.with_suffix(".toml.bak").exists()
 
 
-def test_configure_writes_two_cluster_connections(safe_tmp_path):
+def test_configure_writes_cpu_cluster_connection(safe_tmp_path):
     config = safe_tmp_path / "config.toml"
     config.write_text("[server]\nhost = \"old\"\n", encoding="utf-8")
     values = SetupValues(
@@ -43,18 +43,15 @@ def test_configure_writes_two_cluster_connections(safe_tmp_path):
         server_port=8080,
         cpu_host="cpu-login",
         cpu_repo="rag-cpu",
-        gpu_host="gpu-login",
-        gpu_repo="rag-gpu",
     )
     configure(config, values)
     text = config.read_text(encoding="utf-8")
     assert "enabled = true" in text
     assert 'ssh_host = "cpu-login"' in text
-    assert 'ssh_host = "gpu-login"' in text
     assert "bind_all = true" in text
 
 
-def test_configure_ssh_aliases_creates_and_updates_both_clusters(safe_tmp_path):
+def test_configure_ssh_aliases_creates_and_updates(safe_tmp_path):
     ssh_config = safe_tmp_path / ".ssh" / "config"
     ssh_config.parent.mkdir()
     original = (
@@ -76,22 +73,14 @@ def test_configure_ssh_aliases_creates_and_updates_both_clusters(safe_tmp_path):
         cpu_user="student",
         cpu_identity_file="~/.ssh/id_cpu",
         cpu_repo="rag-cpu",
-        gpu_host="gpu-login",
-        gpu_hostname="gpu.example.edu",
-        gpu_user="student",
-        gpu_identity_file="~/.ssh/id_gpu",
-        gpu_repo="rag-gpu",
     )
     configure_ssh_aliases(ssh_config, values)
 
     cpu = read_ssh_alias(ssh_config, "cpu-login")
-    gpu = read_ssh_alias(ssh_config, "gpu-login")
     text = ssh_config.read_text(encoding="utf-8")
     assert cpu["hostname"] == "cpu.example.edu"
     assert cpu["user"] == "student"
     assert cpu["identityfile"] == "~/.ssh/id_cpu"
-    assert gpu["hostname"] == "gpu.example.edu"
-    assert gpu["identityfile"] == "~/.ssh/id_gpu"
     assert "Compression yes" in text
     assert "Host unrelated" in text
     assert ssh_config.with_name("config.rag-setup.bak").read_text(encoding="utf-8") == original
@@ -104,8 +93,6 @@ def test_validate_rejects_absolute_hpc_repo():
         server_port=8000,
         cpu_host="cpu",
         cpu_repo="/home/me/rag",
-        gpu_host="gpu",
-        gpu_repo="/remote/gpu",
     )
     try:
         _validate(values)
@@ -203,13 +190,13 @@ def test_repository_archive_excludes_local_data_indexes_and_sifs(safe_tmp_path):
 
 def test_remote_container_build_uses_fakeroot_and_selected_definition():
     command = _remote_container_build_command(
-        repo_dir="/scratch/student/rag-gpu",
-        definition_name="Singularity.def",
-        image_name="rag_pipeline.sif",
+        repo_dir="/hpctmp/student/rag-cpu",
+        definition_name="Singularity.cpu.def",
+        image_name="rag_pipeline_cpu.sif",
     )
     assert "apptainer" in command
     assert "singularity" in command
-    assert "build --fakeroot rag_pipeline.sif Singularity.def" in command
+    assert "build --fakeroot rag_pipeline_cpu.sif Singularity.cpu.def" in command
 
 
 def test_provision_cluster_stages_under_hpctmp_and_activates_login_link(
@@ -256,7 +243,9 @@ def test_provision_cluster_stages_under_hpctmp_and_activates_login_link(
     assert "ln -sfn" in joined
 
 
-def test_provision_gpu_cluster_uses_vanda_scratch_root(safe_tmp_path, monkeypatch):
+def test_provision_cluster_verifies_storage_parent_before_use(safe_tmp_path, monkeypatch):
+    """provision_hpc_cluster derives the storage parent from the absolute root
+    and confirms it exists before creating the staging directory."""
     archive = safe_tmp_path / "repository.tar.gz"
     archive.write_bytes(b"archive")
     remote_commands = []
@@ -268,24 +257,23 @@ def test_provision_gpu_cluster_uses_vanda_scratch_root(safe_tmp_path, monkeypatc
         "scripts.setup_instance._upload_provision_file",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr("scripts.setup_instance.secrets.token_hex", lambda size: "gpu123")
+    monkeypatch.setattr("scripts.setup_instance.secrets.token_hex", lambda size: "cpu123")
 
     provision_hpc_cluster(
-        alias="gpu-login",
+        alias="cpu-login",
         user="student",
         storage_root="/scratch/student",
-        relative_repo="rag-gpu",
+        relative_repo="rag-cpu",
         archive_path=archive,
-        image_name="rag_pipeline.sif",
-        definition_name="Singularity.def",
+        image_name="rag_pipeline_cpu.sif",
+        definition_name="Singularity.cpu.def",
         local_image=None,
     )
 
     joined = "\n".join(remote_commands)
     assert "test -d /scratch" in joined
-    assert "/scratch/student/rag-gpu" in joined
-    assert "build --fakeroot rag_pipeline.sif Singularity.def" in joined
-    assert "/hpctmp/student" not in joined
+    assert "/scratch/student/rag-cpu" in joined
+    assert "build --fakeroot rag_pipeline_cpu.sif Singularity.cpu.def" in joined
 
 
 def test_setup_cli_help_runs():
@@ -297,9 +285,7 @@ def test_setup_cli_help_runs():
         check=False,
     )
     assert result.returncode == 0
-    assert "--submit-gpu-job" in result.stdout
     assert "--cpu-hostname" in result.stdout
-    assert "--gpu-hostname" in result.stdout
     assert "--skip-key-install" in result.stdout
     assert "--provision-hpc" in result.stdout
     assert "--skip-hpc-provision" in result.stdout
@@ -423,13 +409,13 @@ def test_provision_skips_upload_when_remote_manifest_matches(safe_tmp_path, monk
     )
 
     provision_hpc_cluster(
-        alias="gpu-login",
+        alias="cpu-login",
         user="student",
-        storage_root="/scratch/student",
-        relative_repo="rag-gpu",
+        storage_root="/hpctmp/student",
+        relative_repo="rag-cpu",
         archive_path=safe_tmp_path / "repository.tar.gz",
-        image_name="rag_pipeline.sif",
-        definition_name="Singularity.def",
+        image_name="rag_pipeline_cpu.sif",
+        definition_name="Singularity.cpu.def",
         local_image=None,
         force=False,
     )
@@ -522,13 +508,13 @@ def test_provision_force_ignores_matching_manifest(safe_tmp_path, monkeypatch):
     )
 
     provision_hpc_cluster(
-        alias="gpu-login",
+        alias="cpu-login",
         user="student",
-        storage_root="/scratch/student",
-        relative_repo="rag-gpu",
+        storage_root="/hpctmp/student",
+        relative_repo="rag-cpu",
         archive_path=safe_tmp_path / "repository.tar.gz",
-        image_name="rag_pipeline.sif",
-        definition_name="Singularity.def",
+        image_name="rag_pipeline_cpu.sif",
+        definition_name="Singularity.cpu.def",
         local_image=None,
         force=True,
     )

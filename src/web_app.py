@@ -38,6 +38,7 @@ from src.api_key_auth import (
     create_default_authenticator,
 )
 from src.caches import BoundedLRU
+from src.coerce import as_bool, as_optional_int, as_positive_float, as_positive_int, as_string_list
 from src.disk_space import DiskSpaceError, check_disk_space, estimate_dir_bytes
 from src.file_lock import acquire_index_lock
 from src.job_logging import log_event, setup_job_logging
@@ -45,11 +46,20 @@ from src.defaults import (
     DEFAULT_ASSET_DIR,
     DEFAULT_ASSET_TRIGGERS,
     DEFAULT_CODE_ENRICHMENT,
+    DEFAULT_CONTEXT_TOKEN_FRACTION,
+    DEFAULT_CONTEXT_WINDOW,
     DEFAULT_DOCLING_ACCELERATOR,
+    DEFAULT_EMBEDDING_BATCH_SIZE,
     DEFAULT_EMBEDDING_DIM,
     DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_TIMEOUT,
     DEFAULT_FORMULA_ENRICHMENT,
     DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_TIMEOUT,
+    DEFAULT_NUM_PREDICT,
+    DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL,
+    DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
+    DEFAULT_PLANNER_MAX_QUERIES,
     DEFAULT_PLANNER_MODEL,
     DEFAULT_OCR_BACKEND,
     DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
@@ -57,15 +67,21 @@ from src.defaults import (
     DEFAULT_OCR_LANGS,
     DEFAULT_PDF_PARSER_MODE,
     DEFAULT_RAPIDOCR_BACKEND,
+    DEFAULT_RETRIEVAL_CANDIDATE_K,
+    DEFAULT_RETRIEVAL_MIN_SCORE,
+    DEFAULT_RETRIEVAL_RELATIVE_CUTOFF,
+    DEFAULT_SAMPLER_TOP_K,
+    DEFAULT_TEMPERATURE,
     DEFAULT_TESSERACT_CMD,
     DEFAULT_TESSERACT_DATA_PATH,
     DEFAULT_TESSERACT_PSM,
     DEFAULT_VISION_ENABLED,
     DEFAULT_VISION_MODEL,
+    DEFAULT_WEB_SEARCH_ENABLED,
+    DEFAULT_WEB_SEARCH_MAX_RESULTS,
+    DEFAULT_WEB_SEARCH_TIMEOUT,
 )
 from src.local_rag import (
-    DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL,
-    DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
     DEFAULT_QUERY_SYSTEM_PROMPT,
     INDEX_MANIFEST_FILENAME,
     update_index_manifest_sources,
@@ -100,7 +116,6 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_optional_int",
     "_page_slice",
     "_string_list",
-    "_load_toml_config",
     "_load_server_config",
     "_load_chat_config",
     "_load_ingestion_config",
@@ -251,33 +266,16 @@ def _resolve_root_path(raw_path: Any, *, default: str | Path | None = None) -> P
     return path if path.is_absolute() else ROOT_DIR / path
 
 
-# DEFAULT_EMBEDDING_MODEL (bge-m3) and DEFAULT_EMBEDDING_DIM (1024) are imported
-# from src.defaults above -- bge-m3 dense dim replaces nomic-embed-text's 768.
-# Texts per embedding request. Raised from 64 -> 128: a larger batch amortizes
-# (~137M params) fits comfortably on a 20GB GPU, and a larger batch amortizes
-# the per-request overhead that dominates cold indexing at 100GB scale. The
-# Pydantic request models cap this at 256 (ge=1, le=256); override via
-# OLLAMA_EMBED_BATCH_SIZE env or --embedding_batch_size CLI flag.
-DEFAULT_EMBEDDING_BATCH_SIZE = 128
-DEFAULT_EMBEDDING_TIMEOUT = 30.0
-DEFAULT_TEMPERATURE = 0.3
-DEFAULT_MAX_K = 40
-DEFAULT_CONTEXT_WINDOW = 8192
-DEFAULT_LLM_NUM_PREDICT = 4096
-DEFAULT_LLM_TIMEOUT = 120.0
-DEFAULT_RETRIEVAL_CANDIDATE_K = 80
-DEFAULT_RETRIEVAL_MIN_SCORE = 0.50
-DEFAULT_RETRIEVAL_RELATIVE_CUTOFF = 0.72
-DEFAULT_CONTEXT_TOKEN_FRACTION = 0.60
-DEFAULT_WEB_SEARCH_ENABLED = True
-DEFAULT_WEB_SEARCH_TIMEOUT = 8.0
-DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
+# Embedding/chat/retrieval defaults are single-sourced in src/defaults.py; the
+# aliases below keep the historical web_app names used by the request models.
+# The Pydantic request models cap embedding_batch_size at 256 (ge=1, le=256);
+# override via OLLAMA_EMBED_BATCH_SIZE env or --embedding_batch_size CLI flag.
+DEFAULT_MAX_K = DEFAULT_SAMPLER_TOP_K
+DEFAULT_LLM_NUM_PREDICT = DEFAULT_NUM_PREDICT
 DEFAULT_SYSTEM_PROMPT = DEFAULT_QUERY_SYSTEM_PROMPT
 DEFAULT_OLLAMA_CHAT_HEALTH_CHECK_INTERVAL = DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL
 DEFAULT_OLLAMA_CHAT_MAX_LOST_HEALTH_CHECKS = DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS
-# DEFAULT_PLANNER_MODEL (gemma4:26b) is imported from src.defaults above.
 DEFAULT_PLANNER_ENABLED = True
-DEFAULT_PLANNER_MAX_QUERIES = 3
 DEFAULT_INDEX_BACKEND = "lancedb"
 DEFAULT_SUMMARY_MODE = "hybrid"
 DEFAULT_CHUNK_TARGET_TOKENS = 900
@@ -411,20 +409,13 @@ def _safe_filename(filename: str) -> str:
     return name or f"upload-{uuid.uuid4().hex}.pdf"
 
 
-def _positive_int(value: Any, default: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
-
-
-def _positive_float(value: Any, default: float) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
+# Value-coercion helpers are shared (src/coerce.py); the historical private
+# names are kept because the split-class modules and tests reference them.
+_positive_int = as_positive_int
+_positive_float = as_positive_float
+_bool_value = as_bool
+_optional_int = as_optional_int
+_string_list = as_string_list
 
 
 def _nonnegative_int(value: Any, default: int) -> int:
@@ -438,28 +429,6 @@ def _nonnegative_int(value: Any, default: int) -> int:
 def _nonempty_str(value: Any, default: str) -> str:
     text = str(value or "").strip()
     return text or default
-
-
-def _bool_value(value: Any, default: bool) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on"}:
-        return True
-    if text in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
-def _optional_int(value: Any, default: int | None) -> int | None:
-    if value is None or value == "":
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _page_slice(rows: list[dict[str, Any]], *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
@@ -479,19 +448,6 @@ def _page_slice(rows: list[dict[str, Any]], *, offset: int = 0, limit: int | Non
     }
 
 
-def _string_list(value: Any, default: tuple[str, ...]) -> list[str]:
-    if isinstance(value, str):
-        parts = [part.strip() for part in value.split(",") if part.strip()]
-        return parts or list(default)
-    if isinstance(value, (list, tuple)):
-        parts = [str(part).strip() for part in value if str(part).strip()]
-        return parts or list(default)
-    return list(default)
-
-
-_TOML_CONFIG_CACHE = BoundedLRU(maxsize=128)
-
-
 def _default_config_path() -> Path:
     configured = os.environ.get("RAG_PIPELINE_CONFIG")
     if configured:
@@ -500,25 +456,11 @@ def _default_config_path() -> Path:
     return ROOT_DIR / "config.toml"
 
 
-def _load_toml_config(config_path: Path) -> dict[str, Any]:
-    cache_key = str(config_path)
-    cached = _TOML_CONFIG_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-    if not config_path.exists():
-        result: dict[str, Any] = {}
-        _TOML_CONFIG_CACHE[cache_key] = result
-        return result
-    try:
-        import tomllib
+def _pipeline_config(config_path: Path | None = None):
+    """Typed config via the shared cached loader (src.config.load_config)."""
+    from src.config import load_config
 
-        with config_path.open("rb") as handle:
-            payload = tomllib.load(handle)
-        result = payload if isinstance(payload, dict) else {}
-    except Exception:
-        result = {}
-    _TOML_CONFIG_CACHE[cache_key] = result
-    return result
+    return load_config(config_path or _default_config_path())
 
 
 def _normalize_server_host(raw_host: Any, *, bind_all: bool) -> str:
@@ -539,47 +481,44 @@ def _server_bind_all_enabled(server_config: dict[str, Any], host: str) -> bool:
 
 
 def _load_server_config(config_path: Path | None = None) -> dict[str, Any]:
-    config_path = config_path or _default_config_path()
-    payload = _load_toml_config(config_path)
-    server_config = payload.get("server", {}) if isinstance(payload.get("server"), dict) else {}
-    bind_all_requested = _bool_value(
-        server_config.get("bind_all"),
-        _bool_value(server_config.get("lan"), False),
+    server = _pipeline_config(config_path).server
+    bind_all_requested = server.bind_all or server.lan
+    host = _normalize_server_host(server.host, bind_all=bind_all_requested)
+    bind_all = _server_bind_all_enabled(
+        {"bind_all": bind_all_requested, "lan": server.lan}, host
     )
-    host = _normalize_server_host(server_config.get("host"), bind_all=bind_all_requested)
-    bind_all = _server_bind_all_enabled(server_config, host)
 
     return {
         "host": host,
         "bind_all": bind_all,
-        "port": _positive_int(server_config.get("port"), DEFAULT_SERVER_PORT),
+        "port": _positive_int(server.port, DEFAULT_SERVER_PORT),
         "health_poll_interval_ms": _positive_int(
-            server_config.get("health_poll_interval_ms"),
+            server.health_poll_interval_ms,
             DEFAULT_HEALTH_POLL_INTERVAL_MS,
         ),
         "jobs_poll_interval_ms": _positive_int(
-            server_config.get("jobs_poll_interval_ms"),
+            server.jobs_poll_interval_ms,
             DEFAULT_JOBS_POLL_INTERVAL_MS,
         ),
         "background_worker_threads": _positive_int(
-            server_config.get("background_worker_threads"),
+            server.background_worker_threads,
             DEFAULT_BACKGROUND_WORKER_THREADS,
         ),
-        "update_remote": _nonempty_str(server_config.get("update_remote"), DEFAULT_UPDATE_REMOTE),
-        "update_branch": _nonempty_str(server_config.get("update_branch"), DEFAULT_UPDATE_BRANCH),
+        "update_remote": _nonempty_str(server.update_remote, DEFAULT_UPDATE_REMOTE),
+        "update_branch": _nonempty_str(server.update_branch, DEFAULT_UPDATE_BRANCH),
         "disk_safety_factor": _positive_float(
-            server_config.get("disk_safety_factor"),
+            server.disk_safety_factor,
             DEFAULT_DISK_SAFETY_FACTOR,
         ),
         "job_workers": _positive_int(
-            server_config.get("job_workers"),
+            server.job_workers,
             DEFAULT_JOB_WORKERS,
         ),
         "query_wait_timeout_seconds": _positive_float(
-            server_config.get("query_wait_timeout_seconds"),
+            server.query_wait_timeout_seconds,
             DEFAULT_QUERY_WAIT_TIMEOUT_SECONDS,
         ),
-        "api_token": str(server_config.get("api_token") or ""),
+        "api_token": str(server.api_token or ""),
     }
 
 
@@ -590,111 +529,95 @@ def _load_api_keys_config(config_path: Path | None = None) -> dict[str, Any]:
     every 50 increments, ``rag_`` key prefix. The master ``[server] api_token``
     is loaded separately and acts as an admin/owner bypass.
     """
-    config_path = config_path or _default_config_path()
-    payload = _load_toml_config(config_path)
-    api_keys = payload.get("api_keys", {}) if isinstance(payload.get("api_keys"), dict) else {}
+    api_keys = _pipeline_config(config_path).api_keys
     return {
-        "enabled": _bool_value(api_keys.get("enabled"), DEFAULT_API_KEYS_ENABLED),
+        "enabled": _bool_value(api_keys.enabled, DEFAULT_API_KEYS_ENABLED),
         "rate_limit_per_minute": _positive_int(
-            api_keys.get("rate_limit_per_minute"), DEFAULT_API_KEYS_RATE_LIMIT
+            api_keys.rate_limit_per_minute, DEFAULT_API_KEYS_RATE_LIMIT
         ),
         "usage_persist_interval": _positive_int(
-            api_keys.get("usage_persist_interval"), DEFAULT_API_KEYS_PERSIST_INTERVAL
+            api_keys.usage_persist_interval, DEFAULT_API_KEYS_PERSIST_INTERVAL
         ),
-        "key_prefix": _nonempty_str(api_keys.get("key_prefix"), DEFAULT_API_KEYS_PREFIX),
+        "key_prefix": _nonempty_str(api_keys.key_prefix, DEFAULT_API_KEYS_PREFIX),
     }
 
 
 def _load_chat_config(config_path: Path | None = None) -> dict[str, Any]:
-    config_path = config_path or _default_config_path()
-    payload = _load_toml_config(config_path)
-    chat_config = payload.get("chat", {}) if isinstance(payload.get("chat"), dict) else {}
-    retrieval_config = payload.get("retrieval", {}) if isinstance(payload.get("retrieval"), dict) else {}
-    ollama_config = payload.get("ollama", {}) if isinstance(payload.get("ollama"), dict) else {}
-
-    raw_hosts = ollama_config.get("hosts", [])
-    hosts = [str(h) for h in raw_hosts] if isinstance(raw_hosts, list) else []
+    cfg = _pipeline_config(config_path)
+    chat = cfg.chat
+    ollama = cfg.ollama
 
     return {
-        "system_prompt": str(chat_config.get("system_prompt") or DEFAULT_SYSTEM_PROMPT),
+        "system_prompt": str(chat.system_prompt or DEFAULT_SYSTEM_PROMPT),
         "context_window": _positive_int(
-            chat_config.get("context_window"),
+            chat.context_window,
             DEFAULT_CONTEXT_WINDOW,
         ),
         "llm_num_predict": _positive_int(
-            chat_config.get("llm_num_predict"),
+            chat.llm_num_predict,
             DEFAULT_LLM_NUM_PREDICT,
         ),
         "retrieval_min_score": _positive_float(
-            retrieval_config.get("min_relevance_score"),
+            cfg.retrieval.min_relevance_score,
             DEFAULT_RETRIEVAL_MIN_SCORE,
         ),
-        "ollama_host": str(ollama_config.get("host") or "http://127.0.0.1:11434"),
-        "ollama_hosts": hosts,
-        "ollama_fallback_enabled": _bool_value(ollama_config.get("fallback_enabled"), True),
+        "ollama_host": str(ollama.host or "http://127.0.0.1:11434"),
+        "ollama_hosts": [str(h) for h in (ollama.hosts or [])],
+        "ollama_fallback_enabled": _bool_value(ollama.fallback_enabled, True),
         "ollama_health_check_interval": _positive_float(
-            ollama_config.get("chat_health_check_interval_seconds"),
+            ollama.chat_health_check_interval_seconds,
             DEFAULT_OLLAMA_CHAT_HEALTH_CHECK_INTERVAL,
         ),
         "ollama_max_lost_health_checks": _positive_int(
-            ollama_config.get("chat_max_lost_health_checks"),
+            ollama.chat_max_lost_health_checks,
             DEFAULT_OLLAMA_CHAT_MAX_LOST_HEALTH_CHECKS,
         ),
-        "planner_model": str(chat_config.get("planner_model") or DEFAULT_PLANNER_MODEL),
-        "planner_enabled": _bool_value(chat_config.get("planner_enabled"), DEFAULT_PLANNER_ENABLED),
+        "planner_model": str(chat.planner_model or DEFAULT_PLANNER_MODEL),
+        "planner_enabled": _bool_value(chat.planner_enabled, DEFAULT_PLANNER_ENABLED),
         "planner_max_queries": _positive_int(
-            chat_config.get("planner_max_queries"),
+            chat.planner_max_queries,
             DEFAULT_PLANNER_MAX_QUERIES,
         ),
     }
 
 
 def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
-    config_path = config_path or _default_config_path()
-    payload = _load_toml_config(config_path)
-    ingestion = payload.get("ingestion", {}) if isinstance(payload.get("ingestion"), dict) else {}
-    models = payload.get("models", {}) if isinstance(payload.get("models"), dict) else {}
-    paths = payload.get("paths", {}) if isinstance(payload.get("paths"), dict) else {}
+    cfg = _pipeline_config(config_path)
+    ingestion = cfg.ingestion
 
     return {
-        "asset_dir": _nonempty_str(paths.get("asset_dir"), DEFAULT_ASSET_DIR),
-        "parser_mode": _nonempty_str(ingestion.get("parser_mode"), DEFAULT_PDF_PARSER_MODE),
-        "accelerator": _nonempty_str(ingestion.get("accelerator"), DEFAULT_DOCLING_ACCELERATOR),
-        "num_threads": _positive_int(ingestion.get("num_threads"), 8),
-        "asset_triggers": _nonempty_str(ingestion.get("asset_triggers"), DEFAULT_ASSET_TRIGGERS),
-        "code_enrichment": _bool_value(ingestion.get("code_enrichment"), DEFAULT_CODE_ENRICHMENT),
-        "formula_enrichment": _bool_value(ingestion.get("formula_enrichment"), DEFAULT_FORMULA_ENRICHMENT),
-        "vision_model": _nonempty_str(models.get("vision_model"), DEFAULT_VISION_MODEL),
-        "vision_enabled": _bool_value(ingestion.get("vision_enabled"), DEFAULT_VISION_ENABLED),
-        "ocr_backend": _nonempty_str(ingestion.get("ocr_backend"), DEFAULT_OCR_BACKEND),
-        "ocr_langs": _string_list(ingestion.get("ocr_langs"), DEFAULT_OCR_LANGS),
-        "ocr_force_full_page": _bool_value(ingestion.get("ocr_force_full_page"), DEFAULT_OCR_FORCE_FULL_PAGE),
+        "asset_dir": _nonempty_str(cfg.paths.asset_dir, DEFAULT_ASSET_DIR),
+        "parser_mode": _nonempty_str(ingestion.parser_mode, DEFAULT_PDF_PARSER_MODE),
+        "accelerator": _nonempty_str(ingestion.accelerator, DEFAULT_DOCLING_ACCELERATOR),
+        "num_threads": _positive_int(ingestion.num_threads, 8),
+        "asset_triggers": _nonempty_str(ingestion.asset_triggers, DEFAULT_ASSET_TRIGGERS),
+        "code_enrichment": _bool_value(ingestion.code_enrichment, DEFAULT_CODE_ENRICHMENT),
+        "formula_enrichment": _bool_value(ingestion.formula_enrichment, DEFAULT_FORMULA_ENRICHMENT),
+        "vision_model": _nonempty_str(cfg.models.vision_model, DEFAULT_VISION_MODEL),
+        "vision_enabled": _bool_value(ingestion.vision_enabled, DEFAULT_VISION_ENABLED),
+        "ocr_backend": _nonempty_str(ingestion.ocr_backend, DEFAULT_OCR_BACKEND),
+        "ocr_langs": _string_list(ingestion.ocr_langs, DEFAULT_OCR_LANGS),
+        "ocr_force_full_page": _bool_value(ingestion.ocr_force_full_page, DEFAULT_OCR_FORCE_FULL_PAGE),
         "ocr_bitmap_area_threshold": _positive_float(
-            ingestion.get("ocr_bitmap_area_threshold"),
+            ingestion.ocr_bitmap_area_threshold,
             DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
         ),
-        "rapidocr_backend": _nonempty_str(ingestion.get("rapidocr_backend"), DEFAULT_RAPIDOCR_BACKEND),
-        "tesseract_cmd": _nonempty_str(ingestion.get("tesseract_cmd"), DEFAULT_TESSERACT_CMD),
-        "tesseract_data_path": str(ingestion.get("tesseract_data_path") or DEFAULT_TESSERACT_DATA_PATH),
-        "tesseract_psm": _optional_int(ingestion.get("tesseract_psm"), DEFAULT_TESSERACT_PSM),
-        "ingestion_workers": _positive_int(ingestion.get("ingestion_workers"), 1),
-        "max_pages_whole_doc": max(0, int(ingestion.get("max_pages_whole_doc", 50))),
-        # Estimated on-disk expansion when PDFs become Markdown + .pages.json
-        # sidecars. Used by the ingest disk-space pre-check so a 100GB corpus
-        # doesn't exhaust disk mid-ingest. Born-digital PDFs expand ~1.5x;
-        # OCR/vision-enriched scanned PDFs can exceed 2x.
-        "ingest_expansion_factor": _positive_float(ingestion.get("ingest_expansion_factor"), 2.0),
+        "rapidocr_backend": _nonempty_str(ingestion.rapidocr_backend, DEFAULT_RAPIDOCR_BACKEND),
+        "tesseract_cmd": _nonempty_str(ingestion.tesseract_cmd, DEFAULT_TESSERACT_CMD),
+        "tesseract_data_path": str(ingestion.tesseract_data_path or DEFAULT_TESSERACT_DATA_PATH),
+        "tesseract_psm": _optional_int(ingestion.tesseract_psm, DEFAULT_TESSERACT_PSM),
+        "ingestion_workers": _positive_int(ingestion.ingestion_workers, 1),
+        "max_pages_whole_doc": max(0, int(ingestion.max_pages_whole_doc)),
+        "ingest_expansion_factor": _positive_float(ingestion.ingest_expansion_factor, 2.0),
     }
 
 
 def _load_uploads_config(config_path: Path | None = None) -> dict[str, Any]:
-    config_path = config_path or _default_config_path()
-    payload = _load_toml_config(config_path)
-    uploads = payload.get("uploads", {}) if isinstance(payload.get("uploads"), dict) else {}
+    uploads = _pipeline_config(config_path).uploads
     return {
-        "max_upload_bytes": max(0, int(uploads.get("max_upload_bytes", 0) or 0)),
-        "max_corpus_bytes": max(0, int(uploads.get("max_corpus_bytes", 0) or 0)),
-        "chunk_bytes": _positive_int(uploads.get("chunk_bytes"), DEFAULT_UPLOAD_CHUNK_BYTES),
+        "max_upload_bytes": max(0, int(uploads.max_upload_bytes or 0)),
+        "max_corpus_bytes": max(0, int(uploads.max_corpus_bytes or 0)),
+        "chunk_bytes": _positive_int(uploads.chunk_bytes, DEFAULT_UPLOAD_CHUNK_BYTES),
     }
 
 
@@ -707,10 +630,7 @@ def _load_indexing_config(config_path: Path | None = None) -> dict[str, Any]:
     ``_apply_ann_search_params`` honor them. Returns the raw section dict;
     normalization (int coercion, fallbacks) happens in ``apply_indexing_config``.
     """
-    config_path = config_path or _default_config_path()
-    payload = _load_toml_config(config_path)
-    indexing = payload.get("indexing", {})
-    return indexing if isinstance(indexing, dict) else {}
+    return dict(_pipeline_config(config_path).indexing)
 
 
 SERVER_CONFIG = _load_server_config()
@@ -1019,75 +939,47 @@ def _remove_path(path: Path) -> None:
 
 
 def _publish_staged_index(staged_db_dir: str | Path, live_db_dir: str | Path) -> None:
+    """Publish a staged index build over the live index.
+
+    Thin wrapper over :func:`_swap_index_into` (move mode, with rollback) that
+    adds the staged-build preconditions, the tight-disk refusal, and
+    preservation of the live overrides/hashes when the staged build does not
+    carry its own.
+    """
     staged_db = Path(staged_db_dir)
     live_db = Path(live_db_dir)
-    staged_lancedb = lancedb_path(staged_db)
-    staged_manifest = staged_db / INDEX_MANIFEST_FILENAME
-    staged_overrides = index_overrides_path(staged_db)
-    staged_hashes = staged_db / "hashes"
-    live_lancedb = lancedb_path(live_db)
-    live_manifest = live_db / INDEX_MANIFEST_FILENAME
-    live_overrides = index_overrides_path(live_db)
-    live_hashes = live_db / "hashes"
-
-    if not staged_lancedb.exists():
-        raise RuntimeError(f"Indexing did not create a LanceDB directory at {staged_lancedb}")
-    if not staged_manifest.exists():
-        raise RuntimeError(f"Indexing did not create an index manifest at {staged_manifest}")
+    if not lancedb_path(staged_db).exists():
+        raise RuntimeError(f"Indexing did not create a LanceDB directory at {lancedb_path(staged_db)}")
+    if not (staged_db / INDEX_MANIFEST_FILENAME).exists():
+        raise RuntimeError(f"Indexing did not create an index manifest at {staged_db / INDEX_MANIFEST_FILENAME}")
 
     live_db.mkdir(parents=True, exist_ok=True)
     # The publish is a same-filesystem rename, so it needs little free space,
     # but refuse outright if the target volume is critically full to avoid a
     # half-swapped live index on a tight disk.
     check_disk_space(live_db, 1)
-    # Cross-process lock: a direct CLI ``main.py --mode index`` run or a second
-    # server must not swap/backup the live index out from under this publish.
-    with acquire_index_lock(live_db):
-        backup_dir = live_db.parent / f".index_backup_{uuid.uuid4().hex}"
-        backup_dir.mkdir(parents=True, exist_ok=False)
-        backup_lancedb = backup_dir / LANCEDB_DIRNAME
-        backup_manifest = backup_dir / INDEX_MANIFEST_FILENAME
-        backup_overrides = backup_dir / index_overrides_path(live_db).name
-        backup_hashes = backup_dir / "hashes"
 
-        try:
-            if live_lancedb.exists():
-                shutil.move(str(live_lancedb), str(backup_lancedb))
-            if live_manifest.exists():
-                shutil.move(str(live_manifest), str(backup_manifest))
-            if live_overrides.exists():
-                shutil.move(str(live_overrides), str(backup_overrides))
-            if live_hashes.exists():
-                shutil.move(str(live_hashes), str(backup_hashes))
-            shutil.move(str(staged_lancedb), str(live_lancedb))
-            shutil.move(str(staged_manifest), str(live_manifest))
-            if staged_overrides.exists():
-                shutil.move(str(staged_overrides), str(live_overrides))
-            elif backup_overrides.exists():
-                shutil.move(str(backup_overrides), str(live_overrides))
-            if staged_hashes.exists():
-                shutil.move(str(staged_hashes), str(live_hashes))
-            elif backup_hashes.exists():
-                shutil.move(str(backup_hashes), str(live_hashes))
-        except Exception:
-            _remove_path(live_lancedb)
-            _remove_path(live_manifest)
-            _remove_path(live_overrides)
-            _remove_path(live_hashes)
-            if backup_lancedb.exists():
-                shutil.move(str(backup_lancedb), str(live_lancedb))
-            if backup_manifest.exists():
-                shutil.move(str(backup_manifest), str(live_manifest))
-            if backup_overrides.exists():
-                shutil.move(str(backup_overrides), str(live_overrides))
-            if backup_hashes.exists():
-                shutil.move(str(backup_hashes), str(live_hashes))
-            raise
-        finally:
-            shutil.rmtree(backup_dir, ignore_errors=True)
-        # Invalidate in-process store/record caches so the next read sees the
-        # freshly published table (mirrors _swap_index_into; previously missing).
-        _invalidate_index_caches(live_db)
+    # The staged build only owns overrides/hashes when it produced them; one
+    # that didn't must not drop the live ones. Move those components aside so
+    # the swap cannot roll them away, then move them back afterwards.
+    preserved: list[tuple[Path, Path]] = []
+    aside_dir = live_db.parent / f".index_preserve_{uuid.uuid4().hex}"
+    for staged_has, live_component in (
+        (index_overrides_path(staged_db).exists(), index_overrides_path(live_db)),
+        ((staged_db / "hashes").exists(), live_db / "hashes"),
+    ):
+        if not staged_has and live_component.exists():
+            aside_dir.mkdir(parents=True, exist_ok=True)
+            aside = aside_dir / live_component.name
+            shutil.move(str(live_component), str(aside))
+            preserved.append((aside, live_component))
+    try:
+        _swap_index_into(staged_db, live_db)
+        for aside, live_component in preserved:
+            if not live_component.exists():
+                shutil.move(str(aside), str(live_component))
+    finally:
+        _remove_path(aside_dir)
 
 
 def index_backup_root(db_dir: str | Path) -> Path:
@@ -2190,6 +2082,7 @@ def update_index_record(
     embedding_dim = int(record.get("embedding_dim") or len(record.get("vector") or []) or DEFAULT_EMBEDDING_DIM)
 
     from src.embeddings import EmbeddingEngine
+    from src import llm_api
 
     engine = EmbeddingEngine(
         model_name=model,
@@ -2199,7 +2092,7 @@ def update_index_record(
     vector = engine.get_mrl_embeddings(
         [content],
         truncate_dim=embedding_dim,
-        prefix="search_document: ",
+        prefix=llm_api.resolve_embedding_prefix(model, "doc"),
     )[0]
 
     with INDEX_LOCK:
@@ -4107,12 +4000,8 @@ def _default_upload_options() -> dict[str, Any]:
     return _upload_options_from_form({})
 
 
-def _sha256_text(value: Any) -> str:
-    return str(value or "").strip().lower()
-
-
 def _is_sha256_hash(value: Any) -> bool:
-    return bool(re.fullmatch(r"[0-9a-f]{64}", _sha256_text(value)))
+    return bool(re.fullmatch(r"[0-9a-f]{64}", str(value or "").strip().lower()))
 
 
 def _assign_upload_source_groups(
@@ -4230,6 +4119,40 @@ def _duplicate_response_detail(
     }
 
 
+def _duplicate_entries(
+    files: list[dict[str, Any]],
+    *,
+    known_hashes: set[str],
+    existing_by_hash: dict[str, dict[str, Any]],
+    status: str,
+) -> list[dict[str, Any]]:
+    """Format duplicate-upload entries from a ``hash -> existing-info`` map.
+
+    Shared tail of the three duplicate detectors (source map, vector store,
+    data dir): every one of them only differs in how it builds
+    ``existing_by_hash``; the file loop and entry shape are identical.
+    """
+    duplicates: list[dict[str, Any]] = []
+    for item in files:
+        file_hash = str(item.get("hash", ""))
+        if not file_hash or file_hash in known_hashes:
+            continue
+        existing = existing_by_hash.get(file_hash)
+        if not existing:
+            continue
+        duplicates.append(
+            {
+                "filename": str(item.get("filename", "")),
+                "hash": file_hash,
+                "existing_filename": str(existing.get("existing_filename", "")),
+                "status": status,
+                "job_id": "",
+                **({"record_id": str(existing.get("record_id", ""))} if existing.get("record_id") else {}),
+            }
+        )
+    return duplicates
+
+
 def _indexed_source_duplicate_entries(
     files: list[dict[str, Any]],
     *,
@@ -4244,26 +4167,12 @@ def _indexed_source_duplicate_entries(
             continue
         source_hash = str(entry.get("source_hash", ""))
         if source_hash and source_hash not in indexed_by_hash:
-            indexed_by_hash[source_hash] = entry
-
-    duplicates: list[dict[str, Any]] = []
-    for item in files:
-        file_hash = str(item.get("hash", ""))
-        if not file_hash or file_hash in known_hashes:
-            continue
-        existing = indexed_by_hash.get(file_hash)
-        if not existing:
-            continue
-        duplicates.append(
-            {
-                "filename": str(item.get("filename", "")),
-                "hash": file_hash,
-                "existing_filename": str(existing.get("source_pdf_name", "")),
-                "status": "indexed",
-                "job_id": "",
+            indexed_by_hash[source_hash] = {
+                "existing_filename": str(entry.get("source_pdf_name", "")),
             }
-        )
-    return duplicates
+    return _duplicate_entries(
+        files, known_hashes=known_hashes, existing_by_hash=indexed_by_hash, status="indexed"
+    )
 
 
 def _vector_store_duplicate_entries(
@@ -4291,31 +4200,16 @@ def _vector_store_duplicate_entries(
             continue
         source_hash = str(row.get("source_hash", ""))
         if source_hash in target_hashes and source_hash not in indexed_by_hash:
-            indexed_by_hash[source_hash] = row
-
-    duplicates: list[dict[str, Any]] = []
-    for item in files:
-        file_hash = str(item.get("hash", ""))
-        if not file_hash or file_hash in known_hashes:
-            continue
-        existing = indexed_by_hash.get(file_hash)
-        if not existing:
-            continue
-        existing_filename = (
-            str(existing.get("source_pdf_name", ""))
-            or Path(str(existing.get("source_pdf_path") or existing.get("file_path") or "")).name
-        )
-        duplicates.append(
-            {
-                "filename": str(item.get("filename", "")),
-                "hash": file_hash,
-                "existing_filename": existing_filename,
-                "status": "indexed",
-                "job_id": "",
-                "record_id": str(existing.get("id", "")),
+            indexed_by_hash[source_hash] = {
+                "existing_filename": (
+                    str(row.get("source_pdf_name", ""))
+                    or Path(str(row.get("source_pdf_path") or row.get("file_path") or "")).name
+                ),
+                "record_id": str(row.get("id", "")),
             }
-        )
-    return duplicates
+    return _duplicate_entries(
+        files, known_hashes=known_hashes, existing_by_hash=indexed_by_hash, status="indexed"
+    )
 
 
 def _path_is_relative_to(path: Path, root: Path) -> bool:
@@ -4522,7 +4416,7 @@ def _data_pdf_duplicate_entries(
                 pass
 
     known_pdf_paths = _known_data_pdf_paths(data_dir=data_dir)
-    existing_by_hash: dict[str, Path] = {}
+    existing_by_hash: dict[str, dict[str, Any]] = {}
     for candidate in data_dir.rglob("*.pdf"):
         try:
             resolved = candidate.resolve()
@@ -4539,26 +4433,10 @@ def _data_pdf_duplicate_entries(
         except OSError:
             continue
         if digest in target_hashes and digest not in existing_by_hash:
-            existing_by_hash[digest] = resolved
-
-    duplicates: list[dict[str, Any]] = []
-    for item in files:
-        file_hash = str(item.get("hash", ""))
-        if not file_hash or file_hash in known_hashes:
-            continue
-        existing = existing_by_hash.get(file_hash)
-        if not existing:
-            continue
-        duplicates.append(
-            {
-                "filename": str(item.get("filename", "")),
-                "hash": file_hash,
-                "existing_filename": existing.name,
-                "status": "uploaded",
-                "job_id": "",
-            }
-        )
-    return duplicates
+            existing_by_hash[digest] = {"existing_filename": resolved.name}
+    return _duplicate_entries(
+        files, known_hashes=known_hashes, existing_by_hash=existing_by_hash, status="uploaded"
+    )
 
 
 def _blocking_duplicate_entries(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4582,7 +4460,7 @@ def _blocking_duplicate_entries(files: list[dict[str, Any]]) -> list[dict[str, A
 def _duplicate_entries_for_hash(file_hash: str) -> list[dict[str, Any]]:
     if not _is_sha256_hash(file_hash):
         raise HTTPException(status_code=400, detail="hash must be a 64-character SHA-256 hex string.")
-    return _blocking_duplicate_entries([{"filename": "", "hash": _sha256_text(file_hash)}])
+    return _blocking_duplicate_entries([{"filename": "", "hash": str(file_hash or "").strip().lower()}])
 
 
 async def _handle_upload_request(request: Request, *, require_source_groups: bool) -> dict[str, Any]:
@@ -4804,7 +4682,7 @@ async def _handle_upload_request(request: Request, *, require_source_groups: boo
 def check_upload_hash(hash: str):
     duplicates = _duplicate_entries_for_hash(hash)
     return {
-        "hash": _sha256_text(hash),
+        "hash": str(hash or "").strip().lower(),
         "exists": bool(duplicates),
         "duplicates": duplicates,
     }
@@ -5238,19 +5116,7 @@ def image_asset(asset_id: str):
     )
 
 
-@app.get("/api/pdfs/{source_hash}/download")
-def download_pdf(source_hash: str):
-    try:
-        path, filename = resolve_pdf_download_path(source_hash)
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return FileResponse(path, media_type="application/pdf", filename=filename)
-
-
-@app.get("/api/pdfs/{source_hash}/view")
-def view_pdf(source_hash: str):
+def _pdf_file_response(source_hash: str, *, inline: bool) -> FileResponse:
     try:
         path, filename = resolve_pdf_download_path(source_hash)
     except PermissionError as exc:
@@ -5261,8 +5127,18 @@ def view_pdf(source_hash: str):
         path,
         media_type="application/pdf",
         filename=filename,
-        content_disposition_type="inline",
+        content_disposition_type="inline" if inline else "attachment",
     )
+
+
+@app.get("/api/pdfs/{source_hash}/download")
+def download_pdf(source_hash: str):
+    return _pdf_file_response(source_hash, inline=False)
+
+
+@app.get("/api/pdfs/{source_hash}/view")
+def view_pdf(source_hash: str):
+    return _pdf_file_response(source_hash, inline=True)
 
 
 @app.delete("/api/pdfs/{source_hash}")

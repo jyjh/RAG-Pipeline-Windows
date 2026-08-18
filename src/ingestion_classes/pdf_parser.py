@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-from src._class_module_support import bind_module_namespace, finalize_split_class
-import src.ingestion as _source_module
+from typing import Protocol
 
-bind_module_namespace(
-    _source_module,
-    globals(),
-    proxy_functions=_source_module._CLASS_MODULE_PROXY_FUNCTIONS,
-)
+import src.ingestion as _source_module
+from src._class_module_support import finalize_split_class
 
 
 class PdfParser(Protocol):

@@ -47,10 +47,7 @@ class LocalVectorIndexer:
         chunk_overlap_tokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS,
         progress_enabled: bool = True,
     ):
-        from src.embeddings import EmbeddingEngine
-        from src import llm_api as _llm_api
-        from src.config import load_config
-        from src.defaults import DEFAULT_EMBEDDING_DIM
+        from src.embeddings import EmbeddingSetup
 
         self.working_dir = working_dir
         self.reuse_db_dir = reuse_db_dir
@@ -59,38 +56,26 @@ class LocalVectorIndexer:
         self.summary_mode = summary_mode
         self.chunk_target_tokens = _positive_int(chunk_target_tokens, DEFAULT_CHUNK_TARGET_TOKENS)
         self.chunk_overlap_tokens = _positive_int(chunk_overlap_tokens, DEFAULT_CHUNK_OVERLAP_TOKENS)
-        self.embedding_model = (
-            "nomic-embed-text"
-            if embedding_model == "nomic-ai/nomic-embed-text-v1.5"
-            else embedding_model
+        # Model alias, dim (explicit > config > default), doc prefix, and engine
+        # construction are centralized in EmbeddingSetup. Threading the dim from
+        # config keeps the index, reuse guards, and manifest consistent; a
+        # model/dim change invalidates an existing index (full re-index needed).
+        setup = EmbeddingSetup(
+            embedding_model,
+            embedding_dim=embedding_dim,
+            batch_size=embedding_batch_size or os.environ.get("LOCAL_RAG_EMBED_BATCH_SIZE"),
+            timeout=embedding_timeout,
         )
-        self.embedding_batch_size = _positive_int(
-            embedding_batch_size or os.environ.get("LOCAL_RAG_EMBED_BATCH_SIZE"),
-            128,
-        )
-        # bge-m3 is 1024-d (was 768 for nomic). Threading the dim from config
-        # keeps the index, reuse guards, and manifest consistent; a model/dim
-        # change invalidates an existing index (full re-index required).
-        if embedding_dim is None:
-            try:
-                embedding_dim = int(load_config().models.embedding_dim)
-            except Exception:
-                embedding_dim = DEFAULT_EMBEDDING_DIM
-        self.embedding_dim = max(1, int(embedding_dim))
-        # bge-m3 is instruction-free (no "search_document:" prefix); nomic/e5
-        # keep their prefixes. Resolved once, reused for every batch.
-        self.doc_prefix = _llm_api.resolve_embedding_prefix(self.embedding_model, "doc")
-        backend_label = "SoCLAaS API" if _llm_api.is_soclaas() else "Ollama"
+        self.embedding_model = setup.model
+        self.embedding_dim = setup.dim
+        self.embedding_batch_size = setup.batch_size
+        self.doc_prefix = setup.doc_prefix
         _status(
-            f"Local index: using {backend_label} embedding model {self.embedding_model} "
+            f"Local index: using {setup.backend_label} embedding model {self.embedding_model} "
             f"(dim={self.embedding_dim}, batch_size={self.embedding_batch_size})",
             enabled=progress_enabled,
         )
-        self.engine = EmbeddingEngine(
-            model_name=self.embedding_model,
-            ollama_batch_size=self.embedding_batch_size,
-            ollama_timeout=embedding_timeout,
-        )
+        self.engine = setup.engine
 
     def _preflight_embeddings(self) -> None:
         from src import llm_api as _llm_api
@@ -143,132 +128,55 @@ class LocalVectorIndexer:
     def _reuse_candidates(
         self,
         store: LanceDBVectorStore,
-        *,
-        max_records: int = 100_000,
+        source_hash: str = "",
     ) -> dict[str, dict[str, Any]]:
-        # Safety ceiling: loading the entire index into RAM (one Python dict
-        # entry per record, each holding an embedding_dim-float vector) is only safe for
-        # small corpora. At 100GB-scale this would hold gigabytes of vectors and
-        # OOM the process. The streaming indexer uses
-        # :meth:`_reuse_candidates_for_source` (one source at a time) instead;
-        # this whole-index path is an edge-case fallback kept for callers that
-        # build records without a source_hash. Guard it so an accidental large
-        # index fails loudly instead of silently exhausting memory.
+        """Vector-reuse candidates keyed by record id (``{content_hash, vector}``).
+
+        With ``source_hash`` only that source's rows are read (constant memory
+        during streaming indexing). Without it the *entire* reuse index is
+        loaded, which is only safe for small corpora -- the whole-index path is
+        an edge-case fallback for records without a source_hash, guarded by
+        ``max_records`` so an accidental large index fails loudly instead of
+        silently exhausting memory.
+        """
+        source_hash = str(source_hash or "")
         if not store.exists():
             return {}
         try:
-            total = store.count()
-            if total > max_records:
-                _status(
-                    f"Local index: whole-index reuse scan refused for {total} records "
-                    f"(cap {max_records}); skipping vector reuse for this batch.",
-                    enabled=self.progress_enabled,
-                )
-                return {}
-            model, dim = store.metadata()
-            if model != self.embedding_model or dim != self.embedding_dim:
-                return {}
-            candidates: dict[str, dict[str, Any]] = {}
-            for record in store.all_records():
-                record_id = str(record.get("id") or "")
-                vector = record.get("vector")
-                if not record_id or vector is None:
-                    continue
-                if len(vector) != self.embedding_dim:
-                    continue
-                candidates[record_id] = {
-                    "content_hash": index_record_content_hash(record),
-                    "vector": [float(value) for value in vector],
-                }
-            return candidates
-        except Exception as exc:
-            _status(
-                f"Local index: existing index could not be inspected for vector reuse: {exc}",
-                enabled=self.progress_enabled,
-            )
-            return {}
-
-    def _reuse_candidates_for_source(
-        self,
-        store: LanceDBVectorStore,
-        source_hash: str,
-    ) -> dict[str, dict[str, Any]]:
-        """Vector-reuse candidates for a single source only.
-
-        Unlike :meth:`_reuse_candidates` (which loads the *entire* reuse index
-        into RAM), this reads only the target source's rows via
-        :meth:`records_by_source_hash`, so peak memory stays ~one file during
-        streaming indexing instead of ~the whole corpus.
-        """
-        source_hash = str(source_hash or "")
-        if not source_hash or not store.exists():
-            return {}
-        try:
-            model, dim = store.metadata()
-            if model != self.embedding_model or dim != self.embedding_dim:
-                return {}
-            candidates: dict[str, dict[str, Any]] = {}
-            for record in store.vectors_by_source_hash([source_hash]):
-                record_id = str(record.get("id") or "")
-                vector = record.get("vector")
-                if not record_id or vector is None:
-                    continue
-                if len(vector) != self.embedding_dim:
-                    continue
-                candidates[record_id] = {
-                    "content_hash": index_record_content_hash(record),
-                    "vector": [float(value) for value in vector],
-                }
-            return candidates
-        except Exception as exc:
-            _status(
-                f"Local index: existing index could not be inspected for vector reuse: {exc}",
-                enabled=self.progress_enabled,
-            )
-            return {}
-
-    def _attach_vectors(
-        self,
-        records: list[dict[str, Any]],
-        *,
-        store: LanceDBVectorStore,
-    ) -> tuple[int, int]:
-        reuse_candidates = self._reuse_candidates(store)
-        pending: list[tuple[int, dict[str, Any]]] = []
-        reused = 0
-        for index, record in enumerate(records):
-            record_id = str(record.get("id") or "")
-            candidate = reuse_candidates.get(record_id)
-            if candidate and candidate["content_hash"] == index_record_content_hash(record):
-                record["vector"] = list(candidate["vector"])
-                record["vector_reused"] = True
-                reused += 1
+            if source_hash:
+                rows = store.vectors_by_source_hash([source_hash])
             else:
-                pending.append((index, record))
-
-        if not pending:
+                total = store.count()
+                if total > 100_000:
+                    _status(
+                        f"Local index: whole-index reuse scan refused for {total} records "
+                        f"(cap 100000); skipping vector reuse for this batch.",
+                        enabled=self.progress_enabled,
+                    )
+                    return {}
+                rows = store.all_records()
+            model, dim = store.metadata()
+            if model != self.embedding_model or dim != self.embedding_dim:
+                return {}
+            candidates: dict[str, dict[str, Any]] = {}
+            for record in rows:
+                record_id = str(record.get("id") or "")
+                vector = record.get("vector")
+                if not record_id or vector is None:
+                    continue
+                if len(vector) != self.embedding_dim:
+                    continue
+                candidates[record_id] = {
+                    "content_hash": index_record_content_hash(record),
+                    "vector": [float(value) for value in vector],
+                }
+            return candidates
+        except Exception as exc:
             _status(
-                f"Local index: reused all {reused} existing vector(s); no embedding batches needed.",
+                f"Local index: existing index could not be inspected for vector reuse: {exc}",
                 enabled=self.progress_enabled,
             )
-            return reused, 0
-
-        self._preflight_embeddings()
-        embedded = 0
-        for file_name, grouped in self._group_pending_by_file(pending).items():
-            _status(
-                f"Local index: embedding {len(grouped)} changed/new record(s) from {file_name}",
-                enabled=self.progress_enabled,
-            )
-            vectors = self._embed_texts(
-                [record["content"] for _, record in grouped],
-                file_name=file_name,
-            )
-            for (record_index, _), vector in zip(grouped, vectors):
-                records[record_index]["vector"] = vector.tolist()
-                embedded += 1
-
-        return reused, embedded
+            return {}
 
     def _attach_vectors_for_file(
         self,
@@ -288,10 +196,7 @@ class LocalVectorIndexer:
         whole-index reuse semantics for callers that build records directly.
         Returns ``(reused, embedded)``.
         """
-        if source_hash:
-            reuse_candidates = self._reuse_candidates_for_source(store, source_hash)
-        else:
-            reuse_candidates = self._reuse_candidates(store)
+        reuse_candidates = self._reuse_candidates(store, source_hash)
         pending: list[dict[str, Any]] = []
         reused = 0
         for record in records:
@@ -338,21 +243,11 @@ class LocalVectorIndexer:
             groups.setdefault(key, []).append(record)
         return groups
 
-    @staticmethod
-    def _group_pending_by_file(
-        pending: list[tuple[int, dict[str, Any]]],
-    ) -> dict[str, list[tuple[int, dict[str, Any]]]]:
-        grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
-        for item in pending:
-            file_name = Path(str(item[1].get("file_path") or "records")).name
-            grouped.setdefault(file_name, []).append(item)
-        return grouped
-
     def _write_file_records(
         self,
         store: LanceDBVectorStore,
         source_groups: list[tuple[str, list[dict[str, Any]]]],
-        manifest: dict[str, Any],
+        manifest: IndexManifest,
     ) -> None:
         """Write one file's already-embedded records to the store (writer thread).
 
@@ -376,7 +271,7 @@ class LocalVectorIndexer:
                     embedding_model=self.embedding_model,
                     embedding_dim=self.embedding_dim,
                 )
-            _merge_records_into_manifest(manifest, source_records)
+            manifest.merge_records(source_records)
 
     def _checkpoint_path(self) -> Path:
         return Path(self.working_dir) / CHECKPOINT_FILENAME
@@ -412,7 +307,7 @@ class LocalVectorIndexer:
         written_records: int,
         total_embedded: int,
         total_reused: int,
-        manifest: dict[str, Any],
+        manifest: IndexManifest,
     ) -> None:
         """Atomically persist resume state.
 
@@ -424,9 +319,7 @@ class LocalVectorIndexer:
         """
         from src.atomic_io import write_json_atomic
 
-        # Strip the non-persisted _working_dir routing key (same as
-        # write_index_manifest_payload) so it never lands in the checkpoint.
-        manifest_snapshot = {k: v for k, v in manifest.items() if k != "_working_dir"}
+        manifest_snapshot = dict(manifest.payload)
         payload = {
             "completed_files": sorted(set(completed_files)),
             "processed_files": int(processed_files),
@@ -496,10 +389,9 @@ class LocalVectorIndexer:
             embedding_dim=self.embedding_dim,
         )
 
-        manifest = _empty_manifest(self.embedding_model, self.embedding_dim)
-        # Stash the working dir so _merge_records_into_manifest can write
-        # per-source content-hash sidecars next to the manifest.
-        manifest["_working_dir"] = str(self.working_dir)
+        manifest = IndexManifest(
+            self.embedding_model, self.embedding_dim, working_dir=self.working_dir
+        )
         total_reused = 0
         total_embedded = 0
         written_records = 0
@@ -529,9 +421,7 @@ class LocalVectorIndexer:
                 # skipped files without re-reading their LanceDB rows.
                 cp_manifest = checkpoint.get("manifest") or {}
                 if isinstance(cp_manifest, dict):
-                    for key, value in cp_manifest.items():
-                        if key != "_working_dir":
-                            manifest[key] = value
+                    manifest.payload.update(cp_manifest)
                 processed_files = int(checkpoint.get("processed_files") or 0)
                 failed_files = int(checkpoint.get("failed_files") or 0)
                 written_records = int(checkpoint.get("written_records") or 0)
@@ -572,6 +462,28 @@ class LocalVectorIndexer:
             if pending_write is not None:
                 pending_write.result()  # propagate write errors synchronously
                 pending_write = None
+
+        def _report_indexing_progress() -> None:
+            # Structured progress for the web UI. Emitted unconditionally (not
+            # gated by progress_enabled) so a multi-day index run surfaced via
+            # the job queue still reports done/total/rate. `done` includes files
+            # completed in a prior run (resume) so the bar reflects overall
+            # position.
+            elapsed_min = max(index_timer.elapsed() / 60.0, 1e-9)
+            emit_progress(
+                phase="indexing",
+                done=len(completed_file_names) + files_done_this_run,
+                total=total_files_to_index,
+                unit="files",
+                rate_per_min=files_done_this_run / elapsed_min,
+                extra={
+                    "records_written": written_records,
+                    "records_embedded": total_embedded,
+                    "records_reused": total_reused,
+                    "failed_files": failed_files,
+                    "resumed": resuming,
+                },
+            )
 
         try:
             # Track the file currently in-flight on the writer thread so a
@@ -672,27 +584,7 @@ class LocalVectorIndexer:
                         f"({total_embedded} embedded, {total_reused} reused cumulative)",
                         enabled=self.progress_enabled,
                     )
-                    # Structured progress for the web UI. Emitted unconditionally
-                    # (not gated by progress_enabled) so a multi-day index run
-                    # surfaced via the job queue still reports done/total/rate.
-                    # `done` includes files completed in a prior run (resume) so
-                    # the bar reflects overall position.
-                    elapsed_min = max(index_timer.elapsed() / 60.0, 1e-9)
-                    done_count = len(completed_file_names) + files_done_this_run
-                    emit_progress(
-                        phase="indexing",
-                        done=done_count,
-                        total=total_files_to_index,
-                        unit="files",
-                        rate_per_min=files_done_this_run / elapsed_min,
-                        extra={
-                            "records_written": written_records,
-                            "records_embedded": total_embedded,
-                            "records_reused": total_reused,
-                            "failed_files": failed_files,
-                            "resumed": resuming,
-                        },
-                    )
+                    _report_indexing_progress()
                     # Periodic checkpoint so a crash loses at most ~one checkpoint
                     # interval of work. Written only after the in-flight write for
                     # the previous file is confirmed durable above.
@@ -720,22 +612,7 @@ class LocalVectorIndexer:
                         f"Local index: failed to index {file_name}: {exc}. Continuing.",
                         enabled=self.progress_enabled,
                     )
-                    elapsed_min = max(index_timer.elapsed() / 60.0, 1e-9)
-                    done_count = len(completed_file_names) + files_done_this_run
-                    emit_progress(
-                        phase="indexing",
-                        done=done_count,
-                        total=total_files_to_index,
-                        unit="files",
-                        rate_per_min=files_done_this_run / elapsed_min,
-                        extra={
-                            "records_written": written_records,
-                            "records_embedded": total_embedded,
-                            "records_reused": total_reused,
-                            "failed_files": failed_files,
-                            "resumed": resuming,
-                        },
-                    )
+                    _report_indexing_progress()
         finally:
             # Flush the last in-flight write before continuing to ANN build.
             _await_pending_write()
@@ -745,7 +622,7 @@ class LocalVectorIndexer:
             write_executor.shutdown(wait=True)
 
 
-        write_index_manifest_payload(self.working_dir, manifest)
+        manifest.write()
         # The build succeeded: the durable manifest supersedes the resume
         # checkpoint, so remove it. A leftover checkpoint in the staged dir
         # would otherwise be published into the live index (harmless but messy)
@@ -819,7 +696,7 @@ class LocalVectorIndexer:
             from src.disk_space import estimate_dir_bytes
             from src.job_logging import write_run_summary
 
-            disk_used = estimate_dir_bytes(self.db_path)
+            disk_used = estimate_dir_bytes(store.db_path)
             write_run_summary(
                 Path(self.working_dir) / ".index_result.json",
                 phase="index",

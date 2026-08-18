@@ -6,7 +6,6 @@ import io
 import logging
 import os
 import re
-import sys
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
@@ -36,20 +35,21 @@ from src.defaults import (
 
 from src._class_module_support import import_split_class
 from src.atomic_io import write_json_atomic, write_text_atomic
+from src.coerce import as_bool, as_optional_int
+from src.console import status as _progress_status
+from src.console import iter_with_progress as _iter_with_progress
 from src.job_logging import RunTimer, log_event, write_run_summary
 
 INGEST_RESULT_FILENAME = ".ingest_result.json"
 
 _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_usable_vision_description",
-    "_legacy_run_ingestion",
     "_ollama_generate",
     "_pdf_components",
     "_default_pdf_reader",
     "_new_pdf_writer",
     "_png_bytes_for_vision",
     "VISION_IMAGE_MAX_EDGE",
-    "_tqdm",
     "_docling_components",
     "_normalize_bool",
     "_normalize_optional_int",
@@ -93,24 +93,6 @@ def _usable_vision_description(description: str) -> bool:
     text = (description or "").strip()
     return bool(text) and text not in FAILED_VISION_DESCRIPTIONS
 
-
-_LegacyDocumentProcessor = import_split_class("src.ingestion_classes._legacy_document_processor", "_LegacyDocumentProcessor")
-_LegacyDocumentProcessor.__module__ = __name__
-
-
-def _legacy_run_ingestion(input_dir: str, output_dir: str):
-    processor = _LegacyDocumentProcessor()
-    os.makedirs(output_dir, exist_ok=True)
-
-    for filename in sorted(os.listdir(input_dir)):
-        if filename.endswith(".pdf"):
-            input_path = os.path.join(input_dir, filename)
-            md_content = processor.process_pdf(input_path)
-
-            output_path = os.path.join(output_dir, f"{Path(filename).stem}.md")
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(md_content)
-            logger.info(f"Processed {filename} -> {output_path}")
 
 PdfParser = import_split_class("src.ingestion_classes.pdf_parser", "PdfParser")
 PdfParser.__module__ = __name__
@@ -221,12 +203,6 @@ def _png_bytes_for_vision(image, fallback_bytes: bytes | None = None) -> bytes:
     return buffered.getvalue()
 
 
-def _tqdm():
-    from tqdm import tqdm
-
-    return tqdm
-
-
 def _docling_components():
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import (
@@ -239,26 +215,13 @@ def _docling_components():
     return InputFormat, AcceleratorDevice, AcceleratorOptions, PdfPipelineOptions, DocumentConverter, PdfFormatOption
 
 
-def _normalize_bool(value: bool | str | int | None, default: bool) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on"}:
-        return True
-    if text in {"0", "false", "no", "off"}:
-        return False
-    return default
+# Shared coercion/console helpers; aliased to the historical names because the
+# split-class modules resolve them through this module's namespace.
+_normalize_bool = as_bool
 
 
 def _normalize_optional_int(value: int | str | None) -> int | None:
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+    return as_optional_int(value, None)
 
 
 def _normalize_ocr_langs(value: str | list[str] | tuple[str, ...] | None, *, backend: str) -> list[str]:
@@ -356,33 +319,6 @@ def _accelerator_value(accelerator: str | Any) -> str:
 def _looks_like_accelerator_failure(exc: Exception) -> bool:
     text = str(exc).lower()
     return "accelerator" in text or "cuda is not available" in text
-
-
-def _iter_with_progress(
-    iterable,
-    *,
-    enabled: bool,
-    total: int | None,
-    desc: str,
-    unit: str,
-):
-    if not enabled:
-        return iterable
-    return _tqdm()(
-        iterable,
-        total=total,
-        desc=desc,
-        unit=unit,
-        leave=False,
-        dynamic_ncols=True,
-        ascii=True,
-    )
-
-
-def _progress_status(message: str, *, enabled: bool = True) -> None:
-    if not enabled:
-        return
-    print(message, file=sys.stderr, flush=True)
 
 
 def _build_docling_converter(
@@ -503,29 +439,33 @@ def _markdown_name_for_pdf(
 # across files in the same worker and avoids re-loading per PDF.
 _PROCESSOR_CACHE: dict[str, DocumentProcessor] = {}
 
+# Option keys that shape the DocumentProcessor. Single source for the worker
+# processor-cache key and the DocumentProcessor constructor call; run_ingestion
+# fills every key in its options dict.
+_PROCESSOR_OPTION_FIELDS = (
+    "vision_model",
+    "parser_mode",
+    "accelerator",
+    "num_threads",
+    "vision_enabled",
+    "asset_triggers",
+    "asset_dir",
+    "code_enrichment",
+    "formula_enrichment",
+    "ocr_backend",
+    "ocr_langs",
+    "ocr_force_full_page",
+    "ocr_bitmap_area_threshold",
+    "rapidocr_backend",
+    "tesseract_cmd",
+    "tesseract_data_path",
+    "tesseract_psm",
+)
+
 
 def _processor_cache_key(options: dict[str, Any]) -> str:
     """Build a stable key for the ingestion config so a worker can reuse a processor."""
-    parts = [
-        str(options.get("vision_model", "")),
-        str(options.get("parser_mode", "")),
-        str(options.get("accelerator", "")),
-        str(options.get("num_threads", "")),
-        str(options.get("vision_enabled", "")),
-        str(options.get("ocr_backend", "")),
-        str(options.get("ocr_langs", "")),
-        str(options.get("ocr_force_full_page", "")),
-        str(options.get("ocr_bitmap_area_threshold", "")),
-        str(options.get("rapidocr_backend", "")),
-        str(options.get("tesseract_cmd", "")),
-        str(options.get("tesseract_data_path", "")),
-        str(options.get("tesseract_psm", "")),
-        str(options.get("code_enrichment", "")),
-        str(options.get("formula_enrichment", "")),
-        str(options.get("asset_triggers", "")),
-        str(options.get("asset_dir", "")),
-    ]
-    return "|".join(parts)
+    return "|".join(str(options.get(key, "")) for key in _PROCESSOR_OPTION_FIELDS)
 
 
 def _get_or_build_processor(options: dict[str, Any], *, progress_enabled: bool) -> DocumentProcessor:
@@ -534,25 +474,7 @@ def _get_or_build_processor(options: dict[str, Any], *, progress_enabled: bool) 
     if processor is None:
         _progress_status("Preparing PDF parser...", enabled=progress_enabled)
         processor = DocumentProcessor(
-            vision_model=options.get("vision_model", DEFAULT_VISION_MODEL),
-            parser_mode=options.get("parser_mode", DEFAULT_PDF_PARSER_MODE),
-            accelerator=options.get("accelerator", DEFAULT_DOCLING_ACCELERATOR),
-            num_threads=options.get("num_threads", 8),
-            vision_enabled=options.get("vision_enabled", DEFAULT_VISION_ENABLED),
-            asset_triggers=options.get("asset_triggers", DEFAULT_ASSET_TRIGGERS),
-            asset_dir=options.get("asset_dir", DEFAULT_ASSET_DIR),
-            code_enrichment=options.get("code_enrichment", DEFAULT_CODE_ENRICHMENT),
-            formula_enrichment=options.get("formula_enrichment", DEFAULT_FORMULA_ENRICHMENT),
-            ocr_backend=options.get("ocr_backend", DEFAULT_OCR_BACKEND),
-            ocr_langs=options.get("ocr_langs"),
-            ocr_force_full_page=options.get("ocr_force_full_page", DEFAULT_OCR_FORCE_FULL_PAGE),
-            ocr_bitmap_area_threshold=options.get(
-                "ocr_bitmap_area_threshold", DEFAULT_OCR_BITMAP_AREA_THRESHOLD
-            ),
-            rapidocr_backend=options.get("rapidocr_backend", DEFAULT_RAPIDOCR_BACKEND),
-            tesseract_cmd=options.get("tesseract_cmd", DEFAULT_TESSERACT_CMD),
-            tesseract_data_path=options.get("tesseract_data_path", DEFAULT_TESSERACT_DATA_PATH),
-            tesseract_psm=options.get("tesseract_psm", DEFAULT_TESSERACT_PSM),
+            **{field: options[field] for field in _PROCESSOR_OPTION_FIELDS},
             progress_enabled=progress_enabled,
             max_pages_whole_doc=int(options.get("max_pages_whole_doc", 50)),
         )

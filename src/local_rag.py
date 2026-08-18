@@ -19,6 +19,29 @@ from typing import Any
 
 from src.atomic_io import write_json_atomic
 from src import llm_api
+from src.coerce import (
+    as_bounded_float as _bounded_float,
+    as_positive_float as _positive_float,
+    as_positive_int as _positive_int,
+)
+from src.console import status as _status
+from src.console import iter_with_progress as _iter_with_progress
+from src.defaults import (
+    DEFAULT_CONTEXT_TOKEN_FRACTION,
+    DEFAULT_CONTEXT_WINDOW,
+    DEFAULT_LLM_TIMEOUT,
+    DEFAULT_NUM_PREDICT,
+    DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL,
+    DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
+    DEFAULT_PLANNER_MAX_QUERIES,
+    DEFAULT_PLANNER_MODEL,
+    DEFAULT_RETRIEVAL_CANDIDATE_K,
+    DEFAULT_RETRIEVAL_MIN_SCORE,
+    DEFAULT_RETRIEVAL_RELATIVE_CUTOFF,
+    DEFAULT_SAMPLER_TOP_K,
+    DEFAULT_WEB_SEARCH_MAX_RESULTS,
+    DEFAULT_WEB_SEARCH_TIMEOUT,
+)
 from src.sectioning import (
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_CHUNK_TARGET_TOKENS,
@@ -31,7 +54,6 @@ from src._class_module_support import import_split_class
 _CLASS_MODULE_PROXY_FUNCTIONS = (
     "build_section_records",
     "_status",
-    "_tqdm",
     "_iter_with_progress",
     "_ollama_pull_command",
     "_normalize_ollama_host",
@@ -57,7 +79,6 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_ollama_tool_calls",
     "generate_search_queries",
     "_split_think_tag_events",
-    "chunk_markdown",
     "estimate_context_tokens",
     "estimate_text_tokens",
     "estimate_json_tokens",
@@ -79,11 +100,8 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "citation_support_warnings",
     "_manifest_source_key",
     "index_record_content_hash",
-    "_build_index_manifest",
-    "_empty_manifest",
-    "_merge_records_into_manifest",
+    "IndexManifest",
     "write_index_manifest",
-    "write_index_manifest_payload",
     "update_index_manifest_sources",
     "load_content_hash_sidecar",
     "_content_hash_sidecar_path",
@@ -95,25 +113,12 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
 
 QUERY_TEMPERATURE = 0.3
 INDEX_MANIFEST_FILENAME = "index_manifest.json"
-DEFAULT_NUM_PREDICT = 4096
-DEFAULT_SAMPLER_TOP_K = 40
-DEFAULT_CONTEXT_WINDOW = 8192
-DEFAULT_LLM_TIMEOUT = 120.0
-DEFAULT_RETRIEVAL_CANDIDATE_K = 80
-DEFAULT_RETRIEVAL_MIN_SCORE = 0.50
-DEFAULT_RETRIEVAL_RELATIVE_CUTOFF = 0.72
+# Engine-internal tuning knobs (not surfaced in config; see src/defaults.py for
+# the shared chat/retrieval defaults).
 DEFAULT_RETRIEVAL_LEXICAL_WEIGHT = 0.20
 DEFAULT_RRF_K = 60
-DEFAULT_CONTEXT_TOKEN_FRACTION = 0.60
 DEFAULT_TOOL_MAX_ROUNDS = 4
 DEFAULT_TOOL_MAX_CALLS = 8
-DEFAULT_WEB_SEARCH_TIMEOUT = 8.0
-DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
-DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL = 5.0
-DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS = 5
-# SoCLAaS exposes only three models, so the planner reuses the main chat model.
-DEFAULT_PLANNER_MODEL = "gemma4:26b"
-DEFAULT_PLANNER_MAX_QUERIES = 3
 DEFAULT_PLANNER_TIMEOUT = 30.0
 DEFAULT_PLANNER_TEMPERATURE = 0.0
 DEFAULT_PLANNER_NUM_PREDICT = 256
@@ -146,63 +151,13 @@ EAGER_CONTEXT_SUFFIX = (
 )
 
 
-def _status(message: str, *, enabled: bool = True) -> None:
-    if enabled:
-        print(message, file=sys.stderr, flush=True)
-
-
-def _tqdm():
-    from tqdm import tqdm
-
-    return tqdm
-
-
-def _iter_with_progress(
-    iterable,
-    *,
-    enabled: bool,
-    total: int | None,
-    desc: str,
-    unit: str,
-):
-    if not enabled:
-        return iterable
-    return _tqdm()(
-        iterable,
-        total=total,
-        desc=desc,
-        unit=unit,
-        leave=False,
-        dynamic_ncols=True,
-        ascii=True,
-    )
-
-
-def _ollama_pull_command(model: str) -> str:
-    executable = shutil.which("ollama")
-    if executable is None:
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            candidate = os.path.join(local_app_data, "Programs", "Ollama", "ollama.exe")
-            if os.path.exists(candidate):
-                executable = candidate
-    if executable is None:
-        executable = "ollama"
-    if " " in executable:
-        executable = f'"{executable}"'
-    return f"{executable} pull {model}"
-
-
 _ACTIVE_OLLAMA_HOST: str | None = None
 
-
-def _normalize_ollama_host(raw: str) -> str:
-    host = (raw or "").strip()
-    if not host:
-        return "http://127.0.0.1:11434"
-    if host.startswith(("http://", "https://")):
-        return host.rstrip("/")
-    return f"http://{host.rstrip('/')}"
+# Shared host normalization + pull-command hint live in llm_api alongside the
+# backend selector; aliases keep the historical module-level names working for
+# the split-class proxy and tests.
+_normalize_ollama_host = llm_api.normalize_ollama_host
+_ollama_pull_command = llm_api.ollama_pull_command
 
 
 def _ollama_host() -> str:
@@ -391,6 +346,9 @@ def _wait_for_ollama_recovery(
             if _ACTIVE_OLLAMA_HOST != healthy_host:
                 _status(f"Ollama dynamic failover: active host updated to {healthy_host}")
                 _ACTIVE_OLLAMA_HOST = healthy_host
+            # OLLAMA_HOST env takes precedence over _ACTIVE_OLLAMA_HOST in
+            # _ollama_host(), so a deployment configured via env var must have
+            # the env updated for the failover to take effect.
             if "OLLAMA_HOST" in os.environ:
                 os.environ["OLLAMA_HOST"] = healthy_host
             return True
@@ -471,30 +429,6 @@ def _ollama_chat_stream(
                     ) from exc
 
     return events()
-
-
-def _positive_int(value: int | str | None, default: int) -> int:
-    if value is None:
-        return default
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return max(1, parsed)
-
-
-def _positive_float(value: float | str | None, default: float) -> float:
-    if value is None:
-        return default
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    return max(0.0, parsed)
-
-
-def _bounded_float(value: float | str | None, default: float, *, minimum: float = 0.0, maximum: float = 1.0) -> float:
-    return min(maximum, max(minimum, _positive_float(value, default)))
 
 
 def _choice_part(response: Any) -> dict[str, Any] | None:
@@ -698,41 +632,6 @@ def generate_search_queries(
     if question.lower() not in planned_lower:
         return [question, *planned][: max_queries]
     return [question] + [q for q in planned if q.lower() != question.lower()][: max_queries - 1]
-
-
-def chunk_markdown(text: str, *, max_chars: int = 3000, overlap: int = 400) -> list[str]:
-    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
-    chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
-
-    def flush_current() -> None:
-        nonlocal current, current_len
-        if current:
-            chunks.append("\n\n".join(current).strip())
-            current = []
-            current_len = 0
-
-    for paragraph in paragraphs:
-        if len(paragraph) > max_chars:
-            flush_current()
-            start = 0
-            while start < len(paragraph):
-                end = min(len(paragraph), start + max_chars)
-                chunks.append(paragraph[start:end].strip())
-                if end == len(paragraph):
-                    break
-                start = max(start + 1, end - overlap)
-            continue
-
-        projected_len = current_len + len(paragraph) + (2 if current else 0)
-        if current and projected_len > max_chars:
-            flush_current()
-        current.append(paragraph)
-        current_len += len(paragraph) + (2 if current_len else 0)
-
-    flush_current()
-    return chunks
 
 
 def estimate_context_tokens(text: str) -> int:
@@ -1042,14 +941,15 @@ def _rrf_fuse(
     *,
     rrf_k: int = 60,
 ) -> dict[str, float]:
-    """Reciproical Rank Fusion of two ranked id lists.
+    """Reciprocal Rank Fusion of two ranked id lists.
 
     Combines a vector-search ranking and a lexical (BM25) ranking into a single
     fused score: ``score(id) = 1/(rrf_k + rank_vector) + 1/(rrf_k + rank_lex)``
     (1-indexed ranks; ids absent from one list contribute 0 from that list).
     ``rrf_k`` (default 60) dampens the influence of highly-ranked items so a
-    single dominant list can't swamp the other. This is the standard RRF used in
-    hybrid retrieval; the ``rrf_k`` config knob has been present but unused.
+    single dominant list can't swamp the other. This is the standard RRF used
+    in hybrid retrieval; the query engine passes its configured
+    ``retrieval_rrf_k`` through.
     """
     scores: dict[str, float] = {}
     for rank, record_id in enumerate(vector_ranked, start=1):
@@ -1135,108 +1035,228 @@ def index_record_content_hash(record: dict[str, Any]) -> str:
     return hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def _build_index_manifest(records: list[dict[str, Any]], *, embedding_model: str, embedding_dim: int) -> dict[str, Any]:
-    manifest = _empty_manifest(embedding_model, embedding_dim)
-    _merge_records_into_manifest(manifest, records)
-    return manifest
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _empty_manifest(embedding_model: str, embedding_dim: int) -> dict[str, Any]:
-    """Return a fresh, empty manifest shell ready for :func:`_merge_records_into_manifest`.
+class IndexManifest:
+    """Builds and persists ``index_manifest.json`` plus per-source hash sidecars.
 
-    Split from :func:`_build_index_manifest` so the streaming indexer can build
-    a manifest incrementally (one file's records merged at a time) instead of
-    holding the whole corpus's records in memory before computing the manifest.
+    The payload dict shape (version / embedding model+dim / per-document
+    entries / running totals) is the on-disk contract. This class owns
+    constructing and updating it; the working dir (which routes sidecar
+    writes) is a real attribute instead of a ``_working_dir`` key smuggled
+    through the payload, so it never leaks into the JSON on disk.
+
+    Per-record content hashes are written to per-source sidecar files
+    (``hashes/<source_key>.json``) rather than embedded in the manifest, so
+    the monolithic ``index_manifest.json`` stays small at scale (millions of
+    chunks would otherwise make it hundreds of MB and re-serialize on every
+    write). The hashes are consumed by tests and available for future
+    vector-reuse bookkeeping; the runtime reuse path computes its own
+    in-memory hashes.
     """
-    return {
-        "version": 1,
-        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "embedding_model": str(embedding_model),
-        "embedding_dim": int(embedding_dim),
-        "total_records": 0,
-        "embedded_records": 0,
-        "reused_records": 0,
-        "documents": {},
-    }
 
+    VERSION = 1
 
-def _merge_records_into_manifest(
-    manifest: dict[str, Any],
-    records: list[dict[str, Any]],
-) -> None:
-    """Fold ``records`` into ``manifest`` in place, updating running counts.
+    def __init__(
+        self,
+        embedding_model: str,
+        embedding_dim: int,
+        *,
+        working_dir: str | Path | None = None,
+        payload: dict[str, Any] | None = None,
+    ):
+        self.embedding_model = str(embedding_model)
+        self.embedding_dim = int(embedding_dim)
+        self.working_dir = str(working_dir) if working_dir is not None else None
+        if payload is None:
+            payload = {
+                "version": self.VERSION,
+                "updated_at": _utc_now_iso(),
+                "embedding_model": self.embedding_model,
+                "embedding_dim": self.embedding_dim,
+                "total_records": 0,
+                "embedded_records": 0,
+                "reused_records": 0,
+                "documents": {},
+            }
+        payload.pop("_working_dir", None)  # tolerate payloads from older code
+        self.payload = payload
 
-    Safe to call repeatedly (once per file during streaming indexing). For
-    re-indexing a source that already has an entry, pass only that file's
-    records and delete the existing document key first.
+    @classmethod
+    def load(
+        cls,
+        working_dir: str | Path,
+        *,
+        embedding_model: str,
+        embedding_dim: int,
+    ) -> "IndexManifest":
+        """Load the manifest from ``working_dir``, or a fresh shell if absent."""
+        path = Path(working_dir) / INDEX_MANIFEST_FILENAME
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except (OSError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        return cls(embedding_model, embedding_dim, working_dir=working_dir, payload=payload)
 
-    Per-record content hashes are written to a per-source sidecar file
-    (``hashes/<source_key>.json``) rather than embedded in the manifest, so the
-    monolithic ``index_manifest.json`` stays small at scale (millions of chunks
-    would otherwise make it hundreds of MB and re-serialize on every write).
-    The hashes are consumed by tests and available for future vector-reuse
-    bookkeeping; the runtime reuse path computes its own in-memory hashes.
-    """
-    documents: dict[str, dict[str, Any]] = manifest.setdefault("documents", {})
-    embedded = int(manifest.get("embedded_records") or 0)
-    reused = int(manifest.get("reused_records") or 0)
-    total = int(manifest.get("total_records") or 0)
-    # Accumulate per-source content hashes for the sidecar write.
-    sidecar_hashes: dict[str, dict[str, str]] = {}
-    for record in records:
-        key = _manifest_source_key(record)
-        document = documents.setdefault(
-            key,
-            {
-                "source_hash": str(record.get("source_hash") or ""),
-                "source_pdf_name": str(record.get("source_pdf_name") or ""),
-                "source_pdf_path": str(record.get("source_pdf_path") or ""),
-                "file_path": str(record.get("file_path") or ""),
-                "record_count": 0,
-                "chunk_count": 0,
-                "summary_count": 0,
-                "content_char_count": 0,
-                "page_start": 0,
-                "page_end": 0,
-                "embedded_count": 0,
-                "reused_count": 0,
-            },
+    @property
+    def documents(self) -> dict[str, dict[str, Any]]:
+        documents = self.payload.setdefault("documents", {})
+        if not isinstance(documents, dict):
+            documents = {}
+            self.payload["documents"] = documents
+        return documents
+
+    def merge_records(self, records: list[dict[str, Any]]) -> None:
+        """Fold ``records`` into the manifest in place, updating running counts.
+
+        Safe to call repeatedly (once per file during streaming indexing). For
+        re-indexing a source that already has an entry, drop the existing
+        document key first (see :meth:`replace_source`).
+        """
+        documents = self.documents
+        payload = self.payload
+        embedded = int(payload.get("embedded_records") or 0)
+        reused = int(payload.get("reused_records") or 0)
+        total = int(payload.get("total_records") or 0)
+        # Accumulate per-source content hashes for the sidecar write.
+        sidecar_hashes: dict[str, dict[str, str]] = {}
+        for record in records:
+            key = _manifest_source_key(record)
+            document = documents.setdefault(
+                key,
+                {
+                    "source_hash": str(record.get("source_hash") or ""),
+                    "source_pdf_name": str(record.get("source_pdf_name") or ""),
+                    "source_pdf_path": str(record.get("source_pdf_path") or ""),
+                    "file_path": str(record.get("file_path") or ""),
+                    "record_count": 0,
+                    "chunk_count": 0,
+                    "summary_count": 0,
+                    "content_char_count": 0,
+                    "page_start": 0,
+                    "page_end": 0,
+                    "embedded_count": 0,
+                    "reused_count": 0,
+                },
+            )
+            node_type = str(record.get("node_type") or "")
+            content = str(record.get("content") or "")
+            record_id = str(record.get("id") or "")
+            if record_id:
+                sidecar_hashes.setdefault(key, {})[record_id] = index_record_content_hash(record)
+            document["record_count"] += 1
+            document["content_char_count"] += len(content)
+            if node_type == "chunk":
+                document["chunk_count"] += 1
+            elif node_type.endswith("summary"):
+                document["summary_count"] += 1
+            page_start = int(record.get("page_start") or 0)
+            page_end = int(record.get("page_end") or 0)
+            if page_start:
+                current = int(document.get("page_start") or 0)
+                document["page_start"] = page_start if not current else min(current, page_start)
+            if page_end:
+                document["page_end"] = max(int(document.get("page_end") or 0), page_end)
+            if record.get("vector_reused"):
+                reused += 1
+                document["reused_count"] = int(document.get("reused_count") or 0) + 1
+            else:
+                embedded += 1
+                document["embedded_count"] = int(document.get("embedded_count") or 0) + 1
+            total += 1
+        payload["total_records"] = total
+        payload["embedded_records"] = embedded
+        payload["reused_records"] = reused
+        payload["updated_at"] = _utc_now_iso()
+        # Write the per-source content-hash sidecars (one file per source
+        # touched in this merge). Cheap: each sidecar is ~one source's worth.
+        if self.working_dir is not None and sidecar_hashes:
+            for source_key, hashes in sidecar_hashes.items():
+                _write_content_hash_sidecar(self.working_dir, source_key, hashes)
+
+    def replace_source(self, source_key: str, records: list[dict[str, Any]]) -> None:
+        """Replace one source's document entry with ``records`` (empty = remove)."""
+        self.documents.pop(source_key, None)
+        if not records:
+            return
+        mini = IndexManifest(self.embedding_model, self.embedding_dim, working_dir=self.working_dir)
+        mini.merge_records(records)
+        entry = mini.documents.get(source_key)
+        if isinstance(entry, dict):
+            self.documents[source_key] = entry
+
+    def recompute_totals(self) -> None:
+        """Recompute the running totals from the per-document entries."""
+        embedded = 0
+        reused = 0
+        total = 0
+        for entry in self.documents.values():
+            if not isinstance(entry, dict):
+                continue
+            count = int(entry.get("record_count") or 0)
+            total += count
+            embedded += int(entry.get("embedded_count") or count)
+            reused += int(entry.get("reused_count") or 0)
+        payload = self.payload
+        payload["version"] = int(payload.get("version") or self.VERSION)
+        payload["embedding_model"] = self.embedding_model
+        payload["embedding_dim"] = self.embedding_dim
+        payload["total_records"] = total
+        payload["embedded_records"] = embedded
+        payload["reused_records"] = reused
+        payload["updated_at"] = _utc_now_iso()
+
+    def write(self, working_dir: str | Path | None = None) -> dict[str, Any]:
+        """Atomically write the manifest JSON; returns the written payload."""
+        target = Path(working_dir) if working_dir is not None else (
+            Path(self.working_dir) if self.working_dir is not None else None
         )
-        node_type = str(record.get("node_type") or "")
-        content = str(record.get("content") or "")
-        record_id = str(record.get("id") or "")
-        if record_id:
-            sidecar_hashes.setdefault(key, {})[record_id] = index_record_content_hash(record)
-        document["record_count"] += 1
-        document["content_char_count"] += len(content)
-        if node_type == "chunk":
-            document["chunk_count"] += 1
-        elif node_type.endswith("summary"):
-            document["summary_count"] += 1
-        page_start = int(record.get("page_start") or 0)
-        page_end = int(record.get("page_end") or 0)
-        if page_start:
-            current = int(document.get("page_start") or 0)
-            document["page_start"] = page_start if not current else min(current, page_start)
-        if page_end:
-            document["page_end"] = max(int(document.get("page_end") or 0), page_end)
-        if record.get("vector_reused"):
-            reused += 1
-            document["reused_count"] = int(document.get("reused_count") or 0) + 1
-        else:
-            embedded += 1
-            document["embedded_count"] = int(document.get("embedded_count") or 0) + 1
-        total += 1
-    manifest["total_records"] = total
-    manifest["embedded_records"] = embedded
-    manifest["reused_records"] = reused
-    manifest["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    # Write the per-source content-hash sidecars (one file per source touched in
-    # this merge). Cheap: each sidecar is ~one source's worth of hashes.
-    working_dir = manifest.get("_working_dir")
-    if isinstance(working_dir, str) and sidecar_hashes:
-        for source_key, hashes in sidecar_hashes.items():
-            _write_content_hash_sidecar(working_dir, source_key, hashes)
+        if target is None:
+            raise ValueError("IndexManifest.write() needs a working_dir (constructor or argument)")
+        payload = {k: v for k, v in self.payload.items() if k != "_working_dir"}
+        write_json_atomic(target / INDEX_MANIFEST_FILENAME, payload)
+        return payload
+
+
+def write_index_manifest(
+    working_dir: str | Path,
+    records: list[dict[str, Any]],
+    *,
+    embedding_model: str,
+    embedding_dim: int,
+) -> dict[str, Any]:
+    manifest = IndexManifest(embedding_model, embedding_dim, working_dir=working_dir)
+    manifest.merge_records(records)
+    return manifest.write()
+
+
+def update_index_manifest_sources(
+    working_dir: str | Path,
+    source_records: dict[str, list[dict[str, Any]]],
+    *,
+    embedding_model: str,
+    embedding_dim: int,
+) -> dict[str, Any]:
+    """Update manifest entries for selected sources without scanning the index.
+
+    ``source_records`` maps source hashes to their current records. An empty
+    list removes that source. This keeps row edits, deletes, and incremental
+    reindex jobs proportional to the affected source rather than materializing
+    every chunk in the corpus.
+    """
+    manifest = IndexManifest.load(
+        working_dir, embedding_model=embedding_model, embedding_dim=embedding_dim
+    )
+    for source_key, records in source_records.items():
+        key = str(source_key or "")
+        if key:
+            manifest.replace_source(key, records)
+    manifest.recompute_totals()
+    return manifest.write()
 
 
 def _content_hash_sidecar_dir(working_dir: str | Path) -> Path:
@@ -1274,123 +1294,6 @@ def load_content_hash_sidecar(
         return {}
     hashes = payload.get("content_hashes") if isinstance(payload, dict) else None
     return dict(hashes) if isinstance(hashes, dict) else {}
-
-
-def _remove_source_from_manifest(manifest: dict[str, Any], source_key: str) -> None:
-    """Drop a document entry from ``manifest`` and recompute running totals.
-
-    Also removes the per-source content-hash sidecar if the manifest carries a
-    ``_working_dir`` (so a source delete cleans up its hashes file too).
-    """
-    documents: dict[str, dict[str, Any]] = manifest.setdefault("documents", {})
-    document = documents.pop(source_key, None)
-    if not document:
-        return
-    delta = int(document.get("record_count") or 0)
-    manifest["total_records"] = max(0, int(manifest.get("total_records") or 0) - delta)
-    # Embedded/reused counts are not recoverable per-source from the stored
-    # document shape, so recompute them as best-effort: subtract the doc's own
-    # record count proportionally only if we tracked it. We did not store
-    # per-doc embedded/reused, so leave the totals as upper-bound-ish and let
-    # the final write be authoritative for a full rebuild. For incremental
-    # re-index the merged records re-add the correct counts.
-    # Best-effort sidecar cleanup.
-    working_dir = manifest.get("_working_dir")
-    if isinstance(working_dir, str):
-        try:
-            sidecar = _content_hash_sidecar_path(working_dir, source_key)
-            if sidecar.exists():
-                sidecar.unlink()
-        except OSError:
-            pass
-
-
-def write_index_manifest_payload(
-    working_dir: str | Path,
-    manifest: dict[str, Any],
-) -> dict[str, Any]:
-    """Write a pre-built manifest dict to ``working_dir`` atomically."""
-    # Strip the internal _working_dir key (used only to route sidecar writes
-    # during _merge_records_into_manifest) so it never lands in the JSON file.
-    payload = {k: v for k, v in manifest.items() if k != "_working_dir"}
-    path = Path(working_dir) / INDEX_MANIFEST_FILENAME
-    write_json_atomic(path, payload)
-    return payload
-
-
-def write_index_manifest(
-    working_dir: str | Path,
-    records: list[dict[str, Any]],
-    *,
-    embedding_model: str,
-    embedding_dim: int,
-) -> dict[str, Any]:
-    # Build the manifest shell, set the working dir so the merge writes
-    # per-source content-hash sidecars next to the manifest, then merge once.
-    manifest = _empty_manifest(embedding_model, embedding_dim)
-    manifest["_working_dir"] = str(working_dir)
-    _merge_records_into_manifest(manifest, records)
-    return write_index_manifest_payload(working_dir, manifest)
-
-
-def update_index_manifest_sources(
-    working_dir: str | Path,
-    source_records: dict[str, list[dict[str, Any]]],
-    *,
-    embedding_model: str,
-    embedding_dim: int,
-) -> dict[str, Any]:
-    """Update manifest entries for selected sources without scanning the index.
-
-    ``source_records`` maps source hashes to their current records. An empty
-    list removes that source. This keeps row edits, deletes, and incremental
-    reindex jobs proportional to the affected source rather than materializing
-    every chunk in the corpus.
-    """
-    path = Path(working_dir) / INDEX_MANIFEST_FILENAME
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except (OSError, ValueError):
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    documents = payload.setdefault("documents", {})
-    if not isinstance(documents, dict):
-        documents = {}
-        payload["documents"] = documents
-
-    for source_key, records in source_records.items():
-        key = str(source_key or "")
-        if not key:
-            continue
-        documents.pop(key, None)
-        if not records:
-            continue
-        mini = _empty_manifest(embedding_model, embedding_dim)
-        mini["_working_dir"] = str(working_dir)
-        _merge_records_into_manifest(mini, records)
-        entry = mini.get("documents", {}).get(key)
-        if isinstance(entry, dict):
-            documents[key] = entry
-
-    embedded = 0
-    reused = 0
-    total = 0
-    for entry in documents.values():
-        if not isinstance(entry, dict):
-            continue
-        count = int(entry.get("record_count") or 0)
-        total += count
-        embedded += int(entry.get("embedded_count") or count)
-        reused += int(entry.get("reused_count") or 0)
-    payload["version"] = int(payload.get("version") or 1)
-    payload["embedding_model"] = str(embedding_model)
-    payload["embedding_dim"] = int(embedding_dim)
-    payload["total_records"] = total
-    payload["embedded_records"] = embedded
-    payload["reused_records"] = reused
-    payload["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    return write_index_manifest_payload(working_dir, payload)
 
 
 DuckDuckGoLiteParser = import_split_class("src.local_rag_classes.duck_duck_go_lite_parser", "DuckDuckGoLiteParser")

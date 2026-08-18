@@ -52,11 +52,11 @@ def main():
             run_ingestion(
                 input_dir=str(input_dir),
                 output_dir=processed_dir,
-                parser_mode=config.ingestion.ocr_strategy,
+                parser_mode=config.ingestion.parser_mode,
                 accelerator=config.ingestion.accelerator,
                 num_threads=config.ingestion.num_threads,
                 asset_dir=asset_dir,
-                code_enrichment=False,
+                code_enrichment=config.ingestion.code_enrichment,
                 formula_enrichment=config.ingestion.formula_enrichment,
                 vision_model=config.models.vision_model,
                 vision_enabled=config.ingestion.vision_enabled,
@@ -78,8 +78,6 @@ def main():
                 embedding_model=config.models.embedding_model,
                 index_backend="lancedb",
                 summary_mode="hybrid",
-                chunk_target_tokens=config.chunking.max_tokens,
-                chunk_overlap_tokens=config.chunking.overlap_tokens,
             )
             logger.info("Indexing completed successfully.")
         except Exception as e:

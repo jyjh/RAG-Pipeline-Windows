@@ -84,17 +84,6 @@ def _fake_local_tool_chat(calls, *, final_events=None):
     return fake_chat
 
 
-def test_chunk_markdown_splits_long_text_without_empty_chunks():
-    text = "alpha\n\n" + ("beta " * 1000)
-
-    chunks = local_rag.chunk_markdown(text, max_chars=100, overlap=10)
-
-    assert chunks
-    assert all(chunk.strip() for chunk in chunks)
-    assert chunks[0] == "alpha"
-    assert len(chunks) > 2
-
-
 def test_write_index_manifest_summarizes_source_quality_counts():
     tmp_path = Path(tempfile.gettempdir()) / f"rag_test_manifest_{uuid.uuid4().hex}"
     try:
@@ -202,37 +191,6 @@ def test_manifest_sidecar_missing_returns_empty():
     tmp_path = Path(tempfile.gettempdir()) / f"rag_test_sidecar_missing_{uuid.uuid4().hex}"
     try:
         assert local_rag.load_content_hash_sidecar(tmp_path, "never-indexed") == {}
-    finally:
-        shutil.rmtree(tmp_path, ignore_errors=True)
-
-
-def test_remove_source_from_manifest_cleans_up_sidecar():
-    """Removing a source also deletes its content-hash sidecar."""
-    tmp_path = Path(tempfile.gettempdir()) / f"rag_test_sidecar_remove_{uuid.uuid4().hex}"
-    try:
-        records = [
-            {
-                "id": "doc.md:0",
-                "node_type": "chunk",
-                "content": "alpha",
-                "source_hash": "hash-a",
-                "source_pdf_name": "a.pdf",
-                "source_pdf_path": "data/a.pdf",
-                "page_start": 1,
-                "page_end": 1,
-            }
-        ]
-        manifest = local_rag.write_index_manifest(
-            tmp_path, records, embedding_model="fake-embed", embedding_dim=3
-        )
-        manifest["_working_dir"] = str(tmp_path)
-        sidecar = local_rag._content_hash_sidecar_path(tmp_path, "hash-a")
-        assert sidecar.exists()
-
-        local_rag._remove_source_from_manifest(manifest, "hash-a")
-
-        assert not sidecar.exists(), "sidecar should be removed with its source"
-        assert "hash-a" not in manifest["documents"]
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 

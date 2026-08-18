@@ -1,7 +1,7 @@
 @echo off
 REM Start the RAG instance with no setup prompts: provisions each HPC cluster
 REM only if its deployed source is stale (or the SIF is missing), then launches
-REM the auto-reconnecting tunnel (HPC mode) and the web server.
+REM the web server.
 REM
 REM Run a full interactive setup (SSH keys, config, prompts) with setup.cmd
 REM instead. To force a redeploy of the remote clusters, run:

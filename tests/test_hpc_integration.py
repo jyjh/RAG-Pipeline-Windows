@@ -8,7 +8,6 @@ from fastapi.testclient import TestClient
 
 from src.hpc import (
     generate_pbs_script,
-    generate_serve_pbs_script,
     parse_hpc_args,
     main as hpc_main,
 )
@@ -17,72 +16,6 @@ import src.local_rag as local_rag
 import src.web_app as web_app
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-
-
-def test_singularity_def_exists_and_valid():
-    singularity_path = ROOT_DIR / "Singularity.def"
-    assert singularity_path.exists(), "Singularity.def must exist in repository root"
-    
-    content = singularity_path.read_text(encoding="utf-8")
-    
-    # Header assertions
-    assert "Bootstrap: docker" in content
-    assert "From: nvidia/cuda:12.1.1-devel-ubuntu22.04" in content
-    
-    # Section presence assertions
-    assert "%labels" in content
-    assert "%environment" in content
-    assert "%post" in content
-    assert "%runscript" in content
-    
-    # Labels assertion
-    assert "Maintainer" in content
-    assert "Version" in content
-    assert "Description" in content
-    
-    # Environment assertions
-    assert "export OLLAMA_HOST=127.0.0.1:11434" in content
-    assert "export LC_ALL=C.UTF-8" in content
-    assert "export LANG=C.UTF-8" in content
-    assert "export PATH=/usr/local/bin:$PATH" in content
-    
-    # Post section dependency assertions
-    assert "python3" in content
-    assert "libgl1" in content
-    assert "libglib2.0-0" in content
-    assert "poppler-utils" in content
-    assert "tesseract-ocr" in content
-    assert "curl" in content
-    assert "git" in content
-    assert "ca-certificates" in content
-    assert "https://download.pytorch.org/whl/cu121" in content
-    # The CUDA 12.1.1 base is ubuntu:22.04 (Python 3.10), but the pinned deps
-    # (onnxruntime~=1.27.0, numpy~=2.4.6) require >=3.11. The image must install
-    # Python 3.14 via deadsnakes AND route the app-stack install through it, or
-    # the build fails with "from versions: max 1.23.2" for onnxruntime.
-    assert "ppa:deadsnakes/ppa" in content, "GPU image must add deadsnakes PPA for Python 3.14"
-    assert "python3.14" in content, "GPU image must install python3.14"
-    assert "python3.14 -m pip install --no-cache-dir torch" in content, \
-        "GPU app-stack pip must run under python3.14, not the system 3.10"
-    
-    # Python package assertions
-    assert "docling~=2.105.0" in content
-    assert "lancedb~=0.33.0" in content
-    assert "pylance~=7.0.0" in content
-    assert "ollama~=0.6.2" in content
-    assert "onnxruntime~=1.27.0" in content
-    assert "fastapi~=0.138.0" in content
-    assert "uvicorn[standard]~=0.49.0" in content
-    
-    # Ollama standalone binary installation assertion. The installer extracts a
-    # .tar.zst, so zstd must be apt-installed; the fallback URL is the current
-    # GitHub release asset (the old ollama.com/download/...tar.gz 404s).
-    assert "ollama" in content.lower()
-    assert "zstd" in content, "image must apt-install zstd (ollama installer needs it)"
-    assert "install.sh" in content
-    assert "ollama-linux-amd64.tar.zst" in content, \
-        "fallback must be the current .tar.zst asset, not the dead .tar.gz URL"
-    assert "tar --zstd -xf" in content, "fallback must extract with zstd, not gzip"
 
 
 def test_nus_hpc_pbs_script_exists_and_valid():
@@ -125,62 +58,11 @@ def test_nus_hpc_pbs_script_exists_and_valid():
         "ingest .pbs must declare a walltime"
 
 
-def test_tunnel_daemon_sh_exists_and_valid():
-    sh_path = ROOT_DIR / "scripts" / "tunnel_daemon.sh"
-    assert sh_path.exists(), "scripts/tunnel_daemon.sh must exist"
-    
-    raw_bytes = sh_path.read_bytes()
-    assert b"\r\n" not in raw_bytes, "scripts/tunnel_daemon.sh MUST use LF line endings"
-    
-    content = raw_bytes.decode("utf-8")
-    assert content.startswith("#!/bin/bash")
-    assert "nus_hpc_gpu" in content
-    assert "11434" in content
-    assert "trap" in content
-    assert "SIGINT" in content
-    assert "ExitOnForwardFailure=yes" in content
-    assert "ServerAliveInterval=15" in content
-    assert "ServerAliveCountMax=3" in content
-    assert "--help" in content
-    # 2-hop support for reaching a GPU compute node via a login/jump host.
-    assert "--jump-host" in content
-    assert "--host-file" in content
-    assert "JUMP_HOST" in content
-    assert "HOST_FILE" in content
-    # ProxyJump flag must be wired into the actual ssh command, not just parsed.
-    assert '"-J"' in content or 'SSH_CMD+=(-J' in content
-
-
-def test_tunnel_daemon_ps1_exists_and_valid():
-    ps1_path = ROOT_DIR / "scripts" / "tunnel_daemon.ps1"
-    assert ps1_path.exists(), "scripts/tunnel_daemon.ps1 must exist"
-    
-    content = ps1_path.read_text(encoding="utf-8")
-    assert ".SYNOPSIS" in content
-    assert ".DESCRIPTION" in content
-    assert ".EXAMPLE" in content
-    assert "param(" in content
-    assert "nus_hpc_gpu" in content
-    assert "11434" in content
-    assert "ExitOnForwardFailure=yes" in content
-    assert "ServerAliveInterval=15" in content
-    assert "ServerAliveCountMax=3" in content
-    assert "try" in content
-    assert "finally" in content
-    assert "Tunnel disconnected. Reconnecting in" in content
-    # 2-hop support (PowerShell parameter names).
-    assert "JumpHost" in content
-    assert "HostFile" in content
-    assert '"-J"' in content
-
-
 def test_hpc_cli_parsing_and_pbs_template_generation():
     # parse_hpc_args uses None as a sentinel for "not specified" so main() can
-    # apply mode-appropriate defaults (ingest vs serve differ, e.g. job name and
-    # CPU count). Unspecified args are therefore None here; the resolution is
-    # exercised via generate_pbs_script() / _build_script_from_args below.
+    # apply mode-appropriate defaults. Unspecified args are therefore None here;
+    # the resolution is exercised via generate_pbs_script() below.
     args = parse_hpc_args([])
-    assert args.serve is False
     assert args.job_name is None
     assert args.ncpus is None
     assert args.mem is None
@@ -235,11 +117,10 @@ def test_hpc_cli_parsing_and_pbs_template_generation():
     assert "ollama pull" not in overridden_pbs
     assert "ollama serve" not in overridden_pbs
 
-    # New CLI surface: --serve, --walltime, -o/--output.
-    serve_args = parse_hpc_args(["--serve", "--walltime", "04:00:00", "-o", "x.pbs"])
-    assert serve_args.serve is True
-    assert serve_args.walltime == "04:00:00"
-    assert serve_args.output == "x.pbs"
+    # New CLI surface: --walltime, -o/--output.
+    tuned_args = parse_hpc_args(["--walltime", "04:00:00", "-o", "x.pbs"])
+    assert tuned_args.walltime == "04:00:00"
+    assert tuned_args.output == "x.pbs"
 
 
 def test_ollama_config_host_resolution_precedence(monkeypatch, tmp_path):
@@ -336,48 +217,8 @@ def test_web_app_health_and_metrics_endpoints_ollama_status(monkeypatch):
 
 
 # ==============================================================================
-# Tests for the live-run + serving-job work (Part A/B/C of the HPC port).
+# Tests for the live-run work (Part A/B/C of the HPC port).
 # ==============================================================================
-
-
-def test_nus_hpc_serve_pbs_script_exists_and_valid():
-    """The long-lived Ollama serving job: keeps ollama alive, publishes its
-    compute-node hostname so the 2-hop tunnel can find it, cleans up on exit."""
-    pbs_path = ROOT_DIR / "scripts" / "nus_hpc_serve.pbs"
-    assert pbs_path.exists(), "scripts/nus_hpc_serve.pbs must exist"
-
-    raw_bytes = pbs_path.read_bytes()
-    assert b"\r\n" not in raw_bytes, "scripts/nus_hpc_serve.pbs MUST use LF line endings"
-
-    content = raw_bytes.decode("utf-8")
-
-    # PBS directives (queue gpu, a GPU, a walltime so it stays alive).
-    assert "#PBS -N rag_ollama_serve" in content
-    assert re.search(r"#PBS -l select=1:ncpus=\d+:mem=\d+[gGmM][bB]?:ngpus=\d+", content)
-    assert re.search(r"#PBS -l walltime=\d{1,4}:\d{2}:\d{2}", content)
-    assert "#PBS -q gpu" in content
-    assert "#PBS -j oe" in content
-
-    # Hostname discovery: the serving job writes its compute node name to a
-    # shared file that the tunnel daemon reads.
-    assert "hostname -f" in content or "hostname" in content
-    assert ".rag_ollama_serving_host" in content
-
-    # Ollama is brought up and kept alive (not exited after a one-shot task).
-    assert "ollama serve" in content
-    assert "/api/version" in content
-    assert "ollama pull" in content
-    assert "/scratch/${USER}" in content
-    assert "/hpctmp/${USER}" not in content
-
-    # The keep-alive loop is what distinguishes a serving job from the ingest
-    # job (which exits after bulk_ingest.py). There must be a blocking sleep.
-    assert "sleep" in content and "while true" in content
-
-    # Cleanup must remove the discovery file (so the tunnel stops targeting a
-    # dead node) but must NOT wipe the persistent model store.
-    assert "rm -f" in content and ".rag_ollama_serving_host" in content
-    assert "trap" in content and "EXIT" in content
 
 
 def test_hpc_generators_reject_injection_and_invalid_inputs():
@@ -401,8 +242,6 @@ def test_hpc_generators_reject_injection_and_invalid_inputs():
         {"input_data_dir": "data$(touch /tmp/p)"},
         {"input_data_dir": "data`whoami`"},
         {"container_sif": 'x" || pwned'},
-        {"ollama_models_dir": "$(evil)"},
-        {"ollama_models_dir": "/tmp/a b"},
         # Bad walltime.
         {"walltime": "99"},
         {"walltime": "99:99"},
@@ -426,22 +265,12 @@ def test_hpc_generators_accept_legitimate_values():
         walltime="12:00:00",
         input_data_dir="/hpctmp/${USER}/pdfs",
         container_sif="rag_pipeline.sif",
-        ollama_models_dir="${HOME}/ollama_models",
     )
     assert "#PBS -N my_index" in ok
     assert "#PBS -l select=1:ncpus=16:mem=64gb:ngpus=2" in ok
     assert "#PBS -l walltime=12:00:00" in ok
     assert "/hpctmp/${USER}/pdfs" in ok
-    # ollama_models_dir is accepted (validated) for backward compat even though
-    # the CPU template no longer interpolates it (embeddings now via SoCLAaS API).
     assert "SOCLAAS_API_KEY" in ok
-
-    serve_ok = generate_serve_pbs_script(
-        ollama_host_file="${HOME}/.rag_ollama_serving_host",
-    )
-    assert "rag_ollama_serve" in serve_ok
-    assert "${HOME}/.rag_ollama_serving_host" in serve_ok
-    assert 'STORAGE_ROOT="/scratch/${USER}"' in serve_ok
 
 
 def test_hpc_module_has_runnable_main():
@@ -455,14 +284,6 @@ def test_hpc_module_has_runnable_main():
     assert result.returncode == 0, result.stderr
     assert "#!/bin/bash" in result.stdout
     assert "#PBS -N rag_ingest_index" in result.stdout
-
-    # Serve mode -> stdout
-    result = subprocess.run(
-        [sys.executable, "-m", "src.hpc", "--serve"],
-        capture_output=True, text=True, cwd=str(ROOT_DIR),
-    )
-    assert result.returncode == 0, result.stderr
-    assert "#PBS -N rag_ollama_serve" in result.stdout
 
     # Bad input -> non-zero exit, no script emitted
     result = subprocess.run(
@@ -551,13 +372,6 @@ def test_hpc_cpu_cli_bundle_and_override_semantics():
     assert "#PBS -q cpu" in cpu
     assert "rag_pipeline_cpu.sif" in cpu
     assert "select=1:ncpus=16:mem=32gb" in cpu
-
-    # CPU serving bundle.
-    cpu_serve = _build_script_from_args(parse_hpc_args(["--cpu", "--serve"]))
-    assert ":ngpus=" not in cpu_serve
-    assert "--nv " not in cpu_serve
-    assert "rag_pipeline_cpu.sif" in cpu_serve
-    assert "rag_ollama_serve" in cpu_serve
 
     # Explicit args override the bundle: --cpu --ngpus 2 -> GPU-shaped.
     mixed = _build_script_from_args(parse_hpc_args(["--cpu", "--ngpus", "2"]))

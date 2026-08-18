@@ -36,13 +36,6 @@ BASE_CFG = HpcConfig(
         storage_root="/hpctmp/me",
         pbs_overrides={"ngpus": 0, "queue": "cpu"},
     ),
-    gpu=HpcClusterConfig(
-        ssh_host="nus_hpc_gpu",            # paid GPU cluster login node (different host)
-        remote_repo_dir="rag-gpu",
-        container_sif="rag_pipeline.sif",
-        storage_root="/scratch/me",
-        pbs_overrides={"ngpus": 1, "queue": "gpu"},
-    ),
     remote_data_dir="data",
     remote_db_dir="db",
     poll_interval_seconds=0.01,  # tight loop in tests
@@ -98,12 +91,6 @@ def test_submit_ingest_index_requires_cpu_cluster():
         b.submit_ingest_index()
 
 
-def test_submit_serve_job_requires_gpu_cluster():
-    b = HpcBackend(HpcConfig())  # no gpu config
-    with pytest.raises(HpcError, match="hpc.gpu.ssh_host"):
-        b.submit_serve_job()
-
-
 def test_cluster_repo_path_must_be_login_relative():
     absolute = replace(
         BASE_CFG,
@@ -136,7 +123,6 @@ def test_connection_check_accepts_post_quantum_ssh_warnings(monkeypatch):
 
     checks = backend.check_connections()
     assert checks["cpu"] == {"ok": True, "configured": True, "detail": "ready"}
-    assert checks["gpu"] == {"ok": True, "configured": True, "detail": "ready"}
 
 
 def test_connection_check_reports_missing_prerequisite_not_pq_warning(monkeypatch):
@@ -383,39 +369,7 @@ def test_fetch_index_uses_explicit_remote_db(tmp_path, monkeypatch):
     assert captured[0][0] == "nus_hpc_cpu:/abs/other/db/"
 
 
-# --- submit_serve_job (routes to the GPU cluster) ----------------------------
-
-
-def test_submit_serve_job_writes_and_qsubs_on_gpu_host(monkeypatch):
-    """The serving job goes to the GPU cluster. Asserts: it routes to the GPU
-    ssh host (never the CPU one), uses the GPU image, and emits the serve
-    template."""
-    b = HpcBackend(BASE_CFG)
-    calls: list[tuple[str, str]] = []
-
-    def fake_run_ssh(host, remote_command, *, capture=True, check=True, timeout=None):
-        calls.append((host, remote_command))
-        if "cat > " in remote_command:
-            return _completed()
-        if "qsub" in remote_command:
-            return _completed("100.aspsus01\n")
-        return _completed()
-
-    monkeypatch.setattr(b, "_run_ssh", fake_run_ssh)
-    job_id = b.submit_serve_job()
-    assert job_id == "100.aspsus01"
-    # CRITICAL: the serve job routes to the GPU cluster host, never the CPU one.
-    assert all(host == "nus_hpc_gpu" for host, _ in calls), \
-        f"serve work must route to the GPU cluster; got hosts {[h for h,_ in calls]}"
-    # The written script is the serve template (rag_ollama_serve) using the GPU image.
-    write_call = next(cmd for _, cmd in calls if "cat > " in cmd)
-    assert "rag_ollama_serve" in write_call
-    assert ".rag_ollama_serving_host" in write_call
-    assert "rag_pipeline.sif" in write_call
-    assert 'STORAGE_ROOT="/scratch/me"' in write_call
-
-
-# --- config wiring: cfg.hpc exists, defaults off, two clusters ---------------
+# --- config wiring: cfg.hpc exists, defaults off, cpu cluster ---------------
 
 
 def test_pipeline_config_has_hpc_section_defaulting_disabled():
@@ -424,21 +378,16 @@ def test_pipeline_config_has_hpc_section_defaulting_disabled():
     cfg = load_config()  # no RAG_PIPELINE_CONFIG in tests -> all defaults
     assert hasattr(cfg, "hpc")
     assert cfg.hpc.enabled is False
-    # Two cluster sub-configs exist with sensible per-cluster defaults.
+    # The CPU cluster sub-config exists with sensible defaults.
     assert cfg.hpc.cpu.ssh_host == ""
-    assert cfg.hpc.gpu.ssh_host == ""
     assert cfg.hpc.cpu.container_sif == "rag_pipeline_cpu.sif"
     assert cfg.hpc.cpu.storage_root == "/hpctmp/${USER}"
-    assert cfg.hpc.gpu.container_sif == "rag_pipeline.sif"
-    assert cfg.hpc.gpu.storage_root == "/scratch/${USER}"
     assert cfg.hpc.cpu.pbs_overrides.get("ngpus") == 0
     assert cfg.hpc.cpu.pbs_overrides.get("queue") == "cpu"
-    assert cfg.hpc.gpu.pbs_overrides.get("ngpus") == 1
-    assert cfg.hpc.gpu.pbs_overrides.get("queue") == "gpu"
 
 
-def test_hpc_config_loads_two_clusters_from_toml(tmp_path, monkeypatch):
-    """[hpc.cpu] and [hpc.gpu] merge into cfg.hpc.cpu / .gpu."""
+def test_hpc_config_loads_cpu_cluster_from_toml(tmp_path, monkeypatch):
+    """[hpc.cpu] merges into cfg.hpc.cpu."""
     toml = """
 [paths]
 db_dir = "db"
@@ -452,12 +401,6 @@ poll_interval_seconds = 30.0
 ssh_host = "cpu_login"
 remote_repo_dir = "rag_cpu"
 storage_root = "/hpctmp/u"
-
-[hpc.gpu]
-ssh_host = "gpu_login"
-remote_repo_dir = "rag_gpu"
-container_sif = "rag_pipeline.sif"
-storage_root = "/scratch/u"
 """
     p = tmp_path / "c.toml"
     p.write_text(toml, encoding="utf-8")
@@ -467,14 +410,9 @@ storage_root = "/scratch/u"
     cfg = load_config()
     assert cfg.hpc.enabled is True
     assert cfg.hpc.poll_interval_seconds == 30.0
-    # Each cluster picked up its own login node.
     assert cfg.hpc.cpu.ssh_host == "cpu_login"
     assert cfg.hpc.cpu.remote_repo_dir == "rag_cpu"
     assert cfg.hpc.cpu.storage_root == "/hpctmp/u"
-    assert cfg.hpc.gpu.ssh_host == "gpu_login"
-    assert cfg.hpc.gpu.remote_repo_dir == "rag_gpu"
-    assert cfg.hpc.gpu.storage_root == "/scratch/u"
-    assert cfg.hpc.gpu.container_sif == "rag_pipeline.sif"
 
 
 # --- SSH/rsync hardening: timeouts + BatchMode/ConnectTimeout ----------------

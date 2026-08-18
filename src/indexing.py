@@ -1,15 +1,10 @@
 ﻿import logging
 import os
-import sys
 
+from src.console import status as _progress_status
 from src.defaults import DEFAULT_EMBEDDING_MODEL
 
 logger = logging.getLogger(__name__)
-
-
-def _progress_status(message: str, *, enabled: bool = True) -> None:
-    if enabled:
-        print(message, file=sys.stderr, flush=True)
 
 
 def run_indexing(

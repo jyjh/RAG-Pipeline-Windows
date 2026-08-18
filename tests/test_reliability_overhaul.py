@@ -289,11 +289,12 @@ def test_run_ingestion_raises_when_all_pdfs_fail(monkeypatch, tmp_path):
 
 def test_embedding_retry_recovers_after_transient_failure(monkeypatch):
     """_ollama_api_with_retry should ride out N-1 failures then succeed."""
-    import src.embeddings as embeddings_mod
+    import src.llm_api as llm_api_mod
 
-    # Zero out backoff sleep so the test is fast.
+    # Zero out backoff sleep so the test is fast (the shared retry engine in
+    # llm_api does the sleeping).
     fake_time = type("FakeTime", (), {"sleep": staticmethod(lambda *_a, **_k: None)})()
-    monkeypatch.setattr(embeddings_mod, "time", fake_time)
+    monkeypatch.setattr(llm_api_mod, "time", fake_time)
 
     engine = EmbeddingEngine(model_name="nomic-embed-text", ollama_retries=3)
     calls = {"n": 0}
@@ -313,10 +314,10 @@ def test_embedding_retry_recovers_after_transient_failure(monkeypatch):
 
 def test_embedding_retry_exhausts_and_raises(monkeypatch):
     engine = EmbeddingEngine(model_name="nomic-embed-text", ollama_retries=2)
-    import src.embeddings as embeddings_mod
+    import src.llm_api as llm_api_mod
 
     monkeypatch.setattr(
-        embeddings_mod, "time", type("FakeTime", (), {"sleep": staticmethod(lambda *_a, **_k: None)})()
+        llm_api_mod, "time", type("FakeTime", (), {"sleep": staticmethod(lambda *_a, **_k: None)})()
     )
     calls = {"n": 0}
 

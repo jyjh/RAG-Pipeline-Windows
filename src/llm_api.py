@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import random
+import shutil
 import socket
 import sys
 import time
@@ -149,24 +150,53 @@ def _is_transient(exc: SoclaasError) -> bool:
     return any(code in msg for code in ("http 429", "http 500", "http 502", "http 503", "http 504"))
 
 
-def _with_retry(fn, *, description: str):
-    attempts = max(1, int(get_llm_api_config().retries))
+def retry_with_backoff(
+    fn,
+    *,
+    attempts: int,
+    description: str,
+    retry_on: type[Exception] | tuple[type[Exception], ...] = Exception,
+    is_retryable=None,
+    announce: bool = False,
+):
+    """Run ``fn`` with bounded exponential backoff (0.5s, 1s, 2s, ... +25% jitter).
+
+    Shared by the SoCLAaS client (transient-error classification) and the
+    Ollama embedding path. A non-retryable exception, or failure on the final
+    attempt, propagates to the caller.
+    """
+    attempts = max(1, int(attempts))
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
             return fn()
-        except SoclaasError as exc:
+        except retry_on as exc:
             last_exc = exc
-            if not _is_transient(exc) or attempt >= attempts:
+            if (is_retryable is not None and not is_retryable(exc)) or attempt >= attempts:
                 raise
             backoff = (0.5 * (2 ** (attempt - 1))) * (1 + random.random() * 0.25)
             logger.warning(
-                "SoCLAaS %s retry %d/%d after %.2fs backoff: %s",
+                "%s retry %d/%d after %.2fs backoff: %s",
                 description, attempt, attempts, backoff, exc,
             )
+            if announce:
+                _status(
+                    f"{description} failed (attempt {attempt}/{attempts}); "
+                    f"retrying in {backoff:.2f}s. Error: {exc}"
+                )
             time.sleep(backoff)
     assert last_exc is not None
     raise last_exc
+
+
+def _with_retry(fn, *, description: str):
+    return retry_with_backoff(
+        fn,
+        attempts=get_llm_api_config().retries,
+        description=f"SoCLAaS {description}",
+        retry_on=SoclaasError,
+        is_retryable=_is_transient,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -336,6 +366,37 @@ def soclaas_status_snapshot(*, timeout: float = 3.0) -> dict[str, Any]:
         "reachable": reachable,
         "detail": detail,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Dormant Ollama-fallback helpers (shared by local_rag.py and embeddings.py)
+# --------------------------------------------------------------------------- #
+
+
+def normalize_ollama_host(raw: str) -> str:
+    """Normalize one Ollama host string (scheme + trailing-slash trim)."""
+    host = (raw or "").strip()
+    if not host:
+        return "http://127.0.0.1:11434"
+    if host.startswith(("http://", "https://")):
+        return host.rstrip("/")
+    return f"http://{host.rstrip('/')}"
+
+
+def ollama_pull_command(model: str) -> str:
+    """Operator-facing ``ollama pull <model>`` hint, resolving the Windows path."""
+    executable = shutil.which("ollama")
+    if executable is None:
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            candidate = os.path.join(local_app_data, "Programs", "Ollama", "ollama.exe")
+            if os.path.exists(candidate):
+                executable = candidate
+    if executable is None:
+        executable = "ollama"
+    if " " in executable:
+        executable = f'"{executable}"'
+    return f"{executable} pull {model}"
 
 
 # --------------------------------------------------------------------------- #

@@ -159,26 +159,23 @@ On Windows, double-click `setup.cmd` (or run it from PowerShell). On Linux or
 macOS, run `./setup.sh`. The wizard:
 
 - preserves the rest of `config.toml` and writes `config.toml.bak`;
-- creates or updates exact CPU/GPU aliases in `~/.ssh/config`, preserving
+- creates or updates the exact CPU alias in `~/.ssh/config`, preserving
   unrelated hosts and writing `config.rag-setup.bak`;
-- creates dedicated Ed25519 keys when missing, installs each public key without
+- creates a dedicated Ed25519 key when missing, installs the public key without
   duplicating `authorized_keys` entries, and verifies key-only login;
 - packages the current working-tree source, stages Atlas9 CPU under
-  `/hpctmp/<username>/<repo-path>` and Vanda GPU under
-  `/scratch/<username>/<repo-path>`, and creates each login-relative symlink;
+  `/hpctmp/<username>/<repo-path>`, and creates the login-relative symlink;
 - uploads an existing matching SIF or builds it remotely with
   Singularity/Apptainer `--fakeroot`, then verifies it before activation;
-- configures the web bind address and local Ollama endpoint;
-- collects each cluster's login hostname, username, private key, and repository
+- configures the web bind address and local Ollama fallback endpoint;
+- collects the cluster's login hostname, username, private key, and repository
   path relative to the directory entered immediately after SSH;
 - verifies Python dependencies, the web port, SSH, file transfer, `qsub`, the
-  remote repositories, and both Singularity images;
+  remote repository, and the Singularity image;
 - optionally creates `.venv` and installs `requirements.txt`;
-- optionally submits the GPU serving job, starts the reconnecting SSH tunnel,
-  and starts the web server.
+- starts the web server.
 
-The paid GPU job is never submitted without an explicit yes/flag. Useful
-non-interactive forms:
+Useful non-interactive forms:
 
 ```powershell
 # Re-check an existing configuration without changing it.
@@ -189,38 +186,31 @@ non-interactive forms:
   --setup-ssh `
   --cpu-host nus_hpc_cpu --cpu-hostname cpu-login.example.edu `
   --cpu-user me --cpu-repo rag-cpu `
-  --gpu-host nus_hpc_gpu --gpu-hostname gpu-login.example.edu `
-  --gpu-user me --gpu-repo rag-gpu `
   --configure-only
 
-# Start against an already-running GPU serving job.
+# Start (provisioning the CPU cluster only if its deployed source is stale).
 .\setup.cmd --non-interactive --start
-
-# Explicitly submit a new paid GPU job, then tunnel and start the web server.
-.\setup.cmd --non-interactive --start --submit-gpu-job
 ```
 
-With `--setup-ssh`, missing keys default to
-`~/.ssh/rag_<alias>_ed25519` and are generated without a passphrase so the web
+With `--setup-ssh`, a missing key defaults to
+`~/.ssh/rag_<alias>_ed25519` and is generated without a passphrase so the web
 service can reconnect unattended. Initial public-key installation may request
 the cluster password or MFA once. Use `--skip-key-install` when an administrator
-must install the generated `.pub` files instead.
+must install the generated `.pub` file instead.
 
-Interactive HPC setup provisions both servers automatically. Atlas9 CPU uses
-`/hpctmp/<username>`; Vanda GPU uses `/scratch/<username>`. The CPU image is
-uploaded from `rag_pipeline_cpu.sif` when present; the GPU image is uploaded
-from `rag_pipeline.sif` when present, otherwise it is built remotely from
-`Singularity.def`. Repository activation retains the prior deployment as
+Interactive HPC setup provisions the CPU cluster automatically. Atlas9 uses
+`/hpctmp/<username>`. The CPU image is uploaded from `rag_pipeline_cpu.sif`
+when present, otherwise it is built remotely from `Singularity.cpu.def`.
+Repository activation retains the prior deployment as
 `<repo>.rag-setup-previous`. Use `--skip-hpc-provision` for connection-only
 configuration, or `--provision-hpc` to reprovision an existing non-interactive
 configuration.
 
-The interactive wizard creates the SSH aliases for you. Existing exact alias
+The interactive wizard creates the SSH alias for you. Existing exact alias
 blocks are updated in place; wildcard/group blocks and unrelated hosts are left
-untouched. It also creates and authorizes the private keys for both aliases.
-Windows OpenSSH `scp` is supported when `rsync` is unavailable.
-Press Ctrl+C to stop the local server and tunnel; a submitted PBS serving job
-continues until its walltime or `qdel`.
+untouched. It also creates and authorizes the private key. Windows OpenSSH
+`scp` is supported when `rsync` is unavailable. Press Ctrl+C to stop the local
+server.
 
 The browser UI reads server host, port, polling intervals, and update target from `config.toml` under `[server]`.
 Use `bind_all = true` to listen on all IPv4 interfaces (`0.0.0.0`) instead of only loopback. If you start
@@ -384,18 +374,20 @@ Near term:
 
 - Pin package versions after successful validation.
 - Add real golden PDF fixtures for scanned, mixed, table, equation, and figure-heavy documents.
-- Benchmark pages/minute, indexing time, query latency, VRAM/RAM usage, and retrieval quality.
+- Benchmark pages/minute, indexing time, query latency, RAM usage, and retrieval quality.
 
 Medium term:
 
-- Add a citation-safe structured block store as the durable source of truth.
-- Add a local FastAPI service and browser UI for team members.
 - Add broader retrieval evaluation with golden question sets.
 - Preserve all source block/page references through chunking and deduplication.
+- Wire `HpcBackend.submit_ingest_index`/`fetch_index` into the web job queue so HPC
+  builds can be triggered from the UI (currently manual via the runbook).
 
 ## Development Notes
 
-- Do not use cloud APIs or hosted models.
+- The primary LLM backend is the hosted SoCLAaS API; the local Ollama transport is
+  a dormant offline fallback. Keep both code paths working.
 - Do not commit generated `db/`, `processed_docs/` test outputs, model caches, or Python cache files unless intentionally curating a fixture.
-- Keep the README as the only root-level project documentation file.
+- Keep the README as the only root-level project documentation file; `docs/` holds
+  historical runbooks and design notes.
 - Treat `processed_docs/*.md` as corpus data, not documentation.

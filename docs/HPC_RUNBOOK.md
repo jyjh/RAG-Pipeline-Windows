@@ -1,10 +1,15 @@
 # NUS HPC Runbook
 
 Build the FSAE RAG index on NUS HPC, then chat through the web app on your
-laptop. Two clusters are available, so pick a path:
+laptop.
 
-- **GPU cluster (paid by the hour):** Path A.
-- **CPU-only cluster (free, unlimited):** Path B.
+> **Path A (GPU serving) is historical.** LLM serving moved to the hosted
+> SoCLAaS API, and the GPU serving job, SSH tunnel, and `Singularity.def` were
+> removed from the repository. Path A is retained below for reference only;
+> use Path B — the CPU cluster runs ingest/index and pulls chat/vision/
+> embeddings from SoCLAaS.
+
+- **CPU-only cluster (free, unlimited):** Path B (recommended).
 
 For a web-server instance, the recommended entry point is the guided setup from
 the repository root:
@@ -13,29 +18,28 @@ the repository root:
 .\setup.cmd
 ```
 
-On Linux/macOS use `./setup.sh`. It writes the two-cluster `[hpc]`
-configuration, creates/updates both aliases in `~/.ssh/config`, records each
+On Linux/macOS use `./setup.sh`. It writes the `[hpc]`
+configuration, creates/updates the CPU alias in `~/.ssh/config`, records the
 repo path relative to the SSH login directory, checks SSH/PBS/images, and can
-start the GPU tunnel plus web server. The manual steps below remain useful for
+start the web server. The manual steps below remain useful for
 cluster preparation and troubleshooting.
 
-The wizard generates a dedicated Ed25519 key for each alias and installs the
-public keys remotely. Expect one password/MFA prompt per cluster on the first
+The wizard generates a dedicated Ed25519 key for the alias and installs the
+public key remotely. Expect one password/MFA prompt on the first
 run. If the site disables password-based key bootstrap, use
 `--skip-key-install` and ask the cluster administrator to install the generated
-`.pub` files.
+`.pub` file.
 
 It also provisions the current repository and its matching container beneath
-`/hpctmp/<username>/<repo-path>` on Atlas9 CPU and
-`/scratch/<username>/<repo-path>` on Vanda GPU. A login-directory symlink keeps
-each configured repo path short (for example `rag-cpu`). Existing local SIFs
-are uploaded; a missing SIF is built remotely with Singularity/Apptainer
+`/hpctmp/<username>/<repo-path>` on Atlas9 CPU. A login-directory symlink keeps
+the configured repo path short (for example `rag-cpu`). An existing local SIF is
+uploaded; a missing SIF is built remotely with Singularity/Apptainer
 `--fakeroot`. Use `--skip-hpc-provision` only when managing those artifacts
 separately.
 
 ## Prerequisites (one-time)
 
-1. **SSH access** to NUS HPC. The guided setup creates the keys and aliases.
+1. **SSH access** to NUS HPC. The guided setup creates the key and alias.
    For manual setup, add an alias to `~/.ssh/config`:
 
    ```sshconfig
@@ -53,14 +57,17 @@ separately.
 3. **Project checked out** on the cluster. The PBS scripts bind-mount `${PWD}:/app`,
    so `qsub` them from the repo root.
 
-4. **Ollama models known to your config.** Confirm the `[models]` tags in
-   `config.toml` match what the PBS jobs `ollama pull` (`nomic-embed-text`,
-   `qwen2.5vl:7b`, `gemma4`, `qwen2.5:1.5b`). If `gemma4` is a custom alias, create
-   it with `ollama create` in the model store before your first run.
+4. **A SoCLAaS API key** provisioned for the job: `~/rag_soclaas_key`
+   (chmod 600) on the login node, the `SOCLAAS_API_KEY` qsub environment
+   variable, or `[llm_api].api_key` in the staged `config.toml`.
 
 ---
 
-## Path A — GPU cluster (paid)
+## Path A — GPU cluster (paid) — HISTORICAL
+
+> The commands in this path reference `Singularity.def`, `scripts/nus_hpc_serve.pbs`,
+> and `scripts/tunnel_daemon.*`, which were removed from the repository when LLM
+> serving moved to the SoCLAaS API. Kept for archaeology only.
 
 ### A1. Build the image (once)
 

@@ -9,37 +9,19 @@ import time
 import uuid
 from pathlib import Path
 
-import gc
-import logging
-import time as _time
-
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
 import src.local_rag as local_rag
 import src.query as query
+from conftest import _rmtree_with_retry
+
 import src.web_app as web_app
 from src.asset_store import ImageAssetStore, image_asset_marker
 from src.index_overrides import load_index_overrides, persist_index_deletions, persist_index_edit
 from src.pdf_registry import load_source_map, write_source_entry
 from src.vector_store import LanceDBVectorStore
-
-
-_cleanup_log = logging.getLogger(__name__)
-
-def _rmtree_with_retry(path, *, attempts=4, delay=0.5):
-    """Remove a directory tree, retrying on Windows file-lock errors."""
-    for attempt in range(1, attempts + 1):
-        gc.collect()
-        try:
-            shutil.rmtree(path)
-            return
-        except (PermissionError, OSError):
-            if attempt >= attempts:
-                _cleanup_log.warning("Could not remove temp dir %s after %d attempts", path, attempts)
-                return
-            _time.sleep(delay * attempt)
 
 
 def _completed(args, *, stdout="", stderr="", returncode=0):

@@ -173,26 +173,21 @@ class LocalQueryEngine:
             planner_max_queries or os.environ.get("LOCAL_RAG_PLANNER_MAX_QUERIES"),
             DEFAULT_PLANNER_MAX_QUERIES,
         )
-        self.engine = EmbeddingEngine(
-            model_name=embedding_model,
-            ollama_batch_size=embedding_batch_size,
-            ollama_timeout=embedding_timeout,
-        )
-        # bge-m3 is 1024-d (was 768 for nomic). Resolve the configured dim and
-        # the query prefix (instruction-free for bge-m3) once; a mismatch with
-        # an existing index is caught at query time (see _ensure_compatible_dim).
-        from src import llm_api as _llm_api
-        from src.config import load_config
-        from src.defaults import DEFAULT_EMBEDDING_DIM
+        # Dim + query prefix + engine construction are centralized in
+        # EmbeddingSetup; a mismatch with an existing index is caught at query
+        # time (see _ensure_compatible_dim).
+        from src.embeddings import EmbeddingSetup
 
-        self.embedding_model = embedding_model
-        if embedding_dim is None:
-            try:
-                embedding_dim = int(load_config().models.embedding_dim)
-            except Exception:
-                embedding_dim = DEFAULT_EMBEDDING_DIM
-        self.embedding_dim = max(1, int(embedding_dim))
-        self.query_prefix = _llm_api.resolve_embedding_prefix(embedding_model, "query")
+        setup = EmbeddingSetup(
+            embedding_model,
+            embedding_dim=embedding_dim,
+            batch_size=embedding_batch_size,
+            timeout=embedding_timeout,
+        )
+        self.engine = setup.engine
+        self.embedding_model = setup.model
+        self.embedding_dim = setup.dim
+        self.query_prefix = setup.query_prefix
         self.store = default_store(working_dir, prefer_lancedb=True)
         self.record_count = self._load_record_count()
 

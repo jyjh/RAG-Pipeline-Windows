@@ -7,55 +7,57 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from src.coerce import (
+    as_bool as _as_bool,
+    as_float as _as_float,
+    as_optional_int as _as_optional_int,
+    as_positive_int as _as_positive_int,
+    as_string_list as _as_langs,
+)
 from src.defaults import (
     DEFAULT_ASSET_DIR,
     DEFAULT_ASSET_TRIGGERS,
     DEFAULT_CODE_ENRICHMENT,
+    DEFAULT_CONTEXT_TOKEN_FRACTION,
+    DEFAULT_CONTEXT_WINDOW,
     DEFAULT_DOCLING_ACCELERATOR,
+    DEFAULT_EMBEDDING_BATCH_SIZE,
     DEFAULT_EMBEDDING_DIM,
+    DEFAULT_EMBEDDING_TIMEOUT,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_FORMULA_ENRICHMENT,
+    DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_TIMEOUT,
+    DEFAULT_NUM_PREDICT,
     DEFAULT_OCR_BACKEND,
     DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
     DEFAULT_OCR_FORCE_FULL_PAGE,
     DEFAULT_OCR_LANGS,
+    DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL,
+    DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
     DEFAULT_PDF_PARSER_MODE,
+    DEFAULT_PLANNER_MAX_QUERIES,
+    DEFAULT_PLANNER_MODEL,
     DEFAULT_RAPIDOCR_BACKEND,
+    DEFAULT_RETRIEVAL_CANDIDATE_K,
+    DEFAULT_RETRIEVAL_MIN_SCORE,
+    DEFAULT_RETRIEVAL_RELATIVE_CUTOFF,
+    DEFAULT_SAMPLER_TOP_K,
+    DEFAULT_TEMPERATURE,
     DEFAULT_TESSERACT_CMD,
     DEFAULT_TESSERACT_DATA_PATH,
     DEFAULT_TESSERACT_PSM,
     DEFAULT_VISION_ENABLED,
     DEFAULT_VISION_MODEL,
+    DEFAULT_WEB_SEARCH_ENABLED,
+    DEFAULT_WEB_SEARCH_MAX_RESULTS,
+    DEFAULT_WEB_SEARCH_TIMEOUT,
     SUPPORTED_OCR_BACKENDS,
     SUPPORTED_RAPIDOCR_BACKENDS,
 )
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-
-def default_llm_model() -> str:
-    try:
-        from src.defaults import DEFAULT_LLM_MODEL
-    except Exception:
-        return "gemma4:26b"
-    return DEFAULT_LLM_MODEL
-
-
-def default_planner_model() -> str:
-    try:
-        from src.defaults import DEFAULT_PLANNER_MODEL
-    except Exception:
-        return "gemma4:26b"
-    return DEFAULT_PLANNER_MODEL
-
-
-def default_planner_max_queries() -> int:
-    try:
-        from src.defaults import DEFAULT_PLANNER_MAX_QUERIES
-    except Exception:
-        return 3
-    return DEFAULT_PLANNER_MAX_QUERIES
 
 
 def run_ingestion(*args, **kwargs):
@@ -74,12 +76,13 @@ def run_indexing(*args, **kwargs):
     return _run_indexing(*args, **kwargs)
 
 
-from src.cli_query_engine import QueryEngine
+class QueryEngine:
+    """Lazy-loading stand-in so query-mode imports don't slow ingest/index runs."""
 
-# Unified default embedding batch size (matches web_app.py and the indexer so
-# the CLI path isn't accidentally 16x slower at scale). Env override
-# OLLAMA_EMBED_BATCH_SIZE and --embedding_batch_size still take precedence.
-DEFAULT_EMBEDDING_BATCH_SIZE = 128
+    def __new__(cls, *args, **kwargs):
+        from src.query import QueryEngine as _QueryEngine
+
+        return _QueryEngine(*args, **kwargs)
 
 
 def _configure_console() -> None:
@@ -91,95 +94,39 @@ def _configure_console() -> None:
                 pass
 
 
-def _load_toml_config(config_path: Path | None = None) -> dict[str, Any]:
-    config_path = config_path or Path("config.toml")
-    if not config_path.exists():
-        return {}
-    try:
-        import tomllib
+def _pipeline_config(config_path: Path | None = None):
+    """Typed config via the shared cached loader (src.config.load_config)."""
+    from src.config import load_config
 
-        with config_path.open("rb") as handle:
-            payload = tomllib.load(handle)
-        return payload if isinstance(payload, dict) else {}
-    except Exception:
-        return {}
-
-
-def _as_bool(value: Any, default: bool) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on"}:
-        return True
-    if text in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
-def _as_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _as_optional_int(value: Any, default: int | None) -> int | None:
-    if value is None or value == "":
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _as_positive_int(value: Any, default: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
-
-
-def _as_langs(value: Any, default: tuple[str, ...]) -> list[str]:
-    if isinstance(value, str):
-        parts = [part.strip() for part in value.split(",") if part.strip()]
-        return parts or list(default)
-    if isinstance(value, (list, tuple)):
-        parts = [str(part).strip() for part in value if str(part).strip()]
-        return parts or list(default)
-    return list(default)
+    return load_config(config_path or Path("config.toml"))
 
 
 def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
-    payload = _load_toml_config(config_path)
-    ingestion = payload.get("ingestion", {}) if isinstance(payload.get("ingestion"), dict) else {}
-    models = payload.get("models", {}) if isinstance(payload.get("models"), dict) else {}
-    paths = payload.get("paths", {}) if isinstance(payload.get("paths"), dict) else {}
+    cfg = _pipeline_config(config_path)
+    ingestion = cfg.ingestion
     return {
-        "asset_dir": str(paths.get("asset_dir") or DEFAULT_ASSET_DIR),
-        "parser_mode": str(ingestion.get("parser_mode") or DEFAULT_PDF_PARSER_MODE),
-        "accelerator": str(ingestion.get("accelerator") or DEFAULT_DOCLING_ACCELERATOR),
-        "num_threads": _as_positive_int(ingestion.get("num_threads"), 8),
-        "asset_triggers": str(ingestion.get("asset_triggers") or DEFAULT_ASSET_TRIGGERS),
-        "code_enrichment": _as_bool(ingestion.get("code_enrichment"), DEFAULT_CODE_ENRICHMENT),
-        "formula_enrichment": _as_bool(ingestion.get("formula_enrichment"), DEFAULT_FORMULA_ENRICHMENT),
-        "vision_model": str(models.get("vision_model") or DEFAULT_VISION_MODEL),
-        "vision_enabled": _as_bool(ingestion.get("vision_enabled"), DEFAULT_VISION_ENABLED),
-        "ocr_backend": str(ingestion.get("ocr_backend") or DEFAULT_OCR_BACKEND),
-        "ocr_langs": _as_langs(ingestion.get("ocr_langs"), DEFAULT_OCR_LANGS),
-        "ocr_force_full_page": _as_bool(ingestion.get("ocr_force_full_page"), DEFAULT_OCR_FORCE_FULL_PAGE),
+        "asset_dir": str(cfg.paths.asset_dir or DEFAULT_ASSET_DIR),
+        "parser_mode": str(ingestion.parser_mode or DEFAULT_PDF_PARSER_MODE),
+        "accelerator": str(ingestion.accelerator or DEFAULT_DOCLING_ACCELERATOR),
+        "num_threads": _as_positive_int(ingestion.num_threads, 8),
+        "asset_triggers": str(ingestion.asset_triggers or DEFAULT_ASSET_TRIGGERS),
+        "code_enrichment": _as_bool(ingestion.code_enrichment, DEFAULT_CODE_ENRICHMENT),
+        "formula_enrichment": _as_bool(ingestion.formula_enrichment, DEFAULT_FORMULA_ENRICHMENT),
+        "vision_model": str(cfg.models.vision_model or DEFAULT_VISION_MODEL),
+        "vision_enabled": _as_bool(ingestion.vision_enabled, DEFAULT_VISION_ENABLED),
+        "ocr_backend": str(ingestion.ocr_backend or DEFAULT_OCR_BACKEND),
+        "ocr_langs": _as_langs(ingestion.ocr_langs, DEFAULT_OCR_LANGS),
+        "ocr_force_full_page": _as_bool(ingestion.ocr_force_full_page, DEFAULT_OCR_FORCE_FULL_PAGE),
         "ocr_bitmap_area_threshold": _as_float(
-            ingestion.get("ocr_bitmap_area_threshold"),
+            ingestion.ocr_bitmap_area_threshold,
             DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
         ),
-        "rapidocr_backend": str(ingestion.get("rapidocr_backend") or DEFAULT_RAPIDOCR_BACKEND),
-        "tesseract_cmd": str(ingestion.get("tesseract_cmd") or DEFAULT_TESSERACT_CMD),
-        "tesseract_data_path": str(ingestion.get("tesseract_data_path") or DEFAULT_TESSERACT_DATA_PATH),
-        "tesseract_psm": _as_optional_int(ingestion.get("tesseract_psm"), DEFAULT_TESSERACT_PSM),
-        "ingestion_workers": _as_positive_int(ingestion.get("ingestion_workers"), 1),
-        "max_pages_whole_doc": max(0, int(ingestion.get("max_pages_whole_doc", 50) or 0)),
+        "rapidocr_backend": str(ingestion.rapidocr_backend or DEFAULT_RAPIDOCR_BACKEND),
+        "tesseract_cmd": str(ingestion.tesseract_cmd or DEFAULT_TESSERACT_CMD),
+        "tesseract_data_path": str(ingestion.tesseract_data_path or DEFAULT_TESSERACT_DATA_PATH),
+        "tesseract_psm": _as_optional_int(ingestion.tesseract_psm, DEFAULT_TESSERACT_PSM),
+        "ingestion_workers": _as_positive_int(ingestion.ingestion_workers, 1),
+        "max_pages_whole_doc": max(0, int(ingestion.max_pages_whole_doc or 0)),
     }
 
 
@@ -190,40 +137,37 @@ def _load_indexing_config(config_path: Path | None = None) -> dict[str, Any]:
     :mod:`src.vector_store` via :func:`apply_indexing_config` before indexing
     starts, so ``create_vector_index()`` and query-time search honor config.toml.
     """
-    payload = _load_toml_config(config_path)
-    indexing = payload.get("indexing", {})
-    return indexing if isinstance(indexing, dict) else {}
+    return dict(_pipeline_config(config_path).indexing)
 
 
 def _load_query_config(config_path: Path | None = None) -> dict[str, Any]:
-    payload = _load_toml_config(config_path)
-    models = payload.get("models", {}) if isinstance(payload.get("models"), dict) else {}
-    chat = payload.get("chat", {}) if isinstance(payload.get("chat"), dict) else {}
-    retrieval = payload.get("retrieval", {}) if isinstance(payload.get("retrieval"), dict) else {}
-    web_search = payload.get("web_search", {}) if isinstance(payload.get("web_search"), dict) else {}
-    ollama = payload.get("ollama", {}) if isinstance(payload.get("ollama"), dict) else {}
+    cfg = _pipeline_config(config_path)
+    chat = cfg.chat
+    retrieval = cfg.retrieval
+    web_search = cfg.web_search
+    ollama = cfg.ollama
     return {
-        "llm_model": str(models.get("llm_model") or default_llm_model()),
-        "embedding_model": str(models.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
-        "embedding_dim": _as_positive_int(models.get("embedding_dim"), DEFAULT_EMBEDDING_DIM),
-        "llm_num_predict": _as_positive_int(chat.get("llm_num_predict"), 4096),
-        "llm_timeout": _as_float(chat.get("llm_timeout"), 120.0),
-        "temperature": _as_float(chat.get("temperature"), 0.3),
-        "max_k": _as_positive_int(chat.get("max_k"), 40),
-        "context_window": _as_positive_int(chat.get("context_window"), 8192),
-        "retrieval_candidate_k": _as_positive_int(retrieval.get("candidate_top_k"), 80),
-        "retrieval_min_score": _as_float(retrieval.get("min_relevance_score"), 0.50),
-        "retrieval_relative_cutoff": _as_float(retrieval.get("relative_relevance_cutoff"), 0.72),
-        "context_token_fraction": _as_float(retrieval.get("context_token_fraction"), 0.60),
-        "web_search_enabled": _as_bool(web_search.get("enabled"), True),
-        "web_search_timeout": _as_float(web_search.get("timeout_seconds"), 8.0),
-        "web_search_max_results": _as_positive_int(web_search.get("max_results"), 5),
-        "ollama_health_check_interval": _as_float(ollama.get("chat_health_check_interval_seconds"), 5.0),
-        "ollama_max_lost_health_checks": _as_positive_int(ollama.get("chat_max_lost_health_checks"), 5),
-        "system_prompt": str(chat.get("system_prompt") or "") or None,
-        "planner_model": str(chat.get("planner_model") or default_planner_model()),
-        "planner_enabled": _as_bool(chat.get("planner_enabled"), True),
-        "planner_max_queries": _as_positive_int(chat.get("planner_max_queries"), default_planner_max_queries()),
+        "llm_model": str(cfg.models.llm_model or DEFAULT_LLM_MODEL),
+        "embedding_model": str(cfg.models.embedding_model or DEFAULT_EMBEDDING_MODEL),
+        "embedding_dim": _as_positive_int(cfg.models.embedding_dim, DEFAULT_EMBEDDING_DIM),
+        "llm_num_predict": _as_positive_int(chat.llm_num_predict, DEFAULT_NUM_PREDICT),
+        "llm_timeout": _as_float(chat.llm_timeout, DEFAULT_LLM_TIMEOUT),
+        "temperature": _as_float(chat.temperature, DEFAULT_TEMPERATURE),
+        "max_k": _as_positive_int(chat.max_k, DEFAULT_SAMPLER_TOP_K),
+        "context_window": _as_positive_int(chat.context_window, DEFAULT_CONTEXT_WINDOW),
+        "retrieval_candidate_k": _as_positive_int(retrieval.candidate_top_k, DEFAULT_RETRIEVAL_CANDIDATE_K),
+        "retrieval_min_score": _as_float(retrieval.min_relevance_score, DEFAULT_RETRIEVAL_MIN_SCORE),
+        "retrieval_relative_cutoff": _as_float(retrieval.relative_relevance_cutoff, DEFAULT_RETRIEVAL_RELATIVE_CUTOFF),
+        "context_token_fraction": _as_float(retrieval.context_token_fraction, DEFAULT_CONTEXT_TOKEN_FRACTION),
+        "web_search_enabled": _as_bool(web_search.enabled, DEFAULT_WEB_SEARCH_ENABLED),
+        "web_search_timeout": _as_float(web_search.timeout_seconds, DEFAULT_WEB_SEARCH_TIMEOUT),
+        "web_search_max_results": _as_positive_int(web_search.max_results, DEFAULT_WEB_SEARCH_MAX_RESULTS),
+        "ollama_health_check_interval": _as_float(ollama.chat_health_check_interval_seconds, DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL),
+        "ollama_max_lost_health_checks": _as_positive_int(ollama.chat_max_lost_health_checks, DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS),
+        "system_prompt": str(chat.system_prompt or "") or None,
+        "planner_model": str(chat.planner_model or DEFAULT_PLANNER_MODEL),
+        "planner_enabled": _as_bool(chat.planner_enabled, True),
+        "planner_max_queries": _as_positive_int(chat.planner_max_queries, DEFAULT_PLANNER_MAX_QUERIES),
     }
 
 
@@ -618,58 +562,62 @@ def main(argv: list[str] | None = None) -> int:
             if not args.question:
                 parser.error("--question is required when --mode query")
             query_config = _load_query_config()
-            answer = QueryEngine(
-                working_dir=args.db_dir,
-                asset_dir=args.asset_dir or _load_ingestion_config()["asset_dir"],
-                model=args.llm_model or query_config["llm_model"],
-                embedding_model=args.embedding_model or query_config["embedding_model"],
-                embedding_batch_size=args.embedding_batch_size or DEFAULT_EMBEDDING_BATCH_SIZE,
-                embedding_timeout=args.embedding_timeout or 30.0,
-                embedding_dim=query_config["embedding_dim"],
-                llm_num_predict=args.llm_num_predict or query_config["llm_num_predict"],
-                llm_timeout=args.llm_timeout if args.llm_timeout is not None else query_config["llm_timeout"],
-                temperature=args.temperature if args.temperature is not None else query_config["temperature"],
-                sampler_top_k=args.max_k or query_config["max_k"],
-                context_window=args.context_window or query_config["context_window"],
-                retrieval_candidate_k=args.retrieval_candidate_k or query_config["retrieval_candidate_k"],
-                retrieval_min_score=(
-                    args.retrieval_min_score
-                    if args.retrieval_min_score is not None
-                    else query_config["retrieval_min_score"]
-                ),
-                retrieval_relative_cutoff=(
-                    args.retrieval_relative_cutoff
-                    if args.retrieval_relative_cutoff is not None
-                    else query_config["retrieval_relative_cutoff"]
-                ),
-                context_token_fraction=(
-                    args.context_token_fraction
-                    if args.context_token_fraction is not None
-                    else query_config["context_token_fraction"]
-                ),
-                web_search_enabled=query_config["web_search_enabled"] and not args.no_web_search,
-                web_search_timeout=(
-                    args.web_search_timeout
-                    if args.web_search_timeout is not None
-                    else query_config["web_search_timeout"]
-                ),
-                web_search_max_results=args.web_search_max_results or query_config["web_search_max_results"],
-                ollama_health_check_interval=(
-                    args.ollama_health_check_interval
-                    if args.ollama_health_check_interval is not None
-                    else query_config["ollama_health_check_interval"]
-                ),
-                ollama_max_lost_health_checks=(
-                    args.ollama_max_lost_health_checks
-                    if args.ollama_max_lost_health_checks is not None
-                    else query_config["ollama_max_lost_health_checks"]
-                ),
-                system_prompt=args.system_prompt if args.system_prompt is not None else query_config["system_prompt"],
-                planner_model=args.planner_model or query_config["planner_model"],
-                planner_enabled=query_config["planner_enabled"] and not args.no_planner,
-                planner_max_queries=args.planner_max_queries or query_config["planner_max_queries"],
-                progress_enabled=not args.no_progress,
-            ).ask(args.question)
+            # CLI flags override config values. "Or-style" flags fall back to
+            # config on 0/empty (matching the historical argparse defaults);
+            # numeric/str flags fall back only when unset (None) so explicit
+            # zeros (e.g. retrieval_min_score=0) are honored.
+            cli_overrides = {
+                key: value
+                for key, value in {
+                    "model": args.llm_model,
+                    "embedding_model": args.embedding_model,
+                    "embedding_batch_size": args.embedding_batch_size,
+                    "embedding_timeout": args.embedding_timeout,
+                    "llm_num_predict": args.llm_num_predict,
+                    "sampler_top_k": args.max_k,
+                    "context_window": args.context_window,
+                    "retrieval_candidate_k": args.retrieval_candidate_k,
+                    "web_search_max_results": args.web_search_max_results,
+                    "planner_model": args.planner_model,
+                    "planner_max_queries": args.planner_max_queries,
+                }.items()
+                if value
+            }
+            cli_overrides.update(
+                {
+                    key: value
+                    for key, value in {
+                        "llm_timeout": args.llm_timeout,
+                        "temperature": args.temperature,
+                        "retrieval_min_score": args.retrieval_min_score,
+                        "retrieval_relative_cutoff": args.retrieval_relative_cutoff,
+                        "context_token_fraction": args.context_token_fraction,
+                        "web_search_timeout": args.web_search_timeout,
+                        "ollama_health_check_interval": args.ollama_health_check_interval,
+                        "ollama_max_lost_health_checks": args.ollama_max_lost_health_checks,
+                        "system_prompt": args.system_prompt,
+                    }.items()
+                    if value is not None
+                }
+            )
+            model = query_config.pop("llm_model")
+            sampler_top_k = query_config.pop("max_k")
+            engine_kwargs = {
+                **query_config,
+                "model": model,
+                "sampler_top_k": sampler_top_k,
+                **cli_overrides,
+                "working_dir": args.db_dir,
+                "asset_dir": args.asset_dir or _load_ingestion_config()["asset_dir"],
+                # Always passed (not only when the CLI set them) so fake
+                # engines in tests and the real QueryEngine signature stay stable.
+                "embedding_batch_size": cli_overrides.pop("embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE),
+                "embedding_timeout": cli_overrides.pop("embedding_timeout", DEFAULT_EMBEDDING_TIMEOUT),
+                "web_search_enabled": query_config["web_search_enabled"] and not args.no_web_search,
+                "planner_enabled": query_config["planner_enabled"] and not args.no_planner,
+                "progress_enabled": not args.no_progress,
+            }
+            answer = QueryEngine(**engine_kwargs).ask(args.question)
             print(answer)
             return 0
     except Exception as exc:

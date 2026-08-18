@@ -4,17 +4,15 @@ import json
 import hashlib
 import logging
 import os
-import shutil
 import socket
-import sys
-import time
-import urllib.error
-import urllib.request
 import urllib3
 from collections import OrderedDict
 from typing import Any
 
 from src import llm_api
+from src.coerce import as_positive_float, as_positive_int
+from src.console import status as _status
+from src.defaults import DEFAULT_EMBEDDING_BATCH_SIZE
 
 _OLLAMA_POOL = urllib3.PoolManager(
     num_pools=4,
@@ -24,72 +22,79 @@ _OLLAMA_POOL = urllib3.PoolManager(
 
 logger = logging.getLogger(__name__)
 
-
-def _status(message: str) -> None:
-    print(message, file=sys.stderr, flush=True)
-
-
-def _ollama_pull_command(model_name: str) -> str:
-    executable = shutil.which("ollama")
-    if executable is None:
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            candidate = os.path.join(local_app_data, "Programs", "Ollama", "ollama.exe")
-            if os.path.exists(candidate):
-                executable = candidate
-    if executable is None:
-        executable = "ollama"
-    if " " in executable:
-        executable = f'"{executable}"'
-    return f"{executable} pull {model_name}"
-
-
-def _positive_int(value: int | str | None, default: int) -> int:
-    if value is None:
-        return default
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return max(1, parsed)
-
-
-def _positive_float(value: float | str | None, default: float) -> float:
-    if value is None:
-        return default
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    return max(0.1, parsed)
+# Shared host helpers live in llm_api (the backend module); kept as module
+# aliases because tests patch these names on src.embeddings.
+_normalize_ollama_host = llm_api.normalize_ollama_host
+_ollama_pull_command = llm_api.ollama_pull_command
 
 
 def _ollama_host() -> str:
     host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").strip()
-    if not host:
-        return "http://127.0.0.1:11434"
-    if host.startswith(("http://", "https://")):
-        return host.rstrip("/")
-    return f"http://{host.rstrip('/')}"
+    return _normalize_ollama_host(host)
 
 
-def _normalize_ollama_host(raw: str) -> str:
-    """Normalize a single Ollama host string (scheme + trailing slash trim)."""
-    host = raw.strip()
-    if not host:
-        return "http://127.0.0.1:11434"
-    if host.startswith(("http://", "https://")):
-        return host.rstrip("/")
-    return f"http://{host.rstrip('/')}"
+def resolve_embedding_dim(explicit: int | None = None) -> int:
+    """Resolve the embedding dimension: explicit arg > ``[models].embedding_dim``
+    > ``DEFAULT_EMBEDDING_DIM``.
+
+    bge-m3 is 1024-d (was 768 for nomic); a model/dim change invalidates an
+    existing index (the indexer/query-engine reuse guards enforce a re-index).
+    """
+    if explicit is not None:
+        return max(1, int(explicit))
+    try:
+        from src.config import load_config
+
+        return max(1, int(load_config().models.embedding_dim))
+    except Exception:
+        from src.defaults import DEFAULT_EMBEDDING_DIM
+
+        return DEFAULT_EMBEDDING_DIM
 
 
-def _resolve_ollama_hosts() -> list[str]:
+class EmbeddingSetup:
+    """Resolved embedding configuration shared by the query engine and indexer.
+
+    Centralizes model aliasing, dim resolution, the instruction prefix, and
+    :class:`EmbeddingEngine` construction so both consumers stay consistent.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        embedding_dim: int | None = None,
+        batch_size: int | str | None = None,
+        timeout: float | None = None,
+    ):
+        self.model = (
+            "nomic-embed-text" if model == "nomic-ai/nomic-embed-text-v1.5" else model
+        )
+        self.dim = resolve_embedding_dim(embedding_dim)
+        self.engine = EmbeddingEngine(
+            model_name=self.model,
+            ollama_batch_size=batch_size,
+            ollama_timeout=timeout,
+        )
+        self.batch_size = getattr(
+            self.engine, "ollama_batch_size", None
+        ) or as_positive_int(batch_size, DEFAULT_EMBEDDING_BATCH_SIZE)
+        self.query_prefix = llm_api.resolve_embedding_prefix(self.model, "query")
+        self.doc_prefix = llm_api.resolve_embedding_prefix(self.model, "doc")
+
+    @property
+    def backend_label(self) -> str:
+        return "SoCLAaS API" if llm_api.is_soclaas() else "Ollama"
+
+
+def _resolve_ollama_hosts(config_hosts: list[str] | None = None) -> list[str]:
     """Resolve the list of Ollama embedding endpoints.
 
     A comma-separated ``OLLAMA_EMBED_HOSTS`` env var enables multi-replica
     embedding: batches are round-robined across the listed hosts in parallel.
-    When unset, falls back to the single ``OLLAMA_HOST`` (so the default is
-    zero behavior change). Duplicates are removed while preserving order.
+    When unset, ``[embeddings].hosts`` from config is used; when that is empty
+    too, falls back to the single ``OLLAMA_HOST`` (so the default is zero
+    behavior change). Duplicates are removed while preserving order.
 
     Examples::
 
@@ -97,6 +102,8 @@ def _resolve_ollama_hosts() -> list[str]:
         # -> ["http://gpu-a:11434", "http://gpu-b:11434"]
     """
     raw = os.environ.get("OLLAMA_EMBED_HOSTS", "").strip()
+    if not raw and config_hosts:
+        raw = ",".join(str(host) for host in config_hosts)
     if not raw:
         return [_ollama_host()]
     hosts: list[str] = []
@@ -109,19 +116,19 @@ def _resolve_ollama_hosts() -> list[str]:
     return hosts or [_ollama_host()]
 
 
-def _resolve_embed_concurrency() -> int:
+def _resolve_embed_concurrency(config_concurrency: int | None = None) -> int:
     """Worker threads for parallel batch embedding.
 
-    Default 1 = serial (preserves existing single-host behavior). When
-    ``OLLAMA_EMBED_HOSTS`` lists multiple replicas the effective parallelism is
+    Default 1 = serial (preserves existing single-host behavior). When the
+    host list has multiple replicas the effective parallelism is
     ``max(concurrency, len(hosts))`` so every replica is used concurrently even
     if the operator left this at 1. Override with ``OLLAMA_EMBED_CONCURRENCY``
-    to push more in-flight batches per host (e.g. with ``OLLAMA_NUM_PARALLEL>1``
-    on the Ollama server).
+    (or ``[embeddings].concurrency``) to push more in-flight batches per host
+    (e.g. with ``OLLAMA_NUM_PARALLEL>1`` on the Ollama server).
     """
     raw = os.environ.get("OLLAMA_EMBED_CONCURRENCY", "").strip()
     try:
-        value = int(raw) if raw else 1
+        value = int(raw) if raw else (int(config_concurrency) if config_concurrency else 1)
     except (TypeError, ValueError):
         value = 1
     return max(1, value)
@@ -157,13 +164,13 @@ class EmbeddingEngine:
 
         emb_cfg = load_config().embeddings
 
-        self.ollama_batch_size = _positive_int(
+        self.ollama_batch_size = as_positive_int(
             ollama_batch_size
             if ollama_batch_size is not None
             else os.environ.get("OLLAMA_EMBED_BATCH_SIZE"),
             emb_cfg.batch_size,
         )
-        self._ollama_timeout_base = _positive_float(
+        self._ollama_timeout_base = as_positive_float(
             ollama_timeout
             if ollama_timeout is not None
             else os.environ.get("OLLAMA_EMBED_TIMEOUT"),
@@ -185,7 +192,7 @@ class EmbeddingEngine:
         # entire multi-hour ingestion; the retry lets it ride out a transient
         # failure. Final-attempt failure still raises so callers can skip the
         # file (per-file isolation) rather than the whole corpus.
-        self.ollama_retries = _positive_int(
+        self.ollama_retries = as_positive_int(
             ollama_retries
             if ollama_retries is not None
             else os.environ.get("OLLAMA_EMBED_RETRIES"),
@@ -193,11 +200,11 @@ class EmbeddingEngine:
         )
         # Bounded LRU cache. At 100GB-scale cold indexing almost every chunk is
         # unique, so an unbounded dict would grow to hold every embedding for
-        # the whole run (768 floats each) and OOM the process. A bounded LRU
-        # caps the footprint while preserving the hit rate for the realistic
-        # repeat cases (re-index reuse, repeated queries). Default 50k entries ≈
-        # ~150MB at 768 float32 each; env-overridable.
-        self.max_cache_entries = _positive_int(
+        # the whole run and OOM the process. A bounded LRU caps the footprint
+        # while preserving the hit rate for the realistic repeat cases
+        # (re-index reuse, repeated queries). Default 50k entries of 1024-d
+        # float32 is ~200MB; env-overridable.
+        self.max_cache_entries = as_positive_int(
             max_cache_entries
             if max_cache_entries is not None
             else os.environ.get("OLLAMA_EMBED_CACHE_MAX"),
@@ -205,17 +212,10 @@ class EmbeddingEngine:
         )
         self._cache: OrderedDict[tuple[int, int, str], Any] = OrderedDict()
 
-        # Persist the config-sourced hosts/concurrency so multi-replica
-        # embedding is configurable without env vars. ``_resolve_ollama_hosts``
-        # and ``_resolve_embed_concurrency`` still honor their env vars; we seed
-        # the env from config only when the env var is unset, preserving the
-        # explicit-arg > env > config > default precedence.
-        if emb_cfg.hosts and not os.environ.get("OLLAMA_EMBED_HOSTS"):
-            os.environ["OLLAMA_EMBED_HOSTS"] = ",".join(emb_cfg.hosts)
-        if emb_cfg.concurrency and emb_cfg.concurrency != 1 and not os.environ.get(
-            "OLLAMA_EMBED_CONCURRENCY"
-        ):
-            os.environ["OLLAMA_EMBED_CONCURRENCY"] = str(int(emb_cfg.concurrency))
+        # Config-sourced multi-replica hosts/concurrency, passed explicitly to
+        # the resolvers (env vars still take precedence inside them).
+        self._config_hosts = list(emb_cfg.hosts or [])
+        self._config_concurrency = int(emb_cfg.concurrency or 1)
 
         self.native_embeddings = load_config().models.native_embeddings
         self._native_model = None
@@ -324,8 +324,8 @@ class EmbeddingEngine:
             return np.empty((0, truncate_dim), dtype=np.float32)
         # Multi-replica Ollama shards batches across hosts (round-robin, applied
         # per batch in _embed_one_batch); parallelize at least len(hosts) ways.
-        hosts = _resolve_ollama_hosts()
-        requested = _resolve_embed_concurrency()
+        hosts = _resolve_ollama_hosts(self._config_hosts)
+        requested = _resolve_embed_concurrency(self._config_concurrency)
         max_workers = max(requested, len(hosts)) if len(hosts) > 1 else requested
         vectors = self._dispatch_embedding_batches(texts, max_workers, self._embed_one_batch)
         return self._postprocess_vectors(vectors, truncate_dim)
@@ -334,7 +334,7 @@ class EmbeddingEngine:
         import numpy as np
         if not texts:
             return np.empty((0, truncate_dim), dtype=np.float32)
-        max_workers = max(1, _resolve_embed_concurrency())
+        max_workers = _resolve_embed_concurrency(self._config_concurrency)
         vectors = self._dispatch_embedding_batches(texts, max_workers, self._soclaas_embed_one_batch)
         return self._postprocess_vectors(vectors, truncate_dim)
 
@@ -425,7 +425,7 @@ class EmbeddingEngine:
         Raises RuntimeError on failure so the dispatcher (serial or ``Future.result``)
         propagates it.
         """
-        hosts = _resolve_ollama_hosts()
+        hosts = _resolve_ollama_hosts(self._config_hosts)
         host = hosts[(batch_number - 1) % len(hosts)]
         _status(
             f"Requesting embeddings from Ollama model: {self.model_name} "
@@ -507,39 +507,16 @@ class EmbeddingEngine:
     ) -> dict[str, Any]:
         """Call :meth:`_ollama_api` with bounded exponential-backoff retry.
 
-        Retries on the transient errors ``_ollama_api`` raises (RuntimeError
-        wrapping timeouts/URL errors). The last attempt's exception propagates
-        so a genuinely broken endpoint still fails the batch -- but only after
-        a few rides through a transient blip.
+        Uses the shared retry engine in :mod:`src.llm_api` (announced on stderr
+        so a slow-Ollama retry storm is visible during a long ingest). The last
+        attempt's exception propagates so a genuinely broken endpoint still
+        fails the batch -- but only after a few rides through a transient blip.
         """
-        import random
-
-        attempts = max(1, int(self.ollama_retries))
-        last_exc: Exception | None = None
-        for attempt in range(1, attempts + 1):
-            try:
-                return self._ollama_api(path, payload, host=host)
-            except RuntimeError as exc:
-                last_exc = exc
-                if attempt >= attempts:
-                    break
-                # Exponential backoff: 0.5s, 1s, 2s, ... plus up to 25% jitter.
-                backoff = (0.5 * (2 ** (attempt - 1))) * (1 + random.random() * 0.25)
-                # Surface the retry in the server log (not just stderr) so a
-                # slow-Ollama-induced retry storm is visible in logs/server.log
-                # during a long ingest. The first retry of each batch warns.
-                logger.warning(
-                    "Ollama embedding retry %d/%d after %.2fs backoff: %s",
-                    attempt,
-                    attempts,
-                    backoff,
-                    exc,
-                )
-                _status(
-                    f"Ollama request failed (attempt {attempt}/{attempts}); "
-                    f"retrying in {backoff:.2f}s. Error: {exc}"
-                )
-                time.sleep(backoff)
-        assert last_exc is not None
-        raise last_exc
+        return llm_api.retry_with_backoff(
+            lambda: self._ollama_api(path, payload, host=host),
+            attempts=self.ollama_retries,
+            description="Ollama request",
+            retry_on=RuntimeError,
+            announce=True,
+        )
 

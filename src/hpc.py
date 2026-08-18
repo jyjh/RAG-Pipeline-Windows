@@ -1,9 +1,8 @@
 """PBS job-script generation for the NUS HPC deployment.
 
-This module programmatically generates the same PBS scripts that live under
-``scripts/`` (``nus_hpc_ingest_index.pbs`` and ``nus_hpc_serve.pbs``) so they
-can be regenerated with overridden resource parameters without hand-editing the
-files.
+This module programmatically generates the same PBS script that lives under
+``scripts/`` (``nus_hpc_ingest_index.pbs``) so it can be regenerated with
+overridden resource parameters without hand-editing the file.
 
 Security note: every interpolated value is validated against a strict
 allow-list *before* it reaches the f-string template. The generated script
@@ -16,7 +15,6 @@ anything outside the safe charset is both safer and format-preserving.
 Run it::
 
     python -m src.hpc                         # ingest job, default params -> stdout
-    python -m src.hpc --serve                 # serving job, default params
     python -m src.hpc --ngpus 2 --mem 64gb    # ingest job, overridden resources
     python -m src.hpc -o myjob.pbs            # write to a file instead
 """
@@ -47,9 +45,6 @@ _WALLTIME_RE = re.compile(r"^\d{1,4}:\d{2}:\d{2}$")
 # blocks command substitution -- $() and backticks -- because '(' ')' and
 # '`' are excluded, along with spaces, quotes, ;, &, | and <>.
 _PATH_RE = re.compile(r"^[A-Za-z0-9._/${}\-]+$")
-
-# Default model tags the pipeline depends on (see config.toml [models]/*).
-DEFAULT_MODELS_TO_PULL = "nomic-embed-text qwen2.5vl:7b gemma4 qwen2.5:1.5b"
 
 
 def _strip(value: str, field: str) -> str:
@@ -153,23 +148,17 @@ def generate_pbs_script(
     input_data_dir: str = "data",
     container_sif: str = "rag_pipeline.sif",
     walltime: str = "08:00:00",
-    ollama_models_dir: str = "${HOME}/ollama_models",
     storage_root: str = "/hpctmp/${USER}",
 ) -> str:
     """Generate the ingest+index PBS script template with validated overrides.
 
     The CPU ingest/index job does the heavy non-LLM work (Docling OCR/parsing,
     chunking, LanceDB writes, ANN build) and calls the hosted SoCLAaS API
-    (``/v1/embeddings`` with bge-m3) for vectors. It no longer runs a local
-    ``ollama serve`` or pulls models. Provision the API key at
-    ``~/rag_soclaas_key`` on the login node (chmod 600), pass it via the qsub
-    environment, or set ``[llm_api].api_key`` in the staged ``config.toml`` so
-    the job can reach the embeddings endpoint.
-
-    ``ollama_models_dir`` is retained in the signature for backward
-    compatibility (validated but unused): the LLM-serving path moved to the
-    hosted SoCLAaS API, and the deprecated GPU serving job
-    (``generate_serve_pbs_script``) is the only remaining Ollama user.
+    (``/v1/embeddings`` with bge-m3) for vectors; it runs no local
+    ``ollama serve``. Provision the API key at ``~/rag_soclaas_key`` on the
+    login node (chmod 600), pass it via the qsub environment, or set
+    ``[llm_api].api_key`` in the staged ``config.toml`` so the job can reach
+    the embeddings endpoint.
     """
     job_name = _validate_name(job_name, "job_name")
     ncpus = _validate_int(ncpus, "ncpus", minimum=1)
@@ -179,7 +168,6 @@ def generate_pbs_script(
     input_data_dir = _validate_path(input_data_dir, "input_data_dir")
     container_sif = _validate_path(container_sif, "container_sif")
     walltime = _validate_walltime(walltime)
-    ollama_models_dir = _validate_path(ollama_models_dir, "ollama_models_dir")
     storage_root = _validate_path(storage_root, "storage_root")
 
     select_clause = _select_clause(ncpus, mem, ngpus)
@@ -233,161 +221,37 @@ singularity exec {nv}${{BIND_MOUNTS}} "${{CONTAINER_SIF}}" python3 scripts/bulk_
 """
 
 
-# --- Serving PBS generator ----------------------------------------------------
-
-
-def generate_serve_pbs_script(
-    job_name: str = "rag_ollama_serve",
-    ncpus: int = 4,
-    mem: str = "16gb",
-    ngpus: int = 1,
-    queue: str = "gpu",
-    walltime: str = "08:00:00",
-    container_sif: str = "rag_pipeline.sif",
-    ollama_models_dir: str = "${HOME}/ollama_models",
-    ollama_host_file: str = "${HOME}/.rag_ollama_serving_host",
-    storage_root: str = "/scratch/${USER}",
-) -> str:
-    """Generate the long-lived Ollama *serving* PBS script.
-
-    DEPRECATED: LLM serving now runs on the hosted SoCLAaS API (``[llm_api]``),
-    so this GPU serving job + SSH tunnel flow is obsolete. The code is retained
-    for reference/revert; the setup wizard no longer submits it.
-
-    Unlike the ingest job, this one does not run the pipeline: it keeps
-    ``ollama serve`` alive on a GPU compute node, publishes that node's hostname
-    to ``ollama_host_file`` (read by the SSH tunnel daemon), pre-pulls the chat
-    models, and blocks until walltime. See ``scripts/nus_hpc_serve.pbs``.
-    """
-    job_name = _validate_name(job_name, "job_name")
-    ncpus = _validate_int(ncpus, "ncpus", minimum=1)
-    mem = _validate_mem(mem)
-    ngpus = _validate_int(ngpus, "ngpus", minimum=0)
-    queue = _validate_name(queue, "queue")
-    walltime = _validate_walltime(walltime)
-    container_sif = _validate_path(container_sif, "container_sif")
-    ollama_models_dir = _validate_path(ollama_models_dir, "ollama_models_dir")
-    ollama_host_file = _validate_path(ollama_host_file, "ollama_host_file")
-    storage_root = _validate_path(storage_root, "storage_root")
-
-    select_clause = _select_clause(ncpus, mem, ngpus)
-    nv = _nv_flag(ngpus)  # "--nv " on GPU, "" on CPU
-
-    return f"""#!/bin/bash
-#PBS -N {job_name}
-#PBS -l {select_clause}
-#PBS -l walltime={walltime}
-#PBS -q {queue}
-#PBS -j oe
-
-set -e
-
-module load singularity
-
-USER="${{USER:-$(whoami)}}"
-PBS_JOBID="${{PBS_JOBID:-local_job}}"
-HOME="${{HOME:-$(eval echo ~${{USER}})}}"
-STORAGE_ROOT="{storage_root}"
-SCRATCH_DIR="${{STORAGE_ROOT}}/rag_serve_scratch_${{PBS_JOBID}}"
-OLLAMA_MODELS_DIR="${{OLLAMA_MODELS_DIR:-{ollama_models_dir}}}"
-OLLAMA_HOST_FILE="${{OLLAMA_HOST_FILE:-{ollama_host_file}}}"
-
-mkdir -p "${{SCRATCH_DIR}}/tmp"
-mkdir -p "${{OLLAMA_MODELS_DIR}}"
-
-COMPUTE_HOST="$(hostname -f 2>/dev/null || hostname)"
-echo "${{COMPUTE_HOST}}" > "${{OLLAMA_HOST_FILE}}"
-
-OLLAMA_PID=""
-cleanup() {{
-    if [ -n "${{OLLAMA_PID}}" ]; then
-        kill -9 "${{OLLAMA_PID}}" 2>/dev/null || true
-    fi
-    rm -f "${{OLLAMA_HOST_FILE}}"
-    rm -rf "${{SCRATCH_DIR}}"
-}}
-trap cleanup EXIT
-
-CONTAINER_SIF="${{CONTAINER_SIF:-{container_sif}}}"
-if [ ! -f "${{CONTAINER_SIF}}" ] && [ -f "${{STORAGE_ROOT}}/{container_sif}" ]; then
-    CONTAINER_SIF="${{STORAGE_ROOT}}/{container_sif}"
-fi
-
-BIND_MOUNTS="-B ${{STORAGE_ROOT}}:${{STORAGE_ROOT}} -B ${{HOME}}:/srv/home -B ${{PWD}}:/app -B ${{OLLAMA_MODELS_DIR}}:/srv/ollama_models"
-
-export OLLAMA_MODELS="/srv/ollama_models"
-export TMPDIR="${{SCRATCH_DIR}}/tmp"
-
-singularity exec {nv}${{BIND_MOUNTS}} "${{CONTAINER_SIF}}" ollama serve > "${{SCRATCH_DIR}}/ollama.log" 2>&1 &
-OLLAMA_PID=$!
-
-MAX_ATTEMPTS=30
-ATTEMPT=0
-READY=0
-while [ ${{ATTEMPT}} -lt ${{MAX_ATTEMPTS}} ]; do
-    if singularity exec ${{BIND_MOUNTS}} "${{CONTAINER_SIF}}" curl -s -f http://127.0.0.1:11434/api/version > /dev/null 2>&1; then
-        READY=1
-        break
-    fi
-    ATTEMPT=$((ATTEMPT + 1))
-    sleep 2
-done
-if [ ${{READY}} -ne 1 ]; then
-    echo "ERROR: Ollama endpoint failed to become ready within timeout."
-    cat "${{SCRATCH_DIR}}/ollama.log" || true
-    exit 1
-fi
-
-DEFAULT_MODELS="{DEFAULT_MODELS_TO_PULL}"
-OLLAMA_MODELS_TO_PULL="${{OLLAMA_MODELS_TO_PULL:-${{DEFAULT_MODELS}}}}"
-for model in ${{OLLAMA_MODELS_TO_PULL}}; do
-    singularity exec ${{BIND_MOUNTS}} "${{CONTAINER_SIF}}" ollama pull "${{model}}" || \
-        echo "WARNING: pull failed for '${{model}}'"
-done
-
-KEEPALIVE_INTERVAL=15
-while true; do
-    sleep "${{KEEPALIVE_INTERVAL}}"
-    echo "${{COMPUTE_HOST}}" > "${{OLLAMA_HOST_FILE}}"
-done
-"""
-
-
 # --- CLI ----------------------------------------------------------------------
 
 
 def parse_hpc_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments for PBS generation.
 
-    ``--serve`` selects the long-lived Ollama serving template; otherwise the
-    ingest+index template is generated. ``--cpu`` switches the default resource
-    bundle to a CPU-only profile (0 GPUs, ``cpu`` queue, ``rag_pipeline_cpu.sif``,
-    more cores). Explicit args always override ``--cpu``'s bundle. ``--output``
-    writes the result to a file instead of stdout.
+    ``--cpu`` switches the default resource bundle to a CPU-only profile
+    (0 GPUs, ``cpu`` queue, ``rag_pipeline_cpu.sif``, more cores). Explicit
+    args always override ``--cpu``'s bundle. ``--output`` writes the result to
+    a file instead of stdout.
     """
     parser = argparse.ArgumentParser(
         prog="python -m src.hpc",
         description="Generate a PBS job script for the NUS HPC deployment.",
     )
-    parser.add_argument("--serve", action="store_true", help="Generate the long-lived Ollama serving job (default: ingest+index).")
     parser.add_argument("--cpu", action="store_true", help="Generate a CPU-only job (0 GPUs, 'cpu' queue, rag_pipeline_cpu.sif). Explicit args still win.")
-    parser.add_argument("--job-name", default=None, help="PBS job name (default: rag_ingest_index / rag_ollama_serve).")
-    parser.add_argument("--ncpus", type=int, default=None, help="Number of CPUs (default: 8 ingest / 4 serve; 16/8 under --cpu).")
-    parser.add_argument("--mem", default=None, help="Memory requirement, e.g. 32gb (default: 32gb ingest / 16gb serve).")
+    parser.add_argument("--job-name", default=None, help="PBS job name (default: rag_ingest_index).")
+    parser.add_argument("--ncpus", type=int, default=None, help="Number of CPUs (default: 8; 16 under --cpu).")
+    parser.add_argument("--mem", default=None, help="Memory requirement, e.g. 32gb (default: 32gb).")
     parser.add_argument("--ngpus", type=int, default=None, help="Number of GPUs (default: 1; 0 under --cpu).")
     parser.add_argument("--queue", default=None, help="PBS queue name (default: gpu; cpu under --cpu).")
     parser.add_argument("--walltime", default=None, help="Job walltime HH:MM:SS (default: 08:00:00).")
     parser.add_argument("--container-sif", default=None, help="Singularity image filename (default: rag_pipeline.sif; rag_pipeline_cpu.sif under --cpu).")
-    parser.add_argument("--ollama-models-dir", default=None, help="Persistent Ollama model store path (default: $HOME/ollama_models).")
-    parser.add_argument("--storage-root", default=None, help="Per-cluster scratch/storage root (CPU default: /hpctmp/$USER; GPU serve default: /scratch/$USER).")
-    parser.add_argument("--ollama-host-file", dest="ollama_host_file", default=None, help="Serving discovery file (serving job only; default: $HOME/.rag_ollama_serving_host).")
-    parser.add_argument("--input-data-dir", default=None, help="Ingest input directory (ingest job only; default: data).")
+    parser.add_argument("--storage-root", default=None, help="Per-cluster scratch/storage root (CPU default: /hpctmp/$USER).")
+    parser.add_argument("--input-data-dir", default=None, help="Ingest input directory (default: data).")
     parser.add_argument("-o", "--output", default=None, help="Write the generated script to this file (default: stdout).")
     return parser.parse_args(argv)
 
 
 def _build_script_from_args(args: argparse.Namespace) -> str:
-    """Dispatch to the selected generator, applying argparse defaults per mode.
+    """Apply argparse defaults per mode and generate the ingest+index script.
 
     ``--cpu`` is a *default bundle*: when set, it changes the defaults for
     ngpus/queue/container_sif/ncpus to CPU-appropriate values, but only for
@@ -414,19 +278,6 @@ def _build_script_from_args(args: argparse.Namespace) -> str:
             mem=args.mem,
         )
 
-    if args.serve:
-        return generate_serve_pbs_script(
-            job_name=args.job_name or "rag_ollama_serve",
-            ncpus=bundle["ncpus"] if bundle["ncpus"] is not None else 4,
-            mem=bundle["mem"] or "16gb",
-            ngpus=bundle["ngpus"],
-            queue=bundle["queue"],
-            walltime=args.walltime or "08:00:00",
-            container_sif=bundle["container_sif"],
-            ollama_models_dir=args.ollama_models_dir or "${HOME}/ollama_models",
-            ollama_host_file=args.ollama_host_file or "${HOME}/.rag_ollama_serving_host",
-            storage_root=args.storage_root or "/scratch/${USER}",
-        )
     return generate_pbs_script(
         job_name=args.job_name or "rag_ingest_index",
         ncpus=bundle["ncpus"] if bundle["ncpus"] is not None else 8,
@@ -435,7 +286,6 @@ def _build_script_from_args(args: argparse.Namespace) -> str:
         queue=bundle["queue"],
         walltime=args.walltime or "08:00:00",
         container_sif=bundle["container_sif"],
-        ollama_models_dir=args.ollama_models_dir or "${HOME}/ollama_models",
         input_data_dir=args.input_data_dir or "data",
         storage_root=args.storage_root or "/hpctmp/${USER}",
     )

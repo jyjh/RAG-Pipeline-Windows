@@ -65,12 +65,6 @@ class SetupValues:
     cpu_identity_file: str = ""
     cpu_repo: str = ""
     cpu_storage_root: str = ""
-    gpu_host: str = ""
-    gpu_hostname: str = ""
-    gpu_user: str = ""
-    gpu_identity_file: str = ""
-    gpu_repo: str = ""
-    gpu_storage_root: str = ""
     local_ollama_port: int = 11434
 
 
@@ -270,14 +264,6 @@ def configure_ssh_aliases(path: Path, values: SetupValues) -> None:
         identity_file=values.cpu_identity_file,
         create_backup=False,
     )
-    upsert_ssh_alias(
-        path,
-        alias=values.gpu_host,
-        hostname=values.gpu_hostname,
-        user=values.gpu_user,
-        identity_file=values.gpu_identity_file,
-        create_backup=False,
-    )
 
 
 def _private_key_path(raw_path: str) -> Path:
@@ -399,32 +385,23 @@ def install_ssh_public_key(
 
 
 def setup_ssh_credentials(values: SetupValues, *, install_public_keys: bool) -> None:
-    """Generate and optionally authorize the dedicated keys for both clusters."""
+    """Generate and optionally authorize the dedicated key for the CPU cluster."""
     if values.mode != "hpc" or not values.manage_ssh_aliases:
         return
-    clusters = (
-        (
-            values.cpu_host,
-            values.cpu_hostname,
-            values.cpu_user,
-            values.cpu_identity_file,
-        ),
-        (
-            values.gpu_host,
-            values.gpu_hostname,
-            values.gpu_user,
-            values.gpu_identity_file,
-        ),
+    alias, hostname, user, raw_key = (
+        values.cpu_host,
+        values.cpu_hostname,
+        values.cpu_user,
+        values.cpu_identity_file,
     )
-    for alias, hostname, user, raw_key in clusters:
-        private_key, public_key = ensure_ssh_private_key(raw_key, alias)
-        if install_public_keys:
-            install_ssh_public_key(
-                hostname=hostname,
-                user=user,
-                private_key=private_key,
-                public_key=public_key,
-            )
+    private_key, public_key = ensure_ssh_private_key(raw_key, alias)
+    if install_public_keys:
+        install_ssh_public_key(
+            hostname=hostname,
+            user=user,
+            private_key=private_key,
+            public_key=public_key,
+        )
 
 
 def _repo_archive_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
@@ -765,9 +742,9 @@ def provision_hpc_cluster(
 
 
 def provision_hpc_servers(values: SetupValues, *, force: bool = False) -> None:
-    """Package once, then provision the CPU and GPU clusters.
+    """Package once, then provision the CPU cluster.
 
-    With ``force=False`` (the default) each cluster is only re-uploaded/rebuilt
+    With ``force=False`` (the default) the cluster is only re-uploaded/rebuilt
     when its deployed manifest is missing or differs from the local source.
     """
     if values.mode != "hpc":
@@ -787,25 +764,6 @@ def provision_hpc_servers(values: SetupValues, *, force: bool = False) -> None:
             image_name="rag_pipeline_cpu.sif",
             definition_name="Singularity.cpu.def",
             local_image=ROOT / "rag_pipeline_cpu.sif",
-            force=force,
-        )
-        provision_hpc_cluster(
-            alias=values.gpu_host,
-            user=values.gpu_user,
-            storage_root=_storage_root(
-                values.gpu_storage_root,
-                values.gpu_user,
-                "/scratch",
-            ),
-            relative_repo=values.gpu_repo,
-            archive_path=archive_path,
-            image_name="rag_pipeline.sif",
-            definition_name="Singularity.def",
-            local_image=(
-                ROOT / "rag_pipeline.sif"
-                if (ROOT / "rag_pipeline.sif").is_file()
-                else None
-            ),
             force=force,
         )
 
@@ -899,33 +857,21 @@ def _validate(values: SetupValues) -> None:
     if not (1 <= values.server_port <= 65535):
         raise ValueError("server port must be between 1 and 65535")
     if not (1 <= values.local_ollama_port <= 65535):
-        raise ValueError("local Ollama tunnel port must be between 1 and 65535")
+        raise ValueError("local Ollama port must be between 1 and 65535")
     if values.mode == "hpc":
-        for label, host, hostname, user, repo in (
-            ("CPU", values.cpu_host, values.cpu_hostname, values.cpu_user, values.cpu_repo),
-            ("GPU", values.gpu_host, values.gpu_hostname, values.gpu_user, values.gpu_repo),
-        ):
-            if not host:
-                raise ValueError(f"{label} SSH alias/host is required")
-            if not _SSH_ALIAS_RE.fullmatch(host):
-                raise ValueError(f"{label} SSH alias contains unsupported characters")
-            if values.manage_ssh_aliases and not hostname:
-                raise ValueError(f"{label} SSH hostname is required")
-            if values.manage_ssh_aliases and not user:
-                raise ValueError(f"{label} SSH username is required")
-            identity = (
-                values.cpu_identity_file if label == "CPU" else values.gpu_identity_file
-            )
-            if values.manage_ssh_aliases and not identity:
-                raise ValueError(f"{label} SSH private-key path is required")
-            _validate_relative_repo(repo, label)
-        if values.cpu_host == values.gpu_host:
-            raise ValueError("CPU and GPU clusters must use different SSH aliases")
-        if values.manage_ssh_aliases:
-            if values.cpu_storage_root != f"/hpctmp/{values.cpu_user}":
-                raise ValueError("Atlas9 CPU storage root must be /hpctmp/<username>")
-            if values.gpu_storage_root != f"/scratch/{values.gpu_user}":
-                raise ValueError("Vanda GPU storage root must be /scratch/<username>")
+        if not values.cpu_host:
+            raise ValueError("CPU SSH alias/host is required")
+        if not _SSH_ALIAS_RE.fullmatch(values.cpu_host):
+            raise ValueError("CPU SSH alias contains unsupported characters")
+        if values.manage_ssh_aliases and not values.cpu_hostname:
+            raise ValueError("CPU SSH hostname is required")
+        if values.manage_ssh_aliases and not values.cpu_user:
+            raise ValueError("CPU SSH username is required")
+        if values.manage_ssh_aliases and not values.cpu_identity_file:
+            raise ValueError("CPU SSH private-key path is required")
+        _validate_relative_repo(values.cpu_repo, "CPU")
+        if values.manage_ssh_aliases and values.cpu_storage_root != f"/hpctmp/{values.cpu_user}":
+            raise ValueError("Atlas9 CPU storage root must be /hpctmp/<username>")
 
 
 def _collect_interactive(config: dict[str, Any], args: argparse.Namespace) -> SetupValues:
@@ -981,54 +927,14 @@ def _collect_interactive(config: dict[str, Any], args: argparse.Namespace) -> Se
             ),
             required=True,
         )
-        values.gpu_host = _prompt(
-            "GPU cluster SSH alias",
-            args.gpu_host or str(_nested(config, "hpc", "gpu", "ssh_host")),
-            required=True,
-        )
-        existing_gpu_alias = read_ssh_alias(args.ssh_config, values.gpu_host)
-        values.gpu_hostname = _prompt(
-            "GPU cluster login hostname",
-            args.gpu_hostname or existing_gpu_alias.get("hostname", ""),
-            required=True,
-        )
-        values.gpu_user = _prompt(
-            "GPU cluster SSH username",
-            args.gpu_user or existing_gpu_alias.get("user", values.cpu_user),
-            required=True,
-        )
-        values.gpu_storage_root = f"/scratch/{values.gpu_user}"
-        values.gpu_identity_file = _prompt(
-            "GPU SSH private key (created automatically if missing)",
-            args.gpu_key
-            or existing_gpu_alias.get("identityfile", "")
-            or f"~/.ssh/rag_{values.gpu_host}_ed25519",
-            required=True,
-        )
-        values.gpu_repo = _prompt(
-            "GPU repo path relative to SSH login directory",
-            args.gpu_repo
-            or _login_relative_repo_default(
-                str(_nested(config, "hpc", "gpu", "remote_repo_dir")),
-                values.gpu_user,
-            ),
-            required=True,
-        )
-        values.local_ollama_port = int(_prompt(
-            "Local Ollama tunnel port",
-            str(args.ollama_port or _configured_ollama_port(config)),
-            required=True,
-        ))
     return values
 
 
 def _collect_non_interactive(config: dict[str, Any], args: argparse.Namespace) -> SetupValues:
     mode = args.mode or ("hpc" if _nested(config, "hpc", "enabled", default=False) else "local")
-    manage_ssh = bool(args.setup_ssh or args.cpu_hostname or args.gpu_hostname)
+    manage_ssh = bool(args.setup_ssh or args.cpu_hostname)
     cpu_alias = args.cpu_host or str(_nested(config, "hpc", "cpu", "ssh_host"))
-    gpu_alias = args.gpu_host or str(_nested(config, "hpc", "gpu", "ssh_host"))
     cpu_user = args.cpu_user or ""
-    gpu_user = args.gpu_user or ""
     return SetupValues(
         mode=mode,
         server_host=args.server_host or str(_nested(config, "server", "host", default="127.0.0.1")),
@@ -1045,18 +951,6 @@ def _collect_non_interactive(config: dict[str, Any], args: argparse.Namespace) -
             str(_nested(config, "hpc", "cpu", "storage_root")),
             cpu_user,
             "/hpctmp",
-        ),
-        gpu_host=gpu_alias,
-        gpu_hostname=args.gpu_hostname or "",
-        gpu_user=gpu_user,
-        gpu_identity_file=(
-            args.gpu_key or (f"~/.ssh/rag_{gpu_alias}_ed25519" if manage_ssh and gpu_alias else "")
-        ),
-        gpu_repo=args.gpu_repo or str(_nested(config, "hpc", "gpu", "remote_repo_dir")),
-        gpu_storage_root=_storage_root(
-            str(_nested(config, "hpc", "gpu", "storage_root")),
-            gpu_user,
-            "/scratch",
         ),
         local_ollama_port=args.ollama_port or _configured_ollama_port(config),
     )
@@ -1084,12 +978,6 @@ def configure(path: Path, values: SetupValues) -> None:
                 "remote_repo_dir": values.cpu_repo,
                 "container_sif": "rag_pipeline_cpu.sif",
                 "storage_root": values.cpu_storage_root or "/hpctmp/${USER}",
-            },
-            "hpc.gpu": {
-                "ssh_host": values.gpu_host,
-                "remote_repo_dir": values.gpu_repo,
-                "container_sif": "rag_pipeline.sif",
-                "storage_root": values.gpu_storage_root or "/scratch/${USER}",
             },
         })
     update_toml_sections(path, updates)
@@ -1167,13 +1055,9 @@ def run_checks(path: Path, values: SetupValues) -> bool:
     else:
         ok, detail = _command_check("ssh")
         checks.append(("ssh", ok, detail))
-        for label, raw_key in (
-            ("CPU SSH key", values.cpu_identity_file),
-            ("GPU SSH key", values.gpu_identity_file),
-        ):
-            if raw_key:
-                key_path = Path(os.path.expandvars(raw_key)).expanduser()
-                checks.append((label, key_path.is_file(), str(key_path)))
+        if values.cpu_identity_file:
+            key_path = Path(os.path.expandvars(values.cpu_identity_file)).expanduser()
+            checks.append(("CPU SSH key", key_path.is_file(), str(key_path)))
         rsync_ok, rsync_detail = _command_check("rsync")
         scp_ok, scp_detail = _command_check("scp")
         checks.append((
@@ -1191,13 +1075,12 @@ def run_checks(path: Path, values: SetupValues) -> bool:
             from src.hpc_backend import HpcBackend
 
             remote = HpcBackend(load_config(path).hpc).check_connections()
-            for name in ("cpu", "gpu"):
-                outcome = remote[name]
-                checks.append((
-                    f"{name.upper()} cluster",
-                    bool(outcome["ok"]),
-                    str(outcome["detail"]),
-                ))
+            outcome = remote["cpu"]
+            checks.append((
+                "CPU cluster",
+                bool(outcome["ok"]),
+                str(outcome["detail"]),
+            ))
         finally:
             if old_config is None:
                 os.environ.pop("RAG_PIPELINE_CONFIG", None)
@@ -1209,59 +1092,11 @@ def run_checks(path: Path, values: SetupValues) -> bool:
     return all(ok for _, ok, _ in checks)
 
 
-def _start_tunnel(values: SetupValues) -> subprocess.Popen[str]:
-    # DEPRECATED: LLM serving now runs on the SoCLAaS API; this SSH tunnel for
-    # the GPU Ollama serving job is obsolete. Retained for reference; no longer
-    # called by start_instance().
-    if os.name == "nt":
-        powershell = shutil.which("pwsh") or shutil.which("powershell")
-        if not powershell:
-            raise RuntimeError("PowerShell was not found; cannot start the tunnel")
-        command = [
-            powershell, "-NoProfile", "-ExecutionPolicy", "Bypass",
-            "-File", str(ROOT / "scripts" / "tunnel_daemon.ps1"),
-            "-JumpHost", values.gpu_host,
-            "-HostFile", "~/.rag_ollama_serving_host",
-            "-LocalPort", str(values.local_ollama_port),
-        ]
-    else:
-        command = [
-            "bash", str(ROOT / "scripts" / "tunnel_daemon.sh"),
-            "--jump-host", values.gpu_host,
-            "--host-file", "~/.rag_ollama_serving_host",
-            "--local-port", str(values.local_ollama_port),
-        ]
-    return subprocess.Popen(command, cwd=ROOT, text=True)
-
-
-def _submit_gpu_job(path: Path) -> str:
-    # DEPRECATED: the GPU Ollama serving job is obsolete (SoCLAaS API now serves
-    # LLM/vision/embeddings). Retained for reference; no longer called by
-    # start_instance().
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
-    from src.config import load_config
-    from src.hpc_backend import HpcBackend
-
-    return HpcBackend(load_config(path).hpc).submit_serve_job()
-
-
-def start_instance(path: Path, values: SetupValues, *, submit_gpu: bool) -> int:
+def start_instance(path: Path, values: SetupValues) -> int:
     children: list[subprocess.Popen[str]] = []
     environment = dict(os.environ)
     environment["RAG_PIPELINE_CONFIG"] = str(path)
     try:
-        if submit_gpu:
-            # DEPRECATED: kept for backward CLI compatibility, but it is a no-op.
-            # LLM/vision/embedding serving moved to the hosted SoCLAaS API
-            # ([llm_api] in config.toml); the GPU Ollama serving job + SSH tunnel
-            # are obsolete. The CPU ingest/index HPC path is unaffected.
-            print(
-                "NOTE: --submit-gpu-job is deprecated and ignored. LLM serving now "
-                "runs on the SoCLAaS API; the GPU Ollama serving job + SSH tunnel "
-                "are no longer started."
-            )
-
         print(f"Starting web server: http://{values.server_host}:{values.server_port}")
         children.append(subprocess.Popen(
             [str(_runtime_python()), "-m", "src.web_app"],
@@ -1299,11 +1134,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cpu-user", help="CPU cluster SSH username")
     parser.add_argument("--cpu-key", help="CPU cluster SSH private-key path")
     parser.add_argument("--cpu-repo")
-    parser.add_argument("--gpu-host", help="GPU cluster SSH alias")
-    parser.add_argument("--gpu-hostname", help="GPU cluster login hostname")
-    parser.add_argument("--gpu-user", help="GPU cluster SSH username")
-    parser.add_argument("--gpu-key", help="GPU cluster SSH private-key path")
-    parser.add_argument("--gpu-repo")
     parser.add_argument(
         "--skip-key-install",
         action="store_true",
@@ -1313,13 +1143,13 @@ def build_parser() -> argparse.ArgumentParser:
     provision_group.add_argument(
         "--provision-hpc",
         action="store_true",
-        help="Upload the repository and provision CPU/GPU SIFs on both clusters "
+        help="Upload the repository and provision the CPU SIF on the cluster "
              "(forces a full redeploy even if the remote is current).",
     )
     provision_group.add_argument(
         "--provision-if-needed",
         action="store_true",
-        help="Provision each cluster only if its deployed source is stale or the "
+        help="Provision the cluster only if its deployed source is stale or the "
              "SIF is missing (the default behavior of the start launchers).",
     )
     provision_group.add_argument(
@@ -1332,11 +1162,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--configure-only", action="store_true")
     parser.add_argument("--start", action="store_true")
-    parser.add_argument(
-        "--submit-gpu-job",
-        action="store_true",
-        help="DEPRECATED no-op: LLM serving now runs on the SoCLAaS API; the GPU Ollama job is not submitted.",
-    )
     parser.add_argument("--skip-checks", action="store_true")
     parser.add_argument(
         "--install-deps",
@@ -1393,16 +1218,11 @@ def main(argv: list[str] | None = None) -> int:
                     values.cpu_user = read_ssh_alias(
                         args.ssh_config, values.cpu_host
                     ).get("user", "")
-                if not values.gpu_user:
-                    values.gpu_user = read_ssh_alias(
-                        args.ssh_config, values.gpu_host
-                    ).get("user", "")
-                if not values.cpu_user or not values.gpu_user:
+                if not values.cpu_user:
                     raise RuntimeError(
-                        "CPU/GPU SSH usernames are required for remote provisioning"
+                        "CPU SSH username is required for remote provisioning"
                     )
                 values.cpu_storage_root = f"/hpctmp/{values.cpu_user}"
-                values.gpu_storage_root = f"/scratch/{values.gpu_user}"
                 provision_hpc_servers(values, force=provision_mode == "force")
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"Configuration failed: {exc}", file=sys.stderr)
@@ -1446,21 +1266,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     should_start = args.start
-    submit_gpu = args.submit_gpu_job
-    if submit_gpu:
-        # Deprecated no-op flag; surface it once so the operator knows.
-        print(
-            "NOTE: --submit-gpu-job is deprecated and ignored. LLM serving now runs "
-            "on the SoCLAaS API; the GPU Ollama serving job is no longer submitted."
-        )
     if not args.non_interactive and not args.start:
         should_start = _prompt_yes_no("Start the instance now?", True)
-        # The GPU Ollama serving job is DEPRECATED (SoCLAaS API now serves LLMs),
-        # so we no longer prompt to submit it.
     if not should_start:
         print("Ready. Start later with setup.cmd --non-interactive --start")
         return 0
-    return start_instance(path, values, submit_gpu=submit_gpu)
+    return start_instance(path, values)
 
 
 if __name__ == "__main__":

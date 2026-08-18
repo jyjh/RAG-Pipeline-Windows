@@ -10,8 +10,8 @@ Design goals
   what ``RagJobQueue._run_pipeline_subprocess`` does locally: run the build and
   relay ``__RAG_PROGRESS__`` lines into a ``progress_callback`` so the SAME web UI
   progress bar works unchanged (parsed by ``src.progress_protocol``).
-- **No new dependencies.** Uses plain ``ssh``/``rsync`` subprocesses, matching the
-  tunnel daemon -- no paramiko/asyncssh to pin.
+- **No new dependencies.** Uses plain ``ssh``/``rsync`` subprocesses -- no
+  paramiko/asyncssh to pin.
 - **Pure and mockable.** Every cluster interaction goes through
   ``self._run_ssh(...)`` / ``self._run_rsync(...)``, which tests monkeypatch. No
   network in the unit tests.
@@ -43,7 +43,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from src.config import HpcClusterConfig, HpcConfig
-from src.hpc import generate_pbs_script, generate_serve_pbs_script
+from src.hpc import generate_pbs_script
 from src.progress_protocol import parse_progress_line
 
 logger = logging.getLogger(__name__)
@@ -168,14 +168,11 @@ def parse_job_exit_code(qstat_output: str) -> int | None:
 
 
 class HpcBackend:
-    """SSH-driven orchestrator for PBS ingest/index/serve jobs.
+    """SSH-driven orchestrator for PBS ingest/index jobs.
 
-    Construct with an ``HpcConfig`` (typically ``load_config().hpc``). Two
-    clusters are supported because the CPU and GPU clusters are separate machines
-    with separate login nodes: build work (ingest/index/fetch) routes to
-    ``cfg.cpu``; the Ollama serving job routes to ``cfg.gpu``. Each cluster
-    interaction runs through ``_run_ssh`` / ``_run_rsync``, which tests
-    monkeypatch; nothing in this class touches the network directly.
+    Construct with an ``HpcConfig`` (typically ``load_config().hpc``). Each
+    cluster interaction runs through ``_run_ssh`` / ``_run_rsync``, which
+    tests monkeypatch; nothing in this class touches the network directly.
     """
 
     def __init__(self, cfg: HpcConfig):
@@ -370,14 +367,13 @@ class HpcBackend:
         return local
 
     def check_connections(self) -> dict[str, dict[str, Any]]:
-        """Verify SSH, PBS, repo and container prerequisites on both clusters.
+        """Verify SSH, PBS, repo and container prerequisites on the CPU cluster.
 
         This is intentionally read-only and powers the guided setup command.
-        A deployment may omit either cluster; omitted clusters are reported as
-        unconfigured rather than raising.
+        An unconfigured cluster is reported as such rather than raising.
         """
         checks: dict[str, dict[str, Any]] = {}
-        for name, cluster in (("cpu", self.cfg.cpu), ("gpu", self.cfg.gpu)):
+        for name, cluster in (("cpu", self.cfg.cpu),):
             if not cluster.ssh_host or not cluster.remote_repo_dir:
                 checks[name] = {"ok": False, "configured": False, "detail": "not configured"}
                 continue
@@ -418,37 +414,6 @@ class HpcBackend:
                 checks[name] = {"ok": False, "configured": True, "detail": str(exc)}
         return checks
 
-    def submit_serve_job(self, *, ollama_host_file_on_hpc: str | None = None) -> str:
-        """Submit the long-lived Ollama serving PBS job to the GPU cluster.
-
-        DEPRECATED: LLM serving now runs on the hosted SoCLAaS API (``[llm_api]``),
-        so this GPU serving job is obsolete. Retained for reference/revert; the
-        setup wizard no longer calls it. New deployments should not submit it.
-
-        Returns the job id. Non-blocking -- the serving job runs until its
-        walltime. Caller then starts the tunnel daemon (pointed at the GPU
-        login node via --jump-host) and points OLLAMA_HOST at the local tunnel
-        port. See scripts/nus_hpc_serve.pbs and docs/HPC_DELEGATION.md.
-        """
-        gpu = self.cfg.gpu
-        self._require_cluster(gpu, "gpu")
-        ollama_host_file = ollama_host_file_on_hpc or "${HOME}/.rag_ollama_serving_host"
-        pbs_script = generate_serve_pbs_script(
-            container_sif=gpu.container_sif,
-            ollama_host_file=ollama_host_file,
-            **self._serve_overrides(gpu),
-        )
-        remote_pbs_path = self._remote_pbs_path(gpu, "serve")
-        self._write_remote_pbs_script(pbs_script, gpu, remote_path=remote_pbs_path)
-        try:
-            return self._qsub(remote_pbs_path, gpu)
-        finally:
-            self._run_ssh(
-                gpu.ssh_host,
-                f"rm -f -- {shlex.quote(remote_pbs_path)}",
-                check=False,
-            )
-
     # ------------------------------------------------------------------ #
     # Internals.
     # ------------------------------------------------------------------ #
@@ -461,23 +426,10 @@ class HpcBackend:
         overrides.setdefault("storage_root", self.cfg.cpu.storage_root)
         accepted = {
             "job_name", "ncpus", "mem", "ngpus", "queue", "input_data_dir",
-            "container_sif", "walltime", "ollama_models_dir", "storage_root",
+            "container_sif", "walltime", "storage_root",
         }
         kwargs = {k: v for k, v in overrides.items() if k in accepted}
         return generate_pbs_script(**kwargs)
-
-    @staticmethod
-    def _serve_overrides(gpu: HpcClusterConfig) -> dict:
-        """Extract generate_serve_pbs_script kwargs from gpu.pbs_overrides."""
-        accepted = {"job_name", "ncpus", "mem", "ngpus", "queue", "walltime",
-                    "container_sif", "ollama_models_dir", "ollama_host_file",
-                    "storage_root"}
-        overrides = {
-            k: v for k, v in gpu.pbs_overrides.items()
-            if k in accepted and k != "container_sif"
-        }
-        overrides.setdefault("storage_root", gpu.storage_root)
-        return overrides
 
     def _remote_pbs_path(self, cluster: HpcClusterConfig, kind: str = "ingest") -> str:
         return posixpath.join(

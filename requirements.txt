@@ -16,6 +16,7 @@
 # PDF/document parsing and OCR
 docling~=2.105.0
 pypdf~=6.14.0
+# No direct imports: RapidOCR's onnxruntime backend (OCR of scanned PDFs).
 onnxruntime~=1.27.0
 
 # Dormant local-LLM fallback. Only used when [llm_api].backend = "ollama" for
@@ -27,9 +28,9 @@ ollama~=0.6.2
 # Numeric/runtime support
 numpy~=2.4.6
 pydantic~=2.13.4
-python-dotenv~=1.2.2
 tqdm~=4.68.3
 lancedb~=0.33.0
+# No direct imports: lancedb's vector engine.
 pylance~=7.0.0
 pyarrow~=24.0.0
 portalocker~=3.2.0
@@ -37,14 +38,12 @@ portalocker~=3.2.0
 # API and browser UI
 fastapi~=0.138.0
 uvicorn[standard]~=0.49.0
-# streamlit is listed but not currently used by the active web UI; retained for
-# potential future use. Remove if not needed.
-streamlit~=1.58.0
 requests~=2.34.2
 # urllib3 is imported directly by src/embeddings.py (module-level PoolManager).
 # requests pulls it transitively, but we pin it explicitly so the embedding
 # HTTP path does not break if requests' dependency changes.
 urllib3~=2.5.0
+# No direct imports: FastAPI multipart/form uploads require it at runtime.
 python-multipart~=0.0.32
 markdown-it-py~=4.2.0
 latex2mathml~=3.81.0
@@ -58,7 +57,3 @@ torchvision~=0.27.1
 
 # Tests
 pytest~=9.1.1
-
-
-# Others
-einops~=0.8.2

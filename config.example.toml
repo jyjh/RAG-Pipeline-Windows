@@ -47,17 +47,10 @@ max_pages_whole_doc = 50
 # Used by the ingest disk-space pre-check. Born-digital ~1.5x; scanned ~2x+.
 ingest_expansion_factor = 2.0
 
-[chunking]
-max_tokens = 900
-overlap_tokens = 120
-adjacent_block_window = 1
-summary_mode = "hybrid"
-index_backend = "lancedb"
-
 # Approximate-nearest-neighbour (ANN) vector index. Below ann_min_rows the
 # table uses a flat (brute-force) scan which is faster for small corpora; above
 # it, an IVF_PQ index makes every query sublinear. These defaults are tuned for
-# nomic-embed-text (768-dim, L2-normalized vectors). Applied at startup via
+# bge-m3 (1024-dim, L2-normalized vectors). Applied at startup via
 # src.vector_store.apply_indexing_config so builds and queries honor them.
 [indexing]
 ann_min_rows = 50000
@@ -108,11 +101,6 @@ max_corpus_bytes = 0
 chunk_bytes = 16777216
 
 [retrieval]
-top_k = 8
-vector_top_k = 24
-bm25_top_k = 24
-rrf_k = 60
-rerank_top_k = 12
 min_relevance_score = 0.50
 relative_relevance_cutoff = 0.72
 candidate_top_k = 80
@@ -154,6 +142,11 @@ chat_max_lost_health_checks = 5
 [chat]
 context_window = 8192
 llm_num_predict = 4096
+# Sampling knobs (llm_timeout is a deprecated compatibility key; the SoCLAaS
+# path uses [llm_api].request_timeout_seconds).
+temperature = 0.3
+max_k = 40
+llm_timeout = 120.0
 # SoCLAaS exposes only three models, so the planner reuses the main chat model.
 planner_model = "gemma4:26b"
 planner_enabled = true
@@ -207,7 +200,7 @@ key_prefix = "rag_"
 
 # Optional web-server -> HPC delegation. Run `setup.cmd` on Windows or
 # `./setup.sh` on Linux/macOS for the guided configuration and connection test.
-# CPU and GPU are separate clusters: CPU builds the index; GPU serves Ollama.
+# The CPU cluster runs ingest/index jobs; embeddings come from the SoCLAaS API.
 [hpc]
 enabled = false
 remote_data_dir = "data"
@@ -228,23 +221,3 @@ queue = "cpu"
 ncpus = 16
 mem = "32gb"
 walltime = "12:00:00"
-
-# DEPRECATED: the GPU-cluster Ollama *serving* job is obsolete now that LLM
-# serving runs on the hosted SoCLAaS API ([llm_api]). This section, the
-# ``generate_serve_pbs_script`` / ``submit_serve_job`` code, and the SSH tunnel
-# daemon are retained for reference/revert only and are no longer wired by the
-# setup wizard. The CPU ingest/index cluster ([hpc.cpu]) stays in active use.
-[hpc.gpu]
-ssh_host = ""
-# Login-relative symlink created by setup; its target lives under
-# /scratch/<username>/<remote_repo_dir>.
-remote_repo_dir = ""
-container_sif = "rag_pipeline.sif"
-storage_root = "/scratch/${USER}"
-
-[hpc.gpu.pbs_overrides]
-ngpus = 1
-queue = "gpu"
-ncpus = 4
-mem = "16gb"
-walltime = "08:00:00"
