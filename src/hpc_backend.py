@@ -300,23 +300,31 @@ class HpcBackend:
         self,
         input_dir_on_hpc: str | None = None,
         *,
+        skip_index: bool = False,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         log_callback: Callable[[str], None] | None = None,
         cancel_event: threading.Event | None = None,
     ) -> PbsJobResult:
-        """Submit the ingest+index PBS job to the CPU cluster, relay progress.
+        """Submit the ingest(+index) PBS job to the CPU cluster, relay progress.
 
         Mirrors the local ``_run_job_subprocess`` contract: blocks until the job
         finishes (or is cancelled), routing ``__RAG_PROGRESS__`` lines from the
         PBS job's stdout into ``progress_callback`` so the existing UI progress
         bar works unchanged. On success returns a ``PbsJobResult`` whose
         ``remote_db_dir`` is where the index landed on the CPU cluster.
+
+        With ``skip_index=True`` the job runs ``bulk_ingest.py --skip-index``:
+        the cluster only parses/OCRs the corpus into Markdown (the HPC's sole
+        role in the split-backend deployment -- embeddings are workstation-
+        local, so the index cannot be built there). The artifact is the
+        processed corpus under ``remote_processed_dir``; bring it home with
+        :meth:`fetch_processed_docs` and build the index locally.
         """
         cpu = self.cfg.cpu
         self._require_cluster(cpu, "cpu")
 
         input_dir = input_dir_on_hpc or self.cfg.remote_data_dir
-        pbs_script = self._build_pbs_script(input_dir)
+        pbs_script = self._build_pbs_script(input_dir, skip_index=skip_index)
         remote_pbs_path = self._write_remote_pbs_script(pbs_script, cpu)
 
         if cancel_event is not None and cancel_event.is_set():
@@ -361,6 +369,25 @@ class HpcBackend:
         self._require_cluster(cpu, "cpu")
         remote = remote_db_dir or self._remote_db_abs_path()
         local = Path(local_db_dir)
+        local.mkdir(parents=True, exist_ok=True)
+        # Trailing slash on the source = "contents of", not the dir itself.
+        self._run_rsync(f"{cpu.ssh_host}:{remote}/", str(local) + "/")
+        return local
+
+    def fetch_processed_docs(self, remote_processed_dir: str | None = None,
+                             local_dir: str | Path = "processed_docs") -> Path:
+        """rsync the ingest-only job's Markdown corpus into ``local_dir``.
+
+        Counterpart to :meth:`fetch_index` for ``skip_index=True`` jobs: the
+        cluster produced ``processed_docs/`` (Docling/pypdf Markdown + page
+        sidecars) without embedding anything; the caller then builds the index
+        locally (``python main.py --mode index``) with the local embedding
+        model. Returns the local path.
+        """
+        cpu = self.cfg.cpu
+        self._require_cluster(cpu, "cpu")
+        remote = remote_processed_dir or self._remote_processed_abs_path()
+        local = Path(local_dir)
         local.mkdir(parents=True, exist_ok=True)
         # Trailing slash on the source = "contents of", not the dir itself.
         self._run_rsync(f"{cpu.ssh_host}:{remote}/", str(local) + "/")
@@ -418,8 +445,8 @@ class HpcBackend:
     # Internals.
     # ------------------------------------------------------------------ #
 
-    def _build_pbs_script(self, input_dir: str) -> str:
-        """Generate the ingest+index PBS script, merging cpu-cluster overrides."""
+    def _build_pbs_script(self, input_dir: str, *, skip_index: bool = False) -> str:
+        """Generate the ingest(+index) PBS script, merging cpu-cluster overrides."""
         overrides = dict(self.cfg.cpu.pbs_overrides)
         overrides.setdefault("input_data_dir", input_dir)
         overrides.setdefault("container_sif", self.cfg.cpu.container_sif)
@@ -429,7 +456,7 @@ class HpcBackend:
             "container_sif", "walltime", "storage_root",
         }
         kwargs = {k: v for k, v in overrides.items() if k in accepted}
-        return generate_pbs_script(**kwargs)
+        return generate_pbs_script(skip_index=skip_index, **kwargs)
 
     def _remote_pbs_path(self, cluster: HpcClusterConfig, kind: str = "ingest") -> str:
         return posixpath.join(
@@ -597,3 +624,10 @@ class HpcBackend:
         if db.startswith("/"):
             return db
         return f"{self.cfg.cpu.remote_repo_dir.rstrip('/')}/{db}"
+
+    def _remote_processed_abs_path(self) -> str:
+        """Resolve the processed-corpus path the same way as the db path."""
+        processed = self.cfg.remote_processed_dir
+        if processed.startswith("/"):
+            return processed
+        return f"{self.cfg.cpu.remote_repo_dir.rstrip('/')}/{processed}"

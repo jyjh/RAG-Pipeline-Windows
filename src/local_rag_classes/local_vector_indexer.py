@@ -36,7 +36,7 @@ class LocalVectorIndexer:
         self,
         working_dir: str = "./db",
         *,
-        embedding_model: str = "bge-m3",
+        embedding_model: str = "nomic-embed-text",
         embedding_batch_size: int | None = None,
         embedding_timeout: float | None = None,
         embedding_dim: int | None = None,
@@ -78,8 +78,11 @@ class LocalVectorIndexer:
         self.engine = setup.engine
 
     def _preflight_embeddings(self) -> None:
-        from src import llm_api as _llm_api
-        backend_label = "SoCLAaS API" if _llm_api.is_soclaas() else "Ollama"
+        # The embeddings transport may differ from the chat/vision backend
+        # ([embeddings].backend), so ask the embeddings resolver, not llm_api.
+        from src.embeddings import embeddings_use_soclaas
+
+        backend_label = "SoCLAaS API" if embeddings_use_soclaas() else "Ollama"
         _status(
             f"Local index: checking {backend_label} embedding endpoint...",
             enabled=self.progress_enabled,

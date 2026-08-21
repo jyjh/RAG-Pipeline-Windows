@@ -149,16 +149,24 @@ def generate_pbs_script(
     container_sif: str = "rag_pipeline.sif",
     walltime: str = "08:00:00",
     storage_root: str = "/hpctmp/${USER}",
+    skip_index: bool = False,
 ) -> str:
-    """Generate the ingest+index PBS script template with validated overrides.
+    """Generate the ingest (+index) PBS script template with validated overrides.
 
-    The CPU ingest/index job does the heavy non-LLM work (Docling OCR/parsing,
-    chunking, LanceDB writes, ANN build) and calls the hosted SoCLAaS API
-    (``/v1/embeddings`` with bge-m3) for vectors; it runs no local
-    ``ollama serve``. Provision the API key at ``~/rag_soclaas_key`` on the
-    login node (chmod 600), pass it via the qsub environment, or set
+    The CPU job does the heavy non-LLM work (Docling OCR/parsing, chunking,
+    LanceDB writes, ANN build) and calls the hosted SoCLAaS API
+    (``/v1/embeddings``) for vectors; it runs no local ``ollama serve``.
+    Provision the API key at ``~/rag_soclaas_key`` on the login node
+    (chmod 600), pass it via the qsub environment, or set
     ``[llm_api].api_key`` in the staged ``config.toml`` so the job can reach
     the embeddings endpoint.
+
+    With ``skip_index=True`` the job runs ``bulk_ingest.py --skip-index``: it
+    stops after ingestion (Markdown under ``processed_docs/``) and never calls
+    the embeddings endpoint -- the index is then built locally with a local
+    embedding model (see ``HpcBackend.fetch_processed_docs``). The SoCLAaS key
+    remains needed only when vision enrichment is enabled in the staged
+    ``[ingestion]`` config.
     """
     job_name = _validate_name(job_name, "job_name")
     ncpus = _validate_int(ncpus, "ncpus", minimum=1)
@@ -172,6 +180,7 @@ def generate_pbs_script(
 
     select_clause = _select_clause(ncpus, mem, ngpus)
     nv = _nv_flag(ngpus)  # "--nv " on GPU, "" on CPU
+    skip_flag = " --skip-index" if skip_index else ""
 
     return f"""#!/bin/bash
 #PBS -N {job_name}
@@ -209,15 +218,17 @@ BIND_MOUNTS="-B ${{STORAGE_ROOT}}:${{STORAGE_ROOT}} -B ${{HOME}}:/srv/home -B ${
 
 export TMPDIR="${{SCRATCH_DIR}}/tmp"
 
-# SoCLAaS API key for the embeddings endpoint (bge-m3). Provision it at
-# ~/rag_soclaas_key on the login node (chmod 600), pass it via the qsub
-# environment, or set [llm_api].api_key in the staged config.toml.
+# SoCLAaS API key. Needed for /v1/embeddings when the job also indexes, and
+# for vision enrichment of figures (qwen3-vl) whenever [ingestion]
+# vision_enabled is true -- including ingest-only (--skip-index) runs.
+# Provision it at ~/rag_soclaas_key on the login node (chmod 600), pass it
+# via the qsub environment, or set [llm_api].api_key in the staged config.toml.
 if [ -z "${{SOCLAAS_API_KEY:-}}" ] && [ -f "${{HOME}}/rag_soclaas_key" ]; then
     export SOCLAAS_API_KEY="$(cat "${{HOME}}/rag_soclaas_key")"
 fi
 
 INPUT_DATA_DIR="${{INPUT_DATA_DIR:-{input_data_dir}}}"
-singularity exec {nv}${{BIND_MOUNTS}} "${{CONTAINER_SIF}}" python3 scripts/bulk_ingest.py --input-dir "{input_data_dir}"
+singularity exec {nv}${{BIND_MOUNTS}} "${{CONTAINER_SIF}}" python3 scripts/bulk_ingest.py --input-dir "{input_data_dir}"{skip_flag}
 """
 
 
@@ -237,6 +248,7 @@ def parse_hpc_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Generate a PBS job script for the NUS HPC deployment.",
     )
     parser.add_argument("--cpu", action="store_true", help="Generate a CPU-only job (0 GPUs, 'cpu' queue, rag_pipeline_cpu.sif). Explicit args still win.")
+    parser.add_argument("--skip-index", action="store_true", help="Ingest-only job: run bulk_ingest.py --skip-index so the cluster produces processed_docs/ Markdown without embedding; index locally afterwards.")
     parser.add_argument("--job-name", default=None, help="PBS job name (default: rag_ingest_index).")
     parser.add_argument("--ncpus", type=int, default=None, help="Number of CPUs (default: 8; 16 under --cpu).")
     parser.add_argument("--mem", default=None, help="Memory requirement, e.g. 32gb (default: 32gb).")
@@ -288,6 +300,7 @@ def _build_script_from_args(args: argparse.Namespace) -> str:
         container_sif=bundle["container_sif"],
         input_data_dir=args.input_data_dir or "data",
         storage_root=args.storage_root or "/hpctmp/${USER}",
+        skip_index=bool(args.skip_index),
     )
 
 

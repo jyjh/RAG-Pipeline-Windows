@@ -6,8 +6,9 @@ laptop.
 > **Path A (GPU serving) is historical.** LLM serving moved to the hosted
 > SoCLAaS API, and the GPU serving job, SSH tunnel, and `Singularity.def` were
 > removed from the repository. Path A is retained below for reference only;
-> use Path B — the CPU cluster runs ingest/index and pulls chat/vision/
-> embeddings from SoCLAaS.
+> use Path B — the CPU cluster runs the ingest-only bulk parse, embeddings run
+> on the workstation (localhosted nomic-embed-text), and chat/vision come from
+> the SoCLAaS API.
 
 - **CPU-only cluster (free, unlimited):** Path B (recommended).
 
@@ -138,9 +139,10 @@ See [Copy the index home & run the web app](#copy-the-index-home--run-the-web-ap
 
 ## Path B — CPU-only cluster (free)
 
-Do all bulk work on the free cluster. Chat is the one thing that genuinely wants
-a GPU (a 7B LLM on CPU is too slow for back-and-forth), so on CPU you build the
-index on the cluster and run the chat LLM locally.
+The cluster's only job is the bulk PDF parse (Docling OCR/pypdf extraction into
+`processed_docs/` Markdown). Embeddings are workstation-local (nomic-embed-text
+via Ollama), so the index cannot be built on the cluster and is built at home;
+chat runs on the SoCLAaS API.
 
 ### B1. Build the image (once)
 
@@ -165,27 +167,56 @@ Edit `config.cpu.toml`:
 ```toml
 [ingestion]
 accelerator = "cpu"          # no CUDA on this cluster
-vision_enabled = false        # qwen2.5-vl crawls on CPU; disable for batch ingest
-ingestion_workers = 4
-
-[embeddings]
-# Multi-node scale-out: list one Ollama replica per node you shard across.
-# N replicas ~= N x throughput. This is the primary CPU scale-out lever.
-hosts = ["http://node-a:11434", "http://node-b:11434", "http://node-c:11434"]
-concurrency = 2
+ingestion_workers = 4        # CPU nodes are core-rich
+# vision enrichment (qwen3-vl) runs through the SoCLAaS API, not local
+# compute, so vision_enabled can stay true -- provision the API key at
+# ~/rag_soclaas_key (chmod 600) on the login node.
 ```
 
-### B3. Ingest + index
+Embeddings never run on the cluster in the default (ingest-only) flow, so no
+embedding settings matter there.
+
+### B3. Ingest (the cluster's only job)
+
+Stage the corpus first — an initial zip of PDFs is fine, unpack it on the
+login node into the data dir:
 
 ```bash
-python -m src.hpc --cpu -o myjob.pbs && qsub myjob.pbs
-# point the pipeline at the CPU config:
-RAG_PIPELINE_CONFIG=config.cpu.toml qsub myjob.pbs
+unzip -o -j corpus.zip -d data
 ```
 
-### B4. Copy the index home & run the web app
+Submit the ingest-only job (`--skip-index` makes it run
+`bulk_ingest.py --skip-index`, stopping after parsing):
 
-See [Copy the index home & run the web app](#copy-the-index-home--run-the-web-app).
+```bash
+python -m src.hpc --cpu --skip-index -o ingest_only.pbs
+RAG_PIPELINE_CONFIG=config.cpu.toml qsub ingest_only.pbs
+```
+
+Bring the Markdown home and build the index locally (local Ollama with
+`nomic-embed-text` pulled):
+
+```bash
+rsync -P nus_hpc:~/<path-to-repo>/processed_docs/ ./processed_docs/
+python main.py --mode index --md_dir processed_docs --db_dir db
+```
+
+Programmatic equivalent: `HpcBackend.submit_ingest_index(skip_index=True)`
+followed by `HpcBackend.fetch_processed_docs()`.
+
+Variant — build the whole index on the cluster instead (embeddings via the
+SoCLAaS API; also set `[models] embedding_model = "bge-m3"`,
+`embedding_dim = 1024` in the config the job reads, and expect a full re-index
+when switching back):
+
+```bash
+python -m src.hpc --cpu -o myjob.pbs
+RAG_PIPELINE_CONFIG=config.cpu.toml EMBEDDINGS_BACKEND=soclaas qsub myjob.pbs
+```
+
+### B4. Copy the corpus home & run the web app
+
+See [Copy the corpus home & run the web app](#copy-the-corpus-home--run-the-web-app).
 
 ### B5. Do you ever need GPU? Measure it.
 
@@ -208,30 +239,30 @@ cluster for bulk work. If your corpus is heavily scanned and vision dominates, a
 
 ---
 
-## Copy the index home & run the web app
+## Copy the corpus home & run the web app
 
-Both paths end here. Bring the built `db/` to your laptop:
+The default (ingest-only) path brings `processed_docs/` home and builds the
+index locally — see B3. The cluster-built-index variant instead syncs the
+finished `db/`:
 
 ```bash
 rsync -P --delete nus_hpc:~/<path-to-repo>/db/ ./db/
 ```
 
-Run the web app locally (it reads local `db/`, talks to Ollama at
-`127.0.0.1:11434`):
+Run the web app locally (it reads local `db/`, embeds queries through local
+Ollama `nomic-embed-text`, and chats via the SoCLAaS API):
 
 ```bash
 python -m src.web_app    # serves on 127.0.0.1:8000
 ```
 
-Verify the Ollama wiring:
+Verify the wiring:
 
 ```bash
 curl -s http://127.0.0.1:8000/api/health | python -m json.tool
-# expect: "ollama_reachability": { "http://127.0.0.1:11434": true }
+# expect: "llm_backend": "soclaas" (reachable) for chat/vision, and
+# "embeddings_backend": "ollama" with "embeddings_reachable": true
 ```
-
-On the GPU path, `127.0.0.1:11434` is your tunnel to the cluster. On the CPU
-path, run a local Ollama for chat (the cluster is for building, not serving).
 
 ---
 

@@ -66,6 +66,7 @@ class SetupValues:
     cpu_repo: str = ""
     cpu_storage_root: str = ""
     local_ollama_port: int = 11434
+    llm_api_key: str = ""
 
 
 def _toml_value(value: Any) -> str:
@@ -793,6 +794,77 @@ def _configured_ollama_port(config: dict[str, Any]) -> int:
         return 11434
 
 
+def _embeddings_backend_view(config: dict[str, Any], chat_backend: str) -> str:
+    """Effective embeddings backend after the same env override the app applies.
+
+    Mirrors ``src.embeddings.resolve_embeddings_backend``: ``EMBEDDINGS_BACKEND``
+    wins, then ``[embeddings].backend`` (absent = the "ollama" default --
+    locally hosted nomic-embed-text), and ``""`` inherits the chat backend.
+    An invalid configured value falls back to the default, mirroring the
+    app's warn-and-ignore behaviour.
+    """
+    env = os.environ.get("EMBEDDINGS_BACKEND", "").strip().lower()
+    if env:
+        return env
+    value = _nested(config, "embeddings", "backend", default=None)
+    resolved = "ollama" if value is None else str(value).strip().lower()
+    if resolved not in ("", "soclaas", "ollama"):
+        resolved = "ollama"
+    return resolved or chat_backend
+
+
+_DEFAULT_LLM_BASE_URL = "https://soclaas-api.comp.nus.edu.sg"
+
+
+def _llm_api_view(config: dict[str, Any]) -> dict[str, str]:
+    """Effective [llm_api] settings after the same env overrides the app applies.
+
+    Mirrors ``src/llm_api.resolve_api_key`` precedence: the env var named in
+    ``key_env`` (default ``SOCLAAS_API_KEY``) wins, then ``LLM_API_KEY``, then
+    the value stored in ``config.toml``. ``LLM_BACKEND`` overrides the backend.
+    """
+    backend = str(_nested(config, "llm_api", "backend", default="soclaas"))
+    env_backend = os.environ.get("LLM_BACKEND", "").strip().lower()
+    if env_backend:
+        backend = env_backend
+    key_env = str(_nested(config, "llm_api", "key_env", default="SOCLAAS_API_KEY"))
+    api_key = str(_nested(config, "llm_api", "api_key", default=""))
+    key_source = "config.toml" if api_key else ""
+    for name in dict.fromkeys((key_env, "LLM_API_KEY")):
+        value = os.environ.get(name, "").strip()
+        if value:
+            api_key = value
+            key_source = f"environment ({name})"
+            break
+    return {
+        "backend": backend,
+        "base_url": str(_nested(config, "llm_api", "base_url", default=_DEFAULT_LLM_BASE_URL)),
+        "models_path": str(_nested(config, "llm_api", "models_path", default="/v1/models")),
+        "api_key": api_key,
+        "key_source": key_source,
+    }
+
+
+def _verify_llm_api_key(base_url: str, models_path: str, api_key: str) -> tuple[bool, str]:
+    """Best-effort live check of the key against the backend's models endpoint."""
+    url = base_url.rstrip("/") + models_path
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            status = getattr(response, "status", 200)
+            response.read()
+    except urllib.error.HTTPError as exc:
+        detail = f"HTTP {exc.code} from {url}"
+        if exc.code in (401, 403):
+            detail += " -- key rejected; double-check the key value"
+        return False, detail
+    except (OSError, urllib.error.URLError) as exc:
+        return False, f"could not reach {url}: {exc}"
+    if 200 <= status < 300:
+        return True, f"accepted by {url}"
+    return False, f"HTTP {status} from {url}"
+
+
 def _login_relative_repo_default(raw: str, user: str) -> str:
     """Convert a legacy absolute home path into a login-relative default."""
     value = str(raw or "").strip().replace("\\", "/")
@@ -851,6 +923,19 @@ def _prompt_yes_no(label: str, default: bool = True) -> bool:
     return value in {"y", "yes"}
 
 
+def _prompt_int(label: str, default: int, lo: int, hi: int) -> int:
+    while True:
+        raw = _prompt(label, str(default))
+        try:
+            value = int(raw)
+        except ValueError:
+            print("  Enter a whole number.")
+            continue
+        if lo <= value <= hi:
+            return value
+        print(f"  Enter a value between {lo} and {hi}.")
+
+
 def _validate(values: SetupValues) -> None:
     if values.mode not in {"local", "hpc"}:
         raise ValueError("mode must be 'local' or 'hpc'")
@@ -885,12 +970,31 @@ def _collect_interactive(config: dict[str, Any], args: argparse.Namespace) -> Se
         args.server_host or str(_nested(config, "server", "host", default="127.0.0.1")),
         required=True,
     )
-    server_port = int(_prompt(
+    server_port = _prompt_int(
         "Web server port",
-        str(args.server_port or _nested(config, "server", "port", default=8000)),
-        required=True,
-    ))
+        int(args.server_port or _nested(config, "server", "port", default=8000)),
+        1,
+        65535,
+    )
     values = SetupValues(mode=mode, server_host=server_host, server_port=server_port)
+    values.llm_api_key = args.set_api_key or ""
+    if not values.llm_api_key:
+        llm = _llm_api_view(config)
+        embeddings_backend = _embeddings_backend_view(config, llm["backend"])
+        if llm["backend"] == "soclaas" and not llm["api_key"]:
+            needs = (
+                "chat, vision, and embeddings"
+                if embeddings_backend == "soclaas"
+                else "chat and vision (embeddings run on local Ollama)"
+            )
+            print(
+                f"\nThe default LLM backend is the hosted SoCLAaS API; {needs}\n"
+                "need an API key."
+            )
+            values.llm_api_key = _prompt(
+                "SoCLAaS API key (blank to skip; set later with --set-api-key)",
+                "",
+            )
     values.local_ollama_port = args.ollama_port or _configured_ollama_port(config)
     if mode == "hpc":
         values.manage_ssh_aliases = True
@@ -953,11 +1057,12 @@ def _collect_non_interactive(config: dict[str, Any], args: argparse.Namespace) -
             "/hpctmp",
         ),
         local_ollama_port=args.ollama_port or _configured_ollama_port(config),
+        llm_api_key=args.set_api_key or "",
     )
 
 
 def configure(path: Path, values: SetupValues) -> None:
-    updates = {
+    updates: dict[str, dict[str, Any]] = {
         "server": {
             "host": values.server_host,
             "port": values.server_port,
@@ -980,6 +1085,8 @@ def configure(path: Path, values: SetupValues) -> None:
                 "storage_root": values.cpu_storage_root or "/hpctmp/${USER}",
             },
         })
+    if values.llm_api_key:
+        updates["llm_api"] = {"api_key": values.llm_api_key}
     update_toml_sections(path, updates)
 
 
@@ -1029,40 +1136,78 @@ def _http_ready(url: str, timeout: float = 2.0) -> bool:
 def run_checks(path: Path, values: SetupValues) -> bool:
     print("\nPreflight checks")
     print("----------------")
-    checks: list[tuple[str, bool, str]] = []
-    checks.append(("Python 3.11+", sys.version_info >= (3, 11), sys.version.split()[0]))
+    # Each check is (label, status, detail) with status OK / WARN / FAIL.
+    # WARN does not fail the run; FAIL does.
+    checks: list[tuple[str, str, str]] = []
+    checks.append((
+        "Python 3.11+",
+        "OK" if sys.version_info >= (3, 11) else "FAIL",
+        sys.version.split()[0],
+    ))
     runtime = _runtime_python()
     checks.append((
         "Python dependencies",
-        _runtime_dependencies_ready(runtime),
+        "OK" if _runtime_dependencies_ready(runtime) else "FAIL",
         str(runtime),
     ))
     try:
         with socket.socket() as probe:
             probe.bind((values.server_host, values.server_port))
-        checks.append(("Web port", True, f"{values.server_host}:{values.server_port} available"))
+        checks.append(("Web port", "OK", f"{values.server_host}:{values.server_port} available"))
     except OSError as exc:
         already_running = _http_ready(f"http://127.0.0.1:{values.server_port}/api/health")
         checks.append((
             "Web port",
-            already_running,
+            "OK" if already_running else "FAIL",
             "RAG web server already running" if already_running else str(exc),
         ))
 
+    llm = _llm_api_view(_load(path))
+    embeddings_backend = _embeddings_backend_view(_load(path), llm["backend"])
+    if llm["backend"] == "soclaas":
+        if llm["api_key"]:
+            checks.append(("SoCLAaS API key", "OK", f"set via {llm['key_source']}"))
+        else:
+            affected = (
+                "chat/vision/embeddings"
+                if embeddings_backend == "soclaas"
+                else "chat/vision"
+            )
+            checks.append((
+                "SoCLAaS API key",
+                "WARN",
+                f"not set -- {affected} will fail; rerun setup with "
+                "--set-api-key <key> or export SOCLAAS_API_KEY",
+            ))
+
     if values.mode == "local":
         ready = _http_ready(f"http://127.0.0.1:{values.local_ollama_port}/api/version")
-        checks.append(("Local Ollama", ready, "ready" if ready else "not reachable"))
+        # Ollama serves the dormant offline chat fallback, but it is REQUIRED
+        # whenever the embeddings transport is local ([embeddings].backend =
+        # "ollama" -- the default).
+        ollama_required = llm["backend"] == "ollama" or embeddings_backend == "ollama"
+        status = "OK" if ready else ("FAIL" if ollama_required else "WARN")
+        if ready:
+            detail = "ready"
+        elif ollama_required:
+            detail = (
+                'not reachable -- required for [embeddings].backend = "ollama" '
+                "(start Ollama and pull nomic-embed-text)"
+            )
+        else:
+            detail = "not reachable -- optional unless an ollama backend is active"
+        checks.append(("Local Ollama", status, detail))
     else:
         ok, detail = _command_check("ssh")
-        checks.append(("ssh", ok, detail))
+        checks.append(("ssh", "OK" if ok else "FAIL", detail))
         if values.cpu_identity_file:
             key_path = Path(os.path.expandvars(values.cpu_identity_file)).expanduser()
-            checks.append(("CPU SSH key", key_path.is_file(), str(key_path)))
+            checks.append(("CPU SSH key", "OK" if key_path.is_file() else "FAIL", str(key_path)))
         rsync_ok, rsync_detail = _command_check("rsync")
         scp_ok, scp_detail = _command_check("scp")
         checks.append((
             "file transfer",
-            rsync_ok or scp_ok,
+            "OK" if (rsync_ok or scp_ok) else "FAIL",
             rsync_detail if rsync_ok else scp_detail,
         ))
         # Import only after configuration is written and ROOT is importable.
@@ -1078,7 +1223,7 @@ def run_checks(path: Path, values: SetupValues) -> bool:
             outcome = remote["cpu"]
             checks.append((
                 "CPU cluster",
-                bool(outcome["ok"]),
+                "OK" if bool(outcome["ok"]) else "FAIL",
                 str(outcome["detail"]),
             ))
         finally:
@@ -1087,9 +1232,9 @@ def run_checks(path: Path, values: SetupValues) -> bool:
             else:
                 os.environ["RAG_PIPELINE_CONFIG"] = old_config
 
-    for label, ok, detail in checks:
-        print(f"  {'OK' if ok else 'FAIL':4}  {label}: {detail}")
-    return all(ok for _, ok, _ in checks)
+    for label, status, detail in checks:
+        print(f"  {status:4}  {label}: {detail}")
+    return all(status != "FAIL" for _, status, _ in checks)
 
 
 def start_instance(path: Path, values: SetupValues) -> int:
@@ -1158,6 +1303,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Configure connections only; do not upload/build remote artifacts.",
     )
     parser.add_argument("--ollama-port", type=int)
+    parser.add_argument(
+        "--set-api-key",
+        default="",
+        metavar="KEY",
+        help="Persist a SoCLAaS API key into [llm_api].api_key in config.toml "
+             "(the SOCLAAS_API_KEY / LLM_API_KEY environment variables still "
+             "override it at runtime).",
+    )
     parser.add_argument("--non-interactive", action="store_true")
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--configure-only", action="store_true")
@@ -1176,7 +1329,58 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _decide_dependency_install(
+    *,
+    dependencies_ready: bool,
+    install_deps: bool,
+    no_install_deps: bool,
+    check_only: bool,
+    non_interactive: bool,
+    prompt_yes_no=_prompt_yes_no,
+) -> bool:
+    """Decide whether to create .venv and install requirements.
+
+    A non-interactive run with missing dependencies installs them instead of
+    failing preflight -- that is what makes the one-click launchers work on a
+    fresh checkout. ``--no-install-deps`` opts out; ``--check-only`` never
+    installs.
+    """
+    if dependencies_ready or no_install_deps or check_only:
+        return install_deps
+    if install_deps:
+        return True
+    if non_interactive:
+        return True
+    return prompt_yes_no(
+        "Runtime dependencies are missing. Create .venv and install them?",
+        True,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
+    """User-facing entry point: converts failures into concise messages."""
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:
+        print("\nSetup interrupted.", file=sys.stderr)
+        return 130
+    except EOFError:
+        print(
+            "\nNo interactive input is available. Rerun from a terminal, or use "
+            "--non-interactive with explicit flags (e.g. --mode local "
+            "--server-host 127.0.0.1 --server-port 8000).",
+            file=sys.stderr,
+        )
+        return 1
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"\nSetup failed: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - one-click UX: no raw tracebacks
+        print(f"\nUnexpected setup error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+
+def _main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     args.ssh_config = args.ssh_config.expanduser().resolve()
     path = args.config.resolve()
@@ -1200,6 +1404,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             configure_ssh_aliases(args.ssh_config, values)
             configure(path, values)
+            if values.llm_api_key:
+                llm = _llm_api_view(_load(path))
+                ok, detail = _verify_llm_api_key(
+                    llm["base_url"], llm["models_path"], llm["api_key"]
+                )
+                if ok:
+                    print(f"\nSoCLAaS API key verified ({detail}).")
+                else:
+                    print(f"\nWARNING: SoCLAaS API key not verified ({detail}).")
+                    print("The key was saved; check it if chat/embeddings fail.")
             # Decide whether (and how) to provision the HPC clusters. The three
             # flags are mutually exclusive; none set means "only provision when
             # the interactive SSH-alias setup flow just ran" (legacy behavior).
@@ -1237,18 +1451,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Previous configuration backed up to {path}.bak")
 
     dependencies_ready = _runtime_dependencies_ready()
-    should_install = args.install_deps
-    if (
-        not dependencies_ready
-        and not args.non_interactive
-        and not args.check_only
-        and not args.no_install_deps
-        and not should_install
-    ):
-        should_install = _prompt_yes_no(
-            "Runtime dependencies are missing. Create .venv and install them?",
-            True,
-        )
+    should_install = _decide_dependency_install(
+        dependencies_ready=dependencies_ready,
+        install_deps=args.install_deps,
+        no_install_deps=args.no_install_deps,
+        check_only=args.check_only,
+        non_interactive=args.non_interactive,
+    )
     if should_install:
         try:
             install_dependencies()
@@ -1269,7 +1478,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.non_interactive and not args.start:
         should_start = _prompt_yes_no("Start the instance now?", True)
     if not should_start:
-        print("Ready. Start later with setup.cmd --non-interactive --start")
+        print(
+            "Ready. Start later with setup.cmd --non-interactive --start "
+            "(Windows) or ./setup.sh --non-interactive --start."
+        )
         return 0
     return start_instance(path, values)
 

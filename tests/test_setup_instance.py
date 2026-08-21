@@ -6,12 +6,16 @@ from pathlib import Path
 
 from scripts.setup_instance import (
     SetupValues,
+    _decide_dependency_install,
+    _embeddings_backend_view,
+    _llm_api_view,
     _validate,
     configure,
     configure_ssh_aliases,
     create_repository_archive,
     ensure_ssh_private_key,
     install_ssh_public_key,
+    main,
     _login_relative_repo_default,
     _remote_container_build_command,
     provision_hpc_cluster,
@@ -289,6 +293,115 @@ def test_setup_cli_help_runs():
     assert "--skip-key-install" in result.stdout
     assert "--provision-hpc" in result.stdout
     assert "--skip-hpc-provision" in result.stdout
+    assert "--set-api-key" in result.stdout
+
+
+def test_configure_writes_api_key_only_when_provided(safe_tmp_path):
+    config = safe_tmp_path / "config.toml"
+    config.write_text('[llm_api]\nbackend = "soclaas"\n', encoding="utf-8")
+
+    values = SetupValues(mode="local", server_host="127.0.0.1", server_port=8000)
+    configure(config, values)
+    assert "api_key" not in config.read_text(encoding="utf-8")
+
+    values = SetupValues(
+        mode="local", server_host="127.0.0.1", server_port=8000, llm_api_key="sk-test"
+    )
+    configure(config, values)
+    assert 'api_key = "sk-test"' in config.read_text(encoding="utf-8")
+    # The unrelated backend line survives the update.
+    assert 'backend = "soclaas"' in config.read_text(encoding="utf-8")
+
+
+def test_llm_api_view_matches_app_precedence(monkeypatch):
+    monkeypatch.delenv("SOCLAAS_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_BACKEND", raising=False)
+
+    view = _llm_api_view({"llm_api": {"api_key": "config-key"}})
+    assert view["api_key"] == "config-key"
+    assert view["key_source"] == "config.toml"
+    assert view["backend"] == "soclaas"
+
+    monkeypatch.setenv("LLM_API_KEY", "llm-env-key")
+    view = _llm_api_view({"llm_api": {"api_key": "config-key"}})
+    assert view["api_key"] == "llm-env-key"
+
+    monkeypatch.setenv("SOCLAAS_API_KEY", "soclaas-env-key")
+    view = _llm_api_view({"llm_api": {"api_key": "config-key"}})
+    assert view["api_key"] == "soclaas-env-key"  # key_env wins over LLM_API_KEY
+
+    monkeypatch.setenv("LLM_BACKEND", "OLLAMA")
+    view = _llm_api_view({})
+    assert view["backend"] == "ollama"
+    assert view["base_url"]  # a default base URL is always available
+
+
+def test_embeddings_backend_view_matches_app_precedence(monkeypatch):
+    monkeypatch.delenv("EMBEDDINGS_BACKEND", raising=False)
+
+    # Absent [embeddings].backend = the app default: local Ollama, even when
+    # chat runs on soclaas (the split deployment).
+    assert _embeddings_backend_view({}, "soclaas") == "ollama"
+    # Explicit "" inherits the chat backend.
+    assert _embeddings_backend_view({"embeddings": {"backend": ""}}, "ollama") == "ollama"
+    assert _embeddings_backend_view({"embeddings": {"backend": ""}}, "soclaas") == "soclaas"
+    # Explicit value wins over both the default and the chat backend.
+    assert _embeddings_backend_view({"embeddings": {"backend": "soclaas"}}, "ollama") == "soclaas"
+    # Invalid configured value falls back to the default (warn-and-ignore).
+    assert _embeddings_backend_view({"embeddings": {"backend": "gpu"}}, "soclaas") == "ollama"
+    # Env override wins over the configured value.
+    monkeypatch.setenv("EMBEDDINGS_BACKEND", "soclaas")
+    assert _embeddings_backend_view({"embeddings": {"backend": "ollama"}}, "ollama") == "soclaas"
+
+
+def test_dependency_install_decision():
+    plan = _decide_dependency_install
+    # Deps present -> never install (unless explicitly asked).
+    assert plan(dependencies_ready=True, install_deps=False, no_install_deps=False,
+                check_only=False, non_interactive=False) is False
+    assert plan(dependencies_ready=True, install_deps=True, no_install_deps=False,
+                check_only=False, non_interactive=False) is True
+    # Missing deps + non-interactive -> auto-install (one-click behavior).
+    assert plan(dependencies_ready=False, install_deps=False, no_install_deps=False,
+                check_only=False, non_interactive=True) is True
+    # Opt-outs are honored.
+    assert plan(dependencies_ready=False, install_deps=False, no_install_deps=True,
+                check_only=False, non_interactive=True) is False
+    assert plan(dependencies_ready=False, install_deps=False, no_install_deps=False,
+                check_only=True, non_interactive=True) is False
+    # Interactive -> asks.
+    asked = []
+    assert plan(dependencies_ready=False, install_deps=False, no_install_deps=False,
+                check_only=False, non_interactive=False,
+                prompt_yes_no=lambda label, default: asked.append(label) or True) is True
+    assert asked
+
+
+def test_main_wraps_keyboard_interrupt_and_eof(monkeypatch):
+    from scripts import setup_instance
+
+    def interrupt(argv=None):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(setup_instance, "_main", interrupt)
+    assert main([]) == 130
+
+    def no_stdin(argv=None):
+        raise EOFError()
+
+    monkeypatch.setattr(setup_instance, "_main", no_stdin)
+    assert main([]) == 1
+
+
+def test_main_wraps_unexpected_errors(monkeypatch):
+    from scripts import setup_instance
+
+    def boom(argv=None):
+        raise RuntimeError("wizard exploded")
+
+    monkeypatch.setattr(setup_instance, "_main", boom)
+    assert main([]) == 1
 
 
 def test_repo_manifest_is_deterministic_and_excludes_artifacts(safe_tmp_path):

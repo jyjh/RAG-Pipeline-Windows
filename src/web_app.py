@@ -3872,6 +3872,11 @@ def _llm_status_snapshot() -> dict[str, Any]:
     ``ollama_*`` keys are always populated (with the live endpoint under
     SoCLAaS) so the existing health/metrics contract and UI keep working; the
     ``llm_*`` keys expose the active backend.
+
+    The additive ``embeddings_*`` keys report the PER-MODALITY embedding
+    transport (``[embeddings].backend``), which may differ from the chat
+    backend -- the default deployment keeps chat/vision on SoCLAaS while
+    embedding locally (Ollama nomic-embed-text).
     """
     from src import llm_api
 
@@ -3880,7 +3885,7 @@ def _llm_status_snapshot() -> dict[str, Any]:
             snap = llm_api.soclaas_status_snapshot(timeout=2.0)
             base_url = snap["base_url"]
             reachable = bool(snap["reachable"])
-            return {
+            snapshot = {
                 "backend": "soclaas",
                 "reachable": reachable,
                 "llm_backend": "soclaas",
@@ -3891,28 +3896,58 @@ def _llm_status_snapshot() -> dict[str, Any]:
                 "ollama_candidate_hosts": [base_url],
                 "ollama_reachability": {base_url: reachable},
             }
-        from src.local_rag import (
-            _ollama_host,
-            _get_ollama_candidate_hosts,
-            _ollama_server_healthy,
-        )
+        else:
+            from src.local_rag import (
+                _ollama_host,
+                _get_ollama_candidate_hosts,
+                _ollama_server_healthy,
+            )
 
-        active_host = _ollama_host()
-        candidate_hosts = _get_ollama_candidate_hosts()
-        reachability: dict[str, bool] = {}
-        for h in candidate_hosts:
-            reachability[h] = bool(_ollama_server_healthy(h, timeout=1.5))
-        return {
-            "backend": "ollama",
-            "reachable": reachability.get(active_host, False),
-            "llm_backend": "ollama",
-            "llm_base_url": active_host,
-            "llm_api_key_configured": True,
-            "llm_detail": "ok" if reachability.get(active_host, False) else "unreachable",
-            "ollama_active_host": active_host,
-            "ollama_candidate_hosts": candidate_hosts,
-            "ollama_reachability": reachability,
-        }
+            active_host = _ollama_host()
+            candidate_hosts = _get_ollama_candidate_hosts()
+            reachability: dict[str, bool] = {}
+            for h in candidate_hosts:
+                reachability[h] = bool(_ollama_server_healthy(h, timeout=1.5))
+            snapshot = {
+                "backend": "ollama",
+                "reachable": reachability.get(active_host, False),
+                "llm_backend": "ollama",
+                "llm_base_url": active_host,
+                "llm_api_key_configured": True,
+                "llm_detail": "ok" if reachability.get(active_host, False) else "unreachable",
+                "ollama_active_host": active_host,
+                "ollama_candidate_hosts": candidate_hosts,
+                "ollama_reachability": reachability,
+            }
+        # Per-modality embeddings transport. Isolated in its own try so a bad
+        # EMBEDDINGS_BACKEND value cannot blank the whole snapshot.
+        try:
+            from src.embeddings import embeddings_use_soclaas, resolve_embeddings_backend
+
+            snapshot["embeddings_backend"] = (
+                resolve_embeddings_backend() or snapshot["llm_backend"]
+            )
+            if embeddings_use_soclaas():
+                if snapshot["llm_backend"] == "soclaas":
+                    # Same endpoint the chat probe just checked; reuse it.
+                    snapshot["embeddings_reachable"] = bool(snapshot["reachable"])
+                    snapshot["embeddings_detail"] = str(snapshot["llm_detail"])
+                else:
+                    emb = llm_api.soclaas_status_snapshot(timeout=2.0)
+                    snapshot["embeddings_reachable"] = bool(emb["reachable"])
+                    snapshot["embeddings_detail"] = str(emb["detail"])
+            else:
+                from src.local_rag import _ollama_host, _ollama_server_healthy
+
+                emb_host = _ollama_host()
+                emb_ok = bool(_ollama_server_healthy(emb_host, timeout=1.5))
+                snapshot["embeddings_reachable"] = emb_ok
+                snapshot["embeddings_detail"] = "ok" if emb_ok else f"unreachable at {emb_host}"
+        except Exception as exc:
+            snapshot.setdefault("embeddings_backend", snapshot["llm_backend"])
+            snapshot["embeddings_reachable"] = False
+            snapshot["embeddings_detail"] = f"status unavailable: {exc}"
+        return snapshot
     except Exception as exc:
         try:
             backend = llm_api.active_backend()
@@ -3922,6 +3957,8 @@ def _llm_status_snapshot() -> dict[str, Any]:
             "backend": backend,
             "reachable": False,
             "llm_backend": backend,
+            "embeddings_backend": backend,
+            "embeddings_reachable": False,
             "ollama_active_host": "",
             "ollama_candidate_hosts": [],
             "ollama_reachability": {},
@@ -5339,7 +5376,7 @@ def index_rows_stream(
             "received": 0,
             "total": 0,
             "embedding_model": DEFAULT_EMBEDDING_MODEL,
-            "embedding_dim": 768,
+            "embedding_dim": DEFAULT_EMBEDDING_DIM,
         }
 
     def generate():

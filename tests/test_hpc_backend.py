@@ -168,6 +168,16 @@ def test_build_pbs_script_input_dir_override():
     assert 'python3 scripts/bulk_ingest.py --input-dir "/hpctmp/me/pdfs"' in script
 
 
+def test_build_pbs_script_skip_index_adds_flag():
+    """skip_index=True appends --skip-index so the cluster only ingests."""
+    b = HpcBackend(BASE_CFG)
+    # Anchor on the command line: the template's comments also mention the
+    # flag in prose, so a whole-script `not in` would false-positive.
+    assert 'bulk_ingest.py --input-dir "data"\n' in b._build_pbs_script("data")
+    script = b._build_pbs_script("data", skip_index=True)
+    assert 'python3 scripts/bulk_ingest.py --input-dir "data" --skip-index\n' in script
+
+
 # --- submit_ingest_index routes to the CPU cluster ---------------------------
 
 
@@ -332,13 +342,37 @@ def test_submit_ingest_index_cancels_before_qsub(monkeypatch):
         if "cat > " in remote_command:
             wrote["v"] = True
             return _completed()
-        if "rm -f " in remote_command:
+        if "rm - f " in remote_command:
             return _completed()
         return _completed()
 
     monkeypatch.setattr(b, "_run_ssh", fake_run_ssh)
     with pytest.raises(HpcError, match="cancelled before qsub"):
         b.submit_ingest_index(cancel_event=cancel)
+
+
+def test_submit_ingest_index_skip_index_writes_flag_into_pbs(monkeypatch):
+    """skip_index=True must reach the generated PBS body uploaded via heredoc."""
+    b = HpcBackend(BASE_CFG)
+    written: list[str] = []
+
+    def fake_run_ssh(host, remote_command, *, capture=True, check=True, timeout=None):
+        if "cat > " in remote_command:
+            written.append(remote_command)
+            return _completed()
+        if "qsub" in remote_command:
+            return _completed("11.aspsus01\n")
+        if "qstat -f" in remote_command:
+            return _completed("    job_state = F\n    Exit_status = 0\n")
+        return _completed()
+
+    monkeypatch.setattr(b, "_run_ssh", fake_run_ssh)
+    result = b.submit_ingest_index(skip_index=True)
+    assert result.job_id == "11.aspsus01"
+    assert result.exit_code == 0
+    assert any(
+        'bulk_ingest.py --input-dir "data" --skip-index' in body for body in written
+    ), "the ingest-only flag must be in the uploaded PBS command line"
 
 
 # --- fetch_index (rsync, from the CPU cluster) -------------------------------
@@ -369,6 +403,34 @@ def test_fetch_index_uses_explicit_remote_db(tmp_path, monkeypatch):
     assert captured[0][0] == "nus_hpc_cpu:/abs/other/db/"
 
 
+# --- fetch_processed_docs (rsync, from the CPU cluster) ----------------------
+
+
+def test_fetch_processed_docs_invokes_rsync_with_trailing_slash(tmp_path, monkeypatch):
+    b = HpcBackend(BASE_CFG)
+    captured: list[tuple[str, str]] = []
+
+    def fake_rsync(source, dest, *, check=True, extra_args=None):
+        captured.append((source, dest))
+        return _completed()
+
+    monkeypatch.setattr(b, "_run_rsync", fake_rsync)
+    local = tmp_path / "processed_docs"
+    out = b.fetch_processed_docs(local_dir=local)
+    assert out == local
+    assert local.exists()
+    # Default remote path is remote_repo_dir/remote_processed_dir (contents-of).
+    assert captured == [(f"{BASE_CFG.cpu.ssh_host}:rag-cpu/processed_docs/", str(local) + "/")]
+
+
+def test_fetch_processed_docs_uses_explicit_remote_dir(tmp_path, monkeypatch):
+    b = HpcBackend(BASE_CFG)
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(b, "_run_rsync", lambda s, d, **k: captured.append((s, d)) or _completed())
+    b.fetch_processed_docs(remote_processed_dir="/abs/md_out", local_dir=tmp_path / "p")
+    assert captured[0][0] == "nus_hpc_cpu:/abs/md_out/"
+
+
 # --- config wiring: cfg.hpc exists, defaults off, cpu cluster ---------------
 
 
@@ -384,6 +446,8 @@ def test_pipeline_config_has_hpc_section_defaulting_disabled():
     assert cfg.hpc.cpu.storage_root == "/hpctmp/${USER}"
     assert cfg.hpc.cpu.pbs_overrides.get("ngpus") == 0
     assert cfg.hpc.cpu.pbs_overrides.get("queue") == "cpu"
+    # Ingest-only fetch target: where a --skip-index job writes its Markdown.
+    assert cfg.hpc.remote_processed_dir == "processed_docs"
 
 
 def test_hpc_config_loads_cpu_cluster_from_toml(tmp_path, monkeypatch):

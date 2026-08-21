@@ -13,11 +13,13 @@ DEFAULT_VISION_ENABLED = True
 DEFAULT_PLANNER_MODEL = "gemma4:26b"
 DEFAULT_PLANNER_MAX_QUERIES = 3
 
-# bge-m3 produces 1024-d dense vectors (vs nomic-embed-text's 768). Changing the
-# embedding model/dim invalidates any existing index -- a full re-index is
-# required (the indexer's model+dim reuse guard enforces this automatically).
-DEFAULT_EMBEDDING_MODEL = "bge-m3"
-DEFAULT_EMBEDDING_DIM = 1024
+# Embeddings default to a locally hosted nomic-embed-text (Ollama, 768-d) while
+# chat/vision stay on SoCLAaS; [embeddings].backend = "soclaas" switches
+# embeddings to the API's bge-m3 (1024-d) instead. Changing the model/dim
+# invalidates any existing index -- a full re-index is required (the indexer's
+# model+dim reuse guard enforces this automatically).
+DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
+DEFAULT_EMBEDDING_DIM = 768
 # Texts per embedding request; also the timeout-measurement baseline.
 DEFAULT_EMBEDDING_BATCH_SIZE = 128
 DEFAULT_EMBEDDING_TIMEOUT = 30.0

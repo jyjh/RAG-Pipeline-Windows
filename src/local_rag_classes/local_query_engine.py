@@ -20,7 +20,7 @@ class LocalQueryEngine:
     # Class-level fallbacks so instances built via ``__new__`` (e.g. unit tests
     # that wire fakes directly, bypassing ``__init__``) still have sensible
     # values. ``__init__`` overrides these with the configured values.
-    embedding_dim: int = 1024
+    embedding_dim: int = 768
     query_prefix: str = ""
 
     def __init__(
@@ -30,7 +30,7 @@ class LocalQueryEngine:
         asset_dir: str | Path | None = None,
         trust_path: str | Path | None = None,
         model: str = "gemma4:26b",
-        embedding_model: str = "bge-m3",
+        embedding_model: str = "nomic-embed-text",
         embedding_batch_size: int | None = None,
         embedding_timeout: float | None = None,
         embedding_dim: int | None = None,

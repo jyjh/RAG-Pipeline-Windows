@@ -33,12 +33,55 @@ def _ollama_host() -> str:
     return _normalize_ollama_host(host)
 
 
+_VALID_EMBEDDINGS_BACKENDS = {"", "soclaas", "ollama"}
+
+
+def resolve_embeddings_backend() -> str:
+    """Resolve the embeddings transport, independently of chat/vision.
+
+    ``[embeddings].backend`` (env ``EMBEDDINGS_BACKEND``) lets a deployment
+    keep chat/vision on the SoCLAaS API while embedding locally (the default:
+    ``"ollama"``, a hosted nomic-embed-text), or vice versa. ``""`` follows
+    ``[llm_api].backend``. ``[models].native_embeddings = true`` still takes
+    precedence over both -- it is deliberately not a value here.
+
+    Mirrors ``llm_api.active_backend`` semantics: an invalid env value raises;
+    an invalid config value warns and is ignored.
+    """
+    env = os.environ.get("EMBEDDINGS_BACKEND", "").strip().lower()
+    if env:
+        if env not in _VALID_EMBEDDINGS_BACKENDS:
+            raise ValueError(
+                f"EMBEDDINGS_BACKEND={env!r}; must be 'soclaas', 'ollama', or unset"
+            )
+        return env
+    from src.config import load_config
+
+    value = (load_config().embeddings.backend or "").strip().lower()
+    if value not in _VALID_EMBEDDINGS_BACKENDS:
+        _status(
+            f"Unknown [embeddings].backend={value!r}; ignoring it and following "
+            "[llm_api].backend."
+        )
+        return ""
+    return value
+
+
+def embeddings_use_soclaas() -> bool:
+    """Whether embeddings go to the SoCLAaS API (False = local Ollama)."""
+    override = resolve_embeddings_backend()
+    if override:
+        return override == "soclaas"
+    return llm_api.is_soclaas()
+
+
 def resolve_embedding_dim(explicit: int | None = None) -> int:
     """Resolve the embedding dimension: explicit arg > ``[models].embedding_dim``
     > ``DEFAULT_EMBEDDING_DIM``.
 
-    bge-m3 is 1024-d (was 768 for nomic); a model/dim change invalidates an
-    existing index (the indexer/query-engine reuse guards enforce a re-index).
+    nomic-embed-text is 768-d (bge-m3 is 1024-d); a model/dim change
+    invalidates an existing index (the indexer/query-engine reuse guards
+    enforce a re-index).
     """
     if explicit is not None:
         return max(1, int(explicit))
@@ -84,7 +127,7 @@ class EmbeddingSetup:
 
     @property
     def backend_label(self) -> str:
-        return "SoCLAaS API" if llm_api.is_soclaas() else "Ollama"
+        return "SoCLAaS API" if embeddings_use_soclaas() else "Ollama"
 
 
 def _resolve_ollama_hosts(config_hosts: list[str] | None = None) -> list[str]:
@@ -228,10 +271,11 @@ class EmbeddingEngine:
             self._init_native_model()
         # Resolve the active backend once (native may fall back on load failure),
         # so the per-batch hot path branches on a cached string instead of
-        # re-reading config/env for every batch.
+        # re-reading config/env for every batch. The embeddings transport may
+        # differ from the chat/vision backend ([embeddings].backend).
         self._backend = (
             "native" if self.native_embeddings and self._native_model is not None
-            else "soclaas" if llm_api.is_soclaas()
+            else "soclaas" if embeddings_use_soclaas()
             else "ollama"
         )
         label = {"native": "Native (SentenceTransformers)",

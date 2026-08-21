@@ -78,8 +78,9 @@ class ModelConfig:
     vision_model: str = DEFAULT_VISION_MODEL
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     reranker_model: str = ""
-    # bge-m3 dense dim. Changing model/dim invalidates an existing index
-    # (full re-index required); the indexer's reuse guard enforces it.
+    # nomic-embed-text dense dim (768). Changing model/dim invalidates an
+    # existing index (full re-index required); the indexer's reuse guard
+    # enforces it.
     embedding_dim: int = DEFAULT_EMBEDDING_DIM
     allow_hash_embeddings: bool = True
     native_embeddings: bool = False
@@ -89,11 +90,13 @@ class ModelConfig:
 class LlmApiConfig:
     """Hosted OpenAI-compatible LLM API (SoCLAaS) used as the primary backend.
 
-    ``backend`` selects the live backend: ``"soclaas"`` (default, hosted API)
-    or ``"ollama"`` (dormant local fallback for offline operation -- the Ollama
-    transport code is retained for this). The SoCLAaS paths cover chat, vision
-    (via chat-completions image parts), and embeddings (bge-m3, 1024-d,
-    instruction-free).
+    ``backend`` selects the live backend for CHAT and VISION: ``"soclaas"``
+    (default, hosted API) or ``"ollama"`` (dormant local fallback for offline
+    operation -- the Ollama transport code is retained for this). Embeddings
+    have their own selector, ``[embeddings].backend`` (default ``"ollama"``:
+    a locally hosted nomic-embed-text), so chat/vision can run on SoCLAaS
+    while embeddings stay local; set it to ``"soclaas"`` to embed through the
+    hosted API (bge-m3, 1024-d) as well.
 
     The API key is read from ``api_key`` here but the env var named in
     ``key_env`` (default ``SOCLAAS_API_KEY``; ``LLM_API_KEY`` is also honored)
@@ -229,6 +232,14 @@ class EmbeddingsConfig:
     ad-hoc overrides without editing the config file.
     """
 
+    # Embedding transport, selected INDEPENDENTLY of chat/vision so the common
+    # split deployment works: SoCLAaS gemma4/qwen3-vl chat+vision with locally
+    # hosted nomic-embed-text embeddings. "ollama" (default) = local Ollama
+    # host(s) from [embeddings].hosts / OLLAMA_HOST; "soclaas" = the hosted
+    # API's bge-m3 (1024-d; pair it with [models] embedding_model/dim);
+    # "" = follow [llm_api].backend. Env EMBEDDINGS_BACKEND overrides.
+    # ([models].native_embeddings = true still takes precedence over both.)
+    backend: str = "ollama"
     batch_size: int = DEFAULT_EMBEDDING_BATCH_SIZE
     timeout_seconds: float = DEFAULT_EMBEDDING_TIMEOUT
     retries: int = 3
@@ -312,6 +323,10 @@ class HpcConfig:
         pbs_overrides=_default_cpu_overrides()))
     # Where the pre-staged corpus lives on the CPU cluster (PBS --input-dir).
     remote_data_dir: str = "data"
+    # Where an ingest-only PBS job (--skip-index) writes the processed
+    # Markdown corpus, relative to remote_repo_dir unless absolute. Fetched
+    # back with HpcBackend.fetch_processed_docs for local indexing.
+    remote_processed_dir: str = "processed_docs"
     # Where the PBS job writes the index (relative to remote_repo_dir unless
     # absolute). bulk_ingest.py writes db/ to its cwd by default.
     remote_db_dir: str = "db"

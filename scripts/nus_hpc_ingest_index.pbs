@@ -1,30 +1,23 @@
 #!/bin/bash
 #PBS -N rag_ingest_index
-#PBS -l select=1:ncpus=8:mem=32gb:ngpus=1
+#PBS -l select=1:ncpus=16:mem=32gb
 #PBS -l walltime=08:00:00
-#PBS -q gpu
+#PBS -q cpu
 #PBS -j oe
 
 set -e
 
-# Load Singularity module on NUS HPC
 module load singularity
 
-# Set scratch directory under /hpctmp/${USER}/rag_scratch_${PBS_JOBID}
 USER="${USER:-$(whoami)}"
 PBS_JOBID="${PBS_JOBID:-local_job}"
-SCRATCH_DIR="/hpctmp/${USER}/rag_scratch_${PBS_JOBID}"
 HOME="${HOME:-$(eval echo ~${USER})}"
+STORAGE_ROOT="/hpctmp/${USER}"
+SCRATCH_DIR="${STORAGE_ROOT}/rag_scratch_${PBS_JOBID}"
 
-# Ensure scratch directory exists
 mkdir -p "${SCRATCH_DIR}"
 mkdir -p "${SCRATCH_DIR}/tmp"
 
-# Cleanup trap for scratch directory. (There are no background daemons to stop:
-# this CPU ingest/index job does only the heavy non-LLM work -- Docling
-# OCR/parsing, chunking, LanceDB writes, ANN build -- and calls the hosted
-# SoCLAaS API /v1/embeddings endpoint for vectors. It no longer runs a local
-# `ollama serve` or pulls models.)
 cleanup() {
     echo "Cleaning up scratch directory..."
     rm -rf "${SCRATCH_DIR}"
@@ -32,43 +25,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Container SIF image location
 CONTAINER_SIF="${CONTAINER_SIF:-rag_pipeline_cpu.sif}"
-if [ ! -f "${CONTAINER_SIF}" ] && [ -f "/hpctmp/${USER}/rag_pipeline_cpu.sif" ]; then
-    CONTAINER_SIF="/hpctmp/${USER}/rag_pipeline_cpu.sif"
+if [ ! -f "${CONTAINER_SIF}" ] && [ -f "${STORAGE_ROOT}/rag_pipeline_cpu.sif" ]; then
+    CONTAINER_SIF="${STORAGE_ROOT}/rag_pipeline_cpu.sif"
 fi
 
-# Set bind mounts for HPC storage access.
-BIND_MOUNTS="-B /hpctmp/${USER}:/hpctmp/${USER} -B ${HOME}:/srv/home -B ${PWD}:/app"
+BIND_MOUNTS="-B ${STORAGE_ROOT}:${STORAGE_ROOT} -B ${HOME}:/srv/home -B ${PWD}:/app"
 
-# Temp paths on high-speed scratch.
 export TMPDIR="${SCRATCH_DIR}/tmp"
 
-# SoCLAaS API key for the embeddings endpoint (bge-m3, /v1/embeddings).
-# Provision it one of three ways:
-#   1. ~/rag_soclaas_key on the login node (chmod 600) -- read below.
-#   2. The qsub environment (export SOCLAAS_API_KEY=... before qsub, or -v).
-#   3. [llm_api].api_key in the staged config.toml (read by the pipeline).
+# SoCLAaS API key. Needed for /v1/embeddings when the job also indexes, and
+# for vision enrichment of figures (qwen3-vl) whenever [ingestion]
+# vision_enabled is true -- including ingest-only (--skip-index) runs.
+# Provision it at ~/rag_soclaas_key on the login node (chmod 600), pass it
+# via the qsub environment, or set [llm_api].api_key in the staged config.toml.
 if [ -z "${SOCLAAS_API_KEY:-}" ] && [ -f "${HOME}/rag_soclaas_key" ]; then
     export SOCLAAS_API_KEY="$(cat "${HOME}/rag_soclaas_key")"
 fi
 
-echo "========================================================"
-echo "NUS HPC RAG Bulk Ingest & Index Job (SoCLAaS embeddings)"
-echo "Job ID: ${PBS_JOBID}"
-echo "User: ${USER}"
-echo "Scratch Directory: ${SCRATCH_DIR}"
-echo "Container SIF: ${CONTAINER_SIF}"
-echo "Working Directory: ${PWD}"
-echo "SoCLAaS API key configured: $([ -n "${SOCLAAS_API_KEY:-}" ] && echo yes || echo 'NO (set ~/rag_soclaas_key or [llm_api].api_key)')"
-echo "========================================================"
-
-# Execute document ingestion and indexing pipeline.
-# Embeddings are served by the SoCLAaS API (bge-m3, 1024-d) -- the CPU node
-# only needs outbound HTTPS to soclaas-api.comp.nus.edu.sg plus the API key.
-echo "Starting bulk document ingestion and indexing..."
 INPUT_DATA_DIR="${INPUT_DATA_DIR:-data}"
-
-singularity exec --nv ${BIND_MOUNTS} "${CONTAINER_SIF}" python3 scripts/bulk_ingest.py --input-dir "${INPUT_DATA_DIR}"
-
-echo "Bulk document ingestion and indexing job finished successfully."
+singularity exec ${BIND_MOUNTS} "${CONTAINER_SIF}" python3 scripts/bulk_ingest.py --input-dir "data"

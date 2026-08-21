@@ -22,6 +22,9 @@ def _soclaas_env(monkeypatch):
     # config.example.toml sets [llm_api].backend = "soclaas"; ensure env never
     # overrides it, and provide a key so require_api_key() succeeds for HTTP tests.
     monkeypatch.delenv("LLM_BACKEND", raising=False)
+    # Embeddings have their own selector ([embeddings].backend, default
+    # "ollama"); isolate it from the developer's environment here.
+    monkeypatch.delenv("EMBEDDINGS_BACKEND", raising=False)
     monkeypatch.setenv("SOCLAAS_API_KEY", "sk-test-key")
 
 
@@ -293,6 +296,10 @@ def test_llm_chat_dispatcher_routes_to_soclaas(monkeypatch):
 
 def test_embedding_engine_uses_soclaas_path(monkeypatch):
     from src.embeddings import EmbeddingEngine
+
+    # The default embeddings backend is local Ollama; opt this transport in
+    # explicitly (the split-selection matrix is covered in test_embeddings.py).
+    monkeypatch.setenv("EMBEDDINGS_BACKEND", "soclaas")
 
     seen = {"model": None, "texts": []}
 

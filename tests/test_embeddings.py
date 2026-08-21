@@ -192,3 +192,85 @@ def test_dedup_hosts_preserves_order(monkeypatch):
         assert _resolve_ollama_hosts() == ["http://a:1", "http://b:1"]
     finally:
         monkeypatch.delenv("OLLAMA_EMBED_HOSTS", raising=False)
+
+
+# --- per-modality backend selection ([embeddings].backend) --------------------
+#
+# The embeddings transport is selected independently of the chat/vision backend
+# so the default split deployment works: SoCLAaS chat/vision + locally hosted
+# nomic-embed-text embeddings.
+
+
+def test_embeddings_backend_default_is_local_ollama(monkeypatch):
+    from src.embeddings import embeddings_use_soclaas, resolve_embeddings_backend
+
+    monkeypatch.delenv("EMBEDDINGS_BACKEND", raising=False)
+    monkeypatch.delenv("RAG_PIPELINE_CONFIG", raising=False)
+    # Defaults: [embeddings].backend = "ollama" even with chat on soclaas.
+    monkeypatch.setenv("LLM_BACKEND", "soclaas")
+    assert resolve_embeddings_backend() == "ollama"
+    assert embeddings_use_soclaas() is False
+
+
+def test_embeddings_backend_empty_follows_chat_backend(monkeypatch, tmp_path):
+    from src.embeddings import embeddings_use_soclaas, resolve_embeddings_backend
+
+    monkeypatch.setenv("LLM_BACKEND", "soclaas")
+    cfg = tmp_path / "split.toml"
+    cfg.write_text('[embeddings]\nbackend = ""\n', encoding="utf-8")
+    monkeypatch.setenv("RAG_PIPELINE_CONFIG", str(cfg))
+    assert resolve_embeddings_backend() == ""
+    assert embeddings_use_soclaas() is True
+
+
+def test_embeddings_backend_env_overrides_config(monkeypatch, tmp_path):
+    from src.embeddings import resolve_embeddings_backend
+
+    cfg = tmp_path / "split.toml"
+    cfg.write_text('[embeddings]\nbackend = "soclaas"\n', encoding="utf-8")
+    monkeypatch.setenv("RAG_PIPELINE_CONFIG", str(cfg))
+    monkeypatch.setenv("EMBEDDINGS_BACKEND", "ollama")
+    assert resolve_embeddings_backend() == "ollama"
+
+
+def test_embeddings_backend_invalid_env_raises(monkeypatch):
+    from src.embeddings import resolve_embeddings_backend
+
+    monkeypatch.setenv("EMBEDDINGS_BACKEND", "gpu")
+    with pytest.raises(ValueError, match="EMBEDDINGS_BACKEND"):
+        resolve_embeddings_backend()
+
+
+def test_engine_routes_to_ollama_with_chat_on_soclaas(monkeypatch):
+    """The default split: chat/vision on SoCLAaS, embeddings on local Ollama."""
+    monkeypatch.delenv("EMBEDDINGS_BACKEND", raising=False)
+    monkeypatch.delenv("RAG_PIPELINE_CONFIG", raising=False)
+    monkeypatch.setenv("LLM_BACKEND", "soclaas")
+
+    engine = EmbeddingEngine(model_name="nomic-embed-text")
+    assert engine._backend == "ollama"
+    monkeypatch.setattr(
+        engine,
+        "_ollama_api",
+        lambda path, payload, host=None: {"embeddings": [[1.0, 0.0]]},
+    )
+    vectors = engine.get_mrl_embeddings(["alpha"], truncate_dim=2)
+    assert vectors.shape == (1, 2)
+
+
+def test_engine_routes_to_soclaas_with_chat_on_ollama(monkeypatch):
+    """The mirror split: offline chat via Ollama, embeddings via SoCLAaS."""
+    from src import llm_api
+
+    monkeypatch.setenv("LLM_BACKEND", "ollama")
+    monkeypatch.setenv("EMBEDDINGS_BACKEND", "soclaas")
+
+    monkeypatch.setattr(
+        llm_api,
+        "soclaas_embed",
+        lambda *, model, input_texts, timeout=None: [[1.0, 0.0] for _ in input_texts],
+    )
+    engine = EmbeddingEngine(model_name="bge-m3")
+    assert engine._backend == "soclaas"
+    vectors = engine.get_mrl_embeddings(["alpha"], truncate_dim=2, prefix="")
+    assert vectors.shape == (1, 2)

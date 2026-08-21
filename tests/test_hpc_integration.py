@@ -21,41 +21,62 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 def test_nus_hpc_pbs_script_exists_and_valid():
     pbs_path = ROOT_DIR / "scripts" / "nus_hpc_ingest_index.pbs"
     assert pbs_path.exists(), "scripts/nus_hpc_ingest_index.pbs must exist"
-    
+
     raw_bytes = pbs_path.read_bytes()
-    
+
     # CRITICAL: Strict LF line endings check
     assert b"\r\n" not in raw_bytes, "scripts/nus_hpc_ingest_index.pbs MUST use LF line endings, no CRLF allowed"
-    
+
     content = raw_bytes.decode("utf-8")
-    
-    # PBS Directives assertions
+
+    # PBS Directives assertions. The static file is the CPU bundle regenerated
+    # from `python -m src.hpc --cpu` (no :ngpus= clause, cpu queue, CPU SIF).
     assert "#PBS -N rag_ingest_index" in content
-    assert "#PBS -l select=1:ncpus=8:mem=32gb:ngpus=1" in content
-    assert "#PBS -q gpu" in content
+    assert "#PBS -l select=1:ncpus=16:mem=32gb" in content
+    assert ":ngpus=" not in content
+    assert "#PBS -q cpu" in content
     assert "#PBS -j oe" in content
-    
+
     # Execution Logic assertions
     assert "module load singularity" in content
     assert "/hpctmp/" in content
     assert "rag_scratch_" in content
     assert "trap" in content
     assert "singularity exec" in content
-    assert "--nv" in content
-    assert "-B /hpctmp/${USER}:/hpctmp/${USER}" in content
-    # The CPU ingest job embeds via the SoCLAaS API (bge-m3) -- it no longer runs
-    # `ollama serve`, pre-pulls models, or probes /api/version. Check the
-    # command forms (the on-disk file documents this in comments).
+    assert "--nv" not in content, "CPU script must not pass --nv to singularity"
+    assert "rag_pipeline_cpu.sif" in content
+    # The CPU job never runs `ollama serve`; embeddings default to the
+    # workstation (ingest-only fetches processed_docs home), and the API key
+    # block below only serves vision enrichment / explicit soclaas-embedding
+    # runs.
     assert "ollama serve >" not in content
     assert "ollama pull" not in content
     assert "/api/version" not in content
     assert "scripts/bulk_ingest.py" in content
     assert "SOCLAAS_API_KEY" in content
 
-    # Walltime must be set (a cold index takes hours; the cluster default is
+    # Walltime must be set (a cold parse takes hours; the cluster default is
     # often too short and kills the job).
     assert re.search(r"#PBS -l walltime=\d{1,4}:\d{2}:\d{2}", content), \
         "ingest .pbs must declare a walltime"
+
+
+def test_hpc_skip_index_generates_ingest_only_job():
+    """skip_index=True appends --skip-index (cluster parses, workstation embeds)."""
+    from src.hpc import _build_script_from_args
+
+    script = generate_pbs_script(
+        ngpus=0, queue="cpu", container_sif="rag_pipeline_cpu.sif", skip_index=True
+    )
+    assert 'python3 scripts/bulk_ingest.py --input-dir "data" --skip-index\n' in script
+
+    # Default keeps the combined ingest+index form (anchor on the command
+    # line; the template's comments mention the flag in prose)...
+    assert 'bulk_ingest.py --input-dir "data"\n' in generate_pbs_script()
+    # ...and the --cpu CLI bundle threads the flag through.
+    cpu_skip = _build_script_from_args(parse_hpc_args(["--cpu", "--skip-index"]))
+    assert 'python3 scripts/bulk_ingest.py --input-dir "data" --skip-index' in cpu_skip
+    assert parse_hpc_args(["--skip-index"]).skip_index is True
 
 
 def test_hpc_cli_parsing_and_pbs_template_generation():
