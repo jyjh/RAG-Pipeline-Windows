@@ -13,6 +13,19 @@ DEFAULT_VISION_ENABLED = True
 DEFAULT_PLANNER_MODEL = "gemma4:26b"
 DEFAULT_PLANNER_MAX_QUERIES = 3
 
+# Chat/planner model served by the LOCAL Ollama fallback. Sized for a 4 GB
+# GPU (GTX 1650-class): qwen3:4b-instruct is ~2.5 GB at Q4_K_M with native
+# tool-calling, whereas the base-name fallback for the cloud tag would pull in
+# gemma4:latest (gemma4 e4b, 9.6 GB) -- far past both VRAM and acceptable cold
+# -load time on this class of hardware. SoCLAaS deployments never use this
+# name; it is only reached through llm_api.resolve_local_model.
+DEFAULT_LOCAL_LLM_MODEL = "qwen3:4b-instruct"
+
+# Ollama keep_alive for local chat/planner requests. Ollama unloads a model
+# after 5 minutes by default; on this hardware a cold reload costs minutes,
+# which the warm-up thread would then have to redo after every idle gap.
+DEFAULT_OLLAMA_KEEP_ALIVE = "30m"
+
 # Embeddings default to a locally hosted nomic-embed-text (Ollama, 768-d) while
 # chat/vision stay on SoCLAaS; [embeddings].backend = "soclaas" switches
 # embeddings to the API's bge-m3 (1024-d) instead. Changing the model/dim

@@ -9,9 +9,14 @@ asset_dir = "db/assets"
 # (https://soclaas-api.comp.nus.edu.sg; see [llm_api]). Embeddings default to
 # a locally hosted all-minilm via Ollama; see [embeddings].backend.
 llm_model = "gemma4:26b"
-local_llm_model = ""
+# Chat/planner model for the LOCAL Ollama fallback (backend = "ollama", or a
+# missing API key). qwen3:4b-instruct (~2.5 GB at Q4_K_M, native tool-calling)
+# fits a 4 GB GPU; without this pin, base-name matching would substitute the
+# cloud tag with gemma4:latest (gemma4 e4b, 9.6 GB) and thrash small GPUs.
+local_llm_model = "qwen3:4b-instruct"
 vision_model = "qwen3-vl:32b"
-local_vision_model = ""
+# Local substitute when the cloud is unavailable (4 GB GPU-friendly).
+local_vision_model = "qwen2.5vl:3b"
 embedding_model = "all-minilm"
 reranker_model = ""
 # all-minilm dense dim. Changing model/dim invalidates an existing index
@@ -148,9 +153,9 @@ max_items_per_run = 200
 # Cloud-unavailable fallback: when backend = "soclaas" but no API key is
 # resolvable, the effective backend automatically becomes the local Ollama
 # below (chat and vision), and cloud-named models are substituted with the
-# closest installed local tag (gemma4:26b -> gemma4:latest,
-# qwen3-vl:32b -> qwen2.5vl). Set env LLM_STRICT_BACKEND=1 to disable the
-# fallback and fail loudly instead.
+# configured local tags ([models].local_llm_model, default qwen3:4b-instruct;
+# local_vision_model, default qwen2.5vl). Set env LLM_STRICT_BACKEND=1 to
+# disable the fallback and fail loudly instead.
 backend = "soclaas"
 base_url = "https://soclaas-api.comp.nus.edu.sg"
 api_key = ""
@@ -181,6 +186,10 @@ llm_num_predict = 4096
 temperature = 0.3
 max_k = 40
 llm_timeout = 120.0
+# Ollama-only: how long the local server keeps the chat model resident between
+# requests. Ollama's own default (5m) unloads the model, and a cold reload on
+# a small GPU costs minutes. "" = the Ollama server default.
+ollama_keep_alive = "30m"
 # SoCLAaS exposes only three models, so the planner reuses the main chat model.
 planner_model = "gemma4:26b"
 planner_enabled = true

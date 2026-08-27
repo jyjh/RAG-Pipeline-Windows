@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -19,6 +20,7 @@ from conftest import _rmtree_with_retry
 
 import src.web_app as web_app
 from src.asset_store import ImageAssetStore, image_asset_marker
+from src.defaults import DEFAULT_LLM_MODEL, DEFAULT_OLLAMA_KEEP_ALIVE
 from src.index_overrides import load_index_overrides, persist_index_deletions, persist_index_edit
 from src.pdf_registry import load_source_map, write_source_entry
 from src.vector_store import LanceDBVectorStore
@@ -984,6 +986,8 @@ def test_chat_config_reads_prompt_retrieval_and_ollama_health_settings(workspace
     config_path.write_text(
         "\n".join(
             [
+                "[models]",
+                'llm_model = "qwen3:4b-instruct"',
                 "[chat]",
                 'system_prompt = "Configured prompt {web_instruction}"',
                 "context_window = 120000",
@@ -991,6 +995,7 @@ def test_chat_config_reads_prompt_retrieval_and_ollama_health_settings(workspace
                 'planner_model = "qwen2.5:1.5b"',
                 "planner_enabled = false",
                 "planner_max_queries = 5",
+                'ollama_keep_alive = "10m"',
                 "[retrieval]",
                 "min_relevance_score = 0.62",
                 "[ollama]",
@@ -1005,6 +1010,7 @@ def test_chat_config_reads_prompt_retrieval_and_ollama_health_settings(workspace
 
     assert config == {
         "system_prompt": "Configured prompt {web_instruction}",
+        "llm_model": "qwen3:4b-instruct",
         "context_window": 120000,
         "llm_num_predict": 24000,
         "planner_model": "qwen2.5:1.5b",
@@ -1017,7 +1023,19 @@ def test_chat_config_reads_prompt_retrieval_and_ollama_health_settings(workspace
         "ollama_fallback_enabled": True,
         "ollama_health_check_interval": 3.5,
         "ollama_max_lost_health_checks": 9,
+        "ollama_keep_alive": "10m",
     }
+
+
+def test_chat_config_defaults_local_model_and_keep_alive(workspace_tmp):
+    """Absent [models].llm_model / [chat].ollama_keep_alive, typed defaults apply."""
+    config_path = workspace_tmp / "config.toml"
+    config_path.write_text("[chat]\n", encoding="utf-8")
+
+    config = web_app._load_chat_config(config_path)
+
+    assert config["llm_model"] == DEFAULT_LLM_MODEL
+    assert config["ollama_keep_alive"] == DEFAULT_OLLAMA_KEEP_ALIVE
 
 
 def test_health_exposes_server_polling_config(monkeypatch):
@@ -1579,6 +1597,70 @@ def test_reindex_request_rejects_invalid_numeric_settings(monkeypatch):
     response = TestClient(web_app.app).post("/api/reindex", json={"embedding_batch_size": 0})
 
     assert response.status_code == 422
+
+
+def test_find_resumable_staged_dir_requires_completed_files(workspace_tmp):
+    db_dir = workspace_tmp / "db"
+    db_dir.mkdir()
+    staged = db_dir.parent / ".index_build_eeee"
+    staged.mkdir()
+    (staged / web_app._STAGED_CHECKPOINT_FILENAME).write_text(
+        json.dumps({"completed_files": ["x.md"]}),
+        encoding="utf-8",
+    )
+
+    assert web_app._find_resumable_staged_dir(db_dir) == staged
+
+    # An empty completed_files list carries no resumable progress -- the
+    # indexer restarts from scratch anyway, so the dir must not be picked.
+    (staged / web_app._STAGED_CHECKPOINT_FILENAME).write_text(
+        json.dumps({"completed_files": []}),
+        encoding="utf-8",
+    )
+
+    assert web_app._find_resumable_staged_dir(db_dir) is None
+
+
+def test_gc_staged_build_dirs_removes_only_abandoned(workspace_tmp):
+    db_dir = workspace_tmp / "db"
+    db_dir.mkdir()
+    parent = db_dir.parent
+    old = time.time() - 2 * web_app.STAGED_BUILD_GC_MIN_AGE_SECONDS
+
+    # No checkpoint at all (crash before first checkpoint).
+    abandoned = parent / ".index_build_aaaa"
+    (abandoned / "lancedb").mkdir(parents=True)
+    # Checkpoint with zero completed files (no resumable progress).
+    empty_ckpt = parent / ".index_build_bbbb"
+    empty_ckpt.mkdir()
+    (empty_ckpt / web_app._STAGED_CHECKPOINT_FILENAME).write_text(
+        json.dumps({"completed_files": []}),
+        encoding="utf-8",
+    )
+    # Resumable progress must survive.
+    resumable = parent / ".index_build_cccc"
+    resumable.mkdir()
+    (resumable / web_app._STAGED_CHECKPOINT_FILENAME).write_text(
+        json.dumps({"completed_files": ["a.md"]}),
+        encoding="utf-8",
+    )
+    # Interrupted publish aside-dir is collected.
+    preserve = parent / ".index_preserve_ffff"
+    preserve.mkdir()
+    # Inside the grace window: never swept (a build may be warming up).
+    fresh = parent / ".index_build_gggg"
+    fresh.mkdir()
+    for entry in (abandoned, empty_ckpt, resumable, preserve):
+        os.utime(entry, (old, old))
+
+    removed = web_app._gc_staged_build_dirs(db_dir)
+
+    assert removed == 3
+    assert not abandoned.exists()
+    assert not empty_ckpt.exists()
+    assert not preserve.exists()
+    assert resumable.exists()
+    assert fresh.exists()
 
 
 def test_job_subprocess_streams_bounded_log_tail(workspace_tmp):
@@ -2552,6 +2634,9 @@ def test_jobs_endpoint_paginates(monkeypatch):
         def list_jobs(self):
             return [{"id": f"job-{index:02}", "filenames": [f"{index}.pdf"]} for index in range(12)]
 
+        def state_version(self):
+            return 0
+
     monkeypatch.setattr(web_app, "job_queue", FakeQueue())
 
     client = TestClient(web_app.app)
@@ -2575,6 +2660,9 @@ def test_jobs_endpoint_reports_active_job_count(monkeypatch):
                 {"id": "job-done", "status": "done"},
             ]
 
+        def state_version(self):
+            return 0
+
     monkeypatch.setattr(web_app, "job_queue", FakeQueue())
 
     client = TestClient(web_app.app)
@@ -2588,9 +2676,13 @@ def test_jobs_endpoint_uses_conditional_etag(monkeypatch):
     class FakeQueue:
         def __init__(self):
             self.jobs = [{"id": "job-a", "status": "queued", "phase": "queued", "filenames": ["a.pdf"]}]
+            self.version = 0
 
         def list_jobs(self):
             return list(self.jobs)
+
+        def state_version(self):
+            return self.version
 
     queue = FakeQueue()
     monkeypatch.setattr(web_app, "job_queue", queue)
@@ -2599,6 +2691,7 @@ def test_jobs_endpoint_uses_conditional_etag(monkeypatch):
     first = client.get("/api/jobs")
     second = client.get("/api/jobs", headers={"If-None-Match": first.headers["etag"]})
     queue.jobs.append({"id": "job-b", "status": "done", "phase": "done", "filenames": ["b.pdf"]})
+    queue.version += 1
     changed = client.get("/api/jobs", headers={"If-None-Match": first.headers["etag"]})
 
     assert first.status_code == 200
@@ -2675,6 +2768,9 @@ def test_read_endpoints_remain_available_during_active_indexing(monkeypatch, wor
 
         def list_jobs(self):
             return [{"id": "job-index", "status": "running", "phase": "indexing", "filenames": []}]
+
+        def state_version(self):
+            return 0
 
     processed_dir = workspace_tmp / "processed"
     processed_dir.mkdir()

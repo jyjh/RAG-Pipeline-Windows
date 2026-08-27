@@ -498,7 +498,7 @@ def _ingest_one_pdf(
     DocumentProcessor (one per process per config) to avoid reloading models.
     """
     from src.asset_store import ImageAssetStore
-    from src.pdf_registry import load_source_map, sha256_file, write_source_entry
+    from src.pdf_registry import sha256_file, source_entry_for, write_source_entry
 
     input_path = Path(input_path_str)
     file_name = input_path.name
@@ -518,11 +518,9 @@ def _ingest_one_pdf(
             source_size = None
             source_mtime_ns = None
         # Resume check is done in the main process before dispatch; re-check
-        # here defensively in case the source map changed concurrently.
-        existing_source_map = load_source_map(output_dir).get("documents", {})
-        if not isinstance(existing_source_map, dict):
-            existing_source_map = {}
-        existing_entry = existing_source_map.get(output_path.name)
+        # here defensively in case the source map changed concurrently. Point
+        # lookup: loading the entire map per PDF was O(N^2) over a corpus.
+        existing_entry = source_entry_for(output_dir, output_path.name)
         if (
             isinstance(existing_entry, dict)
             and str(existing_entry.get("source_hash") or "") == source_hash

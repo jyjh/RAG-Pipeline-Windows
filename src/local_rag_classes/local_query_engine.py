@@ -29,8 +29,8 @@ class LocalQueryEngine:
         *,
         asset_dir: str | Path | None = None,
         trust_path: str | Path | None = None,
-        model: str = "gemma4:26b",
-        embedding_model: str = "nomic-embed-text",
+        model: str = DEFAULT_LLM_MODEL,
+        embedding_model: str | None = None,
         embedding_batch_size: int | None = None,
         embedding_timeout: float | None = None,
         embedding_dim: int | None = None,
@@ -176,10 +176,10 @@ class LocalQueryEngine:
         # Dim + query prefix + engine construction are centralized in
         # EmbeddingSetup; a mismatch with an existing index is caught at query
         # time (see _ensure_compatible_dim).
-        from src.embeddings import EmbeddingSetup
+        from src.embeddings import EmbeddingSetup, configured_embedding_model
 
         setup = EmbeddingSetup(
-            embedding_model,
+            embedding_model or configured_embedding_model(),
             embedding_dim=embedding_dim,
             batch_size=embedding_batch_size,
             timeout=embedding_timeout,

@@ -145,8 +145,9 @@ def reset_local_model_cache() -> None:
 def resolve_local_model(preferred: str, *, vision: bool = False) -> str:
     """Map a (possibly cloud-named) model onto an installed local Ollama model.
 
-    Order: exact tag match > (vision only) the explicitly configured
-    ``[models].local_vision_model`` when installed > same base name
+    Order: exact tag match > the configured ``[models].local_llm_model`` /
+    ``local_vision_model`` knob (default ``qwen3:4b-instruct`` for chat, a
+    4 GB-GPU-sized substitute) when actually installed > same base name
     (``gemma4:26b`` -> ``gemma4``, ``gemma4:latest``) > for vision requests,
     any installed model whose name hints at vision capability
     (``qwen2.5vl``, ``llava``, ...). Returns ``preferred`` unchanged when

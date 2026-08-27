@@ -24,6 +24,8 @@ const state = {
   uploadDataDirty: true,
   pdfsRenderedUrl: "",
   jobsRenderedUrl: "",
+  pdfsFetchSeq: 0,
+  jobsFetchSeq: 0,
   indexLoaded: false,
   indexDirty: true,
   indexRenderedUrl: "",
@@ -62,6 +64,8 @@ const UPDATE_POLL_INTERVAL_MS = 5 * 60 * 1000;
 const RESTART_POLL_INTERVAL_MS = 1000;
 const RESTART_POLL_TIMEOUT_MS = 120000;
 const JOBS_ACTIVE_POLL_INTERVAL_MS = 2000;
+// Lower bound for server-configured poll intervals (see positiveInterval).
+const MIN_SERVER_POLL_INTERVAL_MS = 2000;
 const INDEX_STREAM_BATCH_SIZE = 250;
 const INDEX_CHILD_BATCH_SIZE = 100;
 const CHAT_AUTO_SCROLL_THRESHOLD = 120;
@@ -257,6 +261,23 @@ function stableJson(value) {
   } catch (_) {
     return String(value);
   }
+}
+
+function stableJsonHash(value) {
+  // Compact change-detection key for row patching. The full stableJson(item)
+  // string used to be stored in a data- attribute on every row; for index rows
+  // it includes whole chunk contents, which inflates the DOM and costs an
+  // O(payload) stringify per refresh. A length + double 32-bit FNV mix keeps
+  // change detection at negligible collision risk.
+  const text = stableJson(value);
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ code, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 + code, 0x85ebca6b) >>> 0;
+  }
+  return `${text.length}:${h1.toString(36)}:${h2.toString(36)}`;
 }
 
 async function errorFromResponse(response) {
@@ -1033,18 +1054,35 @@ function persistChatState() {
     chats = [active, ...chats.filter((chat) => chat.id !== active.id)];
   }
   state.chats = chats.slice(0, CHAT_HISTORY_LIMIT);
-  localStorage.setItem(
-    CHAT_STORAGE_KEY,
-    JSON.stringify({
-      activeChatId: state.activeChatId,
-      chats: state.chats.map((chat) => ({
-        ...chat,
-        messages: Array.isArray(chat.messages)
-          ? chat.messages.slice(-CHAT_MESSAGE_LIMIT)
-          : [],
-      })),
-    }),
-  );
+  const buildPayload = (stripRenderedHtml) => JSON.stringify({
+    activeChatId: state.activeChatId,
+    chats: state.chats.map((chat) => ({
+      ...chat,
+      messages: Array.isArray(chat.messages)
+        ? chat.messages.slice(-CHAT_MESSAGE_LIMIT).map((message) => {
+            if (!stripRenderedHtml) {
+              return message;
+            }
+            const { answerHtml, thinkingHtml, ...rest } = message;
+            return rest;
+          })
+        : [],
+    })),
+  });
+  try {
+    localStorage.setItem(CHAT_STORAGE_KEY, buildPayload(false));
+  } catch (error) {
+    // Persisted answers carry raw text AND rendered HTML (~2-3x per message),
+    // which can exceed the ~5MB localStorage budget on long histories. Retry
+    // once without the derived HTML (hydration falls back to plain text); a
+    // second failure is swallowed because persistence must never break an
+    // in-flight stream's cleanup path.
+    try {
+      localStorage.setItem(CHAT_STORAGE_KEY, buildPayload(true));
+    } catch (retryError) {
+      console.warn("Chat history not persisted (storage quota exceeded).", retryError);
+    }
+  }
 }
 
 function persistChatUiState() {
@@ -1268,7 +1306,12 @@ function applyChatConfig(config) {
 
 function positiveInterval(value, fallback) {
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  // Floor server-supplied intervals: a config typo (e.g. 100) would otherwise
+  // become a permanent 10 req/s poll per open tab.
+  return Math.max(parsed, MIN_SERVER_POLL_INTERVAL_MS);
 }
 
 function applyServerConfig(config) {
@@ -1378,7 +1421,7 @@ function updatePageControls({ total, offset, limit, label, prevButton, nextButto
 function patchTableRows(tbody, items, options) {
   const keyFor = options.keyFor;
   const createRow = options.createRow;
-  const renderKeyFor = options.renderKeyFor || ((item) => stableJson(item));
+  const renderKeyFor = options.renderKeyFor || ((item) => stableJsonHash(item));
   const existing = new Map();
   Array.from(tbody.children).forEach((row) => {
     const key = row.dataset.patchKey;
@@ -1814,7 +1857,7 @@ function pdfRowPatchKey(item) {
 }
 
 function pdfRowRenderKey(item, options = {}) {
-  return stableJson({ item, fake: Boolean(options.fake) });
+  return stableJsonHash({ item, fake: Boolean(options.fake) });
 }
 
 function patchPdfRow(item, options = {}) {
@@ -1901,9 +1944,13 @@ function createJobRow(job) {
     ? `<button type="button" class="danger" data-job-action="cancel" data-job-id="${escapeHtml(jobId)}">Cancel</button>`
     : "";
   const logTail = String(job.log_tail || "").trim();
+  const logLineCount = Number(job.log_line_count || 0);
   const logOpen = state.openJobLogIds.has(jobId) ? " open" : "";
-  const logBlock = logTail
-    ? `<details class="job-log" data-job-id="${escapeHtml(jobId)}"${logOpen}><summary>Log (${Number(job.log_line_count || 0)} lines)</summary><pre>${escapeHtml(logTail)}</pre></details>`
+  // The list response omits log_tail entirely (it made every 2s poll ship
+  // every visible job's whole tail); hydrateJobLogs fills open panels from
+  // GET /api/jobs/{id} instead.
+  const logBlock = (logTail || logLineCount)
+    ? `<details class="job-log" data-job-id="${escapeHtml(jobId)}"${logOpen}><summary>Log (${logLineCount} lines)</summary><pre>${escapeHtml(logTail)}</pre></details>`
     : "";
   const progressBlock = formatJobProgress(job);
   row.innerHTML = `
@@ -1914,7 +1961,47 @@ function createJobRow(job) {
     <td>${escapeHtml(job.error || "")}${logBlock}</td>
     <td><div class="job-actions">${cancelButton}</div></td>
   `;
+  row.dataset.jobStatus = String(job.status || "");
   return row;
+}
+
+const jobLogHydratedAt = new Map();
+
+async function hydrateJobLogs() {
+  // Fill empty log panels for open details elements from the job detail
+  // endpoint. Terminal jobs keep their fetched tail; active ones refresh at
+  // most every 5s so an open panel still tails a running ingest.
+  const now = Date.now();
+  els.jobsBody.querySelectorAll("details.job-log[data-job-id]").forEach((details) => {
+    if (!details.open || details.dataset.hydrating) {
+      return;
+    }
+    const jobId = details.dataset.jobId || "";
+    const pre = details.querySelector("pre");
+    if (!jobId || !pre) {
+      return;
+    }
+    const row = details.closest("tr");
+    const statusActive = Boolean(row) && ["queued", "running", "paused_for_queries"].includes(String(row.dataset.jobStatus || ""));
+    if (pre.textContent && !statusActive) {
+      return;
+    }
+    const last = jobLogHydratedAt.get(jobId) || 0;
+    if (pre.textContent && statusActive && now - last < 5000) {
+      return;
+    }
+    details.dataset.hydrating = "1";
+    requestJson(`/api/jobs/${encodeURIComponent(jobId)}`).then((job) => {
+      pre.textContent = String((job && job.log_tail) || "").trim();
+      const summary = details.querySelector("summary");
+      if (summary) {
+        summary.textContent = `Log (${Number((job && job.log_line_count) || 0)} lines)`;
+      }
+      jobLogHydratedAt.set(jobId, Date.now());
+    }).catch(() => {}).finally(() => {
+      delete details.dataset.hydrating;
+    });
+  });
 }
 
 function renderJobRows(jobs) {
@@ -1932,6 +2019,9 @@ async function refreshJobs(options = {}) {
     state.uploadDataDirty = true;
     return;
   }
+  // Stale-response token: a newer call (rapid paging, forced refresh) must
+  // keep an older slow response from overwriting the fresher table state.
+  const fetchSeq = ++state.jobsFetchSeq;
   try {
     const isAll = state.jobsPageSize === "all";
     state.jobsLimit = isAll ? 0 : (Number(state.jobsPageSize) || 10);
@@ -1942,8 +2032,12 @@ async function refreshJobs(options = {}) {
     });
     const url = `/api/jobs?${params}`;
     const data = await requestJson(url);
+    if (fetchSeq !== state.jobsFetchSeq) {
+      return;
+    }
     state.jobsLoaded = true;
     if (data.notModified && state.jobsRenderedUrl === url) {
+      hydrateJobLogs();
       return;
     }
     state.jobsTotal = data.total || 0;
@@ -1955,8 +2049,12 @@ async function refreshJobs(options = {}) {
     }
     renderJobRows(data.jobs || []);
     state.jobsRenderedUrl = url;
+    hydrateJobLogs();
     if (isAll) {
-      els.jobsPageLabel.textContent = `All ${state.jobsTotal} jobs`;
+      const shown = (data.jobs || []).length;
+      els.jobsPageLabel.textContent = shown < state.jobsTotal
+        ? `All ${shown} of ${state.jobsTotal} jobs`
+        : `All ${state.jobsTotal} jobs`;
       els.prevJobsPageButton.disabled = true;
       els.nextJobsPageButton.disabled = true;
     } else {
@@ -1971,8 +2069,16 @@ async function refreshJobs(options = {}) {
     }
     if (wasActive && !state.jobsActive) {
       markIndexDirty();
-      await refreshPdfs({ force: true });
-      await refreshHealth();
+      // Fire-and-forget: the full-corpus refetch must not serialize behind
+      // (or delay) the poll loop that noticed the transition, and a burst of
+      // finishing jobs would otherwise trigger it repeatedly back-to-back.
+      if (state.jobTransitionRefreshTimer) {
+        clearTimeout(state.jobTransitionRefreshTimer);
+      }
+      state.jobTransitionRefreshTimer = setTimeout(() => {
+        state.jobTransitionRefreshTimer = null;
+        refreshPdfs({ force: true }).then(refreshHealth).catch(() => {});
+      }, 1500);
     }
     if (wasActive !== state.jobsActive) {
       scheduleJobsPolling();
@@ -2016,6 +2122,8 @@ async function refreshPdfs(options = {}) {
     state.uploadDataDirty = true;
     return;
   }
+  // Stale-response token (see refreshJobs).
+  const fetchSeq = ++state.pdfsFetchSeq;
   try {
     const isAll = state.pdfPageSize === "all";
     state.pdfLimit = isAll ? 0 : (Number(state.pdfPageSize) || 10);
@@ -2026,6 +2134,9 @@ async function refreshPdfs(options = {}) {
     });
     const url = `/api/pdfs?${params}`;
     const data = await requestJson(url);
+    if (fetchSeq !== state.pdfsFetchSeq) {
+      return;
+    }
     state.pdfsLoaded = true;
     if (data.notModified && state.pdfsRenderedUrl === url) {
       return;
@@ -2038,7 +2149,10 @@ async function refreshPdfs(options = {}) {
     renderPdfRows(data.pdfs || []);
     state.pdfsRenderedUrl = url;
     if (isAll) {
-      els.pdfPageLabel.textContent = `All ${state.pdfTotal} PDFs`;
+      const shown = (data.pdfs || []).length;
+      els.pdfPageLabel.textContent = shown < state.pdfTotal
+        ? `All ${shown} of ${state.pdfTotal} PDFs`
+        : `All ${state.pdfTotal} PDFs`;
       els.prevPdfPageButton.disabled = true;
       els.nextPdfPageButton.disabled = true;
     } else {
@@ -2175,6 +2289,34 @@ function scheduleUpdatePolling() {
     clearInterval(state.updateTimer);
   }
   state.updateTimer = setInterval(refreshUpdateStatus, UPDATE_POLL_INTERVAL_MS);
+}
+
+function handleVisibilityChange() {
+  if (document.hidden) {
+    // Tear the timers down entirely so a background tab stops network traffic
+    // (previously the 2s active-job poll kept running for a whole ingest).
+    if (state.healthTimer) {
+      clearInterval(state.healthTimer);
+      state.healthTimer = null;
+    }
+    if (state.jobsTimer) {
+      clearInterval(state.jobsTimer);
+      state.jobsTimer = null;
+      state.jobsTimerIntervalMs = null;
+    }
+    if (state.updateTimer) {
+      clearInterval(state.updateTimer);
+      state.updateTimer = null;
+    }
+    return;
+  }
+  // Catch up immediately on return, then restore the normal cadence.
+  refreshHealth();
+  refreshJobs();
+  refreshUpdateStatus();
+  scheduleHealthPolling();
+  scheduleUpdatePolling();
+  scheduleJobsPolling();
 }
 
 function duplicateUploadMessage(detail) {
@@ -3184,7 +3326,7 @@ function renderIndexRows(rows) {
   const fragment = document.createDocumentFragment();
   rows.forEach((item) => {
     const recordId = String(item.id || "");
-    const renderKey = stableJson(item);
+    const renderKey = stableJsonHash(item);
     let row = existingTopRows.get(recordId);
     let rowReused = Boolean(row && row.dataset.renderKey === renderKey);
     if (!row || row.dataset.renderKey !== renderKey) {
@@ -3619,6 +3761,10 @@ function createAssetPreviewGrid(assets, options = {}) {
     const image = document.createElement("img");
     image.src = asset.url;
     image.alt = asset.description || fallbackAlt;
+    // Lists can embed many extracted page images; defer fetch/decode until
+    // near the viewport instead of loading every asset up front.
+    image.loading = "lazy";
+    image.decoding = "async";
     link.appendChild(image);
 
     const caption = document.createElement("span");
@@ -4816,3 +4962,4 @@ refreshUpdateStatus();
 scheduleHealthPolling();
 scheduleUpdatePolling();
 scheduleJobsPolling();
+document.addEventListener("visibilitychange", handleVisibilityChange);

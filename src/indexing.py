@@ -2,7 +2,6 @@
 import os
 
 from src.console import status as _progress_status
-from src.defaults import DEFAULT_EMBEDDING_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +11,10 @@ def run_indexing(
     db_dir: str,
     *,
     progress_enabled: bool = True,
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    # None resolves to [models].embedding_model (repo config.toml) at indexer
+    # construction so a bare `--mode index` can never embed with a different
+    # model than the one the live index was built with.
+    embedding_model: str | None = None,
     embedding_batch_size: int | None = None,
     embedding_timeout: float | None = None,
     embedding_dim: int | None = None,

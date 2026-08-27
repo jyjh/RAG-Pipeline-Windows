@@ -29,9 +29,11 @@ from src.console import iter_with_progress as _iter_with_progress
 from src.defaults import (
     DEFAULT_CONTEXT_TOKEN_FRACTION,
     DEFAULT_CONTEXT_WINDOW,
+    DEFAULT_LLM_MODEL,
     DEFAULT_LLM_TIMEOUT,
     DEFAULT_NUM_PREDICT,
     DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL,
+    DEFAULT_OLLAMA_KEEP_ALIVE,
     DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
     DEFAULT_PLANNER_MAX_QUERIES,
     DEFAULT_PLANNER_MODEL,
@@ -153,6 +155,13 @@ EAGER_CONTEXT_SUFFIX = (
 
 _ACTIVE_OLLAMA_HOST: str | None = None
 
+# Ollama keep_alive for local chat/planner payloads. Resolution order:
+# ``LOCAL_RAG_OLLAMA_KEEP_ALIVE`` env > this global (seeded by the web app from
+# its discovered config, mirroring _ACTIVE_OLLAMA_HOST) > bare ``load_config()``
+# (no path = typed defaults, which carry DEFAULT_OLLAMA_KEEP_ALIVE). Empty
+# string = defer to the Ollama server default (5m unload).
+_ACTIVE_OLLAMA_KEEP_ALIVE: str | None = None
+
 # Shared host normalization + pull-command hint live in llm_api alongside the
 # backend selector; aliases keep the historical module-level names working for
 # the split-class proxy and tests.
@@ -237,6 +246,20 @@ def probe_ollama_endpoints(hosts: list[str], timeout: float = 3.0) -> str | None
     return None
 
 
+def _ollama_keep_alive() -> str:
+    env = os.environ.get("LOCAL_RAG_OLLAMA_KEEP_ALIVE")
+    if env is not None:
+        return env.strip()
+    if _ACTIVE_OLLAMA_KEEP_ALIVE is not None:
+        return _ACTIVE_OLLAMA_KEEP_ALIVE.strip()
+    try:
+        from src.config import load_config
+
+        return str(load_config().chat.ollama_keep_alive or "").strip()
+    except Exception:
+        return ""
+
+
 def _ollama_chat(
     *,
     model: str,
@@ -254,6 +277,12 @@ def _ollama_chat(
         "options": options,
         "stream": stream,
     }
+    # Pin the model in server memory across requests: Ollama unloads after 5m
+    # by default, and on a small GPU a cold reload can cost minutes -- long
+    # enough for the next chat request to exceed its timeout.
+    keep_alive = _ollama_keep_alive()
+    if keep_alive:
+        payload["keep_alive"] = keep_alive
     if tools:
         payload["tools"] = tools
     if stream:

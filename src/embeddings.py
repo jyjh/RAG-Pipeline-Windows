@@ -5,8 +5,10 @@ import hashlib
 import logging
 import os
 import socket
+import threading
 import urllib3
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 from src import llm_api
@@ -57,7 +59,7 @@ def resolve_embeddings_backend() -> str:
         return env
     from src.config import load_config
 
-    value = (load_config().embeddings.backend or "").strip().lower()
+    value = (_embeddings_config().embeddings.backend or "").strip().lower()
     if value not in _VALID_EMBEDDINGS_BACKENDS:
         _status(
             f"Unknown [embeddings].backend={value!r}; ignoring it and following "
@@ -86,10 +88,33 @@ def configured_embedding_model() -> str:
     try:
         from src.config import load_config
 
-        value = str(load_config().models.embedding_model or "").strip()
+        value = str(_embeddings_config().models.embedding_model or "").strip()
     except Exception:
         value = ""
     return value or DEFAULT_EMBEDDING_MODEL
+
+
+def _embeddings_config():
+    """Typed config discovered the same way the web layer discovers it.
+
+    A bare ``load_config()`` (no path) intentionally returns pure defaults --
+    it never auto-discovers ``config.toml``. The web app wraps discovery in
+    ``_default_config_path()``; embeddings consumers must too, or an instance
+    configured for all-minilm/384 silently queries with nomic/768 and every
+    retrieval degrades to dimension-mismatch errors.
+    """
+    from src.config import load_config
+
+    return load_config(default_config_path())
+
+
+def default_config_path() -> Path:
+    """Repo ``config.toml``, honoring ``RAG_PIPELINE_CONFIG`` (env override)."""
+    raw = os.environ.get("RAG_PIPELINE_CONFIG")
+    if raw:
+        path = Path(raw)
+        return path if path.is_absolute() else Path(__file__).resolve().parents[1] / raw
+    return Path(__file__).resolve().parents[1] / "config.toml"
 
 
 def resolve_embedding_dim(explicit: int | None = None) -> int:
@@ -103,9 +128,7 @@ def resolve_embedding_dim(explicit: int | None = None) -> int:
     if explicit is not None:
         return max(1, int(explicit))
     try:
-        from src.config import load_config
-
-        return max(1, int(load_config().models.embedding_dim))
+        return max(1, int(_embeddings_config().models.embedding_dim))
     except Exception:
         from src.defaults import DEFAULT_EMBEDDING_DIM
 
@@ -131,10 +154,8 @@ class EmbeddingSetup:
             "nomic-embed-text" if model == "nomic-ai/nomic-embed-text-v1.5" else model
         )
         self.dim = resolve_embedding_dim(embedding_dim)
-        self.engine = EmbeddingEngine(
-            model_name=self.model,
-            ollama_batch_size=batch_size,
-            ollama_timeout=timeout,
+        self.engine = _shared_embedding_engine(
+            self.model, batch_size=batch_size, timeout=timeout
         )
         self.batch_size = getattr(
             self.engine, "ollama_batch_size", None
@@ -145,6 +166,39 @@ class EmbeddingSetup:
     @property
     def backend_label(self) -> str:
         return "SoCLAaS API" if embeddings_use_soclaas() else "Ollama"
+
+
+# Query/indexer construction paths build an EmbeddingSetup per request, which
+# used to throw away the engine's (large) embedding LRU every time. Engines are
+# safe to share across threads (the only mutable state, the LRU, is locked
+# below), so keep a small per-config pool alive instead.
+_SHARED_ENGINES: "OrderedDict[tuple[Any, str, str, str], EmbeddingEngine]" = OrderedDict()
+_SHARED_ENGINES_LOCK = threading.Lock()
+_SHARED_ENGINES_MAX = 8
+
+
+def _shared_embedding_engine(
+    model: str, *, batch_size: int | str | None, timeout: float | None
+) -> "EmbeddingEngine":
+    # The class itself is part of the key: tests monkeypatch
+    # src.embeddings.EmbeddingEngine with fakes, and a cached real engine must
+    # not leak past the patch (and vice versa).
+    engine_cls = globals().get("EmbeddingEngine")
+    key = (engine_cls, str(model), str(batch_size), str(timeout))
+    with _SHARED_ENGINES_LOCK:
+        engine = _SHARED_ENGINES.get(key)
+        if engine is None:
+            engine = engine_cls(
+                model_name=model,
+                ollama_batch_size=batch_size,
+                ollama_timeout=timeout,
+            )
+            _SHARED_ENGINES[key] = engine
+            while len(_SHARED_ENGINES) > _SHARED_ENGINES_MAX:
+                _SHARED_ENGINES.popitem(last=False)
+        else:
+            _SHARED_ENGINES.move_to_end(key)
+        return engine
 
 
 def _resolve_ollama_hosts(config_hosts: list[str] | None = None) -> list[str]:
@@ -222,7 +276,7 @@ class EmbeddingEngine:
         # at corpus scale (embedding throughput) discoverable and tunable.
         from src.config import load_config
 
-        emb_cfg = load_config().embeddings
+        emb_cfg = _embeddings_config().embeddings
 
         self.ollama_batch_size = as_positive_int(
             ollama_batch_size
@@ -271,13 +325,16 @@ class EmbeddingEngine:
             emb_cfg.cache_max_entries,
         )
         self._cache: OrderedDict[tuple[int, int, str], Any] = OrderedDict()
+        # Engines are shared across request threads (see _shared_embedding_engine);
+        # OrderedDict has no atomic compound ops, so guard every cache mutation.
+        self._cache_lock = threading.Lock()
 
         # Config-sourced multi-replica hosts/concurrency, passed explicitly to
         # the resolvers (env vars still take precedence inside them).
         self._config_hosts = list(emb_cfg.hosts or [])
         self._config_concurrency = int(emb_cfg.concurrency or 1)
 
-        self.native_embeddings = load_config().models.native_embeddings
+        self.native_embeddings = _embeddings_config().models.native_embeddings
         self._native_model = None
 
         if model_name == "nomic-ai/nomic-embed-text-v1.5":
@@ -340,11 +397,13 @@ class EmbeddingEngine:
 
         for i, text in enumerate(texts):
             key = self._cache_key(text, truncate_dim, prefix)
-            cached = self._cache.get(key)
+            with self._cache_lock:
+                cached = self._cache.get(key)
+                if cached is not None:
+                    # LRU: mark as recently used so the entry is not evicted while
+                    # still being queried.
+                    self._cache.move_to_end(key)
             if cached is not None:
-                # LRU: mark as recently used so the entry is not evicted while
-                # still being queried.
-                self._cache.move_to_end(key)
                 results[i] = cached
             else:
                 to_compute_indices.append(i)
@@ -361,11 +420,12 @@ class EmbeddingEngine:
 
             for j, idx in enumerate(to_compute_indices):
                 key = self._cache_key(texts[idx], truncate_dim, prefix)
-                self._cache[key] = truncated[j]
-                # Enforce the cap after each insert. Eviction is FIFO by default;
-                # combined with move_to_end on hit this is true LRU.
-                while len(self._cache) > self.max_cache_entries:
-                    self._cache.popitem(last=False)
+                with self._cache_lock:
+                    self._cache[key] = truncated[j]
+                    # Enforce the cap after each insert. Eviction is FIFO by default;
+                    # combined with move_to_end on hit this is true LRU.
+                    while len(self._cache) > self.max_cache_entries:
+                        self._cache.popitem(last=False)
                 results[idx] = truncated[j]
 
         return np.array(results)

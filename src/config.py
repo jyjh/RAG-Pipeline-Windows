@@ -38,11 +38,13 @@ from src.defaults import (
     DEFAULT_FORMULA_ENRICHMENT,
     DEFAULT_LLM_MODEL,
     DEFAULT_LLM_TIMEOUT,
+    DEFAULT_LOCAL_LLM_MODEL,
     DEFAULT_NUM_PREDICT,
     DEFAULT_OCR_BACKEND,
     DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
     DEFAULT_OCR_FORCE_FULL_PAGE,
     DEFAULT_OCR_LANGS,
+    DEFAULT_OLLAMA_KEEP_ALIVE,
     DEFAULT_PDF_PARSER_MODE,
     DEFAULT_PLANNER_MAX_QUERIES,
     DEFAULT_PLANNER_MODEL,
@@ -82,10 +84,11 @@ class PathsConfig:
 class ModelConfig:
     llm_model: str = DEFAULT_LLM_MODEL
     # Chat model used when the LOCAL Ollama backend is active (cloud
-    # unavailable). Pins a small local substitute explicitly (e.g.
-    # "qwen2.5:1.5b") instead of relying on base-name matching against the
-    # cloud tag ("gemma4:26b" -> whatever "gemma4..." is installed).
-    local_llm_model: str = ""
+    # unavailable). Defaults to a 4 GB-GPU-sized substitute (qwen3:4b-instruct)
+    # so the local fallback never base-name-matches the cloud tag onto a model
+    # this hardware cannot serve (gemma4:26b -> gemma4:latest, 9.6 GB). Set to
+    # a different installed tag to override.
+    local_llm_model: str = DEFAULT_LOCAL_LLM_MODEL
     vision_model: str = DEFAULT_VISION_MODEL
     # Vision model used when the LOCAL Ollama backend is active (cloud
     # unavailable). ``vision_model`` below names the cloud-side model; this
@@ -166,6 +169,11 @@ class ChatConfig:
     temperature: float = DEFAULT_TEMPERATURE
     max_k: int = DEFAULT_SAMPLER_TOP_K
     context_window: int = DEFAULT_CONTEXT_WINDOW
+    # Ollama-only: how long the local server keeps the chat model loaded
+    # between requests (Ollama default is 5m; a cold reload on a 4 GB GPU
+    # costs minutes). Passed as the /api/chat ``keep_alive`` field; an empty
+    # string falls back to the Ollama default. Ignored by the SoCLAaS backend.
+    ollama_keep_alive: str = DEFAULT_OLLAMA_KEEP_ALIVE
     system_prompt: str = ""
     planner_model: str = DEFAULT_PLANNER_MODEL
     planner_enabled: bool = True

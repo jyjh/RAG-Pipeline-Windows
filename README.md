@@ -125,7 +125,7 @@ The final command should print `768` (nomic-embed-text dimension). To embed thro
 
 #### Dormant local Ollama chat fallback (optional)
 
-For fully-offline chat/vision operation, set `[llm_api].backend = "ollama"` (or `LLM_BACKEND=ollama`) and point `[ollama].host` at a local Ollama server. Install Ollama, start `ollama serve`, and pull the models you want to use (e.g. `ollama pull gemma4`, `qwen2.5vl:7b`; `nomic-embed-text` is already required for the default local embeddings). Chat/vision transports then route to that local server instead of the SoCLAaS API. This path is not used by default.
+For fully-offline chat/vision operation, set `[llm_api].backend = "ollama"` (or `LLM_BACKEND=ollama`) and point `[ollama].host` at a local Ollama server. Install Ollama, start `ollama serve`, and pull the models you want to use. The default local chat/planner substitute is `qwen3:4b-instruct` (`ollama pull qwen3:4b-instruct`; ~2.5 GB at Q4_K_M with native tool-calling, sized for a 4 GB GPU) — without it, the cloud tag `gemma4:26b` base-name-matches to `gemma4:latest` (gemma4 e4b, 9.6 GB), which no consumer GPU of this class can serve. For vision, `local_vision_model = "qwen2.5vl:3b"` (`ollama pull qwen2.5vl:3b`); `nomic-embed-text` is already required for the default local embeddings. Chat/vision transports then route to that local server instead of the SoCLAaS API. This path is not used by default.
 
 #### Scaling embeddings across multiple Ollama replicas
 

@@ -416,6 +416,14 @@ input[type="file"] {
   border-bottom: 0;
 }
 
+/* Let the browser skip layout/paint work for rows scrolled far out of view.
+   Cheap mitigation for the "All" page-size option over a large corpus; the
+   intrinsic size keeps the scrollbar roughly stable before a row renders. */
+.data-table tbody tr {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 44px;
+}
+
 .pdf-untagged-row {
   background: #fff0f0;
 }

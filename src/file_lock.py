@@ -26,6 +26,7 @@ import portalocker
 # Lock files are dotfiles placed alongside the resource they protect.
 INDEX_LOCK_FILENAME = ".index.lock"
 REGISTRY_LOCK_FILENAME = ".registry.lock"
+ASSET_LOCK_FILENAME = ".assets.lock"
 
 # How long to wait for a contended lock before giving up. A long-running
 # indexing subprocess legitimately holds the index lock for the whole build;
@@ -107,5 +108,23 @@ def acquire_registry_lock(
 ) -> Iterator[object]:
     """Exclusive lock protecting registry / source-map mutations under ``data_dir``."""
     lock_path = _lock_path(data_dir, REGISTRY_LOCK_FILENAME)
+    with _acquire(lock_path, timeout=timeout) as handle:
+        yield handle
+
+
+@contextlib.contextmanager
+def acquire_asset_lock(
+    asset_dir: str | Path,
+    *,
+    timeout: float = DEFAULT_LOCK_TIMEOUT,
+) -> Iterator[object]:
+    """Exclusive lock protecting the shared ``assets_manifest.json``.
+
+    Ingestion workers run as separate OS processes, each rewriting the same
+    manifest; without this lock two concurrent workers can drop each other's
+    entries (last writer wins). Hold it across read-modify-write spans and the
+    final atomic replace, not just the write.
+    """
+    lock_path = _lock_path(asset_dir, ASSET_LOCK_FILENAME)
     with _acquire(lock_path, timeout=timeout) as handle:
         yield handle

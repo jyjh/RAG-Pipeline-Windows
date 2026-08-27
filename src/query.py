@@ -1,5 +1,5 @@
 import logging
-from src.defaults import DEFAULT_LLM_MODEL, DEFAULT_EMBEDDING_MODEL
+from src.defaults import DEFAULT_LLM_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +11,7 @@ class QueryEngine:
         asset_dir: str | None = None,
         trust_path: str | None = None,
         model=DEFAULT_LLM_MODEL,
-        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        embedding_model: str | None = None,
         embedding_batch_size: int | None = None,
         embedding_timeout: float | None = None,
         embedding_dim: int | None = None,

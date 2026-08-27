@@ -63,6 +63,7 @@ from src.defaults import (
     DEFAULT_LLM_TIMEOUT,
     DEFAULT_NUM_PREDICT,
     DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL,
+    DEFAULT_OLLAMA_KEEP_ALIVE,
     DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS,
     DEFAULT_PLANNER_MAX_QUERIES,
     DEFAULT_PLANNER_MODEL,
@@ -92,6 +93,7 @@ from src.local_rag import (
     update_index_manifest_sources,
     write_index_manifest,
 )
+from src import local_rag as _local_rag_module
 from src.index_overrides import (
     clear_overrides_for_sources,
     edited_record_ids,
@@ -99,7 +101,14 @@ from src.index_overrides import (
     persist_index_deletions,
     persist_index_edit,
 )
-from src.pdf_registry import PdfRegistry, load_source_map, remove_source_entries_by_hash, sha256_file, source_map_path
+from src.pdf_registry import (
+    PdfRegistry,
+    load_source_map,
+    registry_state_version,
+    remove_source_entries_by_hash,
+    sha256_file,
+    source_map_state_version,
+)
 from src import auto_tag
 from src.auto_tag import AutoTagInput
 from src.reliability import (
@@ -438,6 +447,15 @@ def _nonempty_str(value: Any, default: str) -> str:
     return text or default
 
 
+# Hard caps for the UI's opt-in "All" page size (limit<=0). Unbounded "All"
+# responses let one tab pull every job/PDF/summary row -- with full chunk text
+# for summaries -- on every poll tick, so each endpoint clamps to a ceiling
+# that keeps the response bounded while still covering the useful range.
+JOBS_MAX_PAGE_SIZE = 500  # == MAX_JOB_HISTORY: "All" still covers all retained jobs
+PDFS_MAX_PAGE_SIZE = 500
+INDEX_SUMMARIES_MAX_PAGE_SIZE = 2000
+
+
 def _page_slice(rows: list[dict[str, Any]], *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
     total = len(rows)
     offset = max(0, int(offset))
@@ -556,6 +574,9 @@ def _load_chat_config(config_path: Path | None = None) -> dict[str, Any]:
 
     return {
         "system_prompt": str(chat.system_prompt or DEFAULT_SYSTEM_PROMPT),
+        # Cloud-side chat model name ([models].llm_model); the local backend
+        # substitutes it via llm_api.resolve_local_model at call time.
+        "llm_model": str(cfg.models.llm_model or DEFAULT_LLM_MODEL),
         "context_window": _positive_int(
             chat.context_window,
             DEFAULT_CONTEXT_WINDOW,
@@ -580,6 +601,10 @@ def _load_chat_config(config_path: Path | None = None) -> dict[str, Any]:
             ollama.chat_max_lost_health_checks,
             DEFAULT_OLLAMA_CHAT_MAX_LOST_HEALTH_CHECKS,
         ),
+        # "" = defer to the Ollama server default (5m unload).
+        "ollama_keep_alive": str(
+            DEFAULT_OLLAMA_KEEP_ALIVE if chat.ollama_keep_alive is None else chat.ollama_keep_alive
+        ).strip(),
         "planner_model": str(chat.planner_model or DEFAULT_PLANNER_MODEL),
         "planner_enabled": _bool_value(chat.planner_enabled, DEFAULT_PLANNER_ENABLED),
         "planner_max_queries": _positive_int(
@@ -644,6 +669,11 @@ def _load_indexing_config(config_path: Path | None = None) -> dict[str, Any]:
 SERVER_CONFIG = _load_server_config()
 API_KEYS_CONFIG = _load_api_keys_config()
 CHAT_CONFIG = _load_chat_config()
+# The Ollama chat payloads read keep_alive from src.local_rag's module global
+# (bare load_config() has no config-path discovery), so seed it from the
+# discovered config exactly once at startup, mirroring how CHAT_CONFIG itself
+# is the discovered snapshot of [chat].
+_local_rag_module._ACTIVE_OLLAMA_KEEP_ALIVE = CHAT_CONFIG["ollama_keep_alive"]
 INGESTION_CONFIG = _load_ingestion_config()
 UPLOADS_CONFIG = _load_uploads_config()
 INDEXING_CONFIG = _load_indexing_config()
@@ -936,13 +966,80 @@ def _find_resumable_staged_dir(live_db_dir: str | Path) -> Path | None:
             data = _json.loads(checkpoint.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if isinstance(data, dict) and isinstance(data.get("completed_files"), list):
+        if isinstance(data, dict) and isinstance(data.get("completed_files"), list) and data.get("completed_files"):
+            # An empty completed_files list means the build never finished its
+            # first checkpoint interval, so there is nothing to resume -- the
+            # indexer would restart the build from scratch anyway. Treating the
+            # dir as non-resumable also lets _gc_staged_build_dirs reclaim it.
             candidates.append(entry)
     if not candidates:
         return None
     # Most recently modified wins (ties broken by name for determinism).
     candidates.sort(key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
     return candidates[0]
+
+
+# A staged dir with no resumable progress is only worth deleting once it is
+# clearly abandoned; the grace window also keeps a just-created (pre-first-
+# checkpoint) dir safe if the GC ever ran while a build was being set up.
+STAGED_BUILD_GC_MIN_AGE_SECONDS = 600.0
+
+
+def _staged_build_checkpoint(entry: Path) -> dict[str, Any] | None:
+    """Parse a staged build dir's checkpoint; None when missing/corrupt/empty."""
+    checkpoint = entry / _STAGED_CHECKPOINT_FILENAME
+    if not checkpoint.exists():
+        return None
+    try:
+        data = json.loads(checkpoint.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("completed_files"), list):
+        return None
+    if not data["completed_files"]:
+        return None
+    return data
+
+
+def _gc_staged_build_dirs(live_db_dir: str | Path, *, min_age_seconds: float = STAGED_BUILD_GC_MIN_AGE_SECONDS) -> int:
+    """Delete abandoned staged index-build dirs, reclaiming their disk space.
+
+    Every crash/OOM/kill before the first checkpointed file used to leave a
+    ``.index_build_<hex>`` dir behind forever, each sized like a full index
+    build (the live repo carried a 217MB one). Runs once at startup, before
+    job recovery re-enqueues any builds, so no live build can be swept. A dir
+    survives only when it holds a checkpoint with completed files -- i.e. real
+    resumable work. ``.index_preserve_<hex>`` aside-dirs from an interrupted
+    publish are also collected: they are only meaningful to the publish that
+    created them, and that publish is gone by definition at startup.
+    """
+    parent = Path(live_db_dir).parent
+    if not parent.is_dir():
+        return 0
+    now = time.time()
+    removed = 0
+    try:
+        candidates = list(parent.iterdir())
+    except OSError:
+        return 0
+    for entry in candidates:
+        if not entry.is_dir():
+            continue
+        if not (entry.name.startswith(".index_build_") or entry.name.startswith(".index_preserve_")):
+            continue
+        try:
+            age = now - entry.stat().st_mtime
+        except OSError:
+            continue
+        if age < min_age_seconds:
+            continue
+        if entry.name.startswith(".index_build_") and _staged_build_checkpoint(entry) is not None:
+            # Resumable progress -- leave it for the next build to resume.
+            continue
+        logger.warning("Removing abandoned staged index dir %s (%.0f min old).", entry.name, age / 60.0)
+        shutil.rmtree(entry, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 def _remove_path(path: Path) -> None:
@@ -1879,7 +1976,13 @@ def list_index_summary_rows(
     db_dir: Path | None = None,
 ) -> dict[str, Any]:
     offset = max(0, int(offset))
-    resolved_limit = None if int(limit) <= 0 else min(max(1, int(limit)), 200)
+    raw_limit = int(limit)
+    if raw_limit <= 0:
+        # The UI's opt-in "All" mode: serve a large bounded page instead of the
+        # entire hierarchy (which ships full chunk text per row).
+        resolved_limit: int | None = INDEX_SUMMARIES_MAX_PAGE_SIZE
+    else:
+        resolved_limit = min(max(1, raw_limit), 200)
     query = str(search or "").strip()
 
     try:
@@ -2531,6 +2634,12 @@ def apply_auto_tag_decisions(
 # --------------------------------------------------------------------------- #
 
 _AUTO_TAG_LOCK = threading.Lock()
+# Upload-triggered auto-tag runs are not exclusive (manual sweeps are), so a
+# rapid burst of uploads would otherwise spawn one LLM-calling thread per
+# event, all contending for the registry lock and the shared LLM backend.
+# A bounded semaphore queues the excess instead.
+_AUTO_TAG_MAX_CONCURRENT_RUNS = 2
+_AUTO_TAG_RUN_SLOTS = threading.BoundedSemaphore(_AUTO_TAG_MAX_CONCURRENT_RUNS)
 # Status of the LATEST manual sweep (POST /api/pdfs/trust/auto-tag); also set
 # by upload-triggered runs. Purely informational for the UI/status endpoint.
 _AUTO_TAG_STATE: dict[str, Any] = {
@@ -2646,7 +2755,14 @@ def _schedule_auto_tag(items: list[dict[str, Any]], *, exclusive: bool = False) 
                     "last_error": "",
                 }
             )
-    thread = threading.Thread(target=_run_auto_tag, args=(items,), daemon=True, name="auto-tag")
+
+    def _run_with_slot_bound() -> None:
+        # Blocking acquire: excess runs wait here (threads are cheap) instead
+        # of stampeding the LLM backend concurrently.
+        with _AUTO_TAG_RUN_SLOTS:
+            _run_auto_tag(items)
+
+    thread = threading.Thread(target=_run_with_slot_bound, args=(), daemon=True, name="auto-tag")
     thread.start()
     return True
 
@@ -2823,7 +2939,66 @@ def _index_manifest_stats(
     return {}
 
 
-_MARKDOWN_QUALITY_CACHE = BoundedLRU(maxsize=2048)
+_MARKDOWN_QUALITY_CACHE = BoundedLRU(maxsize=8192)
+# Quality stats are a pure function of a file's (mtime, size) signature, so a
+# signature-keyed on-disk cache lets cold starts and corpus-wide listing views
+# skip re-reading and regex-scanning every processed markdown file.
+_MARKDOWN_QUALITY_PERSIST_LOCK = threading.Lock()
+_MARKDOWN_QUALITY_PERSIST: dict[Path, dict[str, list[Any]]] = {}
+_MARKDOWN_QUALITY_PERSIST_DIRTY = 0
+_MARKDOWN_QUALITY_PERSIST_LAST_WRITE = 0.0
+_MARKDOWN_QUALITY_PERSIST_FLUSH_DIRTY = 64
+_MARKDOWN_QUALITY_PERSIST_FLUSH_SECONDS = 10.0
+
+
+def _markdown_quality_persist_path(root_dir: Path) -> Path:
+    return root_dir / "data" / ".markdown_quality_cache.json"
+
+
+def _markdown_quality_persist_payload(cache_path: Path) -> dict[str, list[Any]]:
+    loaded = _MARKDOWN_QUALITY_PERSIST.get(cache_path)
+    if loaded is None:
+        try:
+            raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = None
+        files = raw.get("files", {}) if isinstance(raw, dict) else {}
+        loaded = {
+            str(path): entry
+            for path, entry in files.items()
+            if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[1], dict)
+        }
+        _MARKDOWN_QUALITY_PERSIST[cache_path] = loaded
+    return loaded
+
+
+def _markdown_quality_persist_lookup(cache_path: Path, cache_key: str, signature: str) -> dict[str, Any] | None:
+    with _MARKDOWN_QUALITY_PERSIST_LOCK:
+        entry = _markdown_quality_persist_payload(cache_path).get(cache_key)
+    if not isinstance(entry, list) or len(entry) != 2 or entry[0] != signature:
+        return None
+    result = entry[1]
+    return result if isinstance(result, dict) else None
+
+
+def _markdown_quality_persist_store(cache_path: Path, cache_key: str, signature: str, result: dict[str, Any]) -> None:
+    global _MARKDOWN_QUALITY_PERSIST_DIRTY, _MARKDOWN_QUALITY_PERSIST_LAST_WRITE
+    with _MARKDOWN_QUALITY_PERSIST_LOCK:
+        payload = _markdown_quality_persist_payload(cache_path)
+        payload[cache_key] = [signature, dict(result)]
+        _MARKDOWN_QUALITY_PERSIST_DIRTY += 1
+        now = time.monotonic()
+        if (
+            _MARKDOWN_QUALITY_PERSIST_DIRTY < _MARKDOWN_QUALITY_PERSIST_FLUSH_DIRTY
+            and now - _MARKDOWN_QUALITY_PERSIST_LAST_WRITE < _MARKDOWN_QUALITY_PERSIST_FLUSH_SECONDS
+        ):
+            return
+        try:
+            write_json_atomic(cache_path, {"version": 1, "files": payload})
+            _MARKDOWN_QUALITY_PERSIST_DIRTY = 0
+            _MARKDOWN_QUALITY_PERSIST_LAST_WRITE = now
+        except OSError:
+            logger.debug("Failed to persist markdown quality cache.", exc_info=True)
 
 
 def _markdown_quality(processed_markdown_path: str, *, root_dir: Path = ROOT_DIR) -> dict[str, Any]:
@@ -2839,6 +3014,11 @@ def _markdown_quality(processed_markdown_path: str, *, root_dir: Path = ROOT_DIR
     cached = _MARKDOWN_QUALITY_CACHE.get(cache_key)
     if cached is not None and cached[0] == signature:
         return dict(cached[1])
+    persist_path = _markdown_quality_persist_path(root_dir)
+    persisted = _markdown_quality_persist_lookup(persist_path, cache_key, f"{stat.st_mtime_ns}:{stat.st_size}")
+    if persisted is not None:
+        _MARKDOWN_QUALITY_CACHE[cache_key] = (signature, dict(persisted))
+        return dict(persisted)
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -2852,6 +3032,7 @@ def _markdown_quality(processed_markdown_path: str, *, root_dir: Path = ROOT_DIR
         "equation_markers": len(re.findall(r"(?<!\\)\$[^$\n]{1,160}(?<!\\)\$", text)),
     }
     _MARKDOWN_QUALITY_CACHE[cache_key] = (signature, dict(result))
+    _markdown_quality_persist_store(persist_path, cache_key, f"{stat.st_mtime_ns}:{stat.st_size}", result)
     return result
 
 
@@ -2944,6 +3125,61 @@ def _pdf_entry_for_response(
     }
 
 
+def _pdf_source_fields(
+    *,
+    registry_path: Path | None = None,
+    processed_dir: Path | None = None,
+) -> dict[str, dict[str, str]]:
+    """Merge registry and source-map entries into lightweight rows keyed by hash.
+
+    This does no per-document file I/O; callers resolve paths and compute
+    quality only for the rows they actually return.
+    """
+    registry_path = registry_path or PDF_REGISTRY_PATH
+    processed_dir = processed_dir or PROCESSED_DIR
+    fields: dict[str, dict[str, str]] = {}
+
+    payload = PdfRegistry(registry_path).load()
+    for source_hash, entry in payload.get("pdfs", {}).items():
+        if not isinstance(entry, dict):
+            continue
+        fields[str(source_hash)] = {
+            "filename": str(entry.get("filename", "")),
+            "status": str(entry.get("status", "")),
+            "upload_path": str(entry.get("upload_path", "")),
+            "processed_markdown_path": str(entry.get("processed_markdown_path", "")),
+            "updated_at": str(entry.get("updated_at", "")),
+            "last_interrupted_at": str(entry.get("last_interrupted_at", "")),
+            "last_interrupted_job_id": str(entry.get("last_interrupted_job_id", "")),
+            "last_error": str(entry.get("last_error", "")),
+        }
+
+    source_map = load_source_map(processed_dir)
+    for entry in source_map.get("documents", {}).values():
+        if not isinstance(entry, dict):
+            continue
+        source_hash = str(entry.get("source_hash", ""))
+        if not source_hash:
+            continue
+        current = fields.get(source_hash, {})
+        fields[source_hash] = {
+            "filename": str(current.get("filename") or entry.get("source_pdf_name", "")),
+            "status": str(current.get("status") or "indexed"),
+            "upload_path": str(current.get("upload_path") or ""),
+            "source_pdf_path": str(entry.get("source_pdf_path", "")),
+            "processed_markdown_path": str(entry.get("processed_markdown_path", "")),
+            "updated_at": str(entry.get("updated_at", current.get("updated_at", ""))),
+            "last_interrupted_at": str(current.get("last_interrupted_at", "")),
+            "last_interrupted_job_id": str(current.get("last_interrupted_job_id", "")),
+            "last_error": str(current.get("last_error", "")),
+        }
+
+    for item in fields.values():
+        raw_path = str(item.get("upload_path") or item.get("source_pdf_path") or "")
+        item["filename"] = str(item.get("filename") or "") or Path(raw_path).name
+    return fields
+
+
 def list_pdf_documents(
     *,
     search: str = "",
@@ -2954,64 +3190,24 @@ def list_pdf_documents(
     root_dir: Path = ROOT_DIR,
     data_dir: Path = DATA_DIR,
 ) -> dict[str, Any]:
-    registry_path = registry_path or PDF_REGISTRY_PATH
-    processed_dir = processed_dir or PROCESSED_DIR
-    entries: dict[str, dict[str, Any]] = {}
     manifest = _load_index_manifest(DB_DIR)
     trust_payload = _load_trust_registry()
     trust_documents = trust_payload.get("documents", {}) if isinstance(trust_payload.get("documents"), dict) else {}
 
-    payload = PdfRegistry(registry_path).load()
-    for source_hash, entry in payload.get("pdfs", {}).items():
-        if not isinstance(entry, dict):
-            continue
-        entries[str(source_hash)] = _pdf_entry_for_response(
-            source_hash=str(source_hash),
-            filename=str(entry.get("filename", "")),
-            status=str(entry.get("status", "")),
-            upload_path=str(entry.get("upload_path", "")),
-            processed_markdown_path=str(entry.get("processed_markdown_path", "")),
-            updated_at=str(entry.get("updated_at", "")),
-            last_interrupted_at=str(entry.get("last_interrupted_at", "")),
-            last_interrupted_job_id=str(entry.get("last_interrupted_job_id", "")),
-            last_error=str(entry.get("last_error", "")),
-            root_dir=root_dir,
-            data_dir=data_dir,
-        )
+    fields = _pdf_source_fields(registry_path=registry_path, processed_dir=processed_dir)
 
-    source_map = load_source_map(processed_dir)
-    for entry in source_map.get("documents", {}).values():
-        if not isinstance(entry, dict):
-            continue
-        source_hash = str(entry.get("source_hash", ""))
-        if not source_hash:
-            continue
-        current = entries.get(source_hash, {})
-        entries[source_hash] = _pdf_entry_for_response(
-            source_hash=source_hash,
-            filename=str(current.get("filename") or entry.get("source_pdf_name", "")),
-            status=str(current.get("status") or "indexed"),
-            upload_path=str(current.get("upload_path") or ""),
-            source_pdf_path=str(entry.get("source_pdf_path", "")),
-            processed_markdown_path=str(entry.get("processed_markdown_path", "")),
-            updated_at=str(entry.get("updated_at", current.get("updated_at", ""))),
-            last_interrupted_at=str(current.get("last_interrupted_at", "")),
-            last_interrupted_job_id=str(current.get("last_interrupted_job_id", "")),
-            last_error=str(current.get("last_error", "")),
-            root_dir=root_dir,
-            data_dir=data_dir,
-        )
+    rows: list[dict[str, Any]] = []
+    trust_by_hash: dict[str, dict[str, Any]] = {}
+    for source_hash, item in fields.items():
+        row = {"hash": source_hash, **item}
+        if str(row.get("status") or "") == "indexed" and not _index_manifest_stats(row, manifest):
+            row["status"] = "not_indexed"
+        trust_by_hash[source_hash] = _normalize_trust_entry(source_hash, trust_documents.get(source_hash))
+        rows.append(row)
 
-    rows = sorted(entries.values(), key=lambda item: (item.get("filename", ""), item.get("hash", "")))
-    for item in rows:
-        if str(item.get("status") or "") == "indexed" and not _index_manifest_stats(item, manifest):
-            item["status"] = "not_indexed"
-        trust = _normalize_trust_entry(str(item.get("hash") or ""), trust_documents.get(str(item.get("hash") or "")))
-        item["trust"] = trust
-        item["quality"] = _document_quality(item, manifest=manifest, trust=trust, root_dir=root_dir)
     rows.sort(
         key=lambda item: (
-            0 if str(item.get("trust", {}).get("source_group") or "") == SOURCE_GROUP_UNGROUPED else 1,
+            0 if str(trust_by_hash[str(item.get("hash") or "")].get("source_group") or "") == SOURCE_GROUP_UNGROUPED else 1,
             str(item.get("filename") or ""),
             str(item.get("hash") or ""),
         )
@@ -3025,8 +3221,32 @@ def list_pdf_documents(
             or query in str(item.get("hash", "")).lower()
         ]
     page = _page_slice(rows, offset=offset, limit=limit)
+
+    # Enrich (path stats, trust, markdown quality) only the rows on the page so
+    # listing cost stays O(page) in disk I/O instead of O(total documents).
+    page_rows: list[dict[str, Any]] = []
+    for row in page["rows"]:
+        source_hash = str(row.get("hash") or "")
+        trust = trust_by_hash.get(source_hash) or _normalize_trust_entry(source_hash, trust_documents.get(source_hash))
+        item = _pdf_entry_for_response(
+            source_hash=source_hash,
+            filename=str(row.get("filename", "")),
+            status=str(row.get("status", "")),
+            upload_path=str(row.get("upload_path", "")),
+            source_pdf_path=str(row.get("source_pdf_path", "")),
+            processed_markdown_path=str(row.get("processed_markdown_path", "")),
+            updated_at=str(row.get("updated_at", "")),
+            last_interrupted_at=str(row.get("last_interrupted_at", "")),
+            last_interrupted_job_id=str(row.get("last_interrupted_job_id", "")),
+            last_error=str(row.get("last_error", "")),
+            root_dir=root_dir,
+            data_dir=data_dir,
+        )
+        item["trust"] = trust
+        item["quality"] = _document_quality(item, manifest=manifest, trust=trust, root_dir=root_dir)
+        page_rows.append(item)
     return {
-        "pdfs": page["rows"],
+        "pdfs": page_rows,
         "total": page["total"],
         "offset": page["offset"],
         "limit": page["limit"],
@@ -3052,6 +3272,11 @@ def list_job_rows(*, offset: int = 0, limit: int | None = 10, search: str = "") 
             or query in ", ".join(str(name) for name in (job.get("filenames") or [])).lower()
         ]
     page = _page_slice(jobs, offset=offset, limit=limit)
+    # log_tail (200 lines per job) is excluded from the list response: the 2s
+    # active-job poll used to re-ship every visible job's whole tail. The UI
+    # hydrates open log panels from GET /api/jobs/{id} instead.
+    for job in page["rows"]:
+        job.pop("log_tail", None)
     return {
         "jobs": page["rows"],
         "total": page["total"],
@@ -3069,21 +3294,18 @@ def resolve_pdf_download_path(
     root_dir: Path = ROOT_DIR,
     data_dir: Path = DATA_DIR,
 ) -> tuple[Path, str]:
-    documents = list_pdf_documents(
-        search="",
-        registry_path=registry_path,
-        processed_dir=processed_dir,
-        root_dir=root_dir,
-        data_dir=data_dir,
-    )["pdfs"]
-    match = next((item for item in documents if item.get("hash") == source_hash), None)
+    # Single-hash lookup against the lightweight merged fields; a full corpus
+    # listing here made downloads (and full reingest, which loops over every
+    # hash) O(total documents) in path stats per call.
+    fields = _pdf_source_fields(registry_path=registry_path, processed_dir=processed_dir)
+    match = fields.get(str(source_hash))
     if match is None:
         raise FileNotFoundError(f"PDF not found for source hash: {source_hash}")
     raw_path = str(match.get("upload_path") or match.get("source_pdf_path") or "")
     path = _resolve_pdf_path(raw_path, root_dir=root_dir, data_dir=data_dir)
     if not path.exists():
         raise FileNotFoundError(f"PDF file is missing for source hash: {source_hash}")
-    return path, str(match.get("filename") or path.name)
+    return path, str(match.get("filename") or "") or path.name
 
 
 def _pdf_document_by_hash(
@@ -3685,27 +3907,34 @@ def recover_pending_upload_jobs_on_startup() -> dict[str, Any]:
 def _start_local_chat_model_warmup() -> None:
     """Pre-load the local Ollama chat model in a background thread.
 
-    A cold 9-20GB model load can take minutes; without warm-up the first
-    user query pays that load inside its request timeout and times out.
-    Fire-and-forget: any failure just means the first query loads the model.
+    A cold model load on a small GPU can take minutes; without warm-up the
+    first user query pays that load inside its request timeout and times out.
+    Fires for the chat model and, when it resolves to a different local tag,
+    the planner model as well. Fire-and-forget: any failure just means the
+    first query loads the model.
     """
     try:
         from src import llm_api
 
         if llm_api.active_backend() != "ollama":
             return
-        model = llm_api.resolve_local_model(CHAT_CONFIG.get("planner_model") or "")
-        if not model:
+        # [models].llm_model is what /api/chat requests carry; planner_model
+        # only matters when the planner resolves to a distinct local model.
+        chat_model = llm_api.resolve_local_model(CHAT_CONFIG.get("llm_model") or "")
+        planner_model = llm_api.resolve_local_model(CHAT_CONFIG.get("planner_model") or "")
+        models = [m for m in dict.fromkeys((chat_model, planner_model)) if m]
+        if not models:
             return
+        keep_alive = str(CHAT_CONFIG.get("ollama_keep_alive") or "")
 
-        def _warm() -> None:
+        def _warm(model: str) -> None:
             try:
                 payload = json.dumps(
                     {
                         "model": model,
                         "messages": [{"role": "user", "content": "Ready?"}],
                         "stream": False,
-                        "keep_alive": "30m",
+                        **({"keep_alive": keep_alive} if keep_alive else {}),
                     }
                 ).encode("utf-8")
                 request = urllib.request.Request(
@@ -3718,7 +3947,13 @@ def _start_local_chat_model_warmup() -> None:
             except Exception:
                 logger.debug("Local chat model warm-up skipped/failed", exc_info=True)
 
-        threading.Thread(target=_warm, name="ollama-chat-warmup", daemon=True).start()
+        def _warm_all() -> None:
+            for model in models:
+                # Serial loads: two models loading concurrently on one small
+                # GPU thrash VRAM and can push each other into CPU offload.
+                _warm(model)
+
+        threading.Thread(target=_warm_all, daemon=True, name="ollama-chat-warmup").start()
     except Exception:
         logger.debug("Could not start local chat model warm-up", exc_info=True)
 
@@ -3732,6 +3967,12 @@ async def lifespan(app: FastAPI):
         setup_job_logging(Path("logs") / "server.log")
     except OSError:
         pass
+    # Reclaim abandoned staged index builds BEFORE job recovery re-enqueues
+    # interrupted builds, so the sweep can never race a live one.
+    try:
+        _gc_staged_build_dirs(DB_DIR)
+    except Exception:  # noqa: BLE001 - GC must never block startup
+        logger.exception("Staged index dir GC failed; continuing.")
     recover_pending_upload_jobs_on_startup()
     _start_local_chat_model_warmup()
     yield
@@ -4068,6 +4309,31 @@ def health(request: Request):
     return _conditional_json(request, payload, seed)
 
 
+# _on_disk_bytes() recursively stats every file in the Lance table directory
+# (thousands of files at corpus scale). Cache the total per table version --
+# the version-hint signature changes on every publish, so a cached value is
+# never served for a table that has since changed, and the TTL only bounds how
+# often a same-version directory is re-walked.
+_INDEX_DISK_BYTES_TTL_SECONDS = 30.0
+_index_disk_bytes_lock = threading.Lock()
+_index_disk_bytes_cache: dict[str, tuple[str, float, int]] = {}
+
+
+def _cached_index_disk_bytes(store: Any) -> int:
+    hint = Path(store.table_version_hint_path())
+    signature = _file_signature(hint)
+    key = str(hint)
+    now = time.monotonic()
+    with _index_disk_bytes_lock:
+        cached = _index_disk_bytes_cache.get(key)
+        if cached is not None and cached[0] == signature and now - cached[1] < _INDEX_DISK_BYTES_TTL_SECONDS:
+            return cached[2]
+    total = int(store._on_disk_bytes())
+    with _index_disk_bytes_lock:
+        _index_disk_bytes_cache[key] = (signature, now, total)
+    return total
+
+
 @app.get("/api/metrics")
 def metrics(request: Request):
     """Lightweight operational metrics for monitoring a multi-day ingest.
@@ -4089,7 +4355,7 @@ def metrics(request: Request):
             # during a multi-day ingest; serializing it on the index-write lock
             # would stall the dashboard whenever a mutation is in flight.
             record_count = store.count()
-            index_bytes = store._on_disk_bytes()
+            index_bytes = _cached_index_disk_bytes(store)
         except Exception:
             record_count = 0
             index_bytes = 0
@@ -4183,7 +4449,7 @@ def _positive_int_or(value: Any, default: int) -> int:
         return default
 
 
-def _llm_status_snapshot() -> dict[str, Any]:
+def _llm_status_snapshot_uncached() -> dict[str, Any]:
     """Backend-aware LLM reachability snapshot for health and metrics endpoints.
 
     SoCLAaS (primary): probes ``/v1/models`` with the bearer key. Ollama
@@ -4285,13 +4551,57 @@ def _llm_status_snapshot() -> dict[str, Any]:
         }
 
 
+# /api/health and /api/metrics both probe the LLM backend (1.5-2s network
+# timeouts) before their ETag check. A short TTL cache keeps a slow/unreachable
+# endpoint from burning a threadpool token on every poll; the snapshot copy
+# protects the cache from caller mutation.
+_LLM_STATUS_CACHE_TTL_SECONDS = 15.0
+_llm_status_cache_lock = threading.Lock()
+_llm_status_cache: tuple[float, dict[str, Any]] | None = None
+
+
+def _llm_status_snapshot() -> dict[str, Any]:
+    global _llm_status_cache
+    with _llm_status_cache_lock:
+        cached = _llm_status_cache
+        if cached is not None and time.monotonic() - cached[0] < _LLM_STATUS_CACHE_TTL_SECONDS:
+            return dict(cached[1])
+    snapshot = _llm_status_snapshot_uncached()
+    with _llm_status_cache_lock:
+        _llm_status_cache = (time.monotonic(), snapshot)
+    return dict(snapshot)
+
+
 # Backwards-compatible alias; older code/internal references may use this name.
 _ollama_status_snapshot = _llm_status_snapshot
 
 
+# The UI polls /api/update/status every 5 minutes per open tab, and each
+# uncached call spawns several git subprocesses plus a network fetch of the
+# remote. Cache the result briefly so N tabs cost one fetch per TTL window;
+# ?refresh=1 (and the apply path) bypass the cache for a guaranteed-fresh
+# check.
+UPDATE_STATUS_CACHE_TTL_SECONDS = 300.0
+_update_status_cache_lock = threading.Lock()
+_update_status_cache: tuple[float, dict[str, Any]] | None = None
+
+
+def _cached_update_status(*, refresh: bool = False) -> dict[str, Any]:
+    global _update_status_cache
+    if not refresh:
+        with _update_status_cache_lock:
+            cached = _update_status_cache
+            if cached is not None and time.monotonic() - cached[0] < UPDATE_STATUS_CACHE_TTL_SECONDS:
+                return dict(cached[1])
+    payload = get_update_status(fetch=True)
+    with _update_status_cache_lock:
+        _update_status_cache = (time.monotonic(), payload)
+    return dict(payload)
+
+
 @app.get("/api/update/status")
-def update_status():
-    return get_update_status(fetch=True)
+def update_status(refresh: bool = False):
+    return _cached_update_status(refresh=refresh)
 
 
 @app.post("/api/update/apply")
@@ -4775,6 +5085,24 @@ def _data_pdf_duplicate_entries(
                 pass
 
     known_pdf_paths = _known_data_pdf_paths(data_dir=data_dir)
+    # Size gate: identical content implies identical size, so when the size of
+    # every target file is known, candidates with a different size can be
+    # skipped without a full-file SHA-256 read. Falls back to hashing every
+    # candidate as soon as any target size is unknown.
+    target_sizes: set[int] = set()
+    for item in files:
+        item_hash = str(item.get("hash", ""))
+        if not item_hash or item_hash in known_hashes:
+            continue
+        raw_path = str(item.get("staging_path", "") or "")
+        if not raw_path:
+            target_sizes = set()
+            break
+        try:
+            target_sizes.add(Path(raw_path).stat().st_size)
+        except OSError:
+            target_sizes = set()
+            break
     existing_by_hash: dict[str, dict[str, Any]] = {}
     for candidate in data_dir.rglob("*.pdf"):
         try:
@@ -4788,6 +5116,8 @@ def _data_pdf_duplicate_entries(
         if staging_dir.exists() and _path_is_relative_to(resolved, staging_dir):
             continue
         try:
+            if target_sizes and resolved.stat().st_size not in target_sizes:
+                continue
             digest = _cached_pdf_hash(resolved)
         except OSError:
             continue
@@ -5412,9 +5742,23 @@ async def restore_index(request: Request):
 
 @app.get("/api/jobs")
 def list_jobs(request: Request, offset: int = 0, limit: int = 10, search: str = ""):
-    payload = list_job_rows(offset=offset, limit=(None if limit <= 0 else limit), search=search)
-    seed = _payload_signature(payload, "jobs", offset, limit, search)
-    return _conditional_json(request, payload, seed)
+    # Seed the ETag from the queue's monotonically incremented state version
+    # BEFORE building the payload, mirroring /api/pdfs: the 2s active-job poll
+    # can then 304 without paying the O(all-jobs) serialization. The version
+    # bumps on every observable queue change (status/progress/log/pool), so no
+    # stale payload can be served.
+    resolved_limit = JOBS_MAX_PAGE_SIZE if limit <= 0 else min(limit, JOBS_MAX_PAGE_SIZE)
+    seed = _signature_from_parts(
+        "jobs",
+        job_queue.state_version(),
+        offset,
+        limit,
+        search,
+    )
+    if not_modified := _not_modified_or_etag(request, seed):
+        return not_modified
+    payload = list_job_rows(offset=offset, limit=resolved_limit, search=search)
+    return _etagged_json(request, payload, seed)
 
 
 @app.get("/api/jobs/{job_id}")
@@ -5440,12 +5784,16 @@ def pdf_documents(request: Request, search: str = "", offset: int = 0, limit: in
     # The PDF list only changes when ingestion/indexing writes the registry,
     # source map, trust registry, or index manifest. Short-circuit unchanged
     # polls with a conditional 304 instead of rebuilding the whole list.
+    # Registry/source-map freshness comes from their SQLite data_version
+    # counters; those two stores are no longer stat-able JSON files.
     seed = _scoped_signature(
-        _file_signature(
-            PDF_REGISTRY_PATH,
-            source_map_path(PROCESSED_DIR),
-            DOCUMENT_TRUST_PATH,
-            DB_DIR / INDEX_MANIFEST_FILENAME,
+        _signature_from_parts(
+            "reg:" + registry_state_version(PDF_REGISTRY_PATH),
+            "srcmap:" + source_map_state_version(PROCESSED_DIR),
+            _file_signature(
+                DOCUMENT_TRUST_PATH,
+                DB_DIR / INDEX_MANIFEST_FILENAME,
+            ),
         ),
         search=search,
         offset=offset,
@@ -5453,7 +5801,8 @@ def pdf_documents(request: Request, search: str = "", offset: int = 0, limit: in
     )
     if not_modified := _not_modified_or_etag(request, seed):
         return not_modified
-    payload = list_pdf_documents(search=search, offset=offset, limit=(None if limit <= 0 else limit))
+    resolved_limit = PDFS_MAX_PAGE_SIZE if limit <= 0 else min(limit, PDFS_MAX_PAGE_SIZE)
+    payload = list_pdf_documents(search=search, offset=offset, limit=resolved_limit)
     return _etagged_json(request, payload, seed)
 
 
@@ -5488,6 +5837,10 @@ def image_asset(asset_id: str):
         media_type=str(entry.get("mime_type") or "image/png"),
         filename=path.name,
         content_disposition_type="inline",
+        # Asset ids are content-addressed (asset_id embeds the image sha), so a
+        # given id can never change bytes -- cache hard and skip the per-view
+        # revalidation chatter that table re-renders otherwise trigger.
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
     )
 
 

@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 # [server] query_wait_timeout_seconds.
 DEFAULT_QUERY_WAIT_TIMEOUT_SECONDS = 1800.0
 
+# In-memory job history cap. Terminal (done/failed/cancelled) jobs beyond this
+# many total entries are dropped from /api/jobs responses, bounding both the
+# 2s active-job poll payload and long-session memory growth.
+MAX_JOB_HISTORY = 500
+TERMINAL_JOB_STATUSES = frozenset({"done", "failed", "cancelled"})
+
 
 def _human_bytes(value: int | float | None) -> str:
     """Format a byte count as a short human-readable string (e.g. '1.2 GB')."""
@@ -72,6 +78,12 @@ class RagJobQueue:
         self._condition = threading.Condition(threading.RLock())
         self._jobs: dict[str, QueueJob] = {}
         self._queue: deque[str] = deque()
+        # Monotonic counter bumped on every observable queue change (status,
+        # progress, log tail, pool membership). /api/jobs derives its ETag from
+        # this instead of hashing the full payload, so an unchanged poll can
+        # 304 without serializing every job. Must only be touched while holding
+        # ``self._condition``.
+        self._state_version = 0
         # Multiple worker threads pull from the shared deque (each pop is atomic
         # under the condition lock, so no two workers get the same job). This
         # lets ingestion-only phases of different upload jobs overlap. Index-
@@ -88,6 +100,13 @@ class RagJobQueue:
         # Watchdog: an index-mutating job will not wait longer than this for
         # active chats to drain. See DEFAULT_QUERY_WAIT_TIMEOUT_SECONDS.
         self.query_wait_timeout_seconds = max(0.0, float(query_wait_timeout_seconds))
+
+    def _bump_state_version_locked(self) -> None:
+        self._state_version += 1
+
+    def state_version(self) -> int:
+        with self._condition:
+            return self._state_version
 
     def begin_query(self) -> None:
         with self._condition:
@@ -128,6 +147,7 @@ class RagJobQueue:
         job.error = message
         job.finished_at = _utcnow()
         job.progress = None
+        self._bump_state_version_locked()
 
     def _record_interrupted(self, job: QueueJob, message: str) -> None:
         if job.kind == "upload" and job.uploads:
@@ -157,6 +177,7 @@ class RagJobQueue:
             job.log_tail.append(line)
             if len(job.log_tail) > JOB_LOG_TAIL_LINES:
                 del job.log_tail[: len(job.log_tail) - JOB_LOG_TAIL_LINES]
+            self._bump_state_version_locked()
             self._condition.notify_all()
 
     def _set_job_progress(self, job: QueueJob, payload: dict[str, Any]) -> None:
@@ -172,6 +193,7 @@ class RagJobQueue:
             return
         with self._condition:
             job.progress = payload
+            self._bump_state_version_locked()
             self._condition.notify_all()
 
     def enqueue_upload(
@@ -320,13 +342,29 @@ class RagJobQueue:
         with self._condition:
             self._jobs[job.id] = job
             self._queue.append(job.id)
+            self._prune_jobs_locked()
             if auto_start:
                 self._ensure_worker_locked()
+            self._bump_state_version_locked()
             self._condition.notify_all()
         # Persist non-upload jobs so they survive a crash. Done outside the
         # condition lock because the ledger has its own lock and is best-effort.
         self._ledger_record(job)
         return job
+
+    def _prune_jobs_locked(self) -> None:
+        # /api/jobs re-serializes every job ever created (log tails included),
+        # so unbounded history makes the 2s active-job poll progressively more
+        # expensive. Drop oldest terminal jobs beyond the cap; queued, running,
+        # and recovery jobs are never pruned.
+        if len(self._jobs) <= MAX_JOB_HISTORY:
+            return
+        for job_id in list(self._jobs):
+            if len(self._jobs) <= MAX_JOB_HISTORY:
+                break
+            if self._jobs[job_id].status in TERMINAL_JOB_STATUSES:
+                del self._jobs[job_id]
+                self._bump_state_version_locked()
 
     def _ensure_worker_locked(self) -> None:
         # Spawn enough workers to reach ``_max_workers`` as long as there is
@@ -358,10 +396,13 @@ class RagJobQueue:
                     job.status = "running"
                     job.phase = "starting"
                     job.started_at = job.started_at or _utcnow()
+                    self._bump_state_version_locked()
 
             if cancelled_before_start:
                 self._record_interrupted(job, "Job cancelled by user.")
                 self._ledger_remove(job)
+                with self._condition:
+                    self._prune_jobs_locked()
                 continue
 
             try:
@@ -395,6 +436,7 @@ class RagJobQueue:
                     job.error = str(exc)
                     job.finished_at = _utcnow()
                     job.progress = None
+                    self._bump_state_version_locked()
                     self._condition.notify_all()
             else:
                 with self._condition:
@@ -407,12 +449,15 @@ class RagJobQueue:
                         job.finished_at = _utcnow()
                         job.progress = None
                         record_cancelled = False
+                    self._bump_state_version_locked()
                     self._condition.notify_all()
                 if record_cancelled:
                     self._record_interrupted(job, "Job cancelled by user.")
             # Any terminal state (done/failed/cancelled) removes the job from
             # the durable ledger so it is not re-enqueued on the next startup.
             self._ledger_remove(job)
+            with self._condition:
+                self._prune_jobs_locked()
 
     def _ledger_record(self, job: QueueJob) -> None:
         """Persist a tracked (non-upload) job so it survives a crash.
@@ -641,6 +686,7 @@ class RagJobQueue:
                 self._raise_if_cancelled(job)
                 job.status = "paused_for_queries"
                 job.phase = phase
+                self._bump_state_version_locked()
                 self._condition.notify_all()
                 if deadline is not None and time.monotonic() >= deadline:
                     logger.error(
@@ -668,6 +714,7 @@ class RagJobQueue:
             self._raise_if_cancelled(job)
             job.status = "running"
             job.phase = phase
+            self._bump_state_version_locked()
             self._condition.notify_all()
 
     def _save_staged_uploads(self, job: QueueJob) -> Path:
@@ -1274,6 +1321,7 @@ class RagJobQueue:
             if auto_start and recovered:
                 self._ensure_worker_locked()
             if recovered:
+                self._bump_state_version_locked()
                 self._condition.notify_all()
         return {
             "recovered": len(recovered),

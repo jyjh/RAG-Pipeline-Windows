@@ -201,11 +201,16 @@ def test_dedup_hosts_preserves_order(monkeypatch):
 # nomic-embed-text embeddings.
 
 
-def test_embeddings_backend_default_is_local_ollama(monkeypatch):
+def test_embeddings_backend_default_is_local_ollama(monkeypatch, tmp_path):
     from src.embeddings import embeddings_use_soclaas, resolve_embeddings_backend
 
     monkeypatch.delenv("EMBEDDINGS_BACKEND", raising=False)
-    monkeypatch.delenv("RAG_PIPELINE_CONFIG", raising=False)
+    # Embeddings config is discovered via RAG_PIPELINE_CONFIG (env) or the repo
+    # config.toml. Pin an empty [models] file so "defaults" here can never be
+    # silently overridden by edits to the real config file.
+    cfg = tmp_path / "default_models.toml"
+    cfg.write_text("[models]\n", encoding="utf-8")
+    monkeypatch.setenv("RAG_PIPELINE_CONFIG", str(cfg))
     # Defaults: [embeddings].backend = "ollama" even with chat on soclaas.
     monkeypatch.setenv("LLM_BACKEND", "soclaas")
     assert resolve_embeddings_backend() == "ollama"
@@ -275,10 +280,12 @@ def test_embeddings_backend_invalid_env_raises(monkeypatch):
         resolve_embeddings_backend()
 
 
-def test_engine_routes_to_ollama_with_chat_on_soclaas(monkeypatch):
+def test_engine_routes_to_ollama_with_chat_on_soclaas(monkeypatch, tmp_path):
     """The default split: chat/vision on SoCLAaS, embeddings on local Ollama."""
     monkeypatch.delenv("EMBEDDINGS_BACKEND", raising=False)
-    monkeypatch.delenv("RAG_PIPELINE_CONFIG", raising=False)
+    cfg = tmp_path / "default_models.toml"
+    cfg.write_text("[models]\n", encoding="utf-8")
+    monkeypatch.setenv("RAG_PIPELINE_CONFIG", str(cfg))
     monkeypatch.setenv("LLM_BACKEND", "soclaas")
 
     engine = EmbeddingEngine(model_name="nomic-embed-text")

@@ -37,7 +37,7 @@ class LocalVectorIndexer:
         self,
         working_dir: str = "./db",
         *,
-        embedding_model: str = "nomic-embed-text",
+        embedding_model: str | None = None,
         embedding_batch_size: int | None = None,
         embedding_timeout: float | None = None,
         embedding_dim: int | None = None,
@@ -48,7 +48,7 @@ class LocalVectorIndexer:
         chunk_overlap_tokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS,
         progress_enabled: bool = True,
     ):
-        from src.embeddings import EmbeddingSetup
+        from src.embeddings import EmbeddingSetup, configured_embedding_model
 
         self.working_dir = working_dir
         self.reuse_db_dir = reuse_db_dir
@@ -62,7 +62,7 @@ class LocalVectorIndexer:
         # config keeps the index, reuse guards, and manifest consistent; a
         # model/dim change invalidates an existing index (full re-index needed).
         setup = EmbeddingSetup(
-            embedding_model,
+            embedding_model or configured_embedding_model(),
             embedding_dim=embedding_dim,
             batch_size=embedding_batch_size or os.environ.get("LOCAL_RAG_EMBED_BATCH_SIZE"),
             timeout=embedding_timeout,
@@ -855,6 +855,24 @@ class LocalVectorIndexer:
                     f"Run 'rebuild_vector_index' to retrain manually.",
                     enabled=self.progress_enabled,
                 )
+        else:
+            # A corpus that grows past ANN_MIN_ROWS purely through incremental
+            # uploads would otherwise stay on flat brute-force scans forever:
+            # only the full-build path built the first ANN index. Build it here
+            # once the table crosses the threshold.
+            total = store.count()
+            if total >= int(_vector_store_module.ANN_MIN_ROWS):
+                _status(
+                    f"Local incremental index: corpus reached {total} rows; "
+                    "building ANN vector index.",
+                    enabled=self.progress_enabled,
+                )
+                ann_result = store.create_vector_index()
+                if not ann_result.get("built"):
+                    _status(
+                        f"Local incremental index: ANN build did not complete: {ann_result}",
+                        enabled=self.progress_enabled,
+                    )
 
         # Re-indexing uses logical delete (tombstones) then add, so repeated
         # incremental runs accumulate dead fragments that raise scan cost and
