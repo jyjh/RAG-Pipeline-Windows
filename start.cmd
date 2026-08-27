@@ -6,6 +6,10 @@ REM
 REM Run a full interactive setup (SSH keys, config, prompts) with setup.cmd
 REM instead. To force a redeploy of the remote clusters, run:
 REM   start.cmd --provision-hpc
+REM
+REM To deploy an initial PDF corpus (parsed on the HPC cluster, indexed
+REM locally, nested directories inside the zip are fine), run:
+REM   start.cmd --initial-corpus corpus.zip
 setlocal
 cd /d "%~dp0"
 set "ARGS=--non-interactive --start --provision-if-needed %*"

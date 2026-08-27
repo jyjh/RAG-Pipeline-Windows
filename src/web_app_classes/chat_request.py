@@ -15,14 +15,14 @@ bind_module_namespace(
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1)
     llm_model: str = DEFAULT_LLM_MODEL
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    embedding_model: str = CONFIGURED_EMBEDDING_MODEL
     embedding_batch_size: int | None = Field(DEFAULT_EMBEDDING_BATCH_SIZE, ge=1, le=256)
     embedding_timeout: float | None = Field(DEFAULT_EMBEDDING_TIMEOUT, gt=0)
     temperature: float | None = Field(DEFAULT_TEMPERATURE, ge=0, le=5)
     max_k: int | None = Field(DEFAULT_MAX_K, ge=1, le=500)
     context_window: int | None = Field(CHAT_CONFIG["context_window"], ge=512)
     llm_num_predict: int | None = Field(CHAT_CONFIG["llm_num_predict"], ge=1)
-    llm_timeout: float | None = Field(DEFAULT_LLM_TIMEOUT, gt=0)
+    llm_timeout: float | None = Field(CHAT_CONFIG["llm_timeout"], gt=0)
     web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED
     retrieval_candidate_k: int | None = Field(DEFAULT_RETRIEVAL_CANDIDATE_K, ge=1)
     retrieval_min_score: float | None = Field(CHAT_CONFIG["retrieval_min_score"], ge=0, le=1)

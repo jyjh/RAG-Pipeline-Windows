@@ -34,6 +34,21 @@ _RE_TITLE_WHITESPACE = re.compile(r"\s+")
 _RE_TITLE_TRAILING_NUM = re.compile(r"\s+\d{1,4}$")
 _RE_HEADING_LEADING_NUM = re.compile(r"^\d+(?:\.\d+)*\s+")
 _RE_HEADING_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+_RE_LOW_VALUE_SECTION = re.compile(
+    r"^(?:"
+    r"abstract|summary|executive summary|acknowledg(?:e)?ments?|"
+    r"table of contents|contents|preface|foreword|copyright|about the authors?|"
+    r"glossary|nomenclature|abbreviations?|list of (?:figures|tables|symbols)|"
+    r"references?|bibliography|works cited|index"
+    r")$",
+    re.IGNORECASE,
+)
+_RE_LOW_VALUE_APPENDIX = re.compile(
+    r"^appendix(?:\s+[a-z0-9]+)?\s*[-:]*\s*"
+    r"(?:glossary|terms?|definitions?|nomenclature|symbols?|abbreviations?|"
+    r"acknowledg(?:e)?ments?|references?|bibliography|forms?)$",
+    re.IGNORECASE,
+)
 
 _CLASS_MODULE_PROXY_FUNCTIONS = (
     "has_enriched_markdown",
@@ -194,6 +209,22 @@ def build_section_records(
     return [record.to_record() for record in records]
 
 
+def is_low_value_section(title: str) -> bool:
+    """Return True for boilerplate sections that should not be embedded.
+
+    Generic appendices are intentionally retained: an appendix may contain
+    tire data, equations, drawings, or test procedures.  Only appendices whose
+    heading explicitly identifies administrative/reference material are
+    removed.
+    """
+    normalized = re.sub(r"\s+", " ", title).strip().strip(".:;- ")
+    normalized = re.sub(r"^\d+(?:\.\d+)*\s+", "", normalized)
+    return bool(
+        _RE_LOW_VALUE_SECTION.fullmatch(normalized)
+        or _RE_LOW_VALUE_APPENDIX.fullmatch(normalized)
+    )
+
+
 def records_for_section(
     section: SectionNode,
     *,
@@ -212,6 +243,9 @@ def records_for_section(
     source_pdf_name: str = "",
     source_pdf_path: str = "",
 ) -> list[SectionChunk]:
+    if is_low_value_section(section.title):
+        return []
+
     section_path_titles = [*path_titles, section.title]
     section_path = " > ".join(section_path_titles)
     tags = tags_for([doc_title, *section_path_titles])

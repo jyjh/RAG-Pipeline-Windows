@@ -216,11 +216,45 @@ def test_embeddings_backend_empty_follows_chat_backend(monkeypatch, tmp_path):
     from src.embeddings import embeddings_use_soclaas, resolve_embeddings_backend
 
     monkeypatch.setenv("LLM_BACKEND", "soclaas")
+    # Without a SoCLAaS key the chat backend itself falls back to ollama, and
+    # embeddings inherit that fallback (cloud unavailable -> everything local).
+    monkeypatch.delenv("SOCLAAS_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
     cfg = tmp_path / "split.toml"
     cfg.write_text('[embeddings]\nbackend = ""\n', encoding="utf-8")
     monkeypatch.setenv("RAG_PIPELINE_CONFIG", str(cfg))
     assert resolve_embeddings_backend() == ""
+    assert embeddings_use_soclaas() is False
+
+    # With a key the soclaas chat selection is real and embeddings inherit it.
+    monkeypatch.setenv("SOCLAAS_API_KEY", "sk-test")
     assert embeddings_use_soclaas() is True
+
+
+def test_chat_backend_falls_back_to_ollama_without_key(monkeypatch, tmp_path):
+    """Cloud unavailable (no key) -> effective backend is local Ollama."""
+    from src import llm_api
+
+    monkeypatch.delenv("LLM_BACKEND", raising=False)
+    monkeypatch.delenv("LLM_STRICT_BACKEND", raising=False)
+    monkeypatch.delenv("SOCLAAS_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    cfg = tmp_path / "fb.toml"
+    cfg.write_text(
+        '[llm_api]\nbackend = "soclaas"\napi_key = ""\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("RAG_PIPELINE_CONFIG", str(cfg))
+    assert llm_api.active_backend() == "ollama"
+    assert llm_api.is_soclaas() is False
+
+    # LLM_STRICT_BACKEND opts out of the fallback (loud failure instead).
+    monkeypatch.setenv("LLM_STRICT_BACKEND", "1")
+    assert llm_api.active_backend() == "soclaas"
+
+    # A configured key keeps soclaas active.
+    monkeypatch.delenv("LLM_STRICT_BACKEND", raising=False)
+    monkeypatch.setenv("SOCLAAS_API_KEY", "sk-test")
+    assert llm_api.active_backend() == "soclaas"
 
 
 def test_embeddings_backend_env_overrides_config(monkeypatch, tmp_path):

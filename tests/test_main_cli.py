@@ -131,6 +131,7 @@ def test_main_index_dispatches_to_current_indexing(monkeypatch):
         *,
         progress_enabled,
         embedding_model,
+        embedding_dim,
         embedding_batch_size,
         embedding_timeout,
         index_backend,
@@ -144,6 +145,7 @@ def test_main_index_dispatches_to_current_indexing(monkeypatch):
         calls["db_dir"] = db_dir
         calls["progress_enabled"] = progress_enabled
         calls["embedding_model"] = embedding_model
+        calls["embedding_dim"] = embedding_dim
         calls["embedding_batch_size"] = embedding_batch_size
         calls["embedding_timeout"] = embedding_timeout
         calls["index_backend"] = index_backend
@@ -163,8 +165,9 @@ def test_main_index_dispatches_to_current_indexing(monkeypatch):
         "md_dir": "md_in",
         "db_dir": "db_out",
         "progress_enabled": True,
-        "embedding_model": "nomic-embed-text",
-        "embedding_batch_size": 128,
+        "embedding_model": "all-minilm",
+        "embedding_dim": 384,
+        "embedding_batch_size": 64,
         "embedding_timeout": 30.0,
         "index_backend": "lancedb",
         "reuse_db_dir": "db_live",

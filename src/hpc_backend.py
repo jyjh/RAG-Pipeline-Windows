@@ -20,12 +20,14 @@ Design goals
   ``src.progress_protocol.parse_progress_line``.
 
 What this does NOT do (intentionally, see docs/HPC_DELEGATION.md "next steps"):
-- It is not yet wired into ``_run_job_subprocess``. The web app calls it
-  explicitly once ``cfg.hpc.enabled`` is honored at the job-queue seam.
-- It does not rsync user-uploaded PDFs OUT to HPC (corpus is assumed pre-staged;
-  upload-out is an additive ``rsync`` step documented separately).
-- It does not invalidate the server's index caches after ``fetch_index`` -- that
-  is the caller's responsibility (the known gap that needs ``/api/hpc/reload``).
+- It is not wired into the web job queue's ``_run_job_subprocess``; the CLI
+  initial-corpus flow (``scripts/hpc_corpus.py`` via
+  ``setup_instance.py --initial-corpus``) drives it explicitly, and web-UI
+  uploads still ingest locally.
+- It does not invalidate the server's index caches after ``fetch_index`` --
+  that is the caller's responsibility (the known gap that needs
+  ``/api/hpc/reload``). The initial-corpus flow sidesteps it by refusing to
+  run while the web server is up.
 """
 
 from __future__ import annotations
@@ -393,6 +395,39 @@ class HpcBackend:
         self._run_rsync(f"{cpu.ssh_host}:{remote}/", str(local) + "/")
         return local
 
+    def push_corpus_dir(self, local_dir: str | Path, remote_dir: str | None = None) -> str:
+        """Upload a local corpus directory to the cluster; return the remote path.
+
+        ``remote_dir`` defaults to the absolute ``remote_data_dir``. It must be
+        absolute: the generated PBS job bind-mounts absolute corpus dirs 1:1
+        into the container, which repo-relative dirs cannot rely on.
+        """
+        cpu = self.cfg.cpu
+        self._require_cluster(cpu, "cpu")
+        remote = remote_dir or self._remote_data_abs_path()
+        if not remote.startswith("/"):
+            raise HpcError(
+                f"corpus directory must be an absolute cluster path, got {remote!r}"
+            )
+        local = Path(local_dir)
+        if not local.is_dir():
+            raise HpcError(f"local corpus directory not found: {local}")
+        self._run_ssh(cpu.ssh_host, f"mkdir -p {shlex.quote(remote)}")
+        # Trailing slash on the source = "contents of", not the dir itself.
+        self._run_rsync(str(local) + "/", f"{cpu.ssh_host}:{remote}/")
+        return remote
+
+    def remote_file_nonempty(self, remote_path: str) -> bool:
+        """True when a file exists with size > 0 on the CPU login node."""
+        cpu = self.cfg.cpu
+        self._require_cluster(cpu, "cpu")
+        if not remote_path.startswith("/") and not remote_path.startswith("~/"):
+            raise HpcError(f"remote path must be absolute or ~/-relative: {remote_path!r}")
+        result = self._run_ssh(
+            cpu.ssh_host, f"test -s {shlex.quote(remote_path)}", check=False
+        )
+        return result.returncode == 0
+
     def check_connections(self) -> dict[str, dict[str, Any]]:
         """Verify SSH, PBS, repo and container prerequisites on the CPU cluster.
 
@@ -449,11 +484,12 @@ class HpcBackend:
         """Generate the ingest(+index) PBS script, merging cpu-cluster overrides."""
         overrides = dict(self.cfg.cpu.pbs_overrides)
         overrides.setdefault("input_data_dir", input_dir)
+        overrides.setdefault("processed_dir", self.cfg.remote_processed_dir)
         overrides.setdefault("container_sif", self.cfg.cpu.container_sif)
         overrides.setdefault("storage_root", self.cfg.cpu.storage_root)
         accepted = {
             "job_name", "ncpus", "mem", "ngpus", "queue", "input_data_dir",
-            "container_sif", "walltime", "storage_root",
+            "processed_dir", "container_sif", "walltime", "storage_root",
         }
         kwargs = {k: v for k, v in overrides.items() if k in accepted}
         return generate_pbs_script(skip_index=skip_index, **kwargs)
@@ -613,6 +649,13 @@ class HpcBackend:
 
     def _qdel(self, job_id: str, cluster: HpcClusterConfig) -> None:
         self._run_ssh(cluster.ssh_host, f"qdel {shlex.quote(job_id)}", check=False)
+
+    def _remote_data_abs_path(self) -> str:
+        """Resolve the corpus input path relative to the SSH login directory."""
+        data = self.cfg.remote_data_dir
+        if data.startswith("/"):
+            return data
+        return f"{self.cfg.cpu.remote_repo_dir.rstrip('/')}/{data}"
 
     def _remote_db_abs_path(self) -> str:
         """Resolve the index path relative to the SSH login directory.

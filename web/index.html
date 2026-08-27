@@ -60,6 +60,13 @@
         <div class="toolbar">
           <input id="pdfSearchInput" type="search" placeholder="Search PDFs by title or hash" />
           <button id="pdfSearchButton" type="button">Search PDFs</button>
+          <button
+            id="pdfAutoTagButton"
+            type="button"
+            title="Ask the LLM to sort ungrouped PDFs into Official, Student Research, or Unofficial. Automatically tagged PDFs are flagged for review; a manual tag always overrides them."
+          >
+            Auto-tag ungrouped
+          </button>
           <label class="inline-select-label reviewer-label">
             Reviewer
             <input id="reviewerNameInput" type="text" autocomplete="name" placeholder="Your name" />
@@ -281,7 +288,7 @@
             <h3>Review Checklist</h3>
             <ul class="guide-list">
               <li>Confirm each PDF has useful extracted text and nonzero chunks.</li>
-              <li>Tag ungrouped PDFs as Official, Student Research, or Unofficial so retrieval ranking can weight sources correctly.</li>
+              <li>Tag ungrouped PDFs as Official, Student Research, or Unofficial so retrieval ranking can weight sources correctly. Use "Auto-tag ungrouped" for a first LLM pass, then review the Auto-tagged rows; manual tags always override.</li>
               <li>Open cited pages or downloads when an answer affects engineering decisions.</li>
               <li>Flag stale or rejected sources so future users see the risk before relying on them.</li>
               <li>Re-run a single PDF when OCR, figures, formulas, or source metadata look wrong.</li>

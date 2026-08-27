@@ -7,14 +7,16 @@ asset_dir = "db/assets"
 [models]
 # Chat (gemma4:26b) and vision (qwen3-vl:32b) run on the hosted SoCLAaS API
 # (https://soclaas-api.comp.nus.edu.sg; see [llm_api]). Embeddings default to
-# a locally hosted nomic-embed-text via Ollama; see [embeddings].backend.
+# a locally hosted all-minilm via Ollama; see [embeddings].backend.
 llm_model = "gemma4:26b"
+local_llm_model = ""
 vision_model = "qwen3-vl:32b"
-embedding_model = "nomic-embed-text"
+local_vision_model = ""
+embedding_model = "all-minilm"
 reranker_model = ""
-# nomic-embed-text dense dim. Changing model/dim invalidates an existing index
+# all-minilm dense dim. Changing model/dim invalidates an existing index
 # (a full re-index is required); the indexer's model+dim reuse guard enforces it.
-embedding_dim = 768
+embedding_dim = 384
 
 [ingestion]
 ocr_backend = "rapidocr"
@@ -26,7 +28,7 @@ tesseract_cmd = "tesseract"
 tesseract_data_path = ""
 tesseract_psm = 3
 vision_enabled = true
-code_enrichment = true
+code_enrichment = false
 formula_enrichment = true
 accelerator = "auto"
 num_threads = 8
@@ -47,7 +49,7 @@ ingest_expansion_factor = 2.0
 # Approximate-nearest-neighbour (ANN) vector index. Below ann_min_rows the
 # table uses a flat (brute-force) scan which is faster for small corpora; above
 # it, an IVF_PQ index makes every query sublinear. These defaults are tuned
-# for nomic-embed-text (768-dim, L2-normalized vectors). Applied at startup via
+# for all-minilm (384-dim, L2-normalized vectors). Applied at startup via
 # src.vector_store.apply_indexing_config so builds and queries honor them.
 [indexing]
 ann_min_rows = 50000
@@ -64,7 +66,7 @@ ann_retrain_threshold = 0.01
 [embeddings]
 # Embedding transport, chosen INDEPENDENTLY of chat/vision so the default
 # split deployment works: SoCLAaS gemma4/qwen3-vl inference with locally
-# hosted nomic-embed-text embeddings. "ollama" (default) = the local Ollama
+# hosted all-minilm embeddings. "ollama" (default) = the local Ollama
 # host(s) below / OLLAMA_HOST; "soclaas" = the hosted API's bge-m3 (1024-d --
 # pair it with [models] embedding_model = "bge-m3", embedding_dim = 1024 and
 # re-index); "" = follow [llm_api].backend. Env EMBEDDINGS_BACKEND overrides.
@@ -75,8 +77,8 @@ backend = "ollama"
 # then switch back to Ollama (native_embeddings = false) for steady-state
 # incremental updates. Set in [models].native_embeddings instead.
 # Embedding batch size. Larger = better GPU utilization but more memory.
-# 128 is safe for nomic-embed-text; 256-512 on a GPU with headroom.
-batch_size = 128
+# 64 is stable for all-minilm with long RAG chunks on a 4 GB GPU.
+batch_size = 64
 # Per-request timeout. The effective timeout scales with batch size (see
 # timeout_batch_baseline / timeout_max_seconds) so a large batch on a slow GPU
 # does not silently trip the retry loop.
@@ -117,13 +119,38 @@ enabled = true
 timeout_seconds = 8.0
 max_results = 5
 
+# LLM source-group auto-tagging (src/auto_tag.py). PDFs uploaded without a
+# manual source group are classified in the background by the chat model and
+# land in the trust registry exactly like manual tags, but carry an
+# auto_tagged flag (model, confidence, reason, timestamp) so reviewers can
+# audit them; any manual tag clears the flag.
+[auto_tag]
+enabled = true
+# Empty = [models].llm_model (gemma4:26b).
+model = ""
+# Documents per classification request.
+batch_size = 20
+# Decisions below this confidence are dropped and the PDF stays ungrouped.
+min_confidence = 0.6
+# First-page text budget per PDF (filename-only classification when 0).
+excerpt_chars = 1200
+timeout_seconds = 120.0
+# Cap per auto-tag run so one click cannot enqueue the whole corpus.
+max_items_per_run = 200
+
 # Hosted OpenAI-compatible LLM API (SoCLAaS). This is the PRIMARY backend for
 # chat (gemma4:26b) and vision (qwen3-vl:32b, via chat-completions image
 # parts). Embeddings have their own selector -- [embeddings].backend above --
-# and default to a locally hosted nomic-embed-text. Set backend = "ollama"
+# and default to a locally hosted all-minilm. Set backend = "ollama"
 # here to fall back to a local Ollama server for fully-offline chat/vision
 # (the Ollama transport stays in the tree for that).
 [llm_api]
+# Cloud-unavailable fallback: when backend = "soclaas" but no API key is
+# resolvable, the effective backend automatically becomes the local Ollama
+# below (chat and vision), and cloud-named models are substituted with the
+# closest installed local tag (gemma4:26b -> gemma4:latest,
+# qwen3-vl:32b -> qwen2.5vl). Set env LLM_STRICT_BACKEND=1 to disable the
+# fallback and fail loudly instead.
 backend = "soclaas"
 base_url = "https://soclaas-api.comp.nus.edu.sg"
 api_key = ""
@@ -213,6 +240,11 @@ key_prefix = "rag_"
 # for clusters that may embed via the SoCLAaS API (EMBEDDINGS_BACKEND=soclaas).
 [hpc]
 enabled = false
+# The setup wizard writes ABSOLUTE paths under /hpctmp/<user>/rag-corpus/ so
+# the corpus survives re-provisioning (which atomically replaces the repo
+# directory). The relative values below are the legacy repo-relative defaults
+# and keep working; `start.cmd --initial-corpus <zip>` stages the corpus for
+# you either way.
 remote_data_dir = "data"
 remote_processed_dir = "processed_docs"
 remote_db_dir = "db"

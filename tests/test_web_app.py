@@ -1010,6 +1010,7 @@ def test_chat_config_reads_prompt_retrieval_and_ollama_health_settings(workspace
         "planner_model": "qwen2.5:1.5b",
         "planner_enabled": False,
         "planner_max_queries": 5,
+        "llm_timeout": 120.0,
         "retrieval_min_score": 0.62,
         "ollama_host": "http://127.0.0.1:11434",
         "ollama_hosts": [],
@@ -3669,7 +3670,7 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
     assert events[1][1]["sampler_top_k"] == 25
     assert events[1][1]["context_window"] == 4096
     assert events[1][1]["llm_num_predict"] == 512
-    assert events[1][1]["llm_timeout"] == 120.0
+    assert events[1][1]["llm_timeout"] == web_app.CHAT_CONFIG["llm_timeout"]
     assert events[1][1]["web_search_enabled"] is False
     assert events[1][1]["retrieval_candidate_k"] == 80
     assert events[1][1]["retrieval_min_score"] == 0.73

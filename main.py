@@ -217,6 +217,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ollama embedding model name",
     )
     parser.add_argument(
+        "--embedding_dim",
+        type=int,
+        default=None,
+        help="Embedding vector dimension (must match the selected model).",
+    )
+    parser.add_argument(
         "--embedding_batch_size",
         type=int,
         default=None,
@@ -538,13 +544,29 @@ def main(argv: list[str] | None = None) -> int:
                 from src.vector_store import apply_indexing_config
 
                 apply_indexing_config(_load_indexing_config())
+                pipeline_cfg = _pipeline_config()
+                embedding_cfg = pipeline_cfg.embeddings
                 index_kwargs = dict(
                     md_dir=args.md_dir,
                     db_dir=args.db_dir,
                     progress_enabled=not args.no_progress,
-                    embedding_model=args.embedding_model or DEFAULT_EMBEDDING_MODEL,
-                    embedding_batch_size=args.embedding_batch_size or DEFAULT_EMBEDDING_BATCH_SIZE,
-                    embedding_timeout=args.embedding_timeout or 30.0,
+                    embedding_model=(
+                        args.embedding_model
+                        or pipeline_cfg.models.embedding_model
+                        or DEFAULT_EMBEDDING_MODEL
+                    ),
+                    embedding_dim=(
+                        args.embedding_dim
+                        or _as_positive_int(pipeline_cfg.models.embedding_dim, DEFAULT_EMBEDDING_DIM)
+                    ),
+                    embedding_batch_size=(
+                        args.embedding_batch_size
+                        or _as_positive_int(embedding_cfg.batch_size, DEFAULT_EMBEDDING_BATCH_SIZE)
+                    ),
+                    embedding_timeout=(
+                        args.embedding_timeout
+                        or _as_float(embedding_cfg.timeout_seconds, DEFAULT_EMBEDDING_TIMEOUT)
+                    ),
                     index_backend=args.index_backend,
                     reuse_db_dir=args.reuse_db_dir,
                     summary_mode=args.summary_mode,

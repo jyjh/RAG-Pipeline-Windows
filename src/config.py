@@ -21,6 +21,12 @@ from pathlib import Path
 from typing import Any
 
 from src.defaults import (
+    DEFAULT_AUTO_TAG_BATCH_SIZE,
+    DEFAULT_AUTO_TAG_EXCERPT_CHARS,
+    DEFAULT_AUTO_TAG_MAX_ITEMS_PER_RUN,
+    DEFAULT_AUTO_TAG_MIN_CONFIDENCE,
+    DEFAULT_AUTO_TAG_MODEL,
+    DEFAULT_AUTO_TAG_TIMEOUT_SECONDS,
     DEFAULT_CODE_ENRICHMENT,
     DEFAULT_CONTEXT_TOKEN_FRACTION,
     DEFAULT_CONTEXT_WINDOW,
@@ -75,7 +81,17 @@ class PathsConfig:
 @dataclass
 class ModelConfig:
     llm_model: str = DEFAULT_LLM_MODEL
+    # Chat model used when the LOCAL Ollama backend is active (cloud
+    # unavailable). Pins a small local substitute explicitly (e.g.
+    # "qwen2.5:1.5b") instead of relying on base-name matching against the
+    # cloud tag ("gemma4:26b" -> whatever "gemma4..." is installed).
+    local_llm_model: str = ""
     vision_model: str = DEFAULT_VISION_MODEL
+    # Vision model used when the LOCAL Ollama backend is active (cloud
+    # unavailable). ``vision_model`` below names the cloud-side model; this
+    # one pins the local substitute explicitly (e.g. "qwen2.5vl:3b" on a
+    # 4 GB GPU) instead of relying on the registry-hint scan.
+    local_vision_model: str = ""
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     reranker_model: str = ""
     # nomic-embed-text dense dim (768). Changing model/dim invalidates an
@@ -268,6 +284,26 @@ class EmbeddingsConfig:
 
 
 @dataclass
+class AutoTagConfig:
+    """LLM source-group auto-tagging (see ``src/auto_tag.py``).
+
+    When ``enabled`` (default), PDFs uploaded without a manual source group
+    are classified in the background by the chat model and written to the
+    trust registry like any manual tag, but flagged ``auto_tagged`` so
+    reviewers can audit/override them. ``model`` left empty uses
+    ``[models].llm_model`` (gemma4:26b).
+    """
+
+    enabled: bool = True
+    model: str = DEFAULT_AUTO_TAG_MODEL
+    batch_size: int = DEFAULT_AUTO_TAG_BATCH_SIZE
+    min_confidence: float = DEFAULT_AUTO_TAG_MIN_CONFIDENCE
+    excerpt_chars: int = DEFAULT_AUTO_TAG_EXCERPT_CHARS
+    timeout_seconds: float = DEFAULT_AUTO_TAG_TIMEOUT_SECONDS
+    max_items_per_run: int = DEFAULT_AUTO_TAG_MAX_ITEMS_PER_RUN
+
+
+@dataclass
 class OllamaConfig:
     host: str = "http://127.0.0.1:11434"
     hosts: list[str] = field(default_factory=list)
@@ -321,7 +357,11 @@ class HpcConfig:
         container_sif="rag_pipeline_cpu.sif",
         storage_root="/hpctmp/${USER}",
         pbs_overrides=_default_cpu_overrides()))
-    # Where the pre-staged corpus lives on the CPU cluster (PBS --input-dir).
+    # Where the corpus PDFs live on the CPU cluster (PBS --input-dir).
+    # Prefer an ABSOLUTE path under /hpctmp/<user>/rag-corpus (what the setup
+    # wizard writes): provisioning atomically replaces the repo directory, so
+    # anything stored inside it is wiped by a later re-provision. Relative
+    # values resolve against remote_repo_dir (legacy deployments).
     remote_data_dir: str = "data"
     # Where an ingest-only PBS job (--skip-index) writes the processed
     # Markdown corpus, relative to remote_repo_dir unless absolute. Fetched
@@ -348,6 +388,7 @@ class PipelineConfig:
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     llm_api: LlmApiConfig = field(default_factory=LlmApiConfig)
+    auto_tag: AutoTagConfig = field(default_factory=AutoTagConfig)
     hpc: HpcConfig = field(default_factory=HpcConfig)
     # Raw ``[indexing]`` section (ANN tuning keys); normalization happens in
     # src.vector_store.apply_indexing_config, which tolerates missing keys.

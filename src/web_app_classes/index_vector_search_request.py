@@ -15,7 +15,7 @@ bind_module_namespace(
 class IndexVectorSearchRequest(BaseModel):
     query: str = Field(min_length=1)
     relevance_floor: float = Field(DEFAULT_INDEX_VECTOR_RELEVANCE_FLOOR, ge=0, le=1)
-    embedding_model: str | None = DEFAULT_EMBEDDING_MODEL
+    embedding_model: str | None = CONFIGURED_EMBEDDING_MODEL
     embedding_batch_size: int | None = Field(DEFAULT_EMBEDDING_BATCH_SIZE, ge=1, le=256)
     embedding_timeout: float | None = Field(DEFAULT_EMBEDDING_TIMEOUT, gt=0)
 

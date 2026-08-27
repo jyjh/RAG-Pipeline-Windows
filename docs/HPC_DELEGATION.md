@@ -125,27 +125,32 @@ hosts = []                           # add a local fallback if you have one
    `fetch_index` half to pull results.
 
 2. **The corpus is pre-staged on HPC** (`remote_data_dir` points at PDFs already
-   there). Simplest path. **Fallback (not built yet):** before `qsub`, rsync the
-   user's uploaded PDFs out — `HpcBackend` would gain a `push_uploads()` step
-   (`rsync local data/.upload_queue/ → remote_data_dir/`). This is additive and
-   documented as a next step.
+   there — the setup wizard configures an absolute `/hpctmp/<user>/rag-corpus/data`
+   OUTSIDE the provision-swapped repo directory). For the initial deployment this
+   is automated: `start.cmd --initial-corpus corpus.zip` (see
+   `scripts/hpc_corpus.py`) extracts the zip locally, uploads it with
+   `HpcBackend.push_corpus_dir()`, runs the ingest-only job, and fetches the
+   Markdown home. **Not built (by design):** routing *web-UI uploads* through the
+   cluster — those still ingest locally; the corpus zip path is the HPC use case.
 
 ## Known gaps (explicitly NOT done this round)
 
 These are the next steps; flagged so the scope is honest:
 
-- **`_run_job_subprocess` selection logic** — branch on `cfg.hpc.enabled` to use
-  `HpcBackend` instead of the local subprocess. Small change once the backend
-  exists; deliberately deferred so the live job queue isn't touched until you've
-  reviewed `HpcBackend`.
+- **`_run_job_subprocess` selection logic** — branch on `cfg.hpc.enabled` so the
+  web job queue itself can use `HpcBackend` instead of the local subprocess.
+  The CLI path is now wired (`scripts/hpc_corpus.py`, via
+  `setup_instance.py --initial-corpus`); the upload-driven web UI still ingests
+  locally. Deliberately deferred so the live job queue isn't touched until
+  you've reviewed `HpcBackend`.
 - **Cache invalidation after `fetch_index`** — the server opens `db/` lazily and
   caches it for the process lifetime (`_index_store`, `web_app.py:718`). An
   *externally*-produced index won't be seen until `_invalidate_index_caches(db)`
   (`web_app.py:1110`) is called. Today only in-process jobs call it. After
   `fetch_index`, the caller must trigger invalidation — either a new
   `/api/hpc/reload` endpoint or auto-invalidate at the end of `fetch_index`.
-- **Upload-rsync-out** — pushing web-app-uploaded PDFs to HPC (assumption 2's
-  fallback).
+  (The `--initial-corpus` flow sidesteps this by refusing to run while the web
+  server is up and building the index before the server starts.)
 - **Reconciliation of Ollama paths** — embeddings (build) use the in-job Ollama
   on HPC; chat uses the tunnel. No conflict, but `[embeddings].hosts` and
   `[ollama].host` serve different halves and must not be confused.

@@ -298,8 +298,12 @@ def _llm_chat(
             model=model, messages=messages, options=options,
             tools=tools, timeout=timeout,
         )
+    # Local backend: cloud-named models (e.g. gemma4:26b) may not be installed
+    # here; substitute the closest local tag so chat works when the cloud is
+    # unavailable instead of failing every request with "model not found".
     return _ollama_chat(
-        model=model, messages=messages, options=options, stream=stream,
+        model=llm_api.resolve_local_model(model), messages=messages,
+        options=options, stream=stream,
         timeout=timeout, health_check_interval=health_check_interval,
         max_lost_health_checks=max_lost_health_checks, tools=tools,
     )

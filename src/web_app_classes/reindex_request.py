@@ -13,7 +13,7 @@ bind_module_namespace(
 
 
 class ReindexRequest(BaseModel):
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    embedding_model: str = CONFIGURED_EMBEDDING_MODEL
     embedding_batch_size: int | None = Field(DEFAULT_EMBEDDING_BATCH_SIZE, ge=1, le=256)
     embedding_timeout: float | None = Field(DEFAULT_EMBEDDING_TIMEOUT, gt=0)
     index_backend: str = DEFAULT_INDEX_BACKEND

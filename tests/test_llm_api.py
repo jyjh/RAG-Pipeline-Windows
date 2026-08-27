@@ -385,3 +385,66 @@ def test_query_engine_raises_on_dim_mismatch(monkeypatch, tmp_path):
     )
     with pytest.raises(RuntimeError, match="embedding dimension"):
         engine._ensure_compatible_dim()
+
+
+# --- local model resolution (cloud unavailable -> local Ollama) ---------------
+
+
+def test_resolve_local_model_prefers_exact_then_base_match(monkeypatch):
+    monkeypatch.setattr(llm_api, "_ollama_tags", lambda: ["gemma4:latest", "qwen2.5vl:7b"])
+    # Exact tag wins.
+    assert llm_api.resolve_local_model("gemma4:latest") == "gemma4:latest"
+    # Base-name match maps a cloud tag onto the installed local tag.
+    assert llm_api.resolve_local_model("gemma4:26b") == "gemma4:latest"
+
+
+def test_resolve_local_model_vision_hint_fallback(monkeypatch):
+    monkeypatch.setattr(llm_api, "_ollama_tags", lambda: ["nomic-embed-text:latest", "qwen2.5vl:7b"])
+    # No base-name match; the vision hint picks an installed vision model.
+    assert llm_api.resolve_local_model("qwen3-vl:32b", vision=True) == "qwen2.5vl:7b"
+    # Without the vision flag there is no safe substitution: keep the name so
+    # the eventual error names the missing model.
+    assert llm_api.resolve_local_model("qwen3-vl:32b") == "qwen3-vl:32b"
+
+
+def test_resolve_local_model_prefers_configured_local_vision(monkeypatch, tmp_path):
+    """[models].local_vision_model pins the local substitute explicitly."""
+    monkeypatch.setattr(llm_api, "_ollama_tags", lambda: ["qwen2.5vl:7b", "qwen2.5vl:3b"])
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text(
+        '[models]\nvision_model = "qwen3-vl:32b"\nlocal_vision_model = "qwen2.5vl:3b"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RAG_PIPELINE_CONFIG", str(cfg))
+    assert llm_api.resolve_local_model("qwen3-vl:32b", vision=True) == "qwen2.5vl:3b"
+
+
+def test_resolve_local_model_unreachable_ollama_keeps_name(monkeypatch):
+    monkeypatch.setattr(llm_api, "_ollama_tags", lambda: [])
+    assert llm_api.resolve_local_model("gemma4:26b", vision=True) == "gemma4:26b"
+
+
+def test_vision_describer_resolves_local_model_when_cloud_down(monkeypatch):
+    """Without a SoCLAaS key the describer substitutes an installed local model."""
+    import src.ingestion_classes.ollama_vision_describer as describer_module
+    from src.ingestion_classes.ollama_vision_describer import OllamaVisionDescriber
+
+    for name in ("LLM_BACKEND", "SOCLAAS_API_KEY", "LLM_API_KEY", "LLM_STRICT_BACKEND"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(llm_api, "_ollama_tags", lambda: ["qwen2.5vl:7b"])
+
+    seen: list[str] = []
+
+    class _Resp:
+        response = ""
+
+    def fake_generate(*args, **kwargs):
+        seen.append(kwargs.get("model", ""))
+        return _Resp()
+
+    monkeypatch.setattr(describer_module, "_ollama_generate", fake_generate)
+    describer = OllamaVisionDescriber(vision_model="qwen3-vl:32b")
+    describer._ensure_loaded()
+    # The warm-up call went to the substituted LOCAL model, not the cloud name.
+    assert seen and seen[0] == "qwen2.5vl:7b"
+    assert describer.vision_model == "qwen2.5vl:7b"

@@ -6,6 +6,10 @@
 # Run a full interactive setup (SSH keys, config, prompts) with ./setup.sh
 # instead. To force a redeploy of the remote clusters, run:
 #   ./start.sh --provision-hpc
+#
+# To deploy an initial PDF corpus (parsed on the HPC cluster, indexed
+# locally, nested directories inside the zip are fine), run:
+#   ./start.sh --initial-corpus corpus.zip
 set -euo pipefail
 cd "$(dirname "$0")"
 if command -v python3 >/dev/null 2>&1; then

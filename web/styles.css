@@ -1131,6 +1131,13 @@ input[type="file"] {
   color: var(--danger);
 }
 
+/* LLM-assigned source group: normal tag semantics, machine provenance. */
+.quality-auto-tagged {
+  border: 1px solid #b9b4e8;
+  background: #efedfc;
+  color: #4438a8;
+}
+
 .quality-detail,
 .quality-warning {
   display: block;

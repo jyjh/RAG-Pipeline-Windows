@@ -44,21 +44,52 @@ def get_llm_api_config():
 
 
 def active_backend() -> str:
-    """Active backend: ``"soclaas"`` or ``"ollama"`` (env ``LLM_BACKEND`` > config > ``"soclaas"``)."""
+    """Effective backend: ``"soclaas"`` or ``"ollama"``.
+
+    Selection order: env ``LLM_BACKEND`` > ``[llm_api].backend`` > ``"soclaas"``.
+    When the selection is ``soclaas`` but no API key is resolvable, the backend
+    falls back to ``ollama`` -- a missing key means the cloud is unavailable,
+    and every transport (chat, vision, embeddings inheritance) should run
+    locally instead of erroring. Set ``LLM_STRICT_BACKEND=1`` to keep the
+    selected backend and fail loudly when the key is missing.
+    """
     env = os.environ.get("LLM_BACKEND", "").strip().lower()
     if env:
         if env not in _VALID_BACKENDS:
             raise ValueError(f"LLM_BACKEND={env!r}; must be 'soclaas' or 'ollama'")
-        return env
-    backend = (get_llm_api_config().backend or SOCLAAS).strip().lower()
-    if backend not in _VALID_BACKENDS:
-        _status(f"Unknown [llm_api].backend={backend!r}; defaulting to 'soclaas'.")
-        return SOCLAAS
+        backend = env
+    else:
+        backend = (get_llm_api_config().backend or SOCLAAS).strip().lower()
+        if backend not in _VALID_BACKENDS:
+            _status(f"Unknown [llm_api].backend={backend!r}; defaulting to 'soclaas'.")
+            backend = SOCLAAS
+    if backend == SOCLAAS and not _strict_backend() and not resolve_api_key():
+        global _FALLBACK_NOTICE_PRINTED
+        if not _FALLBACK_NOTICE_PRINTED:
+            _FALLBACK_NOTICE_PRINTED = True
+            _status(
+                "SoCLAaS is selected but no API key is configured "
+                f"({get_llm_api_config().key_env}/LLM_API_KEY or [llm_api].api_key); "
+                "falling back to the local Ollama backend for chat/vision."
+            )
+        return OLLAMA
     return backend
 
 
-def is_soclaas() -> bool:
+_FALLBACK_NOTICE_PRINTED = False
+
+
+def _strict_backend() -> bool:
+    return os.environ.get("LLM_STRICT_BACKEND", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def soclaas_ready() -> bool:
+    """True when SoCLAaS is the effective backend (selected AND usable)."""
     return active_backend() == SOCLAAS
+
+
+def is_soclaas() -> bool:
+    return soclaas_ready()
 
 
 def resolve_api_key() -> str:
@@ -69,6 +100,96 @@ def resolve_api_key() -> str:
         if env_val:
             return env_val
     return (cfg.api_key or "").strip()
+
+
+# --------------------------------------------------------------------------- #
+# Local Ollama model resolution
+# --------------------------------------------------------------------------- #
+# Cloud-side model tags (e.g. "gemma4:26b", "qwen3-vl:32b") usually do not
+# exist in the local Ollama registry ("gemma4:latest", "qwen2.5vl:7b"). When
+# the backend falls back to local, map requested names onto installed models
+# instead of failing every call with "model not found".
+
+_TAGS_CACHE: dict[str, Any] = {}
+_VISION_MODEL_HINTS = ("vl", "vision", "llava", "moondream", "minicpm-v", "cogvlm", "gemma3v")
+
+
+def _ollama_tags() -> list[str]:
+    """Installed local Ollama model names (cached; empty when unreachable)."""
+    cached = _TAGS_CACHE.get("tags")
+    if cached is not None:
+        return cached
+    from src.config import load_config
+
+    host = str(getattr(load_config().ollama, "host", "") or "http://127.0.0.1:11434").rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{host}/api/tags", timeout=3.0) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+        names = [
+            str(item.get("name", "")).strip()
+            for item in (payload.get("models") or [])
+            if isinstance(item, dict) and str(item.get("name", "")).strip()
+        ]
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        logger.debug("Could not list local Ollama models: %s", exc)
+        names = []
+    _TAGS_CACHE["tags"] = names
+    return names
+
+
+def reset_local_model_cache() -> None:
+    """Test seam: forget the cached /api/tags result."""
+    _TAGS_CACHE.pop("tags", None)
+
+
+def resolve_local_model(preferred: str, *, vision: bool = False) -> str:
+    """Map a (possibly cloud-named) model onto an installed local Ollama model.
+
+    Order: exact tag match > (vision only) the explicitly configured
+    ``[models].local_vision_model`` when installed > same base name
+    (``gemma4:26b`` -> ``gemma4``, ``gemma4:latest``) > for vision requests,
+    any installed model whose name hints at vision capability
+    (``qwen2.5vl``, ``llava``, ...). Returns ``preferred`` unchanged when
+    Ollama is unreachable or nothing matches -- the subsequent call then
+    fails with the model's real name in the error. Substitutions are logged
+    so the quality difference is visible.
+    """
+    preferred = str(preferred or "").strip()
+    tags = _ollama_tags()
+    if not tags or not preferred:
+        return preferred
+    by_fold = {tag.casefold(): tag for tag in tags}
+    if preferred.casefold() in by_fold:
+        return preferred
+    # Explicitly configured local substitute wins ([models].local_vision_model
+    # / [models].local_llm_model) when it is actually installed.
+    from src.config import load_config
+
+    knob = "local_vision_model" if vision else "local_llm_model"
+    configured = str(getattr(load_config().models, knob, "") or "").strip()
+    if configured and configured.casefold() in by_fold:
+        logger.warning(
+            "Using configured local model %s (cloud model %s not active)",
+            configured, preferred,
+        )
+        return by_fold[configured.casefold()]
+    base = preferred.split(":", 1)[0].casefold()
+    for folded, tag in by_fold.items():
+        if folded.split(":", 1)[0] == base:
+            logger.warning(
+                "Local model substitution: %s not installed; using %s", preferred, tag
+            )
+            return tag
+    if vision:
+        for folded, tag in by_fold.items():
+            tag_base = folded.split(":", 1)[0]
+            if any(hint in tag_base for hint in _VISION_MODEL_HINTS):
+                logger.warning(
+                    "Local vision model substitution: %s not installed; using %s",
+                    preferred, tag,
+                )
+                return tag
+    return preferred
 
 
 def require_api_key() -> str:

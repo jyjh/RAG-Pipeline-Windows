@@ -1,11 +1,11 @@
-import sys
-import shutil
-import uuid
-from pathlib import Path
-
 import gc
 import logging
+import os
+import shutil
+import sys
 import time
+import uuid
+from pathlib import Path
 
 import pytest
 
@@ -33,7 +33,10 @@ if str(ROOT) not in sys.path:
 
 @pytest.fixture
 def safe_tmp_path():
-    root = ROOT / ".tmp_test_pytest_safe"
+    # RAG_TEST_TMP_DIR moves the scratch root when the default directory is
+    # unusable (e.g. a leftover run left it with a broken ACL that only an
+    # elevated shell can delete).
+    root = ROOT / os.environ.get("RAG_TEST_TMP_DIR", ".tmp_test_pytest_safe")
     root.mkdir(exist_ok=True)
     path = root / uuid.uuid4().hex
     path.mkdir()
@@ -41,3 +44,18 @@ def safe_tmp_path():
         yield path
     finally:
         _rmtree_with_retry(path)
+
+
+@pytest.fixture(autouse=True)
+def _inert_llm_auto_tag(monkeypatch):
+    """Keep LLM source-group auto-tagging network-inert during tests.
+
+    Upload paths schedule background auto-tag runs; with a reachable local
+    Ollama those would issue real chat requests and write trust entries into
+    test workspaces mid-test. Stub the classifier suite-wide (returns no
+    decisions); tests that exercise auto-tagging override this with their
+    own fakes.
+    """
+    from src import auto_tag
+
+    monkeypatch.setattr(auto_tag, "classify_documents", lambda items, **kwargs: {})

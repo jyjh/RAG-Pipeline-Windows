@@ -1036,7 +1036,7 @@ class RagJobQueue:
         run_indexing_func = self._run_indexing_func
         resolved = {
             "progress_enabled": options.get("progress_enabled", False),
-            "embedding_model": options.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
+            "embedding_model": options.get("embedding_model") or CONFIGURED_EMBEDDING_MODEL,
             "embedding_batch_size": options.get("embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE),
             "embedding_timeout": options.get("embedding_timeout", DEFAULT_EMBEDDING_TIMEOUT),
             "index_backend": options.get("index_backend", DEFAULT_INDEX_BACKEND),
@@ -1162,7 +1162,7 @@ class RagJobQueue:
                 md_dir,
                 db_dir,
                 progress_enabled=bool(options.get("progress_enabled", False)),
-                embedding_model=options.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
+                embedding_model=options.get("embedding_model") or CONFIGURED_EMBEDDING_MODEL,
                 embedding_batch_size=options.get("embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE),
                 embedding_timeout=options.get("embedding_timeout", DEFAULT_EMBEDDING_TIMEOUT),
                 index_backend=options.get("index_backend", DEFAULT_INDEX_BACKEND),

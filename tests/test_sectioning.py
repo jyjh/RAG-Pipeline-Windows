@@ -51,6 +51,28 @@ def test_markdown_hash_headings_create_sections():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_boilerplate_sections_are_not_indexed_but_technical_appendices_are(tmp_path):
+    markdown_path = tmp_path / "vehicle.md"
+    markdown_path.write_text(
+        "# Summary\nGeneric overview.\n\n"
+        "# Acknowledgements\nThanks to the team.\n\n"
+        "# Appendix A: Glossary\nSlip angle means...\n\n"
+        "# Appendix B: Tire Test Data\nLoad, camber, lateral force.\n\n"
+        "# Suspension Geometry\nCaster and kingpin inclination.\n",
+        encoding="utf-8",
+    )
+
+    records = build_section_records(markdown_path, source_root=tmp_path)
+    paths = {record["section_path"] for record in records}
+    content = "\n".join(str(record["content"]) for record in records)
+
+    assert not any("Summary" in path for path in paths)
+    assert not any("Acknowledgements" in path for path in paths)
+    assert not any("Glossary" in path for path in paths)
+    assert any("Appendix B: Tire Test Data" in path for path in paths)
+    assert "Caster and kingpin inclination" in content
+
+
 def test_outline_extraction_builds_nested_page_ranges():
     overview = FakeDestination("Overview")
     review = FakeDestination("Review")

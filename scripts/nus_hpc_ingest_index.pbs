@@ -43,5 +43,11 @@ if [ -z "${SOCLAAS_API_KEY:-}" ] && [ -f "${HOME}/rag_soclaas_key" ]; then
     export SOCLAAS_API_KEY="$(cat "${HOME}/rag_soclaas_key")"
 fi
 
+# Both dirs honor their environment variables at qsub time (qsub -v). The
+# defaults are baked in by the generator, so the script is self-contained.
 INPUT_DATA_DIR="${INPUT_DATA_DIR:-data}"
-singularity exec ${BIND_MOUNTS} "${CONTAINER_SIF}" python3 scripts/bulk_ingest.py --input-dir "data"
+PROCESSED_DIR="${PROCESSED_DIR:-processed_docs}"
+mkdir -p "${PROCESSED_DIR}"
+singularity exec ${BIND_MOUNTS} "${CONTAINER_SIF}" python3 scripts/bulk_ingest.py \
+    --input-dir "${INPUT_DATA_DIR}" \
+    --processed-dir "${PROCESSED_DIR}"

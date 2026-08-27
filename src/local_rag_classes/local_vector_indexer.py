@@ -4,6 +4,7 @@ import json
 
 from src._class_module_support import bind_module_namespace, finalize_split_class
 import src.local_rag as _source_module
+import src.vector_store as _vector_store_module
 from src.index_overrides import (
     apply_index_overrides,
     apply_overrides_to_records,
@@ -838,7 +839,7 @@ class LocalVectorIndexer:
             # configured threshold. Operators can force a retrain via the
             # 'rebuild_vector_index' job.
             total = store.count()
-            threshold = max(0.0, float(_source_module.ANN_RETRAIN_THRESHOLD))
+            threshold = max(0.0, float(_vector_store_module.ANN_RETRAIN_THRESHOLD))
             retrain = not total or changed_rows / total >= threshold
             if retrain:
                 ann_result = store.create_vector_index()
@@ -886,4 +887,3 @@ class LocalVectorIndexer:
 
 LocalVectorIndexer.__module__ = _source_module.__name__
 finalize_split_class(_source_module, LocalVectorIndexer)
-

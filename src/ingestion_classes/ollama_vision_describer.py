@@ -23,6 +23,16 @@ class OllamaVisionDescriber:
         if self._loaded:
             return
 
+        # Cloud-named vision models (qwen3-vl:32b on SoCLAaS) do not exist in
+        # the local Ollama registry; when the effective backend is local
+        # (cloud unavailable), substitute an installed vision-capable model.
+        from src import llm_api
+
+        if not llm_api.is_soclaas():
+            self.vision_model = llm_api.resolve_local_model(
+                self.vision_model, vision=True
+            )
+
         logger.info("First figure detected - loading vision model: %s", self.vision_model)
         try:
             _ollama_generate(model=self.vision_model, prompt="Hello", keep_alive="30m")

@@ -241,6 +241,9 @@ def test_ollama_vision_describer_uses_prompt_and_larger_context(monkeypatch):
         return SimpleNamespace(response="vision text")
 
     monkeypatch.setattr("src.ingestion._ollama_generate", fake_generate)
+    # No local-model substitution in this test: empty registry keeps the
+    # configured name and never consults a live Ollama.
+    monkeypatch.setattr("src.llm_api._ollama_tags", lambda: [])
 
     describer = OllamaVisionDescriber(vision_model="vision-test")
     result = describer.describe(b"image", prompt="custom prompt")
@@ -677,7 +680,12 @@ def test_run_ingestion_refuses_empty_markdown(monkeypatch, safe_tmp_path):
     monkeypatch.setattr("src.ingestion.DocumentProcessor", EmptyProcessor)
 
     with pytest.raises(RuntimeError, match="empty Markdown"):
-        run_ingestion(str(input_pdf), str(output_dir), progress_enabled=False)
+        run_ingestion(
+            str(input_pdf),
+            str(output_dir),
+            asset_dir=safe_tmp_path / "assets",
+            progress_enabled=False,
+        )
 
     assert not (output_dir / "scan.md").exists()
     assert not (output_dir / ".source_map.json").exists()

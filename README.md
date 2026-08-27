@@ -18,6 +18,7 @@ Retrieval-augmented generation pipeline for NUS FSAE knowledge transfer. The pro
 - `src/local_rag.py`: performs two-tier retrieval over the local LanceDB index and asks the SoCLAaS LLM to answer from retrieved context.
 - `src/query.py`: thin query wrapper around the local RAG path.
 - `src/web_app.py`: local FastAPI browser UI for uploads, queued indexing, index edits, and chat.
+- `src/auto_tag.py`: LLM source-group auto-tagger plugin (gemma4) for the document-trust registry.
 - `src/llm_api.py`: OpenAI-compatible client for the hosted SoCLAaS API (chat, vision, embeddings) and the `soclaas`/`ollama` backend selector.
 - `src/embeddings.py`: calls the embeddings transport selected by `[embeddings].backend` (default: local Ollama `nomic-embed-text`).
 
@@ -34,6 +35,7 @@ Implemented behavior:
 - nomic-embed-text wants `search_document:`/`search_query:` prefixes; they are applied automatically (instruction-free models such as bge-m3 get none).
 - Section-aware chunking from PDF outlines/bookmarks, table-of-contents parsing, or heading fallback.
 - LanceDB-backed vector storage in `db/lancedb`.
+- LLM auto-tagging: PDFs uploaded without a source group are classified into Official / Student Research / Unofficial by `gemma4:26b` (filename + first-page excerpt, batched, confidence-floored) and written to the trust registry like manual tags, but flagged `auto_tagged` with model/confidence/reason for review; a manual tag always overrides. Configure under `[auto_tag]`; trigger a sweep with the web UI's "Auto-tag ungrouped" button or `POST /api/pdfs/trust/auto-tag`.
 
 The `processed_docs/` Markdown files are corpus data generated from sample PDFs, not project documentation.
 
@@ -169,37 +171,52 @@ python -m src.ingestion
 python -m src.indexing
 ```
 
-### Initial corpus build: HPC-CPU ingest-only (one-time)
+### Initial corpus build: one command (`--initial-corpus`)
 
-The CPU cluster's only role is the one-time bulk parse of the initial PDF corpus. Embeddings are workstation-local, so the cluster cannot build the index — it produces `processed_docs/` Markdown and the index is built locally afterwards. From a configured setup (`setup.cmd` provisions the repo + SIF under `/hpctmp/<user>/<repo>`; `<cpu-alias>` is the `[hpc.cpu].ssh_host` alias):
+The CPU cluster's only role is the one-time bulk parse of the initial PDF corpus. Embeddings are workstation-local, so the cluster cannot build the index — it produces `processed_docs/` Markdown and the index is built locally afterwards. From a configured setup (`setup.cmd` provisions the repo + SIF under `/hpctmp/<user>/<repo>`; the corpus itself lives under `/hpctmp/<user>/rag-corpus/`, deliberately outside the repo directory so a later re-provision cannot wipe it):
 
-1. Upload the initial zip of PDFs and unpack it into the cluster's data directory:
+```powershell
+start.cmd --initial-corpus corpus.zip
+```
+
+That single command (implemented by `scripts/hpc_corpus.py`) extracts the zip locally under `data/corpus/<name>/` — **nested directories are preserved**; the pipeline discovers PDFs recursively and disambiguates duplicate names safely — uploads the corpus to the cluster, submits and monitors the ingest-only PBS job (qsub/qstat polling, exit-code verification, live progress), fetches the processed Markdown home, verifies the fetched corpus against the zip, and builds the local index with `main.py --mode index`. Local Ollama must be running with `nomic-embed-text` pulled; if vision enrichment is enabled (`[ingestion] vision_enabled = true`, the default), a usable SoCLAaS key must be reachable (env `SOCLAAS_API_KEY`, `[llm_api].api_key`, or `~/rag_soclaas_key` on the login node) — otherwise the command fails fast instead of silently producing `[Image description failed]` markers (override with `--allow-degraded-vision`).
+
+Re-runs are cheap: PDFs whose content hash already maps to processed Markdown are skipped cluster-side, so resuming after a walltime kill or an interrupted fetch costs nothing. Useful flags: `--skip-index-build` (parse + fetch only), `--allow-degraded-vision`.
+
+Afterwards, start the server (`start.cmd`). Subsequent web-UI uploads ingest and index locally; the cluster is not used again.
+
+<details>
+<summary>Manual equivalent (appendix — prefer <code>--initial-corpus</code>)</summary>
+
+1. Extract the zip locally (structure preserved) and upload it to the corpus dir:
 
    ```powershell
-   scp corpus.zip <cpu-alias>:<remote_repo_dir>/corpus.zip
-   ssh <cpu-alias> "cd <remote_repo_dir> && unzip -o -j corpus.zip -d data && rm corpus.zip"
+   scp corpus.zip <cpu-alias>:/hpctmp/<user>/rag-corpus/data/
+   ssh <cpu-alias> "cd /hpctmp/<user>/rag-corpus/data && unzip -oq corpus.zip && rm corpus.zip"
    ```
 
-2. Generate and submit the ingest-only job. `--skip-index` makes the job run `bulk_ingest.py --skip-index`, so it stops after Docling/pypdf parsing without calling any embeddings endpoint:
+   Do **not** flatten with `unzip -j`: same-named PDFs in different directories would silently overwrite each other, while the pipeline itself handles nested duplicates safely. On Windows, `rsync` is not needed — the programmatic path below falls back to `scp` automatically.
+
+2. Generate and submit the ingest-only job (`--skip-index` stops after Docling/pypdf parsing, before any embeddings):
 
    ```powershell
-   python -m src.hpc --cpu --skip-index -o ingest_only.pbs
+   python -m src.hpc --cpu --skip-index --input-data-dir /hpctmp/<user>/rag-corpus/data --processed-dir /hpctmp/<user>/rag-corpus/processed_docs -o ingest_only.pbs
    scp ingest_only.pbs <cpu-alias>:<remote_repo_dir>/
    ssh <cpu-alias> "cd <remote_repo_dir> && qsub ingest_only.pbs"
    ```
 
-   Monitor with `qstat -u $USER` and the job output file `rag_ingest_index.o<jobid>`. The SoCLAaS key provisioned on the login node (`~/rag_soclaas_key`, chmod 600) is still used for vision enrichment of figures while `[ingestion] vision_enabled` is true — that is the only LLM call the job makes.
+   Monitor with `qstat -u $USER` and the job output file `rag_ingest_index.o<jobid>`, and **check the exit status before fetching** — a walltime kill leaves a partial `processed_docs/` that would otherwise silently index an incomplete corpus. Raise `[hpc.cpu.pbs_overrides] walltime` for large corpora.
 
-3. Bring the processed Markdown home and build the index locally (local Ollama must be running with `nomic-embed-text` pulled):
+3. Bring the processed Markdown home and build the index locally:
 
    ```powershell
-   rsync -P <cpu-alias>:<remote_repo_dir>/processed_docs/ ./processed_docs/
+   rsync -P <cpu-alias>:/hpctmp/<user>/rag-corpus/processed_docs/ ./processed_docs/
    python main.py --mode index --md_dir processed_docs --db_dir db
    ```
 
-4. Start the server (`start.cmd` or `python -m src.web_app`). Subsequent web-UI uploads ingest and index locally; the cluster is not used again.
+</details>
 
-Programmatically, steps 2–3 map to `HpcBackend.submit_ingest_index(skip_index=True)` followed by `HpcBackend.fetch_processed_docs()`. To instead build the entire index on the cluster (embeddings via the SoCLAaS API), generate the job without `--skip-index`, export `EMBEDDINGS_BACKEND=soclaas` (with `[models]` set to bge-m3/1024) for the job, and rsync `db/` home with `HpcBackend.fetch_index()`.
+Programmatically, the flow maps to `HpcBackend.push_corpus_dir()` → `submit_ingest_index(skip_index=True)` → `fetch_processed_docs()`. To instead build the entire index on the cluster (embeddings via the SoCLAaS API), generate the job without `--skip-index`, export `EMBEDDINGS_BACKEND=soclaas` (with `[models]` set to bge-m3/1024) for the job, and rsync `db/` home with `HpcBackend.fetch_index()`.
 
 Run the local browser UI:
 
@@ -436,7 +453,8 @@ Medium term:
 - Add broader retrieval evaluation with golden question sets.
 - Preserve all source block/page references through chunking and deduplication.
 - Wire `HpcBackend.submit_ingest_index`/`fetch_index` into the web job queue so HPC
-  builds can be triggered from the UI (currently manual via the runbook).
+  builds can be triggered from the UI (the CLI path is automated via
+  `start.cmd --initial-corpus`; the upload-driven web UI still ingests locally).
 
 ## Development Notes
 

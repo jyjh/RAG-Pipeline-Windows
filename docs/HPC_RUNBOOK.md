@@ -178,31 +178,53 @@ embedding settings matter there.
 
 ### B3. Ingest (the cluster's only job)
 
-Stage the corpus first — an initial zip of PDFs is fine, unpack it on the
-login node into the data dir:
+Preferred — run everything from the workstation with one command (extract,
+upload, submit, monitor with exit-code verification, fetch, index):
 
 ```bash
-unzip -o -j corpus.zip -d data
+./start.sh --initial-corpus corpus.zip      # or start.cmd on Windows
 ```
+
+Manual equivalent — stage the corpus first. An initial zip of PDFs is fine;
+unpack it on the login node into the corpus data dir, KEEPING the directory
+structure (the pipeline discovers PDFs recursively and handles duplicate
+names, whereas `unzip -j` flattening silently overwrites same-named PDFs from
+different directories):
+
+```bash
+mkdir -p /hpctmp/$USER/rag-corpus/data && cd /hpctmp/$USER/rag-corpus/data
+unzip -oq corpus.zip && rm corpus.zip
+```
+
+The corpus lives under `/hpctmp/$USER/rag-corpus/` — outside the deployed
+repo directory — so a re-provision (which atomically replaces the repo)
+cannot wipe it.
 
 Submit the ingest-only job (`--skip-index` makes it run
 `bulk_ingest.py --skip-index`, stopping after parsing):
 
 ```bash
-python -m src.hpc --cpu --skip-index -o ingest_only.pbs
+python -m src.hpc --cpu --skip-index \
+  --input-data-dir /hpctmp/$USER/rag-corpus/data \
+  --processed-dir /hpctmp/$USER/rag-corpus/processed_docs \
+  -o ingest_only.pbs
 RAG_PIPELINE_CONFIG=config.cpu.toml qsub ingest_only.pbs
 ```
 
 Bring the Markdown home and build the index locally (local Ollama with
-`nomic-embed-text` pulled):
+`nomic-embed-text` pulled). Check the PBS exit status first — a walltime
+kill leaves a partial `processed_docs/` that would otherwise silently index
+an incomplete corpus:
 
 ```bash
-rsync -P nus_hpc:~/<path-to-repo>/processed_docs/ ./processed_docs/
+rsync -P nus_hpc:/hpctmp/$USER/rag-corpus/processed_docs/ ./processed_docs/
 python main.py --mode index --md_dir processed_docs --db_dir db
 ```
 
-Programmatic equivalent: `HpcBackend.submit_ingest_index(skip_index=True)`
-followed by `HpcBackend.fetch_processed_docs()`.
+Programmatic equivalent (what `--initial-corpus` runs, plus exit-code
+verification and a fetched-corpus completeness check):
+`HpcBackend.push_corpus_dir()` → `submit_ingest_index(skip_index=True)` →
+`fetch_processed_docs()`.
 
 Variant — build the whole index on the cluster instead (embeddings via the
 SoCLAaS API; also set `[models] embedding_model = "bge-m3"`,

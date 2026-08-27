@@ -114,6 +114,34 @@ def _validate_int(value, field: str, minimum: int) -> int:
     return ivalue
 
 
+def _is_under(path: str, root: str) -> bool:
+    """True when posix ``path`` equals or lies under posix ``root``."""
+    if path == root:
+        return True
+    return path.startswith(root.rstrip("/") + "/")
+
+
+def _extra_bind_mounts(storage_root: str, *dirs: str) -> str:
+    """1:1 bind flags for absolute dirs the container must see at the same path.
+
+    Only absolute paths need binding (repo-relative dirs already live under the
+    ``${PWD}:/app`` bind), and anything under ``storage_root`` is already covered
+    by its own bind. Order is preserved and duplicates collapse, so generated
+    scripts stay deterministic for tests.
+    """
+    flags: list[str] = []
+    seen = {"/", storage_root.rstrip("/")}
+    for value in dirs:
+        normalized = value.rstrip("/")
+        if not normalized.startswith("/") or normalized in seen:
+            continue
+        if _is_under(normalized, storage_root.rstrip("/")):
+            continue
+        seen.add(normalized)
+        flags.append(f"-B {normalized}:{normalized}")
+    return " ".join(flags)
+
+
 # --- Resource-clause helpers (dual-mode: GPU vs CPU) -------------------------
 #
 # The single mode switch is ngpus. ngpus > 0  => GPU job (":ngpus=N" appended to
@@ -146,6 +174,7 @@ def generate_pbs_script(
     ngpus: int = 1,
     queue: str = "gpu",
     input_data_dir: str = "data",
+    processed_dir: str = "processed_docs",
     container_sif: str = "rag_pipeline.sif",
     walltime: str = "08:00:00",
     storage_root: str = "/hpctmp/${USER}",
@@ -161,8 +190,15 @@ def generate_pbs_script(
     ``[llm_api].api_key`` in the staged ``config.toml`` so the job can reach
     the embeddings endpoint.
 
+    ``input_data_dir`` and ``processed_dir`` may be repo-relative (resolved
+    against the qsub working directory, i.e. the repo bound at /app) or
+    absolute. Absolute dirs must be visible inside the container at the SAME
+    path, so they get their own 1:1 bind mount (unless already covered by the
+    ``storage_root`` bind). This is what lets the corpus live OUTSIDE the
+    provision-swapped repo directory under e.g. ``/hpctmp/<user>/rag-corpus``.
+
     With ``skip_index=True`` the job runs ``bulk_ingest.py --skip-index``: it
-    stops after ingestion (Markdown under ``processed_docs/``) and never calls
+    stops after ingestion (Markdown under ``processed_dir``) and never calls
     the embeddings endpoint -- the index is then built locally with a local
     embedding model (see ``HpcBackend.fetch_processed_docs``). The SoCLAaS key
     remains needed only when vision enrichment is enabled in the staged
@@ -174,6 +210,7 @@ def generate_pbs_script(
     ngpus = _validate_int(ngpus, "ngpus", minimum=0)
     queue = _validate_name(queue, "queue")
     input_data_dir = _validate_path(input_data_dir, "input_data_dir")
+    processed_dir = _validate_path(processed_dir, "processed_dir")
     container_sif = _validate_path(container_sif, "container_sif")
     walltime = _validate_walltime(walltime)
     storage_root = _validate_path(storage_root, "storage_root")
@@ -181,6 +218,13 @@ def generate_pbs_script(
     select_clause = _select_clause(ncpus, mem, ngpus)
     nv = _nv_flag(ngpus)  # "--nv " on GPU, "" on CPU
     skip_flag = " --skip-index" if skip_index else ""
+    extra_binds = _extra_bind_mounts(storage_root, input_data_dir, processed_dir)
+    # Keep BIND_MOUNTS a single interpolatable token: the storage/home/app binds
+    # are fixed, the corpus binds vary per invocation.
+    bind_mounts = (
+        f"-B ${{STORAGE_ROOT}}:${{STORAGE_ROOT}} -B ${{HOME}}:/srv/home -B ${{PWD}}:/app"
+        + (f" {extra_binds}" if extra_binds else "")
+    )
 
     return f"""#!/bin/bash
 #PBS -N {job_name}
@@ -214,7 +258,7 @@ if [ ! -f "${{CONTAINER_SIF}}" ] && [ -f "${{STORAGE_ROOT}}/{container_sif}" ]; 
     CONTAINER_SIF="${{STORAGE_ROOT}}/{container_sif}"
 fi
 
-BIND_MOUNTS="-B ${{STORAGE_ROOT}}:${{STORAGE_ROOT}} -B ${{HOME}}:/srv/home -B ${{PWD}}:/app"
+BIND_MOUNTS="{bind_mounts}"
 
 export TMPDIR="${{SCRATCH_DIR}}/tmp"
 
@@ -227,8 +271,14 @@ if [ -z "${{SOCLAAS_API_KEY:-}}" ] && [ -f "${{HOME}}/rag_soclaas_key" ]; then
     export SOCLAAS_API_KEY="$(cat "${{HOME}}/rag_soclaas_key")"
 fi
 
+# Both dirs honor their environment variables at qsub time (qsub -v). The
+# defaults are baked in by the generator, so the script is self-contained.
 INPUT_DATA_DIR="${{INPUT_DATA_DIR:-{input_data_dir}}}"
-singularity exec {nv}${{BIND_MOUNTS}} "${{CONTAINER_SIF}}" python3 scripts/bulk_ingest.py --input-dir "{input_data_dir}"{skip_flag}
+PROCESSED_DIR="${{PROCESSED_DIR:-{processed_dir}}}"
+mkdir -p "${{PROCESSED_DIR}}"
+singularity exec {nv}${{BIND_MOUNTS}} "${{CONTAINER_SIF}}" python3 scripts/bulk_ingest.py \\
+    --input-dir "${{INPUT_DATA_DIR}}" \\
+    --processed-dir "${{PROCESSED_DIR}}"{skip_flag}
 """
 
 
@@ -257,7 +307,8 @@ def parse_hpc_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--walltime", default=None, help="Job walltime HH:MM:SS (default: 08:00:00).")
     parser.add_argument("--container-sif", default=None, help="Singularity image filename (default: rag_pipeline.sif; rag_pipeline_cpu.sif under --cpu).")
     parser.add_argument("--storage-root", default=None, help="Per-cluster scratch/storage root (CPU default: /hpctmp/$USER).")
-    parser.add_argument("--input-data-dir", default=None, help="Ingest input directory (default: data).")
+    parser.add_argument("--input-data-dir", default=None, help="Ingest input directory (default: data; repo-relative or absolute).")
+    parser.add_argument("--processed-dir", default=None, help="Ingest output directory for processed Markdown (default: processed_docs; repo-relative or absolute).")
     parser.add_argument("-o", "--output", default=None, help="Write the generated script to this file (default: stdout).")
     return parser.parse_args(argv)
 
@@ -299,6 +350,7 @@ def _build_script_from_args(args: argparse.Namespace) -> str:
         walltime=args.walltime or "08:00:00",
         container_sif=bundle["container_sif"],
         input_data_dir=args.input_data_dir or "data",
+        processed_dir=args.processed_dir or "processed_docs",
         storage_root=args.storage_root or "/hpctmp/${USER}",
         skip_index=bool(args.skip_index),
     )

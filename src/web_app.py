@@ -6,6 +6,7 @@ import html
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import shutil
@@ -14,13 +15,17 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
+
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
+
+logger = logging.getLogger(__name__)
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -95,6 +100,8 @@ from src.index_overrides import (
     persist_index_edit,
 )
 from src.pdf_registry import PdfRegistry, load_source_map, remove_source_entries_by_hash, sha256_file, source_map_path
+from src import auto_tag
+from src.auto_tag import AutoTagInput
 from src.reliability import (
     SOURCE_GROUP_UNGROUPED,
     normalize_source_group,
@@ -557,6 +564,7 @@ def _load_chat_config(config_path: Path | None = None) -> dict[str, Any]:
             chat.llm_num_predict,
             DEFAULT_LLM_NUM_PREDICT,
         ),
+        "llm_timeout": _positive_float(chat.llm_timeout, DEFAULT_LLM_TIMEOUT),
         "retrieval_min_score": _positive_float(
             cfg.retrieval.min_relevance_score,
             DEFAULT_RETRIEVAL_MIN_SCORE,
@@ -639,6 +647,14 @@ CHAT_CONFIG = _load_chat_config()
 INGESTION_CONFIG = _load_ingestion_config()
 UPLOADS_CONFIG = _load_uploads_config()
 INDEXING_CONFIG = _load_indexing_config()
+
+# Embedding model for query-side defaults: the configured model (matching the
+# built index), not the repo default -- a mismatch silently degrades every
+# retrieval cosine to noise. Split request classes borrow this via
+# bind_module_namespace.
+from src.embeddings import configured_embedding_model as _configured_embedding_model
+
+CONFIGURED_EMBEDDING_MODEL = _configured_embedding_model()
 
 # Apply ANN tuning once at import so query-time _apply_ann_search_params and
 # create_vector_index() defaults both honor config.toml. Safe no-op when the
@@ -1732,7 +1748,7 @@ def _index_records_snapshot(db_dir: Path | None = None) -> tuple[list[dict[str, 
     payload = store.list_records(offset=0, limit=count, search="")
     result = (
         list(payload.get("rows") or []),
-        str(payload.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
+        str(payload.get("embedding_model") or CONFIGURED_EMBEDDING_MODEL),
         int(payload.get("embedding_dim") or DEFAULT_EMBEDDING_DIM),
     )
     with _INDEX_CACHE_LOCK:
@@ -2078,7 +2094,7 @@ def update_index_record(
     with INDEX_LOCK:
         store = _index_store(resolved_db_dir)
         record = store.get_record(record_id)
-    model = embedding_model or record.get("embedding_model") or DEFAULT_EMBEDDING_MODEL
+    model = embedding_model or record.get("embedding_model") or CONFIGURED_EMBEDDING_MODEL
     embedding_dim = int(record.get("embedding_dim") or len(record.get("vector") or []) or DEFAULT_EMBEDDING_DIM)
 
     from src.embeddings import EmbeddingEngine
@@ -2182,7 +2198,7 @@ def vector_search_index_rows(
         working_dir=str(db_dir or DB_DIR),
         asset_dir=str(ASSET_DIR),
         trust_path=str(DOCUMENT_TRUST_PATH),
-        embedding_model=embedding_model or DEFAULT_EMBEDDING_MODEL,
+        embedding_model=embedding_model or CONFIGURED_EMBEDDING_MODEL,
         embedding_batch_size=embedding_batch_size,
         embedding_timeout=embedding_timeout,
         retrieval_candidate_k=DEFAULT_RETRIEVAL_CANDIDATE_K,
@@ -2282,6 +2298,15 @@ def _default_trust_entry(source_hash: str) -> dict[str, Any]:
         "reviewed_at": "",
         "notes": "",
         "updated_at": "",
+        # LLM auto-tag provenance (src/auto_tag.py). Auto tags apply through
+        # this same registry as manual ones; these fields mark which entries
+        # the model chose, so reviewers can audit them and any manual
+        # source-group change clears them again.
+        "auto_tagged": False,
+        "auto_tag_model": "",
+        "auto_tagged_at": "",
+        "auto_tag_reason": "",
+        "auto_tag_confidence": None,
     }
 
 
@@ -2305,6 +2330,7 @@ def _normalize_trust_entry(source_hash: str, entry: dict[str, Any] | None = None
         "reviewed_at",
         "notes",
         "updated_at",
+        "auto_tagged_at",
     ):
         normalized[key] = str(normalized.get(key) or "").strip()
     normalized["reviewed_by"] = normalized["reviewed_by"][:80]
@@ -2314,6 +2340,16 @@ def _normalize_trust_entry(source_hash: str, entry: dict[str, Any] | None = None
         normalized["source_type"] = "unknown"
     normalized["source_group"] = normalize_source_group(normalized.get("source_group"))
     normalized["reliability_weight"] = source_group_weight(normalized["source_group"])
+    normalized["auto_tagged"] = bool(normalized.get("auto_tagged"))
+    normalized["auto_tag_model"] = str(normalized.get("auto_tag_model") or "").strip()[:80]
+    normalized["auto_tag_reason"] = str(normalized.get("auto_tag_reason") or "").strip()[:200]
+    try:
+        confidence = normalized.get("auto_tag_confidence")
+        normalized["auto_tag_confidence"] = (
+            min(max(float(confidence), 0.0), 1.0) if confidence not in {None, ""} else None
+        )
+    except (TypeError, ValueError):
+        normalized["auto_tag_confidence"] = None
     try:
         year = normalized.get("publication_year")
         normalized["publication_year"] = int(year) if year not in {None, ""} else None
@@ -2352,6 +2388,65 @@ def _trust_warnings(trust: dict[str, Any]) -> list[str]:
     return warnings
 
 
+def _validate_trust_updates(updates: dict[str, Any]) -> None:
+    if "review_status" in updates and updates["review_status"] not in TRUST_REVIEW_STATUSES:
+        choices = ", ".join(sorted(TRUST_REVIEW_STATUSES))
+        raise ValueError(f"review_status must be one of: {choices}")
+    if "source_type" in updates and updates["source_type"] not in TRUST_SOURCE_TYPES:
+        choices = ", ".join(sorted(TRUST_SOURCE_TYPES))
+        raise ValueError(f"source_type must be one of: {choices}")
+    if "source_group" in updates and updates["source_group"] not in TRUST_SOURCE_GROUPS:
+        choices = ", ".join(sorted(TRUST_SOURCE_GROUPS))
+        raise ValueError(f"source_group must be one of: {choices}")
+
+
+def _merged_trust_entry(
+    source_hash: str,
+    entry: dict[str, Any] | None,
+    updates: dict[str, Any],
+    *,
+    auto: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Merge one trust entry under manual- or auto-tag semantics (pure).
+
+    ``auto`` is set only by the LLM auto-tagger and stamps provenance
+    (model/confidence/reason) on the entry. A manual ``source_group`` update
+    (``auto is None``) instead CLEARS the auto-tag fields: a human override
+    always wins over the machine tag.
+    """
+    next_entry = dict(_normalize_trust_entry(source_hash, entry))
+    for key in (
+        "review_status",
+        "source_type",
+        "source_group",
+        "publication_year",
+        "expires_at",
+        "reviewed_by",
+        "notes",
+    ):
+        if key in updates:
+            next_entry[key] = updates[key]
+    if auto is not None:
+        next_entry["auto_tagged"] = True
+        next_entry["auto_tag_model"] = str(auto.get("model") or "")
+        next_entry["auto_tag_confidence"] = auto.get("confidence")
+        next_entry["auto_tag_reason"] = str(auto.get("reason") or "")
+        next_entry["auto_tagged_at"] = _utcnow()
+    elif "source_group" in updates:
+        next_entry["auto_tagged"] = False
+        next_entry["auto_tag_model"] = ""
+        next_entry["auto_tagged_at"] = ""
+        next_entry["auto_tag_reason"] = ""
+        next_entry["auto_tag_confidence"] = None
+    next_entry = _normalize_trust_entry(source_hash, next_entry)
+    if "review_status" in updates:
+        next_entry["reviewed_at"] = _utcnow()
+    elif next_entry["review_status"] == "approved" and not next_entry.get("reviewed_at"):
+        next_entry["reviewed_at"] = _utcnow()
+    next_entry["updated_at"] = _utcnow()
+    return next_entry
+
+
 def update_document_trust(
     source_hash: str,
     updates: dict[str, Any],
@@ -2360,40 +2455,219 @@ def update_document_trust(
 ) -> dict[str, Any]:
     if not source_hash:
         raise ValueError("source_hash is required.")
+    _validate_trust_updates(updates)
     with TRUST_LOCK:
         payload = _load_trust_registry(trust_path)
         documents = payload.setdefault("documents", {})
-        current = _normalize_trust_entry(source_hash, documents.get(source_hash))
-        next_entry = dict(current)
-        if "review_status" in updates and updates["review_status"] not in TRUST_REVIEW_STATUSES:
-            choices = ", ".join(sorted(TRUST_REVIEW_STATUSES))
-            raise ValueError(f"review_status must be one of: {choices}")
-        if "source_type" in updates and updates["source_type"] not in TRUST_SOURCE_TYPES:
-            choices = ", ".join(sorted(TRUST_SOURCE_TYPES))
-            raise ValueError(f"source_type must be one of: {choices}")
-        if "source_group" in updates and updates["source_group"] not in TRUST_SOURCE_GROUPS:
-            choices = ", ".join(sorted(TRUST_SOURCE_GROUPS))
-            raise ValueError(f"source_group must be one of: {choices}")
-        for key in (
-            "review_status",
-            "source_type",
-            "source_group",
-            "publication_year",
-            "expires_at",
-            "reviewed_by",
-            "notes",
-        ):
-            if key in updates:
-                next_entry[key] = updates[key]
-        next_entry = _normalize_trust_entry(source_hash, next_entry)
-        if "review_status" in updates:
-            next_entry["reviewed_at"] = _utcnow()
-        elif next_entry["review_status"] == "approved" and not next_entry.get("reviewed_at"):
-            next_entry["reviewed_at"] = _utcnow()
-        next_entry["updated_at"] = _utcnow()
+        next_entry = _merged_trust_entry(source_hash, documents.get(source_hash), updates)
         documents[source_hash] = next_entry
         _write_trust_registry(payload, trust_path)
         return dict(next_entry)
+
+
+def update_documents_trust(
+    updates_by_hash: dict[str, dict[str, Any]],
+    *,
+    autos_by_hash: dict[str, dict[str, Any]] | None = None,
+    trust_path: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Bulk trust update: ONE registry load and ONE atomic write for many hashes.
+
+    Same per-entry semantics as :func:`update_document_trust`. At corpus scale
+    (tens of thousands of entries) a per-hash load/write loop rewrites the
+    whole JSON registry once per PDF; this path rewrites it once per batch.
+    Every entry is validated before anything is written, so a bad value cannot
+    leave a half-updated registry behind.
+    """
+    autos_by_hash = autos_by_hash or {}
+    for source_hash, updates in updates_by_hash.items():
+        if not source_hash:
+            raise ValueError("source_hash is required.")
+        _validate_trust_updates(updates)
+    with TRUST_LOCK:
+        payload = _load_trust_registry(trust_path)
+        documents = payload.setdefault("documents", {})
+        entries: dict[str, dict[str, Any]] = {}
+        for source_hash, updates in updates_by_hash.items():
+            next_entry = _merged_trust_entry(
+                source_hash, documents.get(source_hash), updates, auto=autos_by_hash.get(source_hash)
+            )
+            documents[source_hash] = next_entry
+            entries[source_hash] = dict(next_entry)
+        if entries:
+            _write_trust_registry(payload, trust_path)
+        return entries
+
+
+def apply_auto_tag_decisions(
+    decisions: dict[str, Any],
+    *,
+    model: str,
+    trust_path: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Write LLM source-group decisions as auto-flagged trust entries.
+
+    The tags land in the registry exactly like manual ones (retrieval ranking
+    is unaffected); each entry just additionally records that it was tagged
+    automatically, by which model, with what confidence/reason.
+    """
+    updates = {
+        source_hash: {"source_group": decision.source_group}
+        for source_hash, decision in decisions.items()
+    }
+    autos = {
+        source_hash: {
+            "model": model,
+            "confidence": decision.confidence,
+            "reason": decision.reason,
+        }
+        for source_hash, decision in decisions.items()
+    }
+    return update_documents_trust(updates, autos_by_hash=autos, trust_path=trust_path)
+
+
+# --------------------------------------------------------------------------- #
+# LLM source-group auto-tagging (src/auto_tag.py plugin orchestration)
+# --------------------------------------------------------------------------- #
+
+_AUTO_TAG_LOCK = threading.Lock()
+# Status of the LATEST manual sweep (POST /api/pdfs/trust/auto-tag); also set
+# by upload-triggered runs. Purely informational for the UI/status endpoint.
+_AUTO_TAG_STATE: dict[str, Any] = {
+    "running": False,
+    "started_at": "",
+    "finished_at": "",
+    "queued": 0,
+    "tagged": 0,
+    "last_error": "",
+}
+
+
+def _auto_tag_settings() -> dict[str, Any]:
+    """Effective [auto_tag] settings with the model fallback resolved."""
+    cfg = _pipeline_config().auto_tag
+    model = str(cfg.model or "").strip() or str(_pipeline_config().models.llm_model or "").strip()
+    return {
+        "enabled": bool(cfg.enabled),
+        "model": model or auto_tag.DEFAULT_MODEL,
+        "batch_size": max(1, int(cfg.batch_size)),
+        "min_confidence": min(max(0.0, float(cfg.min_confidence)), 1.0),
+        "excerpt_chars": max(0, int(cfg.excerpt_chars)),
+        "timeout": max(1.0, float(cfg.timeout_seconds)),
+        "max_items_per_run": max(1, int(cfg.max_items_per_run)),
+    }
+
+
+def _auto_tag_excerpt_source(item: dict[str, Any]) -> str:
+    for key in ("pdf_path", "staging_path", "upload_path", "source_pdf_path"):
+        raw = str(item.get(key) or "").strip()
+        if not raw:
+            continue
+        path = Path(raw)
+        if not path.is_absolute():
+            path = ROOT_DIR / path
+        if path.exists():
+            return str(path)
+    return ""
+
+
+def _run_auto_tag(items: list[dict[str, Any]]) -> None:
+    """Background auto-tag run; logs and records failures, never raises."""
+    settings = _auto_tag_settings()
+    try:
+        inputs = []
+        for item in items:
+            excerpt = ""
+            source = _auto_tag_excerpt_source(item)
+            if source and settings["excerpt_chars"] > 0:
+                excerpt = auto_tag.pdf_excerpt(source, max_chars=settings["excerpt_chars"])
+            inputs.append(
+                AutoTagInput(
+                    source_hash=str(item["hash"]),
+                    filename=str(item.get("filename") or ""),
+                    excerpt=excerpt,
+                )
+            )
+        decisions = auto_tag.classify_documents(
+            inputs,
+            model=settings["model"],
+            batch_size=settings["batch_size"],
+            min_confidence=settings["min_confidence"],
+            timeout=settings["timeout"],
+        )
+        # Only apply decisions for documents this run submitted; a confused
+        # reply must never reach (and overwrite) hashes outside the run.
+        allowed = {str(item["hash"]) for item in items}
+        decisions = {
+            source_hash: decision
+            for source_hash, decision in decisions.items()
+            if source_hash in allowed
+        }
+        if decisions:
+            apply_auto_tag_decisions(decisions, model=settings["model"])
+        with _AUTO_TAG_LOCK:
+            _AUTO_TAG_STATE.update(
+                {
+                    "running": False,
+                    "finished_at": _utcnow(),
+                    "tagged": len(decisions),
+                    "queued": len(items),
+                    "last_error": "",
+                }
+            )
+    except Exception as exc:
+        logger.warning("Auto-tag run failed: %s", exc, exc_info=True)
+        with _AUTO_TAG_LOCK:
+            _AUTO_TAG_STATE.update(
+                {"running": False, "finished_at": _utcnow(), "last_error": str(exc)}
+            )
+
+
+def _schedule_auto_tag(items: list[dict[str, Any]], *, exclusive: bool = False) -> bool:
+    """Start a daemon-thread auto-tag run for ``items``; True when started.
+
+    Upload-triggered runs (``exclusive=False``) always start: they are small,
+    and every trust write is guarded by the registry lock anyway. Manual
+    sweeps (``exclusive=True``) refuse to stack on a running sweep so one
+    click cannot queue the same corpus twice.
+    """
+    if not items:
+        return False
+    if exclusive:
+        with _AUTO_TAG_LOCK:
+            if _AUTO_TAG_STATE.get("running"):
+                return False
+            _AUTO_TAG_STATE.update(
+                {
+                    "running": True,
+                    "started_at": _utcnow(),
+                    "queued": len(items),
+                    "tagged": 0,
+                    "last_error": "",
+                }
+            )
+    thread = threading.Thread(target=_run_auto_tag, args=(items,), daemon=True, name="auto-tag")
+    thread.start()
+    return True
+
+
+def _schedule_upload_auto_tag(uploads: list[dict[str, Any]]) -> None:
+    """Queue LLM auto-tagging for freshly uploaded PDFs left ungrouped."""
+    settings = _auto_tag_settings()
+    if not settings["enabled"]:
+        return
+    items = [
+        {
+            "hash": str(upload["hash"]),
+            "filename": str(upload.get("filename") or ""),
+            "staging_path": str(upload.get("staging_path") or ""),
+        }
+        for upload in uploads
+        if upload.get("hash")
+        and normalize_source_group(upload.get("source_group")) == SOURCE_GROUP_UNGROUPED
+    ]
+    if items:
+        _schedule_auto_tag(items)
 
 
 def _resolve_workspace_path(raw_path: str, *, root_dir: Path = ROOT_DIR) -> Path | None:
@@ -3333,6 +3607,9 @@ RestoreBackupRequest.__module__ = __name__
 DocumentTrustRequest = import_split_class("src.web_app_classes.document_trust_request", "DocumentTrustRequest")
 DocumentTrustRequest.__module__ = __name__
 
+AutoTagRequest = import_split_class("src.web_app_classes.auto_tag_request", "AutoTagRequest")
+AutoTagRequest.__module__ = __name__
+
 
 class BulkDocumentTrustRequest(BaseModel):
     source_hashes: list[str] = Field(default_factory=list)
@@ -3405,6 +3682,47 @@ def recover_pending_upload_jobs_on_startup() -> dict[str, Any]:
     return job_queue.recover_pending_uploads()
 
 
+def _start_local_chat_model_warmup() -> None:
+    """Pre-load the local Ollama chat model in a background thread.
+
+    A cold 9-20GB model load can take minutes; without warm-up the first
+    user query pays that load inside its request timeout and times out.
+    Fire-and-forget: any failure just means the first query loads the model.
+    """
+    try:
+        from src import llm_api
+
+        if llm_api.active_backend() != "ollama":
+            return
+        model = llm_api.resolve_local_model(CHAT_CONFIG.get("planner_model") or "")
+        if not model:
+            return
+
+        def _warm() -> None:
+            try:
+                payload = json.dumps(
+                    {
+                        "model": model,
+                        "messages": [{"role": "user", "content": "Ready?"}],
+                        "stream": False,
+                        "keep_alive": "30m",
+                    }
+                ).encode("utf-8")
+                request = urllib.request.Request(
+                    f"{str(CHAT_CONFIG.get('ollama_host') or 'http://127.0.0.1:11434').rstrip('/')}/api/chat",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib.request.urlopen(request, timeout=600.0).read()
+            except Exception:
+                logger.debug("Local chat model warm-up skipped/failed", exc_info=True)
+
+        threading.Thread(target=_warm, name="ollama-chat-warmup", daemon=True).start()
+    except Exception:
+        logger.debug("Could not start local chat model warm-up", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Configure a persistent server log so background-worker errors and
@@ -3415,6 +3733,7 @@ async def lifespan(app: FastAPI):
     except OSError:
         pass
     recover_pending_upload_jobs_on_startup()
+    _start_local_chat_model_warmup()
     yield
     # Persist any in-flight API-key usage counters so a restart does not lose
     # the tail of usage accounting (the tracker only flushes on a throttle).
@@ -4018,7 +4337,7 @@ def _upload_options_from_form(form: Any) -> dict[str, Any]:
         "max_pages_whole_doc": _nonnegative_int(
             form.get("max_pages_whole_doc"), INGESTION_CONFIG.get("max_pages_whole_doc", 50)
         ),
-        "embedding_model": str(form.get("embedding_model") or DEFAULT_EMBEDDING_MODEL),
+        "embedding_model": str(form.get("embedding_model") or CONFIGURED_EMBEDDING_MODEL),
         "embedding_batch_size": _positive_int(form.get("embedding_batch_size"), DEFAULT_EMBEDDING_BATCH_SIZE),
         "embedding_timeout": _positive_float(form.get("embedding_timeout"), DEFAULT_EMBEDDING_TIMEOUT),
         "index_backend": str(form.get("index_backend") or DEFAULT_INDEX_BACKEND),
@@ -4066,14 +4385,17 @@ def _assign_upload_source_groups(
 
 
 def _apply_upload_source_groups(uploads: list[dict[str, Any]]) -> None:
+    updates_by_hash: dict[str, dict[str, Any]] = {}
     for upload in uploads:
         source_hash = str(upload.get("hash") or "")
         if not source_hash:
             continue
         group = normalize_source_group(upload.get("source_group"))
-        if group == SOURCE_GROUP_UNGROUPED:
+        if group == SOURCE_GROUP_UNGROUPED or group not in TRUST_SOURCE_GROUPS:
             continue
-        update_document_trust(source_hash, {"source_group": group})
+        updates_by_hash[source_hash] = {"source_group": group}
+    if updates_by_hash:
+        update_documents_trust(updates_by_hash)
 
 
 def _upload_hashes(files: list[dict[str, Any]]) -> list[str]:
@@ -4693,6 +5015,10 @@ async def _handle_upload_request(request: Request, *, require_source_groups: boo
             options=options,
         )
         queued_job_ids.add(job_id)
+        # Background LLM tagging for PDFs the uploader left ungrouped.
+        # Non-blocking: the job queue is unaffected and the trust registry
+        # fills in as the model answers; a manual tag always wins later.
+        _schedule_upload_auto_tag(file_uploads)
 
         job_payloads = [job.to_dict()]
         response = dict(job_payloads[0]) if job_payloads else {}
@@ -5131,6 +5457,18 @@ def pdf_documents(request: Request, search: str = "", offset: int = 0, limit: in
     return _etagged_json(request, payload, seed)
 
 
+def _pdf_rows_by_hash() -> dict[str, dict[str, Any]]:
+    """All PDF rows keyed by source hash from ONE listing call.
+
+    ``list_pdf_documents`` merges registry + source map + trust + manifest
+    stats for the whole corpus, so callers that need rows for several hashes
+    (bulk trust updates, auto-tagging) must build this map once instead of
+    re-listing per hash.
+    """
+    rows = list_pdf_documents(search="", offset=0, limit=None)["pdfs"]
+    return {str(item.get("hash") or ""): item for item in rows if item.get("hash")}
+
+
 def _pdf_row_for_hash(source_hash: str) -> dict[str, Any] | None:
     documents = list_pdf_documents(search=source_hash, offset=0, limit=None)["pdfs"]
     return next((item for item in documents if item.get("hash") == source_hash), None)
@@ -5275,13 +5613,85 @@ def update_pdf_trust_bulk(payload: BulkDocumentTrustRequest):
     reviewed_by = str(payload.reviewed_by or "").strip()
     if reviewed_by:
         updates["reviewed_by"] = reviewed_by
+    # One registry write + ONE full listing for the response rows. The old
+    # per-hash loop re-serialized the whole trust registry and rebuilt the
+    # whole corpus listing once per PDF, which made bulk-tagging (and every
+    # concurrent /api/pdfs poll behind the trust lock) crawl at scale.
+    try:
+        entries = update_documents_trust({source_hash: updates for source_hash in hashes})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    rows_by_hash = _pdf_rows_by_hash()
     for source_hash in hashes:
-        try:
-            trust = update_document_trust(source_hash, updates)
-            updated.append({"source_hash": source_hash, "trust": trust, "pdf": _pdf_row_for_hash(source_hash)})
-        except ValueError as exc:
-            failed.append({"source_hash": source_hash, "error": str(exc)})
+        updated.append(
+            {
+                "source_hash": source_hash,
+                "trust": entries.get(source_hash),
+                "pdf": rows_by_hash.get(source_hash),
+            }
+        )
     return {"updated": updated, "failed": failed}
+
+
+@app.get("/api/pdfs/trust/auto-tag")
+def auto_tag_status():
+    settings = _auto_tag_settings()
+    with _AUTO_TAG_LOCK:
+        state = dict(_AUTO_TAG_STATE)
+    return {
+        **state,
+        "enabled": settings["enabled"],
+        "model": settings["model"],
+        "min_confidence": settings["min_confidence"],
+    }
+
+
+@app.post("/api/pdfs/trust/auto-tag")
+def auto_tag_pdfs(payload: AutoTagRequest):
+    settings = _auto_tag_settings()
+    if not settings["enabled"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Auto-tagging is disabled in config ([auto_tag].enabled = false).",
+        )
+
+    rows_by_hash = _pdf_rows_by_hash()
+    requested = {
+        str(raw_hash or "").strip()
+        for raw_hash in (payload.source_hashes or [])
+        if str(raw_hash or "").strip()
+    }
+    # Ungrouped only: auto-tagging must never overwrite a human decision
+    # (manual entries carry auto_tagged = false by definition after a
+    # human set them, but ungrouped is the cheap, unambiguous filter).
+    candidates = [
+        row
+        for row in rows_by_hash.values()
+        if normalize_source_group((row.get("trust") or {}).get("source_group"))
+        == SOURCE_GROUP_UNGROUPED
+        and (not requested or str(row.get("hash")) in requested)
+    ]
+    limit = payload.limit if payload.limit and int(payload.limit) > 0 else settings["max_items_per_run"]
+    candidates = candidates[: int(limit)]
+    if not candidates:
+        return {"queued": [], "status": "idle", "tagged": 0, "message": "No ungrouped PDFs to tag."}
+
+    items = [
+        {
+            "hash": str(row.get("hash") or ""),
+            "filename": str(row.get("filename") or ""),
+            "upload_path": str(row.get("upload_path") or ""),
+            "source_pdf_path": str(row.get("source_pdf_path") or ""),
+        }
+        for row in candidates
+    ]
+    if not _schedule_auto_tag(items, exclusive=True):
+        raise HTTPException(status_code=409, detail="An auto-tag run is already in progress.")
+    return {
+        "queued": [item["hash"] for item in items],
+        "status": "running",
+        "model": settings["model"],
+    }
 
 
 @app.get("/api/index")
@@ -5375,7 +5785,7 @@ def index_rows_stream(
             "type": "done",
             "received": 0,
             "total": 0,
-            "embedding_model": DEFAULT_EMBEDDING_MODEL,
+            "embedding_model": CONFIGURED_EMBEDDING_MODEL,
             "embedding_dim": DEFAULT_EMBEDDING_DIM,
         }
 

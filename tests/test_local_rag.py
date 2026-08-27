@@ -417,6 +417,12 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
 
         monkeypatch.setattr(local_rag, "_ollama_chat", _fake_local_tool_chat(calls))
         monkeypatch.setattr("src.embeddings.EmbeddingEngine", FakeEngine)
+        # Pin the local model registry so the cloud-name substitution is
+        # deterministic (never consults a live Ollama from unit tests).
+        from src import llm_api as _llm_api
+
+        _llm_api.reset_local_model_cache()
+        monkeypatch.setattr(_llm_api, "_ollama_tags", lambda: ["gemma4:latest"])
 
         engine = local_rag.LocalQueryEngine(
             working_dir=str(tmp_path),
@@ -427,7 +433,8 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
         answer = engine.ask("alpha?")
 
         assert answer == "answer [S1]"
-        assert calls[0]["model"] == "gemma4"
+        # Cloud-tagged name maps onto the installed local tag.
+        assert calls[0]["model"] == "gemma4:latest"
         assert calls[0]["tools"][0]["function"]["name"] == "search_local_context"
         assert calls[0]["timeout"] is None
         assert calls[-1]["stream"] is True

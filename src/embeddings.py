@@ -75,6 +75,23 @@ def embeddings_use_soclaas() -> bool:
     return llm_api.is_soclaas()
 
 
+def configured_embedding_model() -> str:
+    """Effective embedding model: ``[models].embedding_model`` > repo default.
+
+    The repo default (nomic-embed-text) matches a fresh deployment, but an
+    instance whose index was built with another model (e.g. all-minilm) must
+    keep embedding queries with that same model or retrieval cosines collapse
+    to noise. Query-side fallbacks use this instead of DEFAULT_EMBEDDING_MODEL.
+    """
+    try:
+        from src.config import load_config
+
+        value = str(load_config().models.embedding_model or "").strip()
+    except Exception:
+        value = ""
+    return value or DEFAULT_EMBEDDING_MODEL
+
+
 def resolve_embedding_dim(explicit: int | None = None) -> int:
     """Resolve the embedding dimension: explicit arg > ``[models].embedding_dim``
     > ``DEFAULT_EMBEDDING_DIM``.

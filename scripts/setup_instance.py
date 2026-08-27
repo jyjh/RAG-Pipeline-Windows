@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import json
 import os
 import posixpath
 import re
@@ -50,6 +51,10 @@ _REPO_ARCHIVE_EXCLUDED_NAMES = {
     "db_out",
     "logs",
     "processed_docs",
+    # Local-only config backups (written by update_toml_sections). Never useful
+    # remotely, and shipping them would leak the PREVIOUS API key to the cluster.
+    "config.toml.bak",
+    "config.toml.tmp",
 }
 
 
@@ -426,7 +431,11 @@ def _repo_archive_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
 _REPO_MANIFEST_NAME = ".rag_manifest"
 
 
-def _build_repo_manifest(source_root: Path = ROOT) -> str:
+def _build_repo_manifest(
+    source_root: Path = ROOT,
+    *,
+    exclude: frozenset[str] | set[str] = frozenset(),
+) -> str:
     """Return a deterministic content fingerprint of the archived source tree.
 
     Walks ``source_root`` with the SAME exclusions as the archive filter so the
@@ -435,6 +444,11 @@ def _build_repo_manifest(source_root: Path = ROOT) -> str:
     and independent of filesystem walk order or mtimes. The whole buffer is then
     SHA-256'd into a header line so a single comparison suffices to detect any
     change, but the per-file lines are retained for diagnosing what differed.
+
+    ``exclude`` drops additional root-relative files from the fingerprint. The
+    freshness check uses it for ``config.toml`` (see ``_manifest_fingerprint``
+    callers): config edits (API key, ports) must not trigger a full re-upload of
+    the source + multi-GB SIF when nothing else changed.
     """
     entries: list[tuple[str, str]] = []
     excluded = _REPO_ARCHIVE_EXCLUDED_NAMES
@@ -444,6 +458,8 @@ def _build_repo_manifest(source_root: Path = ROOT) -> str:
         if any(p in excluded for p in parts):
             return True
         if any(p.startswith((".index_build_", ".tmp_test_", ".pytest_")) for p in parts):
+            return True
+        if len(parts) == 1 and parts[0] in exclude:
             return True
         return False
 
@@ -471,6 +487,73 @@ def _manifest_fingerprint(manifest: str) -> str:
         if line.startswith("# sha256="):
             return line.split("=", 1)[1].strip()
     return ""
+
+
+# Files whose changes must NOT mark the deployed source stale: config.toml is
+# rewritten by every setup run (API key, ports), but the deploy only needs the
+# new file pushed -- not a full re-upload of the source archive and the
+# multi-GB SIF over a non-resumable Windows scp.
+_CONFIG_SYNC_EXCLUDE = frozenset({"config.toml"})
+
+
+def _manifest_without(manifest: str, names: frozenset[str] | set[str]) -> str:
+    """Drop root-level file lines from a manifest buffer and re-header it."""
+    kept = [
+        line
+        for line in manifest.splitlines()
+        if not line.startswith("# sha256=") and line.split("\0", 1)[0] not in names
+    ]
+    body = "".join(f"{line}\n" for line in kept)
+    overall = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return f"# sha256={overall}\n{body}"
+
+
+def _file_sha256(path: Path, *, chunk: int = 1024 * 1024) -> str:
+    """Streaming SHA-256 of a (possibly multi-GB) file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(chunk)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _remote_sha256(alias: str, remote_path: str) -> str:
+    """First sha256sum token of ``remote_path`` on the cluster, or ""."""
+    ssh = shutil.which("ssh")
+    if not ssh:
+        return ""
+    try:
+        result = subprocess.run(
+            [
+                ssh,
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=20",
+                alias,
+                f"sha256sum {shlex.quote(remote_path)} 2>/dev/null | cut -d' ' -f1",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=600,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip().splitlines()[0].strip() if result.returncode == 0 and result.stdout.strip() else ""
+
+
+def _sync_config_only(alias: str, target_repo: str, manifest: str, staging_dir: Path) -> None:
+    """Push just config.toml + a fresh manifest; skip archive/SIF entirely."""
+    local_config = ROOT / "config.toml"
+    if not local_config.is_file():
+        return
+    _upload_provision_file(local_config, alias, posixpath.join(target_repo, "config.toml"))
+    manifest_file = staging_dir / _REPO_MANIFEST_NAME
+    manifest_file.write_text(manifest, encoding="utf-8", newline="\n")
+    _upload_provision_file(manifest_file, alias, posixpath.join(target_repo, _REPO_MANIFEST_NAME))
 
 
 def create_repository_archive(destination: Path, source_root: Path = ROOT) -> Path:
@@ -518,6 +601,47 @@ def _run_provision_ssh(
             f"remote provisioning command failed on {alias} "
             f"(exit {result.returncode})"
         )
+
+
+def _reuse_remote_sif_if_unchanged(
+    alias: str, existing_sif: str, staged_sif: str, local_image: Path
+) -> bool:
+    """Copy the deployed SIF into the staged repo when it matches the local one.
+
+    A re-provision triggered by a source change almost never changes the
+    multi-GB SIF. Comparing checksums (tens of seconds over ssh) and copying on
+    the cluster filesystem beats re-uploading gigabytes over scp, which on
+    Windows has no resume. Returns True when the staged SIF is ready.
+    """
+    ssh = shutil.which("ssh")
+    if not ssh:
+        return False
+    try:
+        present = subprocess.run(
+            [
+                ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
+                alias, f"test -s {shlex.quote(existing_sif)}",
+            ],
+            check=False, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if present.returncode != 0:
+        return False
+    local_digest = _file_sha256(local_image)
+    remote_digest = _remote_sha256(alias, existing_sif)
+    if not remote_digest or remote_digest != local_digest:
+        return False
+    print(
+        f"{local_image.name} on {alias} matches the local image (sha256); "
+        "copying it into the staged repo instead of re-uploading."
+    )
+    _run_provision_ssh(
+        alias,
+        f"cp {shlex.quote(existing_sif)} {shlex.quote(staged_sif)}",
+        timeout=30 * 60,
+    )
+    return True
 
 
 def _upload_provision_file(source: Path, alias: str, remote_path: str) -> None:
@@ -648,13 +772,20 @@ def provision_hpc_cluster(
 
     # --- Freshness check -------------------------------------------------
     # Compare the local source fingerprint against the deployed remote one.
-    # If they agree AND the SIF is already in place, there is nothing to do.
+    # The comparison ignores config.toml (rewritten by every setup run), so a
+    # config-only change degrades to a one-file sync instead of a full
+    # re-upload of the source archive and the multi-GB SIF.
     local_manifest = _build_repo_manifest(ROOT)
+    local_core_fingerprint = _manifest_fingerprint(
+        _build_repo_manifest(ROOT, exclude=_CONFIG_SYNC_EXCLUDE)
+    )
     local_fingerprint = _manifest_fingerprint(local_manifest)
-    if not force and local_fingerprint:
+    if not force and local_core_fingerprint:
         remote_manifest = _remote_manifest(alias, target_repo)
-        remote_fingerprint = _manifest_fingerprint(remote_manifest)
-        if remote_fingerprint and remote_fingerprint == local_fingerprint:
+        remote_core_fingerprint = _manifest_fingerprint(
+            _manifest_without(remote_manifest, _CONFIG_SYNC_EXCLUDE)
+        )
+        if remote_core_fingerprint and remote_core_fingerprint == local_core_fingerprint:
             # Source is current; only confirm the SIF survived.
             ssh = shutil.which("ssh")
             if ssh:
@@ -666,7 +797,16 @@ def provision_hpc_cluster(
                     check=False, timeout=30,
                 )
                 if check.returncode == 0:
-                    print(f"\n{alias}: already up to date ({target_repo}); skipping upload.")
+                    if _manifest_fingerprint(remote_manifest) == local_fingerprint:
+                        print(f"\n{alias}: already up to date ({target_repo}); skipping upload.")
+                        return
+                    _sync_config_only(
+                        alias, target_repo, local_manifest, archive_path.parent
+                    )
+                    print(
+                        f"\n{alias}: source unchanged; synced config.toml only "
+                        f"({target_repo}); skipped archive/SIF upload."
+                    )
                     return
             # SIF missing -> fall through to re-provision (rebuilds SIF only).
 
@@ -691,12 +831,13 @@ def provision_hpc_cluster(
         _run_provision_ssh(alias, extract, timeout=600)
 
         if local_image is not None and local_image.is_file():
-            print(f"Uploading {image_name} to {alias} (large transfer)...")
-            _upload_provision_file(
-                local_image,
-                alias,
-                posixpath.join(staged_repo, image_name),
+            staged_sif = posixpath.join(staged_repo, image_name)
+            reused = _reuse_remote_sif_if_unchanged(
+                alias, target_sif, staged_sif, local_image
             )
+            if not reused:
+                print(f"Uploading {image_name} to {alias} (large transfer)...")
+                _upload_provision_file(local_image, alias, staged_sif)
         else:
             print(f"Building {image_name} on {alias}...")
             _run_provision_ssh(
@@ -1061,7 +1202,42 @@ def _collect_non_interactive(config: dict[str, Any], args: argparse.Namespace) -
     )
 
 
+def _cluster_corpus_dirs(values: SetupValues) -> dict[str, str] | None:
+    """Absolute cluster corpus dirs under ``/hpctmp/<user>/rag-corpus``.
+
+    Keeping data/processed/db OUTSIDE ``remote_repo_dir`` is a correctness
+    requirement, not a preference: provisioning atomically replaces the repo
+    directory (old -> ``.rag-setup-previous`` -> deleted on the next run), so
+    anything stored inside it -- an uploaded corpus, a finished parse -- is
+    destroyed by a later re-provision. Returns None when the username is
+    unknown (legacy repo-relative dirs are kept then; provisioning will fail
+    loudly asking for the username anyway).
+    """
+    if values.mode != "hpc" or not values.cpu_user:
+        return None
+    corpus_root = _storage_root(values.cpu_storage_root, values.cpu_user, "/hpctmp")
+    corpus_root = f"{corpus_root.rstrip('/')}/rag-corpus"
+    return {
+        "remote_data_dir": f"{corpus_root}/data",
+        "remote_processed_dir": f"{corpus_root}/processed_docs",
+        "remote_db_dir": f"{corpus_root}/db",
+    }
+
+
 def configure(path: Path, values: SetupValues) -> None:
+    hpc_updates: dict[str, Any] = {
+        "enabled": values.mode == "hpc",
+        "poll_interval_seconds": 15.0,
+    }
+    corpus_dirs = _cluster_corpus_dirs(values)
+    if corpus_dirs is not None:
+        hpc_updates.update(corpus_dirs)
+    else:
+        hpc_updates.update({
+            "remote_data_dir": "data",
+            "remote_processed_dir": "processed_docs",
+            "remote_db_dir": "db",
+        })
     updates: dict[str, dict[str, Any]] = {
         "server": {
             "host": values.server_host,
@@ -1069,12 +1245,7 @@ def configure(path: Path, values: SetupValues) -> None:
             "bind_all": values.server_host in {"0.0.0.0", "::"},
         },
         "ollama": {"host": f"http://127.0.0.1:{values.local_ollama_port}"},
-        "hpc": {
-            "enabled": values.mode == "hpc",
-            "remote_data_dir": "data",
-            "remote_db_dir": "db",
-            "poll_interval_seconds": 15.0,
-        },
+        "hpc": hpc_updates,
     }
     if values.mode == "hpc":
         updates.update({
@@ -1133,7 +1304,37 @@ def _http_ready(url: str, timeout: float = 2.0) -> bool:
         return False
 
 
-def run_checks(path: Path, values: SetupValues) -> bool:
+def _ollama_model_installed(ollama_port: int, model: str) -> bool:
+    """Best-effort check that ``model`` is pulled in the local Ollama."""
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{ollama_port}/api/tags", timeout=3.0
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except (OSError, ValueError, urllib.error.URLError):
+        return True  # endpoint unreachable/unparseable: don't pile on the port check
+    names = {
+        str(item.get("name", "")).split(":")[0]
+        for item in (payload.get("models") or [])
+        if isinstance(item, dict)
+    }
+    return not names or model in names
+
+
+def run_checks(
+    path: Path,
+    values: SetupValues,
+    *,
+    cluster_required: bool = False,
+) -> bool:
+    """Preflight checks. WARN never blocks; FAIL does.
+
+    ``cluster_required`` marks a run that will talk to the HPC cluster
+    (provisioning or an --initial-corpus parse). Cluster connectivity is only
+    a hard dependency then -- daily serving needs just Ollama + the LLM API,
+    so an unreachable campus cluster must not block the web server from
+    starting.
+    """
     print("\nPreflight checks")
     print("----------------")
     # Each check is (label, status, detail) with status OK / WARN / FAIL.
@@ -1162,8 +1363,9 @@ def run_checks(path: Path, values: SetupValues) -> bool:
             "RAG web server already running" if already_running else str(exc),
         ))
 
-    llm = _llm_api_view(_load(path))
-    embeddings_backend = _embeddings_backend_view(_load(path), llm["backend"])
+    config_payload = _load(path)
+    llm = _llm_api_view(config_payload)
+    embeddings_backend = _embeddings_backend_view(config_payload, llm["backend"])
     if llm["backend"] == "soclaas":
         if llm["api_key"]:
             checks.append(("SoCLAaS API key", "OK", f"set via {llm['key_source']}"))
@@ -1180,34 +1382,61 @@ def run_checks(path: Path, values: SetupValues) -> bool:
                 "--set-api-key <key> or export SOCLAAS_API_KEY",
             ))
 
-    if values.mode == "local":
-        ready = _http_ready(f"http://127.0.0.1:{values.local_ollama_port}/api/version")
-        # Ollama serves the dormant offline chat fallback, but it is REQUIRED
-        # whenever the embeddings transport is local ([embeddings].backend =
-        # "ollama" -- the default).
-        ollama_required = llm["backend"] == "ollama" or embeddings_backend == "ollama"
-        status = "OK" if ready else ("FAIL" if ollama_required else "WARN")
-        if ready:
-            detail = "ready"
-        elif ollama_required:
-            detail = (
-                'not reachable -- required for [embeddings].backend = "ollama" '
-                "(start Ollama and pull nomic-embed-text)"
-            )
+    # Local Ollama, in EVERY mode: embeddings default to a locally hosted
+    # nomic-embed-text, so index builds and query-time embedding fail without
+    # it regardless of where parsing happens. (Historically this checked only
+    # local mode; with HPC parse-only deployments the dependency inverted.)
+    ready = _http_ready(f"http://127.0.0.1:{values.local_ollama_port}/api/version")
+    ollama_required = llm["backend"] == "ollama" or embeddings_backend == "ollama"
+    if ready:
+        detail = "ready"
+        embedding_model = str(_nested(
+            config_payload, "models", "embedding_model", default="nomic-embed-text"
+        ))
+        if embeddings_backend == "ollama" and not _ollama_model_installed(
+            values.local_ollama_port, embedding_model
+        ):
+            checks.append((
+                "Local Ollama",
+                "WARN",
+                f"reachable but '{embedding_model}' is not pulled; run: "
+                f"ollama pull {embedding_model}",
+            ))
         else:
-            detail = "not reachable -- optional unless an ollama backend is active"
-        checks.append(("Local Ollama", status, detail))
+            checks.append(("Local Ollama", "OK", detail))
     else:
+        if ollama_required:
+            checks.append((
+                "Local Ollama",
+                "FAIL",
+                'not reachable -- required for [embeddings].backend = "ollama" '
+                "(start Ollama and pull the embedding model)",
+            ))
+        else:
+            checks.append((
+                "Local Ollama",
+                "WARN",
+                "not reachable -- optional unless an ollama backend is active",
+            ))
+
+    if values.mode != "local":
+        # Cluster tooling/connectivity is only a hard requirement on runs that
+        # will actually use the cluster; serving runs degrade to WARN.
+        severity = "FAIL" if cluster_required else "WARN"
         ok, detail = _command_check("ssh")
-        checks.append(("ssh", "OK" if ok else "FAIL", detail))
+        checks.append(("ssh", "OK" if ok else severity, detail))
         if values.cpu_identity_file:
             key_path = Path(os.path.expandvars(values.cpu_identity_file)).expanduser()
-            checks.append(("CPU SSH key", "OK" if key_path.is_file() else "FAIL", str(key_path)))
+            checks.append((
+                "CPU SSH key",
+                "OK" if key_path.is_file() else severity,
+                str(key_path),
+            ))
         rsync_ok, rsync_detail = _command_check("rsync")
         scp_ok, scp_detail = _command_check("scp")
         checks.append((
             "file transfer",
-            "OK" if (rsync_ok or scp_ok) else "FAIL",
+            "OK" if (rsync_ok or scp_ok) else severity,
             rsync_detail if rsync_ok else scp_detail,
         ))
         # Import only after configuration is written and ROOT is importable.
@@ -1223,7 +1452,7 @@ def run_checks(path: Path, values: SetupValues) -> bool:
             outcome = remote["cpu"]
             checks.append((
                 "CPU cluster",
-                "OK" if bool(outcome["ok"]) else "FAIL",
+                "OK" if bool(outcome["ok"]) else severity,
                 str(outcome["detail"]),
             ))
         finally:
@@ -1303,6 +1532,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Configure connections only; do not upload/build remote artifacts.",
     )
     parser.add_argument("--ollama-port", type=int)
+    parser.add_argument(
+        "--initial-corpus",
+        type=Path,
+        default=None,
+        metavar="ZIP",
+        help="Deploy an initial PDF corpus: parse it on the HPC cluster, fetch "
+             "the Markdown home, and build the local index (requires hpc mode). "
+             "Nested directories inside the zip are supported.",
+    )
+    parser.add_argument(
+        "--allow-degraded-vision",
+        action="store_true",
+        help="With --initial-corpus: proceed without a SoCLAaS key even though "
+             "vision enrichment is enabled (figure descriptions will degrade).",
+    )
+    parser.add_argument(
+        "--skip-index-build",
+        action="store_true",
+        help="With --initial-corpus: stop after fetching processed_docs/; build "
+             "the index later with main.py --mode index.",
+    )
     parser.add_argument(
         "--set-api-key",
         default="",
@@ -1384,6 +1634,7 @@ def _main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     args.ssh_config = args.ssh_config.expanduser().resolve()
     path = args.config.resolve()
+    config_preexisted = path.exists()
     existing = _load(path)
     values = (
         _collect_non_interactive(existing, args)
@@ -1396,7 +1647,25 @@ def _main(argv: list[str] | None = None) -> int:
         print(f"Setup error: {exc}", file=sys.stderr)
         return 2
 
+    # Decide whether (and how) to provision the HPC clusters. The three flags
+    # are mutually exclusive; none set means "only provision when the
+    # interactive SSH-alias setup flow just ran" (legacy behavior).
+    provision_mode = "none"
+    if args.provision_hpc:
+        provision_mode = "force"
+    elif args.provision_if_needed:
+        provision_mode = "if-needed"
+    elif values.mode == "hpc" and not args.skip_hpc_provision and values.manage_ssh_aliases:
+        # Interactive first-run flow: SSH aliases were just written, so the
+        # remote has never been provisioned -- deploy unconditionally.
+        provision_mode = "force"
+
     if not args.check_only:
+        # Resolve the CPU SSH username early: configure() needs it to place the
+        # cluster corpus directories under /hpctmp/<user>/rag-corpus (outside
+        # the provision-swapped repo), and provisioning needs it below.
+        if values.mode == "hpc" and not values.cpu_user:
+            values.cpu_user = read_ssh_alias(args.ssh_config, values.cpu_host).get("user", "")
         try:
             setup_ssh_credentials(
                 values,
@@ -1414,24 +1683,8 @@ def _main(argv: list[str] | None = None) -> int:
                 else:
                     print(f"\nWARNING: SoCLAaS API key not verified ({detail}).")
                     print("The key was saved; check it if chat/embeddings fail.")
-            # Decide whether (and how) to provision the HPC clusters. The three
-            # flags are mutually exclusive; none set means "only provision when
-            # the interactive SSH-alias setup flow just ran" (legacy behavior).
-            provision_mode = "none"
-            if args.provision_hpc:
-                provision_mode = "force"
-            elif args.provision_if_needed:
-                provision_mode = "if-needed"
-            elif values.mode == "hpc" and not args.skip_hpc_provision and values.manage_ssh_aliases:
-                # Interactive first-run flow: SSH aliases were just written, so
-                # the remote has never been provisioned -- deploy unconditionally.
-                provision_mode = "force"
             should_provision = provision_mode != "none" and values.mode == "hpc"
             if should_provision:
-                if not values.cpu_user:
-                    values.cpu_user = read_ssh_alias(
-                        args.ssh_config, values.cpu_host
-                    ).get("user", "")
                 if not values.cpu_user:
                     raise RuntimeError(
                         "CPU SSH username is required for remote provisioning"
@@ -1449,6 +1702,13 @@ def _main(argv: list[str] | None = None) -> int:
         print(f"\nConfiguration saved to {path}")
         if path.with_suffix(path.suffix + ".bak").exists():
             print(f"Previous configuration backed up to {path}.bak")
+        if args.non_interactive and not config_preexisted and values.mode == "local":
+            print(
+                "\nNOTE: No config.toml existed before this run, so one was created "
+                "in LOCAL mode -- PDF parsing runs on this machine.\n"
+                "      For cluster-backed parsing, run the guided setup once "
+                "(setup.cmd / ./setup.sh) and choose mode 'hpc'."
+            )
 
     dependencies_ready = _runtime_dependencies_ready()
     should_install = _decide_dependency_install(
@@ -1465,9 +1725,44 @@ def _main(argv: list[str] | None = None) -> int:
             print(f"Dependency installation failed: {exc}", file=sys.stderr)
             return 1
 
+    # Initial corpus deployment (parse on HPC, fetch, index locally). Runs
+    # after dependency installation (the index build needs the venv) and
+    # before preflight checks (which then validate the freshly built state).
+    if args.initial_corpus and not (args.check_only or args.configure_only):
+        if values.mode != "hpc":
+            print(
+                "\n--initial-corpus requires hpc mode; this instance is "
+                "configured for local parsing. Run the guided setup (setup.cmd) "
+                "and choose mode 'hpc'.",
+                file=sys.stderr,
+            )
+            return 1
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from scripts.hpc_corpus import CorpusError, run_initial_corpus
+
+        try:
+            corpus_exit = run_initial_corpus(
+                args.initial_corpus,
+                config_path=path,
+                allow_degraded_vision=args.allow_degraded_vision,
+                skip_index_build=args.skip_index_build,
+            )
+        except CorpusError as exc:
+            print(f"\nInitial corpus deployment failed: {exc}", file=sys.stderr)
+            return 1
+        if corpus_exit != 0:
+            return corpus_exit
+
     checks_ok = True
     if not args.skip_checks:
-        checks_ok = run_checks(path, values)
+        checks_ok = run_checks(
+            path,
+            values,
+            cluster_required=(
+                provision_mode != "none" and values.mode == "hpc"
+            ) or bool(args.initial_corpus),
+        )
     if not checks_ok:
         print("\nPreflight failed; fix the items above and rerun setup.", file=sys.stderr)
         return 1

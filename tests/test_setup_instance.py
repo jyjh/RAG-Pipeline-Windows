@@ -55,6 +55,46 @@ def test_configure_writes_cpu_cluster_connection(safe_tmp_path):
     assert "bind_all = true" in text
 
 
+def test_configure_writes_corpus_dirs_outside_repo(safe_tmp_path):
+    """With a known username the corpus dirs must live OUTSIDE remote_repo_dir.
+
+    Provisioning atomically replaces the repo directory, so data/processed/db
+    inside it would be wiped by any later re-provision (e.g. after a config
+    edit changed the source manifest).
+    """
+    config = safe_tmp_path / "config.toml"
+    config.write_text("[server]\nhost = \"old\"\n", encoding="utf-8")
+    values = SetupValues(
+        mode="hpc",
+        server_host="0.0.0.0",
+        server_port=8080,
+        cpu_host="cpu-login",
+        cpu_user="student",
+        cpu_storage_root="/hpctmp/student",
+        cpu_repo="rag-cpu",
+    )
+    configure(config, values)
+    text = config.read_text(encoding="utf-8")
+    assert 'remote_data_dir = "/hpctmp/student/rag-corpus/data"' in text
+    assert 'remote_processed_dir = "/hpctmp/student/rag-corpus/processed_docs"' in text
+    assert 'remote_db_dir = "/hpctmp/student/rag-corpus/db"' in text
+
+
+def test_configure_keeps_legacy_dirs_without_username(safe_tmp_path):
+    config = safe_tmp_path / "config.toml"
+    values = SetupValues(
+        mode="hpc",
+        server_host="127.0.0.1",
+        server_port=8000,
+        cpu_host="cpu-login",
+        cpu_repo="rag-cpu",
+    )
+    configure(config, values)
+    text = config.read_text(encoding="utf-8")
+    assert 'remote_data_dir = "data"' in text
+    assert 'remote_processed_dir = "processed_docs"' in text
+
+
 def test_configure_ssh_aliases_creates_and_updates(safe_tmp_path):
     ssh_config = safe_tmp_path / ".ssh" / "config"
     ssh_config.parent.mkdir()
@@ -537,6 +577,148 @@ def test_provision_skips_upload_when_remote_manifest_matches(safe_tmp_path, monk
     assert remote_commands == []  # no staging/extract/build/activate happened
 
 
+def test_provision_config_only_change_syncs_config_alone(safe_tmp_path, monkeypatch):
+    """A config.toml-only change must not re-upload the archive or the SIF.
+
+    config.toml is rewritten by every setup run (API key, ports). Without the
+    sans-config freshness comparison, `--set-api-key` followed by start.cmd
+    would re-upload the full source archive AND the multi-GB SIF over
+    non-resumable Windows scp -- and wipe any corpus still stored inside the
+    repo directory via the repo replacement.
+    """
+    from scripts.setup_instance import _build_repo_manifest, provision_hpc_cluster
+
+    src = safe_tmp_path / "repo"
+    src.mkdir()
+    (src / "main.py").write_text("print('same')\n", encoding="utf-8")
+    (src / "config.toml").write_text("old = true\n", encoding="utf-8")
+    deployed_manifest = _build_repo_manifest(src)
+
+    # Now change ONLY config.toml locally.
+    (src / "config.toml").write_text("api_key = \"new\"\n", encoding="utf-8")
+    monkeypatch.setattr("scripts.setup_instance.ROOT", src)
+
+    def fake_subprocess_run(cmd, **kwargs):
+        remote = cmd[-1] if isinstance(cmd, list) and len(cmd) > 1 else ""
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+        if remote.startswith("cat ") and ".rag_manifest" in remote:
+            class RM:
+                returncode = 0
+                stdout = deployed_manifest
+                stderr = ""
+            return RM()
+        return R()  # test -s <sif> -> SIF exists
+
+    monkeypatch.setattr("scripts.setup_instance.subprocess.run", fake_subprocess_run)
+
+    uploads = []
+    remote_commands = []
+    monkeypatch.setattr(
+        "scripts.setup_instance._upload_provision_file",
+        lambda *a, **k: uploads.append(a),
+    )
+    monkeypatch.setattr(
+        "scripts.setup_instance._run_provision_ssh",
+        lambda alias, command, **k: remote_commands.append(command),
+    )
+
+    provision_hpc_cluster(
+        alias="cpu-login",
+        user="student",
+        storage_root="/hpctmp/student",
+        relative_repo="rag-cpu",
+        archive_path=safe_tmp_path / "repository.tar.gz",
+        image_name="rag_pipeline_cpu.sif",
+        definition_name="Singularity.cpu.def",
+        local_image=None,
+        force=False,
+    )
+
+    # Exactly two one-file syncs: config.toml and the fresh manifest.
+    uploaded_names = sorted(path.name for path, _, _ in uploads)
+    assert uploaded_names == [".rag_manifest", "config.toml"]
+    # No staging/extract/activate cycle ran.
+    assert remote_commands == []
+
+
+def _provision_sif_test_harness(safe_tmp_path, monkeypatch, *, remote_sha):
+    """Shared scaffolding for the SIF dedup tests; returns (uploads, commands)."""
+    from scripts.setup_instance import provision_hpc_cluster
+
+    src = safe_tmp_path / "repo"
+    src.mkdir()
+    (src / "main.py").write_text("print('v2')\n", encoding="utf-8")
+    monkeypatch.setattr("scripts.setup_instance.ROOT", src)
+
+    # Remote manifest fetch fails -> source considered stale -> full provision.
+    # The SIF existence probe (`test -s`) inside the dedup helper must succeed.
+    def fake_subprocess_run(cmd, **kwargs):
+        remote = cmd[-1] if isinstance(cmd, list) and len(cmd) > 1 else ""
+        class R:
+            def __init__(self, rc):
+                self.returncode = rc
+            stdout = ""
+            stderr = ""
+        return R(0 if remote.startswith("test -s ") else 1)
+
+    monkeypatch.setattr("scripts.setup_instance.subprocess.run", fake_subprocess_run)
+
+    local_sif = safe_tmp_path / "rag_pipeline_cpu.sif"
+    local_sif.write_bytes(b"fake-sif-bytes")
+    from scripts.setup_instance import _file_sha256
+    digest = _file_sha256(local_sif)
+    monkeypatch.setattr(
+        "scripts.setup_instance._remote_sha256",
+        lambda alias, path: digest if remote_sha == "match" else "0" * 64,
+    )
+
+    uploads = []
+    remote_commands = []
+    monkeypatch.setattr(
+        "scripts.setup_instance._upload_provision_file",
+        lambda *a, **k: uploads.append(a),
+    )
+    monkeypatch.setattr(
+        "scripts.setup_instance._run_provision_ssh",
+        lambda alias, command, **k: remote_commands.append(command),
+    )
+    provision_hpc_cluster(
+        alias="cpu-login",
+        user="student",
+        storage_root="/hpctmp/student",
+        relative_repo="rag-cpu",
+        archive_path=safe_tmp_path / "repository.tar.gz",
+        image_name="rag_pipeline_cpu.sif",
+        definition_name="Singularity.cpu.def",
+        local_image=local_sif,
+        force=False,
+    )
+    return uploads, remote_commands
+
+
+def test_provision_reuses_matching_remote_sif(safe_tmp_path, monkeypatch):
+    """Checksum-identical remote SIF is cp'd from the old repo, not re-uploaded."""
+    uploads, remote_commands = _provision_sif_test_harness(
+        safe_tmp_path, monkeypatch, remote_sha="match"
+    )
+    sif_uploads = [u for u in uploads if u[0].name == "rag_pipeline_cpu.sif"]
+    assert sif_uploads == [], "unchanged SIF must not be re-uploaded"
+    assert any("cp " in command and "rag_pipeline_cpu.sif" in command
+               for command in remote_commands)
+
+
+def test_provision_reuploads_sif_when_checksum_differs(safe_tmp_path, monkeypatch):
+    uploads, remote_commands = _provision_sif_test_harness(
+        safe_tmp_path, monkeypatch, remote_sha="differ"
+    )
+    sif_uploads = [u for u in uploads if u[0].name == "rag_pipeline_cpu.sif"]
+    assert sif_uploads, "a changed SIF must be uploaded"
+    assert not any("cp " in command for command in remote_commands)
+
+
 def test_provision_redeploys_when_remote_manifest_differs(safe_tmp_path, monkeypatch):
     """A stale or absent remote manifest triggers a full provision."""
     from scripts.setup_instance import provision_hpc_cluster
@@ -637,6 +819,106 @@ def test_provision_force_ignores_matching_manifest(safe_tmp_path, monkeypatch):
     assert ssh_calls == []  # force short-circuits the manifest fetch entirely
     joined = "\n".join(remote_commands)
     assert "tar -xzf" in joined
+
+
+def _hpc_values(**overrides) -> "SetupValues":
+    base = dict(
+        mode="hpc",
+        server_host="127.0.0.1",
+        server_port=8000,
+        cpu_host="cpu-login",
+        cpu_repo="rag-cpu",
+    )
+    base.update(overrides)
+    return SetupValues(**base)
+
+
+def test_run_checks_ollama_fails_in_hpc_mode(safe_tmp_path, monkeypatch):
+    """Embeddings are workstation-local in EVERY mode: a missing Ollama must
+    fail preflight even when parsing is delegated to the cluster."""
+    import scripts.setup_instance as si
+
+    config = safe_tmp_path / "config.toml"
+    config.write_text(
+        "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\n[hpc]\nenabled = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(si, "_http_ready", lambda url, timeout=2.0: False)
+    ok = si.run_checks(config, _hpc_values(), cluster_required=False)
+    assert ok is False  # Local Ollama FAIL (embeddings default to ollama)
+
+
+def test_run_checks_cluster_down_warns_when_not_required(safe_tmp_path, monkeypatch):
+    """Daily serving must not be blocked by a campus-cluster outage."""
+    import scripts.setup_instance as si
+
+    config = safe_tmp_path / "config.toml"
+    config.write_text(
+        "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\n[hpc]\nenabled = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(si, "_http_ready", lambda url, timeout=2.0: True)
+    monkeypatch.setattr(si, "_ollama_model_installed", lambda port, model: True)
+    monkeypatch.setattr(si, "_command_check", lambda name: (False, "not found"))
+    monkeypatch.setattr(si, "_runtime_dependencies_ready", lambda python=None: True)
+
+    class Unreachable:
+        def check_connections(self):
+            return {"cpu": {"ok": False, "configured": True, "detail": "SSH refused"}}
+
+    monkeypatch.setattr("src.hpc_backend.HpcBackend", lambda cfg: Unreachable())
+    # Not provisioning/parsing: cluster problems degrade to WARN -> start OK.
+    assert si.run_checks(config, _hpc_values(), cluster_required=False) is True
+    # Provisioning or --initial-corpus will need the cluster: FAIL -> blocked.
+    assert si.run_checks(config, _hpc_values(), cluster_required=True) is False
+
+
+def test_run_checks_ollama_warns_when_model_missing(safe_tmp_path, monkeypatch, capsys):
+    import scripts.setup_instance as si
+
+    config = safe_tmp_path / "config.toml"
+    config.write_text(
+        "[server]\nhost = \"127.0.0.1\"\nport = 8000\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(si, "_http_ready", lambda url, timeout=2.0: True)
+    monkeypatch.setattr(si, "_ollama_model_installed", lambda port, model: False)
+    monkeypatch.setattr(si, "_command_check", lambda name: (True, "found"))
+    monkeypatch.setattr(si, "_runtime_dependencies_ready", lambda python=None: True)
+    values = SetupValues(mode="local", server_host="127.0.0.1", server_port=8000)
+    assert si.run_checks(config, values) is True  # WARN, not FAIL
+    assert "ollama pull nomic-embed-text" in capsys.readouterr().out
+
+
+def test_fresh_config_local_mode_notice(safe_tmp_path, capsys, monkeypatch):
+    """A non-interactive run on a fresh checkout must say it defaulted to
+    LOCAL mode instead of silently parsing everything on the workstation."""
+    monkeypatch.chdir(safe_tmp_path)
+    config = safe_tmp_path / "config.toml"
+    rc = main([
+        "--non-interactive", "--configure-only", "--skip-checks",
+        "--no-install-deps", "--mode", "local",
+        "--config", str(config),
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "LOCAL mode" in out
+    assert "setup.cmd" in out
+
+
+def test_initial_corpus_rejected_in_local_mode(safe_tmp_path, capsys, monkeypatch):
+    """--initial-corpus with a local-mode config fails fast with guidance."""
+    monkeypatch.chdir(safe_tmp_path)
+    config = safe_tmp_path / "config.toml"
+    config.write_text("[server]\nhost = \"127.0.0.1\"\nport = 8000\n", encoding="utf-8")
+    corpus_zip = safe_tmp_path / "corpus.zip"
+    corpus_zip.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+    rc = main([
+        "--non-interactive", "--skip-checks", "--no-install-deps",
+        "--config", str(config), "--initial-corpus", str(corpus_zip),
+    ])
+    assert rc == 1
+    assert "hpc" in capsys.readouterr().err.lower()
 
 
 def test_start_cli_passes_provision_if_needed():

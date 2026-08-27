@@ -159,23 +159,36 @@ def test_build_pbs_script_is_cpu_shaped_from_overrides():
     # CPU bundle: no :ngpus= clause, no --nv.
     assert ":ngpus=" not in script
     assert "--nv " not in script
-    assert "python3 scripts/bulk_ingest.py --input-dir \"data\"" in script
+    assert '--input-dir "${INPUT_DATA_DIR}"' in script
+    # processed_dir flows from cfg.remote_processed_dir into the script default.
+    assert 'PROCESSED_DIR="${PROCESSED_DIR:-processed_docs}"' in script
 
 
 def test_build_pbs_script_input_dir_override():
     b = HpcBackend(BASE_CFG)
     script = b._build_pbs_script("/hpctmp/me/pdfs")
-    assert 'python3 scripts/bulk_ingest.py --input-dir "/hpctmp/me/pdfs"' in script
+    # The override becomes the baked default of the INPUT_DATA_DIR variable.
+    assert 'INPUT_DATA_DIR="${INPUT_DATA_DIR:-/hpctmp/me/pdfs}"' in script
+    # Under STORAGE_ROOT, so no extra 1:1 bind is emitted for it.
+    assert "-B /hpctmp/me/pdfs:" not in script
+
+
+def test_build_pbs_script_processed_dir_override():
+    cfg = replace(BASE_CFG, remote_processed_dir="/hpctmp/me/rag-corpus/processed_docs")
+    b = HpcBackend(cfg)
+    script = b._build_pbs_script("/hpctmp/me/rag-corpus/data")
+    assert 'PROCESSED_DIR="${PROCESSED_DIR:-/hpctmp/me/rag-corpus/processed_docs}"' in script
 
 
 def test_build_pbs_script_skip_index_adds_flag():
     """skip_index=True appends --skip-index so the cluster only ingests."""
     b = HpcBackend(BASE_CFG)
+    script = b._build_pbs_script("data")
     # Anchor on the command line: the template's comments also mention the
     # flag in prose, so a whole-script `not in` would false-positive.
-    assert 'bulk_ingest.py --input-dir "data"\n' in b._build_pbs_script("data")
+    assert "--skip-index" not in script.split("bulk_ingest.py", 1)[1]
     script = b._build_pbs_script("data", skip_index=True)
-    assert 'python3 scripts/bulk_ingest.py --input-dir "data" --skip-index\n' in script
+    assert '--processed-dir "${PROCESSED_DIR}" --skip-index' in script
 
 
 # --- submit_ingest_index routes to the CPU cluster ---------------------------
@@ -371,8 +384,50 @@ def test_submit_ingest_index_skip_index_writes_flag_into_pbs(monkeypatch):
     assert result.job_id == "11.aspsus01"
     assert result.exit_code == 0
     assert any(
-        'bulk_ingest.py --input-dir "data" --skip-index' in body for body in written
+        '--processed-dir "${PROCESSED_DIR}" --skip-index' in body for body in written
     ), "the ingest-only flag must be in the uploaded PBS command line"
+
+
+# --- push_corpus_dir (rsync, to the CPU cluster) ------------------------------
+
+
+def test_push_corpus_dir_uploads_contents(tmp_path, monkeypatch):
+    b = HpcBackend(BASE_CFG)
+    ssh_cmds: list[str] = []
+    transfers: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        b, "_run_ssh",
+        lambda host, cmd, **k: ssh_cmds.append(cmd) or _completed(),
+    )
+    monkeypatch.setattr(
+        b, "_run_rsync",
+        lambda s, d, **k: transfers.append((s, d)) or _completed(),
+    )
+    local = tmp_path / "corpus"
+    local.mkdir()
+    (local / "a.pdf").write_bytes(b"%PDF")
+
+    remote = b.push_corpus_dir(local, "/hpctmp/me/rag-corpus/data")
+
+    assert remote == "/hpctmp/me/rag-corpus/data"
+    assert any("mkdir -p" in cmd and "/hpctmp/me/rag-corpus/data" in cmd for cmd in ssh_cmds)
+    # Trailing slash on the source = "contents of"; scp fallback relies on it.
+    assert transfers == [(str(local) + "/", "nus_hpc_cpu:/hpctmp/me/rag-corpus/data/")]
+
+
+def test_push_corpus_dir_rejects_relative_default(tmp_path, monkeypatch):
+    """The default remote dir must be absolute (it gets a 1:1 container bind)."""
+    b = HpcBackend(BASE_CFG)  # remote_data_dir="data" -> repo-relative
+    local = tmp_path / "corpus"
+    local.mkdir()
+    with pytest.raises(HpcError, match="absolute"):
+        b.push_corpus_dir(local)
+
+
+def test_push_corpus_dir_rejects_missing_local_dir(tmp_path, monkeypatch):
+    b = HpcBackend(BASE_CFG)
+    with pytest.raises(HpcError, match="not found"):
+        b.push_corpus_dir(tmp_path / "missing", "/hpctmp/me/rag-corpus/data")
 
 
 # --- fetch_index (rsync, from the CPU cluster) -------------------------------

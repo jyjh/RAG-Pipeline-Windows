@@ -119,6 +119,7 @@ const els = {
   forceUploadButton: document.getElementById("forceUploadButton"),
   pdfSearchInput: document.getElementById("pdfSearchInput"),
   pdfSearchButton: document.getElementById("pdfSearchButton"),
+  pdfAutoTagButton: document.getElementById("pdfAutoTagButton"),
   reviewerNameInput: document.getElementById("reviewerNameInput"),
   prevPdfPageButton: document.getElementById("prevPdfPageButton"),
   pdfPageLabel: document.getElementById("pdfPageLabel"),
@@ -1643,6 +1644,44 @@ async function applyBulkTagGroup() {
   await refreshPdfs({ force: true });
 }
 
+async function runAutoTagSweep() {
+  if (els.pdfAutoTagButton) {
+    els.pdfAutoTagButton.disabled = true;
+  }
+  try {
+    const selected = Array.from(state.selectedPdfHashes);
+    const body = selected.length ? { source_hashes: selected } : {};
+    setStatus(els.uploadStatus, "Asking the LLM to sort ungrouped PDFs...");
+    const result = await requestJson("/api/pdfs/trust/auto-tag", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const queued = Array.isArray(result.queued) ? result.queued : [];
+    if (!queued.length) {
+      setStatus(els.uploadStatus, result.message || "No ungrouped PDFs to tag.");
+      return;
+    }
+    setStatus(
+      els.uploadStatus,
+      `Auto-tagging ${queued.length} PDF${queued.length === 1 ? "" : "s"} with ${result.model || "the LLM"}. Rows update as decisions land.`
+    );
+    // Decisions are written to the trust registry as the model answers;
+    // poll a few times so rows flip to their auto tag without a manual reload.
+    for (const delay of [4000, 12000, 30000]) {
+      setTimeout(() => {
+        refreshPdfs({ force: true });
+      }, delay);
+    }
+  } catch (error) {
+    setStatus(els.uploadStatus, error.message, true);
+  } finally {
+    if (els.pdfAutoTagButton) {
+      els.pdfAutoTagButton.disabled = false;
+    }
+  }
+}
+
 function formatBrowserTimestamp(value) {
   const text = String(value || "").trim();
   if (!text) {
@@ -1674,6 +1713,13 @@ function renderQualityCell(item) {
   const reviewedAt = formatBrowserTimestamp(trust.reviewed_at);
   const sourceGroup = String(trust.source_group || "ungrouped");
   const reliabilityWeight = Number(trust.reliability_weight || sourceGroupWeight(sourceGroup));
+  const autoTagged = Boolean(trust.auto_tagged);
+  const autoTagModel = String(trust.auto_tag_model || "").trim();
+  const autoConfidence =
+    trust.auto_tag_confidence === null || trust.auto_tag_confidence === undefined || trust.auto_tag_confidence === ""
+      ? ""
+      : Number(trust.auto_tag_confidence).toFixed(2);
+  const autoTagReason = String(trust.auto_tag_reason || "").trim();
   const metrics = [
     Number(data.chunk_count || 0) ? `${Number(data.chunk_count)} chunks` : "",
     Number(data.markdown_char_count || 0) ? `${Number(data.markdown_char_count)} chars` : "",
@@ -1682,9 +1728,11 @@ function renderQualityCell(item) {
   return `
     <span class="quality-badge quality-${escapeHtml(label)}">${escapeHtml(qualityTitle(label))}</span>
     ${sourceGroup === "ungrouped" ? '<span class="quality-badge quality-untagged">Untagged</span>' : ""}
+    ${autoTagged ? `<span class="quality-badge quality-auto-tagged" title="Group chosen automatically by ${escapeHtml(autoTagModel || "the LLM")}; a manual tag overrides it">Auto-tagged</span>` : ""}
     <span class="quality-detail">${escapeHtml(metrics.join(" | "))}</span>
     <span class="quality-detail">Trust: ${escapeHtml(trustTitle(trust.review_status))} | ${escapeHtml(sourceTypeTitle(trust.source_type))}</span>
     <span class="quality-detail">Group: ${escapeHtml(sourceGroupTitle(sourceGroup))} | weight ${escapeHtml(reliabilityWeight.toFixed(2))}</span>
+    ${autoTagged ? `<span class="quality-detail">Auto: ${escapeHtml(autoTagModel || "LLM")}${autoConfidence ? ` | confidence ${escapeHtml(autoConfidence)}` : ""}${autoTagReason ? ` | ${escapeHtml(autoTagReason)}` : ""}</span>` : ""}
     ${reviewedBy ? `<span class="quality-detail">Reviewed by: ${escapeHtml(reviewedBy)}${reviewedAt ? ` | ${escapeHtml(reviewedAt)}` : ""}</span>` : ""}
     <span class="quality-warning">${escapeHtml(warningText)}</span>
     ${trustNotes ? `<span class="quality-note">Note: ${escapeHtml(trustNotes)}</span>` : ""}
@@ -4624,6 +4672,10 @@ if (els.pdfSelectAllCheckbox) {
 }
 if (els.pdfBulkTagButton) {
   els.pdfBulkTagButton.addEventListener("click", applyBulkTagGroup);
+}
+
+if (els.pdfAutoTagButton) {
+  els.pdfAutoTagButton.addEventListener("click", runAutoTagSweep);
 }
 if (els.pdfBulkClearButton) {
   els.pdfBulkClearButton.addEventListener("click", clearPdfSelection);

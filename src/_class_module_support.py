@@ -43,7 +43,7 @@ class _PendingSplitInstance:
         )
 
 
-def _pending_split_class(class_name: str):
+def _pending_split_class(class_name: str, module_name: str | None = None):
     try:
         from pydantic import BaseModel
     except Exception:
@@ -52,6 +52,18 @@ def _pending_split_class(class_name: str):
         bases = (BaseModel,)
 
     def __new__(cls, *args, **kwargs):
+        # The split module was mid-import when this stub was handed out
+        # (circular import, e.g. ``python -m src.web_app``). By call time it
+        # has finished; resolve the real class and construct that instead.
+        if module_name:
+            module = importlib.import_module(module_name)
+            real = vars(module).get(class_name)
+            if (
+                isinstance(real, type)
+                and real is not cls
+                and not hasattr(real, "_split_pending_class_name")
+            ):
+                return real(*args, **kwargs)
         return _PendingSplitInstance(class_name, args, kwargs)
 
     return type(
@@ -67,7 +79,22 @@ def _pending_split_class(class_name: str):
 
 def import_split_class(module_name: str, class_name: str):
     module = importlib.import_module(module_name)
-    return getattr(module, class_name, _pending_split_class(class_name))
+    return getattr(
+        module, class_name, _pending_split_class(class_name, module_name)
+    )
+
+
+# Split-class stubs placed into borrowing modules' globals by
+# bind_module_namespace, as (target_globals, name). Under a circular import
+# (e.g. ``python -m src.web_app``: queue_job -> web_app -> queue_job), a
+# borrower like rag_job_queue can bind the pending stub for a class whose
+# split module is still mid-import; setdefault would keep that dead stub
+# forever. finalize_split_class uses this registry to rebind the real class.
+_STUB_BINDINGS: list[tuple[dict[str, Any], str]] = []
+
+
+def _is_pending_stub_class(value: Any) -> bool:
+    return isinstance(value, type) and hasattr(value, "_split_pending_class_name")
 
 
 def finalize_split_class(module: ModuleType, cls: type) -> None:
@@ -75,6 +102,19 @@ def finalize_split_class(module: ModuleType, cls: type) -> None:
     for name, value in list(module.__dict__.items()):
         if isinstance(value, _PendingSplitInstance) and value.class_name == cls.__name__:
             setattr(module, name, cls(*value.args, **value.kwargs))
+    remaining: list[tuple[dict[str, Any], str]] = []
+    for target_globals, name in _STUB_BINDINGS:
+        current = target_globals.get(name)
+        if current is cls:
+            continue
+        if (
+            _is_pending_stub_class(current)
+            and current._split_pending_class_name == cls.__name__
+        ):
+            target_globals[name] = cls
+        else:
+            remaining.append((target_globals, name))
+    _STUB_BINDINGS[:] = remaining
 
 
 def bind_module_namespace(
@@ -86,6 +126,8 @@ def bind_module_namespace(
     """Bind a split class module to its original compatibility module."""
     for name, value in module.__dict__.items():
         if not name.startswith("__"):
+            if _is_pending_stub_class(value):
+                _STUB_BINDINGS.append((target_globals, name))
             target_globals.setdefault(name, value)
 
     for name in proxy_functions:

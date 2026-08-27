@@ -54,6 +54,21 @@ def test_nus_hpc_pbs_script_exists_and_valid():
     assert "/api/version" not in content
     assert "scripts/bulk_ingest.py" in content
     assert "SOCLAAS_API_KEY" in content
+    # The job honors INPUT_DATA_DIR/PROCESSED_DIR at qsub time instead of a
+    # baked-in literal (the old template defined the variable and ignored it).
+    assert 'INPUT_DATA_DIR="${INPUT_DATA_DIR:-data}"' in content
+    assert 'PROCESSED_DIR="${PROCESSED_DIR:-processed_docs}"' in content
+    assert '--input-dir "${INPUT_DATA_DIR}"' in content
+    assert '--processed-dir "${PROCESSED_DIR}"' in content
+
+    # The static file must stay byte-identical to the generator's --cpu bundle
+    # so the checked-in sample never drifts from the code that produces it.
+    from src.hpc import _build_script_from_args, parse_hpc_args as _parse
+    regenerated = _build_script_from_args(_parse(["--cpu"]))
+    assert content == regenerated, (
+        "scripts/nus_hpc_ingest_index.pbs is stale; regenerate with "
+        "`python -m src.hpc --cpu`"
+    )
 
     # Walltime must be set (a cold parse takes hours; the cluster default is
     # often too short and kills the job).
@@ -68,15 +83,54 @@ def test_hpc_skip_index_generates_ingest_only_job():
     script = generate_pbs_script(
         ngpus=0, queue="cpu", container_sif="rag_pipeline_cpu.sif", skip_index=True
     )
-    assert 'python3 scripts/bulk_ingest.py --input-dir "data" --skip-index\n' in script
+    assert '--input-dir "${INPUT_DATA_DIR}"' in script
+    assert '--processed-dir "${PROCESSED_DIR}" --skip-index' in script
 
     # Default keeps the combined ingest+index form (anchor on the command
     # line; the template's comments mention the flag in prose)...
-    assert 'bulk_ingest.py --input-dir "data"\n' in generate_pbs_script()
+    default_script = generate_pbs_script()
+    assert '--processed-dir "${PROCESSED_DIR}"\n' in default_script
+    assert "--skip-index" not in default_script.split("bulk_ingest.py", 1)[1]
     # ...and the --cpu CLI bundle threads the flag through.
     cpu_skip = _build_script_from_args(parse_hpc_args(["--cpu", "--skip-index"]))
-    assert 'python3 scripts/bulk_ingest.py --input-dir "data" --skip-index' in cpu_skip
+    assert '--processed-dir "${PROCESSED_DIR}" --skip-index' in cpu_skip
     assert parse_hpc_args(["--skip-index"]).skip_index is True
+
+
+def test_hpc_pbs_env_vars_override_baked_defaults():
+    """INPUT_DATA_DIR/PROCESSED_DIR env vars are honored, not just defined."""
+    script = generate_pbs_script(input_data_dir="data", processed_dir="processed_docs")
+    assert 'INPUT_DATA_DIR="${INPUT_DATA_DIR:-data}"' in script
+    assert 'PROCESSED_DIR="${PROCESSED_DIR:-processed_docs}"' in script
+    # The exec line consumes the variables instead of baked-in literals.
+    exec_lines = [line for line in script.splitlines() if "--input-dir" in line]
+    assert exec_lines and '"${INPUT_DATA_DIR}"' in exec_lines[0]
+    assert 'mkdir -p "${PROCESSED_DIR}"' in script
+
+
+def test_hpc_pbs_binds_absolute_corpus_dirs():
+    """Absolute input/processed dirs get 1:1 binds; storage-root subpaths don't."""
+    from src.hpc import _extra_bind_mounts
+
+    # Under storage_root -> covered by its bind, no extra flag.
+    assert _extra_bind_mounts(
+        "/hpctmp/u", "/hpctmp/u/rag-corpus/data", "/hpctmp/u/rag-corpus/processed_docs"
+    ) == ""
+    # Outside storage_root -> each gets a 1:1 bind, deduplicated.
+    assert _extra_bind_mounts(
+        "/hpctmp/u", "/scratch/corpus/data", "/scratch/corpus/data", "processed_docs"
+    ) == "-B /scratch/corpus/data:/scratch/corpus/data"
+
+    script = generate_pbs_script(
+        ngpus=0,
+        input_data_dir="/scratch/corpus/data",
+        processed_dir="/scratch/corpus/processed_docs",
+    )
+    assert "-B /scratch/corpus/data:/scratch/corpus/data" in script
+    assert "-B /scratch/corpus/processed_docs:/scratch/corpus/processed_docs" in script
+    # Absolute dirs become the env-var defaults baked into the script.
+    assert 'INPUT_DATA_DIR="${INPUT_DATA_DIR:-/scratch/corpus/data}"' in script
+    assert 'PROCESSED_DIR="${PROCESSED_DIR:-/scratch/corpus/processed_docs}"' in script
 
 
 def test_hpc_cli_parsing_and_pbs_template_generation():
@@ -112,7 +166,7 @@ def test_hpc_cli_parsing_and_pbs_template_generation():
     assert "#PBS -N rag_ingest_index" in default_pbs
     assert "#PBS -l select=1:ncpus=8:mem=32gb:ngpus=1" in default_pbs
     assert "#PBS -q gpu" in default_pbs
-    assert "python3 scripts/bulk_ingest.py --input-dir \"data\"" in default_pbs
+    assert '--input-dir "${INPUT_DATA_DIR}"' in default_pbs
 
     # Generate PBS script with parameter overrides
     overridden_pbs = generate_pbs_script(
@@ -128,7 +182,7 @@ def test_hpc_cli_parsing_and_pbs_template_generation():
     assert "#PBS -l select=1:ncpus=16:mem=64gb:ngpus=2" in overridden_pbs
     assert "#PBS -q high_gpu" in overridden_pbs
     assert "CONTAINER_SIF=\"${CONTAINER_SIF:-custom_rag.sif}\"" in overridden_pbs
-    assert "python3 scripts/bulk_ingest.py --input-dir \"custom_data\"" in overridden_pbs
+    assert 'INPUT_DATA_DIR="${INPUT_DATA_DIR:-custom_data}"' in overridden_pbs
 
     # The CPU ingest generator no longer runs Ollama: embeddings come from the
     # SoCLAaS API. Regenerated jobs must carry the API-key step + walltime and
@@ -364,8 +418,8 @@ def test_hpc_cpu_generator_omits_gpu_clauses():
     assert ":ngpus=" not in cpu, "CPU script must not emit :ngpus= clause"
     # No singularity --nv anywhere in the script.
     assert "--nv " not in cpu, "CPU script must not pass --nv to singularity"
-    # Pipeline invocation must still be intact.
-    assert "python3 scripts/bulk_ingest.py --input-dir \"data\"" in cpu
+    # Pipeline invocation must still be intact (env-var driven).
+    assert '--input-dir "${INPUT_DATA_DIR}"' in cpu
 
 
 def test_hpc_gpu_generator_regression_guard():
