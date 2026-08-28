@@ -1,10 +1,10 @@
 ﻿# Local FSAE RAG Pipeline
 
-Retrieval-augmented generation pipeline for NUS FSAE knowledge transfer. The project ingests technical PDFs and notes, extracts text/tables/equations/figures, builds a local vector index, and answers questions through the hosted SoCLAaS LLM API. Bulk PDF parsing/OCR runs on the HPC CPU cluster (its only role) or locally; embedding and index construction run on the workstation against a locally hosted nomic-embed-text (Ollama); chat and vision inference are served by the SoCLAaS API. A local Ollama chat backend remains supported as a dormant fallback for fully-offline operation.
+Retrieval-augmented generation pipeline for NUS FSAE knowledge transfer. The project ingests technical PDFs and notes, extracts text/tables/equations/figures, builds a local vector index, and answers questions through the hosted SoCLAaS LLM API. Bulk PDF parsing/OCR runs on the HPC CPU cluster (its only role) or locally; embedding and index construction run on the workstation against a locally hosted all-minilm (Ollama); chat and vision inference are served by the SoCLAaS API. A local Ollama chat backend remains supported as a dormant fallback for fully-offline operation.
 
 ## Goals And Constraints
 
-- Serve chat (gemma4:26b) and vision (qwen3-vl:32b) through the hosted OpenAI-compatible SoCLAaS API; serve embeddings from a locally hosted `nomic-embed-text` (768-d) via Ollama.
+- Serve chat (gemma4:26b) and vision (qwen3-vl:32b) through the hosted OpenAI-compatible SoCLAaS API; serve embeddings from a locally hosted `all-minilm` (384-d) via Ollama.
 - Keep the compute-heavy PDF parsing/OCR (Docling) on the free HPC CPU cluster — its only usage — and the chunking, LanceDB, ANN build, and embedding work local.
 - Support a dormant local Ollama chat/vision backend for offline operation (`[llm_api].backend = "ollama"`).
 - Support STEM and engineering documents: textbooks, lecture notes, research papers, reports, scanned PDFs, tables, figures, charts, and equations.
@@ -20,7 +20,7 @@ Retrieval-augmented generation pipeline for NUS FSAE knowledge transfer. The pro
 - `src/web_app.py`: local FastAPI browser UI for uploads, queued indexing, index edits, and chat.
 - `src/auto_tag.py`: LLM source-group auto-tagger plugin (gemma4) for the document-trust registry.
 - `src/llm_api.py`: OpenAI-compatible client for the hosted SoCLAaS API (chat, vision, embeddings) and the `soclaas`/`ollama` backend selector.
-- `src/embeddings.py`: calls the embeddings transport selected by `[embeddings].backend` (default: local Ollama `nomic-embed-text`).
+- `src/embeddings.py`: calls the embeddings transport selected by `[embeddings].backend` (default: local Ollama `all-minilm`).
 
 Implemented behavior:
 
@@ -30,9 +30,9 @@ Implemented behavior:
 - `qwen3-vl:32b` vision enrichment (via SoCLAaS chat-completions image parts) for figures/charts/diagrams.
 - Inline vision-description injection so figures remain near surrounding explanatory text.
 - Chat inference using `gemma4:26b` via the SoCLAaS API by default.
-- Embeddings using a locally hosted `nomic-embed-text` (Ollama) by default; `[embeddings].backend = "soclaas"` switches them to the hosted API's `bge-m3` (1024-d) instead.
-- 768-dimensional normalized vectors for retrieval.
-- nomic-embed-text wants `search_document:`/`search_query:` prefixes; they are applied automatically (instruction-free models such as bge-m3 get none).
+- Embeddings using a locally hosted `all-minilm` (Ollama) by default; `[embeddings].backend = "soclaas"` switches them to the hosted API's `bge-m3` (1024-d) instead.
+- 384-dimensional normalized vectors for retrieval (all-MiniLM-L6-v2 geometry).
+- all-minilm and bge-m3 are instruction-free (no prefixes); switching to `nomic-embed-text` or an e5 model applies `search_document:`/`search_query:` prefixes automatically.
 - Section-aware chunking from PDF outlines/bookmarks, table-of-contents parsing, or heading fallback.
 - LanceDB-backed vector storage in `db/lancedb`.
 - LLM auto-tagging: PDFs uploaded without a source group are classified into Official / Student Research / Unofficial by `gemma4:26b` (filename + first-page excerpt, batched, confidence-floored) and written to the trust registry like manual tags, but flagged `auto_tagged` with model/confidence/reason for review; a manual tag always overrides. Configure under `[auto_tag]`; trigger a sweep with the web UI's "Auto-tag ungrouped" button or `POST /api/pdfs/trust/auto-tag`.
@@ -67,7 +67,7 @@ Common options (all pass through to `scripts/setup_instance.py`):
 .\setup.cmd --non-interactive --start       # configure-if-needed + start (what start.cmd does)
 ```
 
-`start.cmd` / `./start.sh` skip the prompts entirely and only provision the HPC cluster when its deployed source is stale. In local mode the wizard checks local Ollama, which is required for the default local embedding backend (`nomic-embed-text`) and the dormant offline chat backend; the preflight fails only when Ollama is unreachable.
+`start.cmd` / `./start.sh` skip the prompts entirely and only provision the HPC cluster when its deployed source is stale. In local mode the wizard checks local Ollama, which is required for the default local embedding backend (`all-minilm`) and the dormant offline chat backend; the preflight fails only when Ollama is unreachable.
 
 The rest of this section describes the manual, conda-based setup for development.
 
@@ -103,13 +103,13 @@ The endpoint and backend are configured under `[llm_api]` in `config.toml` (defa
 Embeddings run locally by default: `[embeddings].backend = "ollama"` (env `EMBEDDINGS_BACKEND` overrides) serves them from a local Ollama host while chat/vision stay on SoCLAaS. Install Ollama, start it, and pull the model:
 
 ```powershell
-ollama pull nomic-embed-text
+ollama pull all-minilm
 ```
 
 Verify the embedding endpoint before indexing:
 
 ```powershell
-$body = @{ model = "nomic-embed-text"; input = "embedding health check" } | ConvertTo-Json
+$body = @{ model = "all-minilm"; input = "embedding health check" } | ConvertTo-Json
 $response = Invoke-RestMethod `
   -Uri "http://127.0.0.1:11434/api/embed" `
   -Method Post `
@@ -119,13 +119,13 @@ $response = Invoke-RestMethod `
 $response.embeddings[0].Count
 ```
 
-The final command should print `768` (nomic-embed-text dimension). To embed through the SoCLAaS API instead, set `[embeddings].backend = "soclaas"` (or `$env:EMBEDDINGS_BACKEND = "soclaas"`) plus `[models] embedding_model = "bge-m3"`, `embedding_dim = 1024`, and verify the key can reach `soclaas-api.comp.nus.edu.sg/v1/embeddings`.
+The final command should print `384` (all-minilm dimension). To embed through the SoCLAaS API instead, set `[embeddings].backend = "soclaas"` (or `$env:EMBEDDINGS_BACKEND = "soclaas"`) plus `[models] embedding_model = "bge-m3"`, `embedding_dim = 1024`, and verify the key can reach `soclaas-api.comp.nus.edu.sg/v1/embeddings`.
 
-> **Re-index required.** Switching the embedding model between `nomic-embed-text` (768-d, local) and `bge-m3` (1024-d, SoCLAaS) invalidates any existing index. Delete `db/` (or the staged build dir) and rebuild — the indexer's model+dimension reuse guard enforces this automatically and the query engine raises a clear re-index error on a dimension mismatch.
+> **Re-index required.** Switching the embedding model (all-minilm 384-d, nomic-embed-text 768-d, bge-m3 1024-d) invalidates any existing index. Delete `db/` (or the staged build dir) and rebuild — the indexer's model+dimension reuse guard enforces this automatically and the query engine raises a clear re-index error on a dimension mismatch.
 
 #### Dormant local Ollama chat fallback (optional)
 
-For fully-offline chat/vision operation, set `[llm_api].backend = "ollama"` (or `LLM_BACKEND=ollama`) and point `[ollama].host` at a local Ollama server. Install Ollama, start `ollama serve`, and pull the models you want to use. The default local chat/planner substitute is `qwen3:4b-instruct` (`ollama pull qwen3:4b-instruct`; ~2.5 GB at Q4_K_M with native tool-calling, sized for a 4 GB GPU) — without it, the cloud tag `gemma4:26b` base-name-matches to `gemma4:latest` (gemma4 e4b, 9.6 GB), which no consumer GPU of this class can serve. For vision, `local_vision_model = "qwen2.5vl:3b"` (`ollama pull qwen2.5vl:3b`); `nomic-embed-text` is already required for the default local embeddings. Chat/vision transports then route to that local server instead of the SoCLAaS API. This path is not used by default.
+For fully-offline chat/vision operation, set `[llm_api].backend = "ollama"` (or `LLM_BACKEND=ollama`) and point `[ollama].host` at a local Ollama server. Install Ollama, start `ollama serve`, and pull the models you want to use. The default local chat/planner substitute is `qwen3:4b-instruct` (`ollama pull qwen3:4b-instruct`; ~2.5 GB at Q4_K_M with native tool-calling, sized for a 4 GB GPU) — without it, the cloud tag `gemma4:26b` base-name-matches to `gemma4:latest` (gemma4 e4b, 9.6 GB), which no consumer GPU of this class can serve. For vision, `local_vision_model = "qwen2.5vl:3b"` (`ollama pull qwen2.5vl:3b`); `all-minilm` is already required for the default local embeddings. Automatic fallbacks refuse any installed variant larger than `LOCAL_MODEL_MAX_BYTES` (default 4 GiB) instead of silently loading a model the GPU cannot serve. Chat/vision transports then route to that local server instead of the SoCLAaS API. This path is not used by default.
 
 #### Scaling embeddings across multiple Ollama replicas
 
@@ -162,7 +162,7 @@ rapidocr_backend = "onnxruntime"
 
 Optional backends are `auto`, `tesseract_cli`, `tesseract`, and `easyocr`. Tesseract backends require a system Tesseract install and language data; set `tesseract_cmd`, `tesseract_data_path`, and `tesseract_psm` when using them. Successfully described Docling figures/charts are stored as PNG assets under `[paths] asset_dir` (`db/assets` by default), marked in Markdown with stable image-asset IDs, and shown as thumbnails/links in local source panels alongside their searchable vision descriptions.
 
-Indexing and query embed through the local `nomic-embed-text` (Ollama) by default and chat through the SoCLAaS API (`gemma4:26b`). Use `--embedding_model` to select a different embedding model, `--embedding_batch_size` to tune batch size, and `--embedding_timeout 30` to fail clearly instead of waiting indefinitely. Indexing writes chunks to LanceDB, with `--summary_mode hybrid`, `--chunk_target_tokens 900`, and `--chunk_overlap_tokens 120` by default; the overlap is only used when a detected section is too large. Reindexing reuses existing vectors when a record ID, content hash, embedding model, and embedding dimension are unchanged, and writes `db/index_manifest.json` with per-document chunk/quality counts for the browser UI. Query mode defaults for `context_window`, `llm_num_predict`, and `min_relevance_score` are set in `config.toml`; local retrieval also reranks vector candidates with a bounded lexical score, controlled by `LOCAL_RAG_RETRIEVAL_LEXICAL_WEIGHT` when needed. The SoCLAaS chat path retries transient errors with bounded exponential backoff (configurable via `[llm_api].retries`); the dormant Ollama fallback cancels after `--ollama_max_lost_health_checks` failed health checks spaced by `--ollama_health_check_interval`.
+Indexing and query embed through the local `all-minilm` (Ollama) by default and chat through the SoCLAaS API (`gemma4:26b`). Use `--embedding_model` to select a different embedding model, `--embedding_batch_size` to tune batch size, and `--embedding_timeout 30` to fail clearly instead of waiting indefinitely. Indexing writes chunks to LanceDB, with `--summary_mode hybrid`, `--chunk_target_tokens 900`, and `--chunk_overlap_tokens 120` by default; the overlap is only used when a detected section is too large. Reindexing reuses existing vectors when a record ID, content hash, embedding model, and embedding dimension are unchanged, and writes `db/index_manifest.json` with per-document chunk/quality counts for the browser UI. Query mode defaults for `context_window`, `llm_num_predict`, and `min_relevance_score` are set in `config.toml`; local retrieval also reranks vector candidates with a bounded lexical score, controlled by `LOCAL_RAG_RETRIEVAL_LEXICAL_WEIGHT` when needed. The SoCLAaS chat path retries transient errors with bounded exponential backoff (configurable via `[llm_api].retries`); the dormant Ollama fallback cancels after `--ollama_max_lost_health_checks` failed health checks spaced by `--ollama_health_check_interval`.
 
 The module entrypoints can also be used for the default directories:
 
@@ -179,7 +179,7 @@ The CPU cluster's only role is the one-time bulk parse of the initial PDF corpus
 start.cmd --initial-corpus corpus.zip
 ```
 
-That single command (implemented by `scripts/hpc_corpus.py`) extracts the zip locally under `data/corpus/<name>/` — **nested directories are preserved**; the pipeline discovers PDFs recursively and disambiguates duplicate names safely — uploads the corpus to the cluster, submits and monitors the ingest-only PBS job (qsub/qstat polling, exit-code verification, live progress), fetches the processed Markdown home, verifies the fetched corpus against the zip, and builds the local index with `main.py --mode index`. Local Ollama must be running with `nomic-embed-text` pulled; if vision enrichment is enabled (`[ingestion] vision_enabled = true`, the default), a usable SoCLAaS key must be reachable (env `SOCLAAS_API_KEY`, `[llm_api].api_key`, or `~/rag_soclaas_key` on the login node) — otherwise the command fails fast instead of silently producing `[Image description failed]` markers (override with `--allow-degraded-vision`).
+That single command (implemented by `scripts/hpc_corpus.py`) extracts the zip locally under `data/corpus/<name>/` — **nested directories are preserved**; the pipeline discovers PDFs recursively and disambiguates duplicate names safely — uploads the corpus to the cluster, submits and monitors the ingest-only PBS job (qsub/qstat polling, exit-code verification, live progress), fetches the processed Markdown home, verifies the fetched corpus against the zip, and builds the local index with `main.py --mode index`. Local Ollama must be running with the configured embedding model (`all-minilm` by default) pulled; if vision enrichment is enabled (`[ingestion] vision_enabled = true`, the default), a usable SoCLAaS key must be reachable (env `SOCLAAS_API_KEY`, `[llm_api].api_key`, or `~/rag_soclaas_key` on the login node) — otherwise the command fails fast instead of silently producing `[Image description failed]` markers (override with `--allow-degraded-vision`).
 
 Re-runs are cheap: PDFs whose content hash already maps to processed Markdown are skipped cluster-side, so resuming after a walltime kill or an interrupted fetch costs nothing. Useful flags: `--skip-index-build` (parse + fetch only), `--allow-degraded-vision`.
 
@@ -311,8 +311,8 @@ Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/
    - Figures/charts can be sent to `qwen3-vl:32b` through the SoCLAaS API.
 
 2. **Embeddings**
-   - Embeddings run on a locally hosted `nomic-embed-text` (Ollama, 768-d) by default, selected by `[embeddings].backend` independently of the chat/vision backend.
-   - nomic wants `search_document:`/`search_query:` prefixes; they are applied automatically (instruction-free models such as bge-m3 get none).
+   - Embeddings run on a locally hosted `all-minilm` (Ollama, 384-d) by default, selected by `[embeddings].backend` independently of the chat/vision backend.
+   - all-minilm and bge-m3 need no instruction prefixes; nomic/e5 models get `search_document:`/`search_query:` applied automatically.
    - Embeddings are L2-normalized.
    - `[embeddings].backend = "soclaas"` switches embeddings to the hosted API's `bge-m3` (1024-d); a model/dim switch requires a full re-index.
 
@@ -335,8 +335,8 @@ Open `http://127.0.0.1:8000`. The web app accepts PDF uploads, queues ingestion/
 
 ## Hardware And Runtime Notes
 
-- Chat and vision inference are served by the SoCLAaS API; those calls only need outbound HTTPS to `soclaas-api.comp.nus.edu.sg` plus the API key. The workstation also runs local Ollama for embeddings (`nomic-embed-text`).
-- The CPU HPC job does the non-LLM parse work (Docling OCR/parsing) and runs ingest-only by default (`--skip-index`); the workstation embeds with local nomic and builds LanceDB/ANN. A full ingest+index cluster job remains available for `EMBEDDINGS_BACKEND=soclaas` deployments.
+- Chat and vision inference are served by the SoCLAaS API; those calls only need outbound HTTPS to `soclaas-api.comp.nus.edu.sg` plus the API key. The workstation also runs local Ollama for embeddings (`all-minilm`).
+- The CPU HPC job does the non-LLM parse work (Docling OCR/parsing) and runs ingest-only by default (`--skip-index`); the workstation embeds with local all-minilm and builds LanceDB/ANN. A full ingest+index cluster job remains available for `EMBEDDINGS_BACKEND=soclaas` deployments.
 - The dormant Ollama fallback's `keep_alive="0"` can evict inactive models between phases, and VRAM pressure can be relieved by reducing Ollama parallelism or the embedding batch size.
 
 ## Troubleshooting
@@ -370,7 +370,7 @@ $ollama = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
 & $ollama list
 & $ollama ps
 
-$body = @{ model = "nomic-embed-text"; input = "embedding health check" } | ConvertTo-Json
+$body = @{ model = "all-minilm"; input = "embedding health check" } | ConvertTo-Json
 $response = Invoke-RestMethod `
   -Uri "http://127.0.0.1:11434/api/embed" `
   -Method Post `

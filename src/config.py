@@ -51,6 +51,7 @@ from src.defaults import (
     DEFAULT_RAPIDOCR_BACKEND,
     DEFAULT_RETRIEVAL_CANDIDATE_K,
     DEFAULT_RETRIEVAL_MIN_SCORE,
+    DEFAULT_RETRIEVAL_RRF_K,
     DEFAULT_RETRIEVAL_RELATIVE_CUTOFF,
     DEFAULT_SAMPLER_TOP_K,
     DEFAULT_TEMPERATURE,
@@ -97,9 +98,8 @@ class ModelConfig:
     local_vision_model: str = ""
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     reranker_model: str = ""
-    # nomic-embed-text dense dim (768). Changing model/dim invalidates an
-    # existing index (full re-index required); the indexer's reuse guard
-    # enforces it.
+    # all-minilm dense dim (384). Changing model/dim invalidates an existing
+    # index (full re-index required); the indexer's reuse guard enforces it.
     embedding_dim: int = DEFAULT_EMBEDDING_DIM
     allow_hash_embeddings: bool = True
     native_embeddings: bool = False
@@ -113,8 +113,8 @@ class LlmApiConfig:
     (default, hosted API) or ``"ollama"`` (dormant local fallback for offline
     operation -- the Ollama transport code is retained for this). Embeddings
     have their own selector, ``[embeddings].backend`` (default ``"ollama"``:
-    a locally hosted nomic-embed-text), so chat/vision can run on SoCLAaS
-    while embeddings stay local; set it to ``"soclaas"`` to embed through the
+    a locally hosted all-minilm), so chat/vision can run on SoCLAaS while
+    embeddings stay local; set it to ``"soclaas"`` to embed through the
     hosted API (bge-m3, 1024-d) as well.
 
     The API key is read from ``api_key`` here but the env var named in
@@ -161,6 +161,25 @@ class IngestionConfig:
 
 
 @dataclass
+class ChunkingConfig:
+    """``[chunking]`` section: section splitting + index-backend selection.
+
+    Consumed by ``main.py --mode index`` so CLI index builds honor the same
+    knobs the web UI's reindex form exposes. The web job queue always sends
+    explicit values from the request, so these mainly govern direct CLI runs.
+    """
+
+    # Target chunk size within one detected section.
+    max_tokens: int = 900
+    # Overlap used only when splitting an oversized detected section.
+    overlap_tokens: int = 120
+    # How to derive document/section summary records: hybrid | deterministic | llm.
+    summary_mode: str = "hybrid"
+    # Vector index storage backend. LanceDB is the only supported backend.
+    index_backend: str = "lancedb"
+
+
+@dataclass
 class ChatConfig:
     """``[chat]`` generation/planner settings for query mode."""
 
@@ -188,6 +207,9 @@ class RetrievalConfig:
     min_relevance_score: float = DEFAULT_RETRIEVAL_MIN_SCORE
     relative_relevance_cutoff: float = DEFAULT_RETRIEVAL_RELATIVE_CUTOFF
     context_token_fraction: float = DEFAULT_CONTEXT_TOKEN_FRACTION
+    # RRF damping constant for fusing vector + BM25 rankings (60 is the value
+    # from the original RRF paper). Higher = lower-ranked lists count more.
+    rrf_k: int = DEFAULT_RETRIEVAL_RRF_K
 
 
 @dataclass
@@ -258,7 +280,7 @@ class EmbeddingsConfig:
 
     # Embedding transport, selected INDEPENDENTLY of chat/vision so the common
     # split deployment works: SoCLAaS gemma4/qwen3-vl chat+vision with locally
-    # hosted nomic-embed-text embeddings. "ollama" (default) = local Ollama
+    # hosted all-minilm embeddings. "ollama" (default) = local Ollama
     # host(s) from [embeddings].hosts / OLLAMA_HOST; "soclaas" = the hosted
     # API's bge-m3 (1024-d; pair it with [models] embedding_model/dim);
     # "" = follow [llm_api].backend. Env EMBEDDINGS_BACKEND overrides.
@@ -387,6 +409,7 @@ class PipelineConfig:
     paths: PathsConfig = field(default_factory=PathsConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
     ingestion: IngestionConfig = field(default_factory=IngestionConfig)
+    chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     web_search: WebSearchConfig = field(default_factory=WebSearchConfig)
@@ -439,6 +462,23 @@ def _merge_dataclass(target: Any, values: dict[str, Any], *, path: str = "") -> 
 # Parsed-config cache keyed on (resolved path, mtime, size). ``load_config``
 # returns a deep copy so callers can mutate without polluting the cache.
 _CONFIG_CACHE: dict[tuple[str, int, int], PipelineConfig] = {}
+
+
+def default_config_path() -> Path:
+    """Repo ``config.toml``, honoring ``RAG_PIPELINE_CONFIG`` (env override).
+
+    Relative env values anchor at the repo root so the resolution is
+    independent of the process working directory. Module-level helpers that
+    cannot receive an explicit path (``src.llm_api``, ``src.local_rag``) must
+    pass this to :func:`load_config` -- a bare ``load_config()`` returns pure
+    dataclass defaults and never touches disk, which silently ignores
+    config.toml when the env var is unset.
+    """
+    raw = os.environ.get("RAG_PIPELINE_CONFIG")
+    if raw:
+        path = Path(raw)
+        return path if path.is_absolute() else Path(__file__).resolve().parents[1] / raw
+    return Path(__file__).resolve().parents[1] / "config.toml"
 
 
 def load_config(path: str | os.PathLike[str] | None = None) -> PipelineConfig:

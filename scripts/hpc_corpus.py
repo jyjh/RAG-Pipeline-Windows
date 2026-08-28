@@ -233,9 +233,9 @@ def _http_json(url: str, timeout: float = 5.0) -> Any:
 def check_local_ollama(config: Any) -> None:
     """Local Ollama + the configured embedding model are required pre-index.
 
-    Embeddings run on the workstation (default ``nomic-embed-text`` via
-    Ollama); checking BEFORE the cluster job avoids parsing for hours only to
-    fail at the first embedding call.
+    Embeddings run on the workstation (default ``all-minilm`` via Ollama);
+    checking BEFORE the cluster job avoids parsing for hours only to fail at
+    the first embedding call.
     """
     if _effective_embeddings_backend(config) != "ollama":
         return
@@ -247,7 +247,7 @@ def check_local_ollama(config: Any) -> None:
             f"Local Ollama is not reachable at {host} but embeddings depend on "
             f"it. Start Ollama (https://ollama.com) and re-run. ({exc})"
         ) from exc
-    model = str(getattr(config.models, "embedding_model", "nomic-embed-text"))
+    model = str(getattr(config.models, "embedding_model", "all-minilm"))
     try:
         tags = _http_json(f"{host}/api/tags")
         names = {

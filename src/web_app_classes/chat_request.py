@@ -27,6 +27,7 @@ class ChatRequest(BaseModel):
     retrieval_candidate_k: int | None = Field(DEFAULT_RETRIEVAL_CANDIDATE_K, ge=1)
     retrieval_min_score: float | None = Field(CHAT_CONFIG["retrieval_min_score"], ge=0, le=1)
     retrieval_relative_cutoff: float | None = Field(DEFAULT_RETRIEVAL_RELATIVE_CUTOFF, ge=0, le=1)
+    retrieval_rrf_k: int | None = Field(CHAT_CONFIG["retrieval_rrf_k"], ge=1)
     context_token_fraction: float | None = Field(DEFAULT_CONTEXT_TOKEN_FRACTION, gt=0, le=1)
     web_search_timeout: float | None = Field(DEFAULT_WEB_SEARCH_TIMEOUT, gt=0)
     web_search_max_results: int | None = Field(DEFAULT_WEB_SEARCH_MAX_RESULTS, ge=1, le=20)

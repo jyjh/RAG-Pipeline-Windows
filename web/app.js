@@ -47,6 +47,11 @@ const state = {
   indexLoadToken: 0,
   uploadDragDepth: 0,
   pendingForceUploadToken: "",
+  // Selection stash for the Force-upload retry (the file input is cleared
+  // when the batch ends, even on a duplicate block).
+  pendingDuplicateFiles: null,
+  pendingDuplicateSourceGroups: null,
+  pollFailureCount: 0,
   sourceGroupPromptResolver: null,
   selectedPdfHashes: new Set(),
   openJobLogIds: new Set(),
@@ -463,10 +468,11 @@ async function requestJson(path, options = {}) {
       return { ...cached.data, notModified: true };
     }
   }
-  // A mutating request failed auth: offer to (re-)enter the API key, then retry
-  // once. Surfaced here so every requestJson caller benefits without per-call
-  // handling. GETs never hit this (they carry no key and are not gated).
-  if (response.status === 401 && method !== "GET" && !options.__apiKeyRetried) {
+  // A request failed auth: offer to (re-)enter the API key, then retry once.
+  // Surfaced here so every requestJson caller benefits without per-call
+  // handling. Sensitive GETs are gated server-side when auth is configured,
+  // so they flow through the same prompt-and-retry path.
+  if (response.status === 401 && !options.__apiKeyRetried) {
     const key = await promptForApiKey();
     if (key) {
       return requestJson(path, { ...options, __apiKeyRetried: true });
@@ -499,7 +505,6 @@ function uploadFormData(path, body, options = {}) {
     request.addEventListener("load", () => {
       const text = request.responseText || "";
       if (request.status === 401 && !options.__apiKeyRetried) {
-        resolvedWithAuthRetry = true;
         promptForApiKey().then((key) => {
           if (key) {
             uploadFormData(path, body, { ...options, __apiKeyRetried: true }).then(resolve, reject);
@@ -549,26 +554,33 @@ function isAbortError(error) {
 const CHUNKED_UPLOAD_THRESHOLD = 128 * 1024 * 1024; // 128 MiB
 const CHUNKED_UPLOAD_CHUNK_SIZE = 16 * 1024 * 1024; // 16 MiB
 
+// Server contract: upload_id must be a 32-char hex token (it becomes a path
+// component under the staging dir, and anything else is rejected).
+function newUploadId() {
+  const bytes = new Uint8Array(16);
+  if (window.crypto && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i += 1) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 // Upload a single large file via the chunked/resumable protocol. Splits the
 // file into CHUNKED_UPLOAD_CHUNK_SIZE pieces, POSTs each to /api/uploads/chunk,
 // then finalizes with /api/uploads/complete. On a 409 offset-mismatch (server
-// has more/fewer bytes than expected), re-syncs via /api/uploads/chunk_status
-// and resumes from the server's offset. Returns the completion response.
-async function uploadFileChunked(file, { sourceGroup = "", onProgress = null } = {}) {
+// has more/fewer bytes than expected), re-syncs to the server's offset and
+// resumes. Returns the completion response.
+async function uploadFileChunked(
+  file,
+  { sourceGroup = "", forceDuplicates = false, forceToken = "", onProgress = null } = {},
+) {
   const totalSize = file.size;
   const chunkSize = CHUNKED_UPLOAD_CHUNK_SIZE;
-  const uploadId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const uploadId = newUploadId();
   let offset = 0;
-
-  // Try to resume an existing partial upload for this id (rare on first run).
-  try {
-    const status = await requestJson(`/api/uploads/chunk_status?upload_id=${encodeURIComponent(uploadId)}`);
-    if (status && typeof status.offset === "number") {
-      offset = status.offset;
-    }
-  } catch (_) {
-    // Ignore -- start from 0.
-  }
 
   while (offset < totalSize) {
     const end = Math.min(offset + chunkSize, totalSize);
@@ -600,6 +612,12 @@ async function uploadFileChunked(file, { sourceGroup = "", onProgress = null } =
 
   const completeBody = { upload_id: uploadId, filename: file.name };
   if (sourceGroup) completeBody.source_groups = sourceGroup;
+  if (forceDuplicates) {
+    // Mirrors the single-POST path: without this a forced duplicate of a
+    // large file uploads every byte and then fails with 409 at complete.
+    completeBody.force_duplicates = "true";
+    if (forceToken) completeBody.force_token = forceToken;
+  }
   const completeResult = await requestJson("/api/uploads/complete", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -742,12 +760,13 @@ function clearApiKey() {
   return setApiKey("");
 }
 
-// Apply the stored API key to a Headers object in place. Mutating requests get
-// the X-API-Token header (same name the legacy single-token middleware used);
-// GET reads stay header-free so an empty store / fresh deploy keeps working.
+// Apply the stored API key to a Headers object in place. Sent on ALL methods:
+// sensitive GETs (/api/pdfs, /api/index, /api/jobs) are gated server-side when
+// auth is configured, and fetch() can carry headers (unlike the <a>/<img>
+// media routes, which intentionally stay open).
 function applyApiKeyHeaders(headers, { method }) {
   const key = getApiKey();
-  if (key && String(method || "GET").toUpperCase() !== "GET") {
+  if (key) {
     headers.set("X-API-Token", key);
   }
   return headers;
@@ -1218,10 +1237,17 @@ function persistChatState() {
 }
 
 function persistChatUiState() {
-  localStorage.setItem(
-    CHAT_UI_STORAGE_KEY,
-    JSON.stringify({ chatSidebarCollapsed: state.chatSidebarCollapsed }),
-  );
+  // Guarded like persistChatState: in a storage-blocked context (e.g. Safari
+  // private mode) an unguarded write throws, and this runs during init --
+  // the rest of startup (render, polling) would never run.
+  try {
+    localStorage.setItem(
+      CHAT_UI_STORAGE_KEY,
+      JSON.stringify({ chatSidebarCollapsed: state.chatSidebarCollapsed }),
+    );
+  } catch (_) {
+    // Storage unavailable; the preference is simply not persisted.
+  }
 }
 
 function activeChat() {
@@ -1433,7 +1459,9 @@ async function refreshHealth() {
       `${data.record_count} indexed chunks | ` +
       `${queue.active_query_count || 0} active queries | ` +
       `${queue.queued_count || 0} queued jobs`;
+    notePollSuccess();
   } catch (error) {
+    notePollFailure();
     els.statusLine.textContent = `Health check failed: ${error.message}`;
   }
 }
@@ -2386,6 +2414,7 @@ async function refreshJobs(options = {}) {
       return;
     }
     state.jobsLoaded = true;
+    notePollSuccess();
     const wasActive = state.jobsActive;
     state.jobsActive = Number(data.active_count || 0) > 0;
     if (data.notModified && state.jobsRenderedUrl === url) {
@@ -2446,6 +2475,7 @@ async function refreshJobs(options = {}) {
       scheduleJobsPolling();
     }
   } catch (error) {
+    notePollFailure();
     setStatus(els.uploadStatus, error.message, true);
   }
 }
@@ -2666,15 +2696,38 @@ async function handlePdfAction(event) {
   }
 }
 
+// Poll backoff: consecutive failed polls stretch the interval so a down or
+// restarting server isn't hammered every 2s indefinitely; the first success
+// restores the normal cadence.
+function pollBackoffMultiplier() {
+  return Math.min(1 + state.pollFailureCount, 30);
+}
+
+function notePollFailure() {
+  state.pollFailureCount += 1;
+  scheduleHealthPolling();
+  scheduleJobsPolling();
+}
+
+function notePollSuccess() {
+  if (state.pollFailureCount) {
+    state.pollFailureCount = 0;
+    scheduleHealthPolling();
+    scheduleJobsPolling();
+  }
+}
+
 function scheduleHealthPolling() {
   if (state.healthTimer) {
     clearInterval(state.healthTimer);
   }
-  state.healthTimer = setInterval(refreshHealth, state.healthPollIntervalMs);
+  const interval = state.healthPollIntervalMs * pollBackoffMultiplier();
+  state.healthTimer = setInterval(refreshHealth, interval);
 }
 
 function scheduleJobsPolling() {
-  const interval = state.jobsActive ? JOBS_ACTIVE_POLL_INTERVAL_MS : state.jobsPollIntervalMs;
+  const base = state.jobsActive ? JOBS_ACTIVE_POLL_INTERVAL_MS : state.jobsPollIntervalMs;
+  const interval = base * pollBackoffMultiplier();
   if (state.jobsTimer && state.jobsTimerIntervalMs === interval) {
     return;
   }
@@ -2736,6 +2789,8 @@ function duplicateUploadMessage(detail) {
 
 function clearDuplicatePrompt() {
   state.pendingForceUploadToken = "";
+  state.pendingDuplicateFiles = null;
+  state.pendingDuplicateSourceGroups = null;
   els.duplicatePrompt.hidden = true;
   els.duplicatePromptText.textContent = "";
   els.forceUploadButton.disabled = true;
@@ -3093,6 +3148,8 @@ async function uploadFiles(forceDuplicates = false, forceToken = "") {
       if (file.size >= CHUNKED_UPLOAD_THRESHOLD) {
         result = await uploadFileChunked(file, {
           sourceGroup: sourceGroups[index] || "",
+          forceDuplicates: isForced,
+          forceToken,
           onProgress(progress) {
             if (progress.percent === null) {
               setStatus(
@@ -3147,6 +3204,11 @@ async function uploadFiles(forceDuplicates = false, forceToken = "") {
   state.pdfOffset = 0;
 
   if (firstDuplicateDetail && allJobs.length === 0) {
+    // Keep the selection for the Force button: the input was just cleared and
+    // Force re-reads it, so without this stash the button always aborted with
+    // "Choose one or more PDF files."
+    state.pendingDuplicateFiles = files;
+    state.pendingDuplicateSourceGroups = sourceGroups;
     showDuplicatePrompt(firstDuplicateDetail);
     setStatus(
       els.uploadStatus,
@@ -4858,8 +4920,11 @@ function isTransientNotice(text) {
   return (
     text === "Embedding query and retrieving context..." ||
     text === "Planning retrieval tool calls..." ||
+    text === "Searching local context..." ||
     /^Running .+\.\.\.$/.test(text) ||
     /^Retrieved \d+ .+\(s\)\.?$/.test(text) ||
+    // Planner path: "Retrieved N local source chunk(s) from M query/queries."
+    /^Retrieved \d+ .+\(s\) from \d+ quer(y|ies)\.$/.test(text) ||
     /^Retrieved \d+ context chunk\(s\)\. Requesting answer from .+\.\.\.$/.test(text)
   );
 }
@@ -5020,6 +5085,10 @@ async function runChatExchange(chat, question, { announceUser = true } = {}) {
   state.streamingChatId = chat.id;
   const abortController = new AbortController();
   state.chatAbortController = abortController;
+  // Stall watchdog state lives at function scope: the catch/finally blocks
+  // below read and clear it.
+  let streamStalled = false;
+  let stallTimer = 0;
   if (announceUser) {
     addUserMessageToChat(chat, question);
     const userBody = addMessage("You", question);
@@ -5030,9 +5099,11 @@ async function runChatExchange(chat, question, { announceUser = true } = {}) {
   renderSavedChats();
 
   try {
+    const chatHeaders = { "Content-Type": "application/json" };
+    applyApiKeyHeaders(chatHeaders, { method: "POST" });
     const response = await fetch("/api/chat/stream", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: chatHeaders,
       signal: abortController.signal,
       body: JSON.stringify({
         question,
@@ -5044,6 +5115,22 @@ async function runChatExchange(chat, question, { announceUser = true } = {}) {
         web_search_enabled: Boolean(els.webSearchInput.checked),
       }),
     });
+    // With API keys configured the chat POST can 401 like any other request;
+    // run the same prompt-and-retry flow instead of dumping the raw JSON
+    // body into the message's error notice.
+    if (response.status === 401) {
+      const key = await promptForApiKey();
+      if (key) {
+        state.streamingChatId = null;
+        state.chatAbortController = null;
+        setSendButtonStreaming(false);
+        const placeholder = assistantParts.body?.closest(".message");
+        if (placeholder) {
+          placeholder.remove();
+        }
+        return runChatExchange(chat, question, { announceUser });
+      }
+    }
     if (!response.ok || !response.body) {
       throw new Error(await response.text());
     }
@@ -5051,6 +5138,21 @@ async function runChatExchange(chat, question, { announceUser = true } = {}) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    // Abort when no bytes arrive for CHAT_STREAM_STALL_TIMEOUT_MS. Chosen
+    // above the worst legitimate first-token latency (a cold local model
+    // load, ~1-2 min) so only a genuinely hung stream trips it.
+    const CHAT_STREAM_STALL_TIMEOUT_MS = 300000;
+    stallTimer = setTimeout(() => {
+      streamStalled = true;
+      abortController.abort();
+    }, CHAT_STREAM_STALL_TIMEOUT_MS);
+    const resetStallTimer = () => {
+      clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => {
+        streamStalled = true;
+        abortController.abort();
+      }, CHAT_STREAM_STALL_TIMEOUT_MS);
+    };
     const processLine = (line) => {
       const trimmed = line.trim();
       if (!trimmed) {
@@ -5069,6 +5171,7 @@ async function runChatExchange(chat, question, { announceUser = true } = {}) {
       if (done) {
         break;
       }
+      resetStallTimer();
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
@@ -5080,11 +5183,20 @@ async function runChatExchange(chat, question, { announceUser = true } = {}) {
     processLine(buffer);
   } catch (error) {
     if (error.name === "AbortError") {
-      appendStreamEvent(assistantParts, { type: "notice", text: "Generation stopped." });
+      appendStreamEvent(
+        assistantParts,
+        {
+          type: "notice",
+          text: streamStalled
+            ? "Generation timed out: the server stopped sending output. Click Send to retry."
+            : "Generation stopped.",
+        },
+      );
     } else {
       appendStreamEvent(assistantParts, { type: "error", text: error.message });
     }
   } finally {
+    clearTimeout(stallTimer);
     await formatAssistantMessage(assistantParts);
     addAssistantMessageToChat(chat, assistantParts);
     state.streamingChatId = null;
@@ -5684,6 +5796,12 @@ async function handleAdminKeyAction(event) {
   if (!control) {
     return;
   }
+  // The body listener fires for both click and change; a <select> must only
+  // act on change. On click it would POST the CURRENT role immediately and
+  // the subsequent re-render would destroy the open dropdown.
+  if (event.type === "click" && control.tagName === "SELECT") {
+    return;
+  }
   if (control.tagName === "BUTTON" && control.disabled) {
     return;
   }
@@ -6281,6 +6399,26 @@ els.uploadButton.addEventListener("click", () => uploadFiles());
 els.forceUploadButton.addEventListener("click", () => {
   if (!state.pendingForceUploadToken) {
     return;
+  }
+  // uploadFiles clears the file input when the batch ends (even on a
+  // duplicate block); restore the stashed selection -- and the source-group
+  // picks -- before retrying, otherwise Force aborts with an empty input.
+  if (state.pendingDuplicateFiles?.length) {
+    const transfer = new DataTransfer();
+    for (const file of state.pendingDuplicateFiles) {
+      transfer.items.add(file);
+    }
+    els.fileInput.files = transfer.files;
+    updateSelectedFilesLabel();
+    renderUploadGroupSelectors();
+    const groups = state.pendingDuplicateSourceGroups || [];
+    state.pendingDuplicateFiles.forEach((file, index) => {
+      const select = fileToGroupSelect.get(file);
+      const group = groups[index];
+      if (select && group && select.querySelector(`option[value="${group}"]`)) {
+        select.value = group;
+      }
+    });
   }
   uploadFiles(true, state.pendingForceUploadToken);
 });

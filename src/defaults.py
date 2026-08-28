@@ -26,14 +26,16 @@ DEFAULT_LOCAL_LLM_MODEL = "qwen3:4b-instruct"
 # which the warm-up thread would then have to redo after every idle gap.
 DEFAULT_OLLAMA_KEEP_ALIVE = "30m"
 
-# Embeddings default to a locally hosted nomic-embed-text (Ollama, 768-d) while
+# Embeddings default to a locally hosted all-minilm (Ollama, 384-d) while
 # chat/vision stay on SoCLAaS; [embeddings].backend = "soclaas" switches
 # embeddings to the API's bge-m3 (1024-d) instead. Changing the model/dim
 # invalidates any existing index -- a full re-index is required (the indexer's
 # model+dim reuse guard enforces this automatically).
-DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
-DEFAULT_EMBEDDING_DIM = 768
-# Texts per embedding request; also the timeout-measurement baseline.
+DEFAULT_EMBEDDING_MODEL = "all-minilm"
+DEFAULT_EMBEDDING_DIM = 384
+# Texts per embedding request; also the timeout-measurement baseline. The
+# shipped config.example.toml pins 64 for 4 GB GPUs; 128 remains the
+# unconfigured default (all-minilm is small enough to batch larger).
 DEFAULT_EMBEDDING_BATCH_SIZE = 128
 DEFAULT_EMBEDDING_TIMEOUT = 30.0
 
@@ -48,6 +50,7 @@ DEFAULT_LLM_TIMEOUT = 120.0
 DEFAULT_RETRIEVAL_CANDIDATE_K = 80
 DEFAULT_RETRIEVAL_MIN_SCORE = 0.50
 DEFAULT_RETRIEVAL_RELATIVE_CUTOFF = 0.72
+DEFAULT_RETRIEVAL_RRF_K = 60
 DEFAULT_CONTEXT_TOKEN_FRACTION = 0.60
 DEFAULT_WEB_SEARCH_ENABLED = True
 DEFAULT_WEB_SEARCH_TIMEOUT = 8.0

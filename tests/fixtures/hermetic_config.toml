@@ -1,0 +1,10 @@
+# Hermetic config for the test suite (tests/conftest.py points
+# RAG_PIPELINE_CONFIG here via an autouse fixture).
+#
+# Deliberately minimal: every section not listed below falls back to the
+# src.config dataclass defaults, so tests never depend on a developer's repo
+# config.toml (whose [llm_api].backend may be "ollama") or on the ambient
+# environment. Only the chat/vision backend is pinned explicitly for clarity;
+# embeddings keep their own selector default ([embeddings].backend = "ollama").
+[llm_api]
+backend = "soclaas"

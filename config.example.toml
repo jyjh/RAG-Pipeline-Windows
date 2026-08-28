@@ -51,6 +51,14 @@ max_pages_whole_doc = 50
 # Used by the ingest disk-space pre-check. Born-digital ~1.5x; scanned ~2x+.
 ingest_expansion_factor = 2.0
 
+# Section splitting + index backend, honored by `main.py --mode index` (CLI).
+# Web UI index jobs send their own explicit values from the reindex form.
+[chunking]
+max_tokens = 900
+overlap_tokens = 120
+summary_mode = "hybrid"
+index_backend = "lancedb"
+
 # Approximate-nearest-neighbour (ANN) vector index. Below ann_min_rows the
 # table uses a flat (brute-force) scan which is faster for small corpora; above
 # it, an IVF_PQ index makes every query sublinear. These defaults are tuned
@@ -117,6 +125,9 @@ min_relevance_score = 0.50
 relative_relevance_cutoff = 0.72
 candidate_top_k = 80
 context_token_fraction = 0.60
+# RRF damping constant for fusing vector + BM25 rankings (60 = the value from
+# the original RRF paper).
+rrf_k = 60
 
 [web_search]
 # Provider is DuckDuckGo Lite, built in; there is no provider key to set.

@@ -167,7 +167,9 @@ def test_main_index_dispatches_to_current_indexing(monkeypatch):
         "progress_enabled": True,
         "embedding_model": "all-minilm",
         "embedding_dim": 384,
-        "embedding_batch_size": 64,
+        # Hermetic fixture config does not set [embeddings]; the dataclass
+        # default (128) applies.
+        "embedding_batch_size": 128,
         "embedding_timeout": 30.0,
         "index_backend": "lancedb",
         "reuse_db_dir": "db_live",
@@ -198,6 +200,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys, tmp_
             retrieval_candidate_k,
             retrieval_min_score,
             retrieval_relative_cutoff,
+            retrieval_rrf_k,
             context_token_fraction,
             web_search_enabled,
             web_search_timeout,
@@ -225,6 +228,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys, tmp_
             calls["retrieval_candidate_k"] = retrieval_candidate_k
             calls["retrieval_min_score"] = retrieval_min_score
             calls["retrieval_relative_cutoff"] = retrieval_relative_cutoff
+            calls["retrieval_rrf_k"] = retrieval_rrf_k
             calls["context_token_fraction"] = context_token_fraction
             calls["web_search_enabled"] = web_search_enabled
             calls["web_search_timeout"] = web_search_timeout
@@ -262,10 +266,10 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys, tmp_
         "working_dir": "db_in",
         "asset_dir": "db/assets",
         "model": "custom-model",
-        "embedding_model": "nomic-embed-text",
+        "embedding_model": "all-minilm",
         "embedding_batch_size": 128,
         "embedding_timeout": 30.0,
-        "embedding_dim": 768,
+        "embedding_dim": 384,
         "llm_num_predict": 4096,
         "llm_timeout": 120.0,
         "temperature": 0.3,
@@ -274,6 +278,7 @@ def test_main_query_dispatches_to_current_query_engine(monkeypatch, capsys, tmp_
         "retrieval_candidate_k": 80,
         "retrieval_min_score": 0.5,
         "retrieval_relative_cutoff": 0.72,
+        "retrieval_rrf_k": 60,
         "context_token_fraction": 0.6,
         "web_search_enabled": True,
         "web_search_timeout": 8.0,
@@ -313,6 +318,7 @@ def test_main_query_reads_config_defaults_and_cli_flags_override(monkeypatch, ca
                 "candidate_top_k = 44",
                 "min_relevance_score = 0.25",
                 "relative_relevance_cutoff = 0.4",
+                "rrf_k = 44",
                 "context_token_fraction = 0.5",
                 "[web_search]",
                 "enabled = true",
@@ -337,6 +343,10 @@ def test_main_query_reads_config_defaults_and_cli_flags_override(monkeypatch, ca
 
     monkeypatch.setattr(main, "QueryEngine", FakeQueryEngine)
     monkeypatch.chdir(tmp_path)
+    # main.py resolves config.toml via src.config.default_config_path()
+    # (repo-root anchored, working-directory independent), so point the env
+    # override at the tmp config instead of relying on chdir.
+    monkeypatch.setenv("RAG_PIPELINE_CONFIG", str(tmp_path / "config.toml"))
 
     result = main.main(
         [
@@ -374,6 +384,7 @@ def test_main_query_reads_config_defaults_and_cli_flags_override(monkeypatch, ca
     assert calls["retrieval_candidate_k"] == 44
     assert calls["retrieval_min_score"] == 0.7
     assert calls["retrieval_relative_cutoff"] == 0.4
+    assert calls["retrieval_rrf_k"] == 44
     assert calls["context_token_fraction"] == 0.5
     assert calls["web_search_enabled"] is False
     assert calls["web_search_timeout"] == 3.5

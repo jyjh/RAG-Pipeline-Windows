@@ -887,7 +887,7 @@ def test_run_checks_ollama_warns_when_model_missing(safe_tmp_path, monkeypatch, 
     monkeypatch.setattr(si, "_runtime_dependencies_ready", lambda python=None: True)
     values = SetupValues(mode="local", server_host="127.0.0.1", server_port=8000)
     assert si.run_checks(config, values) is True  # WARN, not FAIL
-    assert "ollama pull nomic-embed-text" in capsys.readouterr().out
+    assert "ollama pull all-minilm" in capsys.readouterr().out
 
 
 def test_fresh_config_local_mode_notice(safe_tmp_path, capsys, monkeypatch):

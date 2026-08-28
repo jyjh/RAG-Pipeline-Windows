@@ -41,6 +41,7 @@ from src.defaults import (
     DEFAULT_RAPIDOCR_BACKEND,
     DEFAULT_RETRIEVAL_CANDIDATE_K,
     DEFAULT_RETRIEVAL_MIN_SCORE,
+    DEFAULT_RETRIEVAL_RRF_K,
     DEFAULT_RETRIEVAL_RELATIVE_CUTOFF,
     DEFAULT_SAMPLER_TOP_K,
     DEFAULT_TEMPERATURE,
@@ -95,10 +96,15 @@ def _configure_console() -> None:
 
 
 def _pipeline_config(config_path: Path | None = None):
-    """Typed config via the shared cached loader (src.config.load_config)."""
-    from src.config import load_config
+    """Typed config via the shared cached loader (src.config.load_config).
 
-    return load_config(config_path or Path("config.toml"))
+    Without an explicit path or ``RAG_PIPELINE_CONFIG``, resolves the repo
+    ``config.toml`` (working-directory independent) instead of falling back
+    to pure dataclass defaults.
+    """
+    from src.config import default_config_path, load_config
+
+    return load_config(config_path if config_path is not None else default_config_path())
 
 
 def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
@@ -158,6 +164,7 @@ def _load_query_config(config_path: Path | None = None) -> dict[str, Any]:
         "retrieval_candidate_k": _as_positive_int(retrieval.candidate_top_k, DEFAULT_RETRIEVAL_CANDIDATE_K),
         "retrieval_min_score": _as_float(retrieval.min_relevance_score, DEFAULT_RETRIEVAL_MIN_SCORE),
         "retrieval_relative_cutoff": _as_float(retrieval.relative_relevance_cutoff, DEFAULT_RETRIEVAL_RELATIVE_CUTOFF),
+        "retrieval_rrf_k": _as_positive_int(retrieval.rrf_k, DEFAULT_RETRIEVAL_RRF_K),
         "context_token_fraction": _as_float(retrieval.context_token_fraction, DEFAULT_CONTEXT_TOKEN_FRACTION),
         "web_search_enabled": _as_bool(web_search.enabled, DEFAULT_WEB_SEARCH_ENABLED),
         "web_search_timeout": _as_float(web_search.timeout_seconds, DEFAULT_WEB_SEARCH_TIMEOUT),
@@ -237,8 +244,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--index_backend",
         choices=["lancedb"],
-        default="lancedb",
-        help="Vector index storage backend for index mode. LanceDB is the only supported backend.",
+        default=None,
+        help="Vector index storage backend for index mode (default: [chunking].index_backend, lancedb). "
+        "LanceDB is the only supported backend.",
     )
     parser.add_argument(
         "--reuse_db_dir",
@@ -248,20 +256,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--summary_mode",
         choices=["hybrid", "deterministic", "llm"],
-        default="hybrid",
-        help="How to derive document and section summary records during indexing.",
+        default=None,
+        help="How to derive document and section summary records during indexing "
+        "(default: [chunking].summary_mode).",
     )
     parser.add_argument(
         "--chunk_target_tokens",
         type=int,
-        default=900,
-        help="Target chunk size used within one detected section.",
+        default=None,
+        help="Target chunk size used within one detected section (default: [chunking].max_tokens).",
     )
     parser.add_argument(
         "--chunk_overlap_tokens",
         type=int,
-        default=120,
-        help="Overlap used only when splitting an oversized detected section.",
+        default=None,
+        help="Overlap used only when splitting an oversized detected section "
+        "(default: [chunking].overlap_tokens).",
     )
     parser.add_argument(
         "--source_hashes",
@@ -326,6 +336,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Keep chunks with score at least this fraction of the best hit.",
+    )
+    parser.add_argument(
+        "--retrieval_rrf_k",
+        type=int,
+        default=None,
+        help="RRF damping constant for fusing vector + BM25 rankings (default: [retrieval].rrf_k).",
     )
     parser.add_argument(
         "--context_token_fraction",
@@ -546,6 +562,7 @@ def main(argv: list[str] | None = None) -> int:
                 apply_indexing_config(_load_indexing_config())
                 pipeline_cfg = _pipeline_config()
                 embedding_cfg = pipeline_cfg.embeddings
+                chunking_cfg = pipeline_cfg.chunking
                 index_kwargs = dict(
                     md_dir=args.md_dir,
                     db_dir=args.db_dir,
@@ -567,11 +584,28 @@ def main(argv: list[str] | None = None) -> int:
                         args.embedding_timeout
                         or _as_float(embedding_cfg.timeout_seconds, DEFAULT_EMBEDDING_TIMEOUT)
                     ),
-                    index_backend=args.index_backend,
+                    index_backend=(
+                        args.index_backend
+                        or str(chunking_cfg.index_backend or "").strip().lower()
+                        or "lancedb"
+                    ),
                     reuse_db_dir=args.reuse_db_dir,
-                    summary_mode=args.summary_mode,
-                    chunk_target_tokens=args.chunk_target_tokens,
-                    chunk_overlap_tokens=args.chunk_overlap_tokens,
+                    # "Or-style" flags: CLI value wins, else [chunking], else
+                    # the run_indexing defaults (hybrid / 900 / 120).
+                    summary_mode=(
+                        args.summary_mode
+                        or str(chunking_cfg.summary_mode or "").strip().lower()
+                        or "hybrid"
+                    ),
+                    chunk_target_tokens=(
+                        args.chunk_target_tokens
+                        or _as_positive_int(chunking_cfg.max_tokens, 900)
+                    ),
+                    chunk_overlap_tokens=(
+                        args.chunk_overlap_tokens
+                        if args.chunk_overlap_tokens is not None
+                        else max(0, int(chunking_cfg.overlap_tokens or 0))
+                    ),
                     resume=bool(args.resume),
                 )
                 source_hashes = [value.strip() for value in args.source_hashes.split(",") if value.strip()]
@@ -613,6 +647,7 @@ def main(argv: list[str] | None = None) -> int:
                         "temperature": args.temperature,
                         "retrieval_min_score": args.retrieval_min_score,
                         "retrieval_relative_cutoff": args.retrieval_relative_cutoff,
+                        "retrieval_rrf_k": args.retrieval_rrf_k,
                         "context_token_fraction": args.context_token_fraction,
                         "web_search_timeout": args.web_search_timeout,
                         "ollama_health_check_interval": args.ollama_health_check_interval,

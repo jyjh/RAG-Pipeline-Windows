@@ -1018,6 +1018,7 @@ def test_chat_config_reads_prompt_retrieval_and_ollama_health_settings(workspace
         "planner_max_queries": 5,
         "llm_timeout": 120.0,
         "retrieval_min_score": 0.62,
+        "retrieval_rrf_k": 60,
         "ollama_host": "http://127.0.0.1:11434",
         "ollama_hosts": [],
         "ollama_fallback_enabled": True,
@@ -1063,6 +1064,9 @@ def test_health_exposes_server_polling_config(monkeypatch):
         "jobs_poll_interval_ms": 60000,
         "update_remote": "origin",
         "update_branch": "main",
+        # The master token is redacted from the open health endpoint.
+        "api_token": "",
+        "api_token_configured": False,
     }
     assert response.json()["chat"] == {
         "context_window": web_app.CHAT_CONFIG["context_window"],
@@ -1644,7 +1648,8 @@ def test_gc_staged_build_dirs_removes_only_abandoned(workspace_tmp):
         json.dumps({"completed_files": ["a.md"]}),
         encoding="utf-8",
     )
-    # Interrupted publish aside-dir is collected.
+    # Interrupted publish aside-dir is repair-only: GC must leave it alone
+    # (it can hold the only copy of the live overrides/hashes).
     preserve = parent / ".index_preserve_ffff"
     preserve.mkdir()
     # Inside the grace window: never swept (a build may be warming up).
@@ -1655,10 +1660,10 @@ def test_gc_staged_build_dirs_removes_only_abandoned(workspace_tmp):
 
     removed = web_app._gc_staged_build_dirs(db_dir)
 
-    assert removed == 3
+    assert removed == 2
     assert not abandoned.exists()
     assert not empty_ckpt.exists()
-    assert not preserve.exists()
+    assert preserve.exists()
     assert resumable.exists()
     assert fresh.exists()
 
@@ -4363,13 +4368,18 @@ def test_admin_api_key_endpoints_open_in_zero_config(monkeypatch, safe_tmp_path)
 
     client = TestClient(web_app.app)
     assert client.get("/api/admin/api-keys").status_code == 200
-    # Creating keys is refused while the authenticator exists but auth config
-    # is enabled=False at import; if it exists it is usable, so expect either
-    # a successful create or a clean 400, never a 500.
-    response = client.post(
+    # Creating keys from a NON-loopback client is refused in the zero-config
+    # state: the first admin key must not be mintable by a LAN host (it would
+    # gate the whole deployment under the attacker's key). Loopback clients
+    # get a successful create or a clean 400, never a 500.
+    lan_response = client.post(
         "/api/admin/api-keys", json={"label": "first", "role": "user"}
     )
-    assert response.status_code in {200, 400}
+    assert lan_response.status_code == 403
+    local_response = TestClient(web_app.app, client=("127.0.0.1", 51000)).post(
+        "/api/admin/api-keys", json={"label": "first", "role": "user"}
+    )
+    assert local_response.status_code in {200, 400}
 
 
 def test_pdf_documents_endpoint_filters_by_group_and_trust(monkeypatch, workspace_tmp):
@@ -4418,3 +4428,186 @@ def test_pdf_documents_endpoint_filters_by_group_and_trust(monkeypatch, workspac
 
     everything = client.get("/api/pdfs", params={"source_group": "all"}).json()
     assert everything["total"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Audit hardening: chunk-upload containment, health redaction, admin
+# zero-config loopback guard, client model/path overrides, publish repair.
+# ---------------------------------------------------------------------------
+
+
+def _chunk_post(client, *, upload_id, offset="0", total_size="4", body=b"1234", filename="doc.pdf"):
+    return client.post(
+        "/api/uploads/chunk",
+        files={"chunk": (filename, body, "application/octet-stream")},
+        data={"upload_id": upload_id, "filename": filename, "offset": offset, "total_size": total_size},
+    )
+
+
+def test_chunk_upload_rejects_non_hex_upload_id():
+    """upload_id becomes a path component; only 32-char hex tokens are valid."""
+    client = TestClient(web_app.app)
+    traversal = _chunk_post(client, upload_id="..\\..\\evil")
+    assert traversal.status_code == 400
+    absolute = _chunk_post(client, upload_id="C:\\Windows\\Temp\\evil")
+    assert absolute.status_code == 400
+    short = _chunk_post(client, upload_id="abc")
+    assert short.status_code == 400
+    # And chunk_status is contained too (no file-existence oracle).
+    probed = client.get("/api/uploads/chunk_status", params={"upload_id": "../../secret.pdf"})
+    assert probed.status_code == 400
+
+
+def test_chunk_upload_rejects_bad_offset_and_size():
+    client = TestClient(web_app.app)
+    bad_offset = _chunk_post(client, upload_id="a" * 32, offset="abc")
+    assert bad_offset.status_code == 400
+    negative = _chunk_post(client, upload_id="a" * 32, offset="-1")
+    assert negative.status_code == 400
+
+
+def test_chunk_upload_accepts_hex_id_and_appends():
+    client = TestClient(web_app.app)
+    upload_id = "b" * 32
+    ok = _chunk_post(client, upload_id=upload_id, body=b"hello")
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["offset"] == 5
+    part = web_app.STAGING_DIR / upload_id / f"{upload_id}.part"
+    assert part.read_bytes() == b"hello"
+    part.unlink(missing_ok=True)
+    part.parent.rmdir()
+
+
+def test_health_redacts_master_token(monkeypatch, safe_tmp_path):
+    """/api/health is an open GET; it must never echo the master token."""
+    monkeypatch.setattr(
+        web_app, "SERVER_CONFIG", {**web_app.SERVER_CONFIG, "api_token": "secret-token-xyz"}
+    )
+    client = TestClient(web_app.app)
+    data = client.get("/api/health").json()
+    assert data["server"]["api_token"] == ""
+    assert data["server"]["api_token_configured"] is True
+
+
+def test_admin_key_creation_requires_loopback_in_zero_config(monkeypatch, safe_tmp_path):
+    """No master token + empty store: only the local machine may mint the
+    first admin key (otherwise any LAN host takes over the auth system)."""
+    from src.api_key_auth import ApiKeyAuthenticator, KeyStore
+
+    authenticator = ApiKeyAuthenticator(
+        KeyStore(Path(safe_tmp_path) / ".api_keys.json"), default_rate_limit=60, persist_interval=999
+    )
+    monkeypatch.setattr(web_app, "api_authenticator", authenticator)
+    monkeypatch.setattr(web_app, "_API_TOKEN", "")
+
+    lan_client = TestClient(web_app.app)  # default client host is not loopback
+    denied = lan_client.post("/api/admin/api-keys", json={"label": "attacker", "role": "admin"})
+    assert denied.status_code == 403
+    assert authenticator.store.list_keys() == []
+
+    local_client = TestClient(web_app.app, client=("127.0.0.1", 51000))
+    allowed = local_client.post("/api/admin/api-keys", json={"label": "owner", "role": "user"})
+    assert allowed.status_code == 200
+    # The store is no longer zero-config: the listing now requires the admin
+    # credential (the freshly minted key is user-role -> 401 for a bare GET).
+    assert local_client.get("/api/admin/api-keys").status_code == 401
+
+
+def test_safe_client_model_rejects_oversized_override(monkeypatch):
+    """A client-named exact match of a huge installed model falls back to the
+    configured default; unknown names pass through unchanged."""
+    from src import llm_api
+
+    monkeypatch.setattr(llm_api, "_ollama_model_sizes", lambda: {"gemma4:latest": 96127041536})
+    monkeypatch.setenv("LOCAL_MODEL_MAX_BYTES", str(4 * 1024 ** 3))
+    assert (
+        web_app._safe_client_model("gemma4:latest", fallback="qwen3:4b-instruct")
+        == "qwen3:4b-instruct"
+    )
+    assert web_app._safe_client_model("qwen3:4b-instruct", fallback="qwen3:4b-instruct") == "qwen3:4b-instruct"
+    assert web_app._safe_client_model("not-installed:8b", fallback="qwen3:4b-instruct") == "not-installed:8b"
+    monkeypatch.setenv("LOCAL_MODEL_MAX_BYTES", "0")
+    assert web_app._safe_client_model("gemma4:latest", fallback="qwen3:4b-instruct") == "gemma4:latest"
+
+
+def test_repair_preserved_components_restores_missing_and_prunes_stale(safe_tmp_path):
+    """A crash mid-publish strands the only overrides/hashes copy in the
+    aside dir; startup must restore it (the old GC deleted it)."""
+    live = safe_tmp_path / "db"
+    live.mkdir()
+    (live / "index_overrides.json").write_text("{}", encoding="utf-8")
+    aside = safe_tmp_path / ".index_preserve_abc123"
+    (aside / "hashes").mkdir(parents=True)
+    (aside / "hashes" / "x.json").write_text("{}", encoding="utf-8")
+    (aside / "index_overrides.json").write_text("{}", encoding="utf-8")
+
+    resolved = web_app._repair_preserved_components(live)
+
+    assert resolved == 1
+    assert (live / "hashes" / "x.json").exists()  # restored from the aside dir
+    assert (live / "index_overrides.json").exists()  # live copy untouched
+    assert not aside.exists()  # fully resolved -> removed
+
+
+def test_repair_preserved_components_keeps_unrestorable(safe_tmp_path, monkeypatch):
+    import shutil as _shutil
+
+    live = safe_tmp_path / "db"
+    live.mkdir()
+    aside = safe_tmp_path / ".index_preserve_keep"
+    (aside / "hashes").mkdir(parents=True)
+    real_move = _shutil.move
+
+    def failing_move(*args, **kwargs):
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr(web_app.shutil, "move", failing_move)
+    try:
+        web_app._repair_preserved_components(live)
+    finally:
+        monkeypatch.setattr(web_app.shutil, "move", real_move)
+    # The aside dir must survive a failed restore -- it is the only copy.
+    assert aside.exists()
+
+
+def test_gc_staged_build_dirs_leaves_preserve_and_rollover(safe_tmp_path):
+    """Preserve dirs are repair-only, rollover dirs are warn-only: the GC must
+    touch neither (both can hold the only copy of live data)."""
+    live = safe_tmp_path / "db"
+    live.mkdir()
+    for name in (".index_preserve_old", ".index_rollover_old"):
+        target = safe_tmp_path / name
+        target.mkdir()
+        os.utime(target, (time.time() - 10_000, time.time() - 10_000))
+    build = safe_tmp_path / ".index_build_stale"
+    build.mkdir()
+    os.utime(build, (time.time() - 10_000, time.time() - 10_000))
+
+    removed = web_app._gc_staged_build_dirs(live)
+
+    assert removed == 1  # only the un-checkpointed .index_build_ dir
+    assert (safe_tmp_path / ".index_preserve_old").exists()
+    assert (safe_tmp_path / ".index_rollover_old").exists()
+    assert not build.exists()
+
+
+def test_tracked_job_ledger_lifecycle(workspace_tmp):
+    """Ledger correctness around enqueue/cancel: recorded while pending (crash
+    recovery), removed on cancel (no resurrection at startup)."""
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=workspace_tmp / "db",
+    )
+    job = queue.enqueue_backup(job_id="ledger-cancel-test", auto_start=False)
+    try:
+        entries = json.loads(queue.ledger.path.read_text(encoding="utf-8"))["jobs"]
+        assert "ledger-cancel-test" in entries  # recorded BEFORE it can run
+
+        cancelled = queue.cancel_job("ledger-cancel-test")
+        assert cancelled["status"] == "cancelled"
+        entries = json.loads(queue.ledger.path.read_text(encoding="utf-8"))["jobs"]
+        assert "ledger-cancel-test" not in entries  # never resurrects
+    finally:
+        with queue._condition:
+            queue._jobs.pop("ledger-cancel-test", None)

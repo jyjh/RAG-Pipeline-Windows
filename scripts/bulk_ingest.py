@@ -16,7 +16,7 @@ from pathlib import Path
 # Add project root to sys.path so we can import src
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.config import load_config
+from src.config import default_config_path, load_config
 from src.ingestion import run_ingestion
 from src.indexing import run_indexing
 
@@ -72,7 +72,9 @@ def main(argv=None):
         logger.error(f"Input directory does not exist or is not a directory: {input_dir}")
         sys.exit(1)
 
-    config = load_config()
+    # Discovered config (repo config.toml / RAG_PIPELINE_CONFIG); a bare
+    # load_config() would read pure defaults and ignore config.toml.
+    config = load_config(default_config_path())
     processed_dir = Path(args.processed_dir) if args.processed_dir else Path(config.paths.processed_dir)
     db_dir = Path(args.db_dir) if args.db_dir else Path(config.paths.db_dir)
     asset_dir = Path(args.asset_dir) if args.asset_dir else Path(config.paths.asset_dir)

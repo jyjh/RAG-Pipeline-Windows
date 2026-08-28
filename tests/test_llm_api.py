@@ -448,3 +448,121 @@ def test_vision_describer_resolves_local_model_when_cloud_down(monkeypatch):
     # The warm-up call went to the substituted LOCAL model, not the cloud name.
     assert seen and seen[0] == "qwen2.5vl:7b"
     assert describer.vision_model == "qwen2.5vl:7b"
+
+
+# --- size-aware local substitution (4 GB-GPU ceiling) ------------------------
+
+
+def test_resolve_local_model_refuses_over_ceiling_base_match(monkeypatch):
+    """gemma4:26b must not silently map onto a 9.6 GB gemma4:latest."""
+    monkeypatch.setattr(llm_api, "_ollama_tags", lambda: ["gemma4:latest"])
+    monkeypatch.setattr(llm_api, "_ollama_model_sizes", lambda: {"gemma4:latest": 96127041536})
+    monkeypatch.setenv("LOCAL_MODEL_MAX_BYTES", str(4 * 1024 ** 3))
+    # Refuse the oversized substitution; the caller fails loudly on the
+    # cloud name (with a pull hint) instead of thrashing a small GPU.
+    assert llm_api.resolve_local_model("gemma4:26b") == "gemma4:26b"
+
+
+def test_resolve_local_model_prefers_smallest_base_variant(monkeypatch):
+    monkeypatch.setattr(
+        llm_api, "_ollama_tags", lambda: ["gemma4:latest", "gemma4:4b"]
+    )
+    monkeypatch.setattr(
+        llm_api,
+        "_ollama_model_sizes",
+        lambda: {"gemma4:latest": 96127041536, "gemma4:4b": 2500000000},
+    )
+    monkeypatch.setenv("LOCAL_MODEL_MAX_BYTES", str(4 * 1024 ** 3))
+    assert llm_api.resolve_local_model("gemma4:26b") == "gemma4:4b"
+
+
+def test_resolve_local_model_unknown_size_keeps_first_match(monkeypatch):
+    """Without size data (older Ollama / stubbed tags) behavior is unchanged."""
+    monkeypatch.setattr(llm_api, "_ollama_tags", lambda: ["gemma4:latest"])
+    monkeypatch.setattr(llm_api, "_ollama_model_sizes", lambda: {})
+    monkeypatch.setenv("LOCAL_MODEL_MAX_BYTES", str(4 * 1024 ** 3))
+    assert llm_api.resolve_local_model("gemma4:26b") == "gemma4:latest"
+
+
+def test_resolve_local_model_vision_degrades_to_smallest_when_all_over_ceiling(monkeypatch):
+    """Vision capability is required: pick the smallest even if over ceiling."""
+    monkeypatch.setattr(
+        llm_api, "_ollama_tags", lambda: ["qwen2.5vl:7b", "qwen2.5vl:32b"]
+    )
+    monkeypatch.setattr(
+        llm_api,
+        "_ollama_model_sizes",
+        lambda: {"qwen2.5vl:7b": 5970000000, "qwen2.5vl:32b": 32000000000},
+    )
+    monkeypatch.setenv("LOCAL_MODEL_MAX_BYTES", str(4 * 1024 ** 3))
+    assert llm_api.resolve_local_model("qwen3-vl:32b", vision=True) == "qwen2.5vl:7b"
+
+
+def test_resolve_local_model_prefers_smallest_vision_hint(monkeypatch):
+    monkeypatch.setattr(
+        llm_api, "_ollama_tags", lambda: ["llava:34b", "qwen2.5vl:3b", "qwen2.5vl:7b"]
+    )
+    monkeypatch.setattr(
+        llm_api,
+        "_ollama_model_sizes",
+        lambda: {"llava:34b": 20000000000, "qwen2.5vl:3b": 3200000000, "qwen2.5vl:7b": 5970000000},
+    )
+    monkeypatch.setenv("LOCAL_MODEL_MAX_BYTES", str(4 * 1024 ** 3))
+    assert llm_api.resolve_local_model("qwen3-vl:32b", vision=True) == "qwen2.5vl:3b"
+
+
+def test_resolve_local_model_ceiling_disabled_by_env(monkeypatch):
+    monkeypatch.setattr(llm_api, "_ollama_tags", lambda: ["gemma4:latest"])
+    monkeypatch.setattr(llm_api, "_ollama_model_sizes", lambda: {"gemma4:latest": 96127041536})
+    monkeypatch.setenv("LOCAL_MODEL_MAX_BYTES", "0")
+    assert llm_api.resolve_local_model("gemma4:26b") == "gemma4:latest"
+
+
+def test_resolve_local_model_exact_and_configured_pin_bypass_ceiling(monkeypatch):
+    """Exact matches and explicit pins are never ceiling-checked."""
+    monkeypatch.setattr(llm_api, "_ollama_tags", lambda: ["gemma4:26b", "qwen2.5vl:3b"])
+    monkeypatch.setattr(
+        llm_api,
+        "_ollama_model_sizes",
+        lambda: {"gemma4:26b": 52000000000, "qwen2.5vl:3b": 3200000000},
+    )
+    monkeypatch.setenv("LOCAL_MODEL_MAX_BYTES", str(4 * 1024 ** 3))
+    assert llm_api.resolve_local_model("gemma4:26b") == "gemma4:26b"
+
+
+def test_ollama_tags_ttl_refetches_after_expiry(monkeypatch):
+    """A pulled model becomes visible without a server restart (TTL cache)."""
+    calls = {"n": 0}
+
+    def fake_models():
+        calls["n"] += 1
+        return [("qwen3:4b-instruct", 2500000000)] if calls["n"] > 1 else []
+
+    monkeypatch.setattr(llm_api, "_fetch_ollama_models", fake_models)
+    monkeypatch.setattr(llm_api.time, "monotonic", lambda: 1000.0)
+    llm_api.reset_local_model_cache()
+    assert llm_api._ollama_tags() == []
+    assert llm_api._ollama_tags() == []  # cached within TTL
+    # Advance the fake clock past the TTL -> refetch sees the new model.
+    monkeypatch.setattr(llm_api.time, "monotonic", lambda: 1000.0 + llm_api._TAGS_CACHE_TTL_SECONDS + 1)
+    assert llm_api._ollama_tags() == ["qwen3:4b-instruct"]
+    llm_api.reset_local_model_cache()
+
+
+def test_native_hf_aliases_resolve_to_real_hub_ids():
+    from src.embeddings import _NATIVE_HF_MODEL_ALIASES
+
+    assert _NATIVE_HF_MODEL_ALIASES["all-minilm"] == "sentence-transformers/all-MiniLM-L6-v2"
+    assert _NATIVE_HF_MODEL_ALIASES["nomic-embed-text"] == "nomic-ai/nomic-embed-text-v1.5"
+
+
+def test_exceeds_local_size_ceiling(monkeypatch):
+    """Client-override vetting helper: installed + over ceiling only."""
+    monkeypatch.setattr(llm_api, "_ollama_model_sizes", lambda: {"gemma4:latest": 96127041536})
+    monkeypatch.setenv("LOCAL_MODEL_MAX_BYTES", str(4 * 1024 ** 3))
+    assert llm_api.exceeds_local_size_ceiling("gemma4:latest") is True
+    assert llm_api.exceeds_local_size_ceiling("gemma4:latest".upper()) is True
+    assert llm_api.exceeds_local_size_ceiling("not-installed:8b") is False
+    assert llm_api.exceeds_local_size_ceiling("") is False
+    monkeypatch.setenv("LOCAL_MODEL_MAX_BYTES", "0")
+    assert llm_api.exceeds_local_size_ceiling("gemma4:latest") is False

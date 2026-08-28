@@ -37,10 +37,16 @@ def _status(message: str) -> None:
 
 
 def get_llm_api_config():
-    """Return the ``[llm_api]`` config section."""
-    from src.config import load_config
+    """Return the ``[llm_api]`` config section (config.toml-discovered).
 
-    return load_config().llm_api
+    Discovery goes through :func:`src.config.default_config_path` so the
+    section reflects config.toml even when ``RAG_PIPELINE_CONFIG`` is unset
+    (e.g. a bare ``python -m src.web_app`` start). A bare ``load_config()``
+    here would silently read hardcoded defaults instead.
+    """
+    from src.config import default_config_path, load_config
+
+    return load_config(default_config_path()).llm_api
 
 
 def active_backend() -> str:
@@ -111,35 +117,137 @@ def resolve_api_key() -> str:
 # instead of failing every call with "model not found".
 
 _TAGS_CACHE: dict[str, Any] = {}
+# /api/tags is cheap but not free; a short TTL lets a model pulled mid-session
+# become visible to substitution without waiting for a server restart.
+_TAGS_CACHE_TTL_SECONDS = 60.0
 _VISION_MODEL_HINTS = ("vl", "vision", "llava", "moondream", "minicpm-v", "cogvlm", "gemma3v")
+
+# Ceiling for AUTOMATIC local model substitution (base-name/hint fallbacks).
+# The configured pins ([models].local_llm_model / local_vision_model) are
+# sized for a 4 GB GPU; the fallbacks must not silently route onto a 6-10 GB
+# variant that thrashes such a GPU. Exact matches and the explicit pins are
+# never ceiling-checked. 0 disables. Env-overridable.
+_LOCAL_MODEL_DEFAULT_MAX_BYTES = 4 * 1024 ** 3
+
+
+def _local_model_max_bytes() -> int:
+    raw = os.environ.get("LOCAL_MODEL_MAX_BYTES", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return _LOCAL_MODEL_DEFAULT_MAX_BYTES
+
+
+def _format_bytes(num_bytes: int) -> str:
+    gib = num_bytes / (1024 ** 3)
+    if gib >= 1:
+        return f"{gib:.1f} GiB"
+    return f"{num_bytes / (1024 ** 2):.0f} MiB"
+
+
+def _ollama_tag_hosts() -> list[str]:
+    """Candidate hosts for model enumeration, in chat-resolution order.
+
+    Mirrors ``src.local_rag._get_ollama_candidate_hosts`` precedence
+    (``OLLAMA_HOST`` env > ``[ollama].host`` > ``[ollama].hosts``) so model
+    substitution enumerates the same Ollama that serves chat.
+    """
+    from src.config import default_config_path, load_config
+
+    cfg = load_config(default_config_path()).ollama
+    primary = os.environ.get("OLLAMA_HOST", "").strip() or str(getattr(cfg, "host", "") or "")
+    candidates = [primary or "http://127.0.0.1:11434"]
+    candidates.extend(str(host) for host in (getattr(cfg, "hosts", None) or []))
+    unique: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = normalize_ollama_host(candidate)
+        if normalized not in seen:
+            seen.add(normalized)
+            unique.append(normalized)
+    return unique
+
+
+def _fetch_ollama_models() -> list[tuple[str, int | None]]:
+    """Query ``/api/tags`` on each candidate host until one answers."""
+    for host in _ollama_tag_hosts():
+        try:
+            with urllib.request.urlopen(f"{host}/api/tags", timeout=3.0) as response:
+                payload = json.loads(response.read().decode("utf-8", "replace"))
+            models: list[tuple[str, int | None]] = []
+            for item in (payload.get("models") or []):
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).strip()
+                if not name:
+                    continue
+                size = item.get("size")
+                models.append((
+                    name,
+                    int(size) if isinstance(size, (int, float)) and size > 0 else None,
+                ))
+            if models:
+                return models
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            logger.debug("Could not list local Ollama models at %s: %s", host, exc)
+    return []
+
+
+def _ollama_models() -> list[tuple[str, int | None]]:
+    """``(name, size_bytes)`` per installed local Ollama model (TTL-cached)."""
+    cached = _TAGS_CACHE.get("models")
+    fetched_at = _TAGS_CACHE.get("fetched_at")
+    if cached is not None and fetched_at is not None:
+        if (time.monotonic() - fetched_at) < _TAGS_CACHE_TTL_SECONDS:
+            return cached
+    models = _fetch_ollama_models()
+    _TAGS_CACHE["models"] = models
+    _TAGS_CACHE["sizes"] = {
+        name.casefold(): size for name, size in models if size
+    }
+    _TAGS_CACHE["fetched_at"] = time.monotonic()
+    return models
 
 
 def _ollama_tags() -> list[str]:
-    """Installed local Ollama model names (cached; empty when unreachable)."""
-    cached = _TAGS_CACHE.get("tags")
-    if cached is not None:
-        return cached
-    from src.config import load_config
+    """Installed local Ollama model names (TTL-cached; empty when unreachable)."""
+    return [name for name, _size in _ollama_models()]
 
-    host = str(getattr(load_config().ollama, "host", "") or "http://127.0.0.1:11434").rstrip("/")
-    try:
-        with urllib.request.urlopen(f"{host}/api/tags", timeout=3.0) as response:
-            payload = json.loads(response.read().decode("utf-8", "replace"))
-        names = [
-            str(item.get("name", "")).strip()
-            for item in (payload.get("models") or [])
-            if isinstance(item, dict) and str(item.get("name", "")).strip()
-        ]
-    except (OSError, ValueError, urllib.error.URLError) as exc:
-        logger.debug("Could not list local Ollama models: %s", exc)
-        names = []
-    _TAGS_CACHE["tags"] = names
-    return names
+
+def _ollama_model_sizes() -> dict[str, int]:
+    """Folded model name -> on-disk size in bytes ({} when unknown).
+
+    Populated only by a real ``/api/tags`` fetch. When ``_ollama_tags`` is
+    stubbed (tests), sizes stay unknown and size-aware substitution is
+    skipped rather than guessed.
+    """
+    return dict(_TAGS_CACHE.get("sizes") or {})
 
 
 def reset_local_model_cache() -> None:
-    """Test seam: forget the cached /api/tags result."""
-    _TAGS_CACHE.pop("tags", None)
+    """Forget the cached /api/tags result (test seam; also forces a refetch)."""
+    _TAGS_CACHE.clear()
+
+
+def exceeds_local_size_ceiling(model: str) -> bool:
+    """True when ``model`` is installed locally and larger than the ceiling.
+
+    Used to vet CLIENT-supplied model overrides: the configured
+    ``[models].local_*`` pins are the operator's choice and bypass the
+    ceiling, but a request field naming an exact installed tag (e.g. a
+    9.6 GB chat model) would otherwise load a model the host cannot serve.
+    Unknown sizes (older Ollama, stubbed tags) are never flagged.
+    """
+    name = str(model or "").strip()
+    if not name:
+        return False
+    size = _ollama_model_sizes().get(name.casefold())
+    if size is None:
+        return False
+    max_bytes = _local_model_max_bytes()
+    return 0 < max_bytes < size
 
 
 def resolve_local_model(preferred: str, *, vision: bool = False) -> str:
@@ -154,6 +262,17 @@ def resolve_local_model(preferred: str, *, vision: bool = False) -> str:
     Ollama is unreachable or nothing matches -- the subsequent call then
     fails with the model's real name in the error. Substitutions are logged
     so the quality difference is visible.
+
+    Size-aware fallbacks: automatic substitutions prefer the SMALLEST
+    installed candidate (by on-disk size from /api/tags) and refuse any
+    candidate above ``LOCAL_MODEL_MAX_BYTES`` (default 4 GiB -- the sizing
+    target of the local pins). A refused chat substitution returns
+    ``preferred`` so the call fails loudly with a pull hint instead of
+    loading a model the GPU cannot serve; a refused vision substitution
+    degrades to the smallest over-ceiling vision model, because failing
+    every figure description is worse than a slow one. Exact matches and the
+    explicitly configured pins bypass the ceiling (the operator asked for
+    them), and unknown sizes (older Ollama servers) keep the old behavior.
     """
     preferred = str(preferred or "").strip()
     tags = _ollama_tags()
@@ -164,32 +283,77 @@ def resolve_local_model(preferred: str, *, vision: bool = False) -> str:
         return preferred
     # Explicitly configured local substitute wins ([models].local_vision_model
     # / [models].local_llm_model) when it is actually installed.
-    from src.config import load_config
+    from src.config import default_config_path, load_config
 
     knob = "local_vision_model" if vision else "local_llm_model"
-    configured = str(getattr(load_config().models, knob, "") or "").strip()
+    configured = str(
+        getattr(load_config(default_config_path()).models, knob, "") or ""
+    ).strip()
     if configured and configured.casefold() in by_fold:
         logger.warning(
             "Using configured local model %s (cloud model %s not active)",
             configured, preferred,
         )
         return by_fold[configured.casefold()]
+
+    sizes = _ollama_model_sizes()
+    max_bytes = _local_model_max_bytes()
+
+    def _eligible(candidates: list[str]) -> list[str]:
+        """Candidates within the size ceiling; unknown sizes stay eligible."""
+        if max_bytes <= 0:
+            return list(candidates)
+        return [
+            tag for tag in candidates
+            if tag.casefold() not in sizes or sizes[tag.casefold()] <= max_bytes
+        ]
+
     base = preferred.split(":", 1)[0].casefold()
-    for folded, tag in by_fold.items():
-        if folded.split(":", 1)[0] == base:
-            logger.warning(
-                "Local model substitution: %s not installed; using %s", preferred, tag
-            )
-            return tag
+    base_matches = [
+        tag for folded, tag in by_fold.items() if folded.split(":", 1)[0] == base
+    ]
+    eligible = _eligible(base_matches)
+    if eligible:
+        # Prefer the smallest installed variant (e.g. gemma4:4b over
+        # gemma4:latest at 9.6 GiB).
+        chosen = min(eligible, key=lambda t: sizes.get(t.casefold(), 0))
+        logger.warning(
+            "Local model substitution: %s not installed; using %s", preferred, chosen
+        )
+        return chosen
+    if base_matches:
+        _status(
+            f"Refusing local substitution for {preferred}: installed variant(s) "
+            f"{', '.join(base_matches)} exceed the {_format_bytes(max_bytes)} "
+            "local-model ceiling (LOCAL_MODEL_MAX_BYTES) and cannot be served "
+            "by this host. Install a smaller local model and set "
+            f"[models].{knob} to its tag."
+        )
+        return preferred
     if vision:
-        for folded, tag in by_fold.items():
-            tag_base = folded.split(":", 1)[0]
-            if any(hint in tag_base for hint in _VISION_MODEL_HINTS):
-                logger.warning(
-                    "Local vision model substitution: %s not installed; using %s",
-                    preferred, tag,
+        hint_matches = [
+            tag for folded, tag in by_fold.items()
+            if any(hint in folded.split(":", 1)[0] for hint in _VISION_MODEL_HINTS)
+        ]
+        if hint_matches:
+            # Vision capability is required for figure enrichment; when every
+            # candidate is over the ceiling, degrade to the smallest rather
+            # than failing every image.
+            eligible = _eligible(hint_matches) or hint_matches
+            chosen = min(eligible, key=lambda t: sizes.get(t.casefold(), 0))
+            if 0 < max_bytes < sizes.get(chosen.casefold(), 0):
+                _status(
+                    f"Local vision substitution {chosen} "
+                    f"({_format_bytes(sizes.get(chosen.casefold(), 0))}) exceeds the "
+                    f"{_format_bytes(max_bytes)} local-model ceiling; expecting slow "
+                    "CPU offload. Pull a smaller vision model and set "
+                    "[models].local_vision_model."
                 )
-                return tag
+            logger.warning(
+                "Local vision model substitution: %s not installed; using %s",
+                preferred, chosen,
+            )
+            return chosen
     return preferred
 
 
@@ -531,11 +695,11 @@ def resolve_embedding_prefix(model: str, kind: str) -> str:
 
     Config override (``[embeddings].doc_prefix``/``query_prefix``) wins; else
     nomic/e5 get ``"search_document: "``/``"search_query: "`` and instruction-free
-    families (bge-m3, gte, jina, ...) get ``""``.
+    families (all-minilm, bge-m3, gte, jina, ...) get ``""``.
     """
-    from src.config import load_config
+    from src.config import default_config_path, load_config
 
-    cfg = load_config().embeddings
+    cfg = load_config(default_config_path()).embeddings
     configured = ((cfg.query_prefix if kind == "query" else cfg.doc_prefix) or "").strip()
     if configured:
         return configured

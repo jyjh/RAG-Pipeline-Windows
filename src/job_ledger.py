@@ -30,7 +30,7 @@ LEDGER_VERSION = 1
 
 # Job kinds that are NOT tracked by the PDF registry and therefore need the
 # ledger for crash recovery. Upload jobs are recovered via the registry.
-LEDGER_TRACKED_KINDS = {"reindex", "reindex_source", "rebuild", "backup", "restore", "rebuild_vector_index"}
+LEDGER_TRACKED_KINDS = {"reindex", "reindex_source", "rebuild", "backup", "restore", "rebuild_vector_index", "compact"}
 
 _LOCK = threading.RLock()
 # Bounded LRU: the ledger is tiny (a handful of paths per server instance) so

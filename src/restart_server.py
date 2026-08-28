@@ -123,6 +123,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _wait_for_startup(host: str, port: int, timeout_seconds: float = 60.0) -> bool:
+    """Poll until the replacement server answers on its port (or give up).
+
+    The helper has no way to roll the update back at this point -- the old
+    process already exited -- but a loud, durable record that the new server
+    never came up turns a silent outage into an actionable one.
+    """
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if _port_open(host, port):
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     root = Path(args.root).resolve()
@@ -153,6 +168,20 @@ def main(argv: list[str] | None = None) -> int:
 
     with log_path.open("a", encoding="utf-8") as log:
         log.write(f"{_utcnow()} spawned PID {process.pid}\n")
+
+    came_up = _wait_for_startup(_connect_host(args.host), args.port)
+    with log_path.open("a", encoding="utf-8") as log:
+        if came_up and _process_alive(process.pid):
+            log.write(f"{_utcnow()} replacement server is up on port {args.port}\n")
+        else:
+            # The old server is gone at this point; make the failure loud and
+            # durable. The uvicorn stdout above (same log) names the cause
+            # (import error after a bad pull, port conflict, ...).
+            log.write(
+                f"{_utcnow()} ERROR: replacement server did not come up within "
+                "60s (see log above). Re-run `git reset --hard` to the previous "
+                "commit and start the server manually.\n"
+            )
     return 0
 
 

@@ -754,10 +754,11 @@ class LanceDBVectorStore:
 
     @staticmethod
     def _metadata(rows: list[dict[str, Any]]) -> tuple[str, int]:
+        # Fallback mirrors DEFAULT_EMBEDDING_MODEL/DIM (all-minilm, 384-d).
         if not rows:
-            return "nomic-embed-text", 768
+            return "all-minilm", 384
         first = rows[0]
-        return str(first.get("embedding_model") or "nomic-embed-text"), int(first.get("embedding_dim") or 768)
+        return str(first.get("embedding_model") or "all-minilm"), int(first.get("embedding_dim") or 384)
 
     @staticmethod
     def _row_for_lance(

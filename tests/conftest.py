@@ -47,6 +47,23 @@ def safe_tmp_path():
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_pipeline_config(monkeypatch):
+    """Point config discovery at a known test config.
+
+    Module-level helpers (src.llm_api, src.local_rag, src.embeddings) resolve
+    config.toml via ``src.config.default_config_path()``. Without this fixture
+    they would read the developer's repo config.toml, and backend-dependent
+    tests would pass or fail depending on that file's ``[llm_api].backend``.
+    Tests that need a specific config set ``RAG_PIPELINE_CONFIG`` themselves
+    (a test's own monkeypatch.setenv overrides this fixture's value).
+    """
+    monkeypatch.setenv(
+        "RAG_PIPELINE_CONFIG",
+        str(ROOT / "tests" / "fixtures" / "hermetic_config.toml"),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _inert_llm_auto_tag(monkeypatch):
     """Keep LLM source-group auto-tagging network-inert during tests.
 

@@ -940,7 +940,7 @@ def _embeddings_backend_view(config: dict[str, Any], chat_backend: str) -> str:
 
     Mirrors ``src.embeddings.resolve_embeddings_backend``: ``EMBEDDINGS_BACKEND``
     wins, then ``[embeddings].backend`` (absent = the "ollama" default --
-    locally hosted nomic-embed-text), and ``""`` inherits the chat backend.
+    locally hosted all-minilm), and ``""`` inherits the chat backend.
     An invalid configured value falls back to the default, mirroring the
     app's warn-and-ignore behaviour.
     """
@@ -1383,15 +1383,15 @@ def run_checks(
             ))
 
     # Local Ollama, in EVERY mode: embeddings default to a locally hosted
-    # nomic-embed-text, so index builds and query-time embedding fail without
-    # it regardless of where parsing happens. (Historically this checked only
+    # all-minilm, so index builds and query-time embedding fail without it
+    # regardless of where parsing happens. (Historically this checked only
     # local mode; with HPC parse-only deployments the dependency inverted.)
     ready = _http_ready(f"http://127.0.0.1:{values.local_ollama_port}/api/version")
     ollama_required = llm["backend"] == "ollama" or embeddings_backend == "ollama"
     if ready:
         detail = "ready"
         embedding_model = str(_nested(
-            config_payload, "models", "embedding_model", default="nomic-embed-text"
+            config_payload, "models", "embedding_model", default="all-minilm"
         ))
         if embeddings_backend == "ollama" and not _ollama_model_installed(
             values.local_ollama_port, embedding_model

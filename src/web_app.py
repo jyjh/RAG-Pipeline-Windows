@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -79,6 +80,7 @@ from src.defaults import (
     DEFAULT_RAPIDOCR_BACKEND,
     DEFAULT_RETRIEVAL_CANDIDATE_K,
     DEFAULT_RETRIEVAL_MIN_SCORE,
+    DEFAULT_RETRIEVAL_RRF_K,
     DEFAULT_RETRIEVAL_RELATIVE_CUTOFF,
     DEFAULT_SAMPLER_TOP_K,
     DEFAULT_TEMPERATURE,
@@ -284,6 +286,60 @@ def _resolve_root_path(raw_path: Any, *, default: str | Path | None = None) -> P
     value = raw_path if raw_path not in (None, "") else default
     path = Path(str(value or ""))
     return path if path.is_absolute() else ROOT_DIR / path
+
+
+def _contained_client_path(raw_path: Any, default: str) -> str:
+    """Vet a client-supplied workspace path override.
+
+    Returns the server-configured default (resolved to an absolute path,
+    matching the historical behavior) when the value is empty or resolves
+    outside the repo root, so a request cannot redirect writes (asset
+    extraction, staging) to an arbitrary directory. A client value that
+    resolves to the same location as the configured default is accepted (the
+    repo may legitimately reach it through a symlink, which ``resolve()``
+    follows).
+    """
+    value = str(raw_path or "").strip()
+    if not value:
+        return str(_resolve_root_path(default))
+    resolved = _resolve_root_path(value)
+    try:
+        resolved_resolved = resolved.resolve()
+        inside_root = resolved_resolved.relative_to(ROOT_DIR.resolve()) is not None
+        matches_default = resolved_resolved == Path(default).resolve()
+    except (ValueError, OSError):
+        inside_root = matches_default = False
+    if not (inside_root or matches_default):
+        logger.warning(
+            "Rejected client path override %r (outside workspace); using server default %r.",
+            value, default,
+        )
+        return str(_resolve_root_path(default))
+    return str(resolved)
+
+
+def _safe_client_model(model: Any, *, fallback: str) -> str:
+    """Vet a client-supplied model-name override against the local size ceiling.
+
+    A request field can name any installed tag; an exact match of a model the
+    host cannot serve (e.g. the 9.6 GB ``gemma4:latest``) would bypass the
+    small-model pins the local deployment was sized for. Oversized names fall
+    back to the server-configured model; unknown or non-installed names pass
+    through unchanged (they fail later with the model's real name in the
+    error, exactly like today).
+    """
+    from src import llm_api
+
+    requested = str(model or "").strip()
+    if not requested or requested == fallback:
+        return fallback
+    if llm_api.exceeds_local_size_ceiling(requested):
+        logger.warning(
+            "Rejected client model override %r (exceeds the local model size ceiling); using %r.",
+            requested, fallback,
+        )
+        return fallback
+    return requested
 
 
 # Embedding/chat/retrieval defaults are single-sourced in src/defaults.py; the
@@ -615,6 +671,12 @@ def _load_chat_config(config_path: Path | None = None) -> dict[str, Any]:
             chat.planner_max_queries,
             DEFAULT_PLANNER_MAX_QUERIES,
         ),
+        # RRF damping constant for fusing vector + BM25 rankings; flows into
+        # ChatRequest and the query engine.
+        "retrieval_rrf_k": _positive_int(
+            cfg.retrieval.rrf_k,
+            DEFAULT_RETRIEVAL_RRF_K,
+        ),
     }
 
 
@@ -673,10 +735,10 @@ def _load_indexing_config(config_path: Path | None = None) -> dict[str, Any]:
 SERVER_CONFIG = _load_server_config()
 API_KEYS_CONFIG = _load_api_keys_config()
 CHAT_CONFIG = _load_chat_config()
-# The Ollama chat payloads read keep_alive from src.local_rag's module global
-# (bare load_config() has no config-path discovery), so seed it from the
-# discovered config exactly once at startup, mirroring how CHAT_CONFIG itself
-# is the discovered snapshot of [chat].
+# The Ollama chat payloads read keep_alive from src.local_rag's module global;
+# seed it from the discovered config exactly once at startup so the module
+# global takes precedence over src.local_rag's own discovered-config fallback
+# (mirroring how CHAT_CONFIG itself is the discovered snapshot of [chat]).
 _local_rag_module._ACTIVE_OLLAMA_KEEP_ALIVE = CHAT_CONFIG["ollama_keep_alive"]
 INGESTION_CONFIG = _load_ingestion_config()
 UPLOADS_CONFIG = _load_uploads_config()
@@ -763,7 +825,32 @@ def _job_subprocess_env(worker_threads: int | None = None) -> dict[str, str]:
 def _job_subprocess_creationflags() -> int:
     if os.name != "nt":
         return 0
-    return int(getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000))
+    # CREATE_NEW_PROCESS_GROUP lets CTRL_BREAK reach the ingestion
+    # subprocess's ProcessPoolExecutor workers on cancellation (they share
+    # the console group); TerminateProcess -- what Popen.terminate() does on
+    # Windows -- never reaches them and leaves orphans writing into the
+    # shared processed_docs/.
+    new_group = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    return new_group | int(getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000))
+
+
+def _signal_subprocess_terminate(process: subprocess.Popen) -> None:
+    """Best-effort first-phase stop signal for a pipeline subprocess.
+
+    On Windows this raises CTRL_BREAK for the whole console group so the
+    subprocess's worker children die with it; on POSIX it is a plain
+    SIGTERM. Best-effort throughout -- the caller escalates to kill().
+    """
+    if os.name == "nt":
+        try:
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+            return
+        except (OSError, ValueError):
+            pass
+    try:
+        process.terminate()
+    except OSError:
+        pass
 
 
 def _process_output_tail(result: subprocess.CompletedProcess[str], *, limit: int = 4000) -> str:
@@ -852,7 +939,7 @@ def _run_job_subprocess(
                 reader_done.wait(timeout=5)
                 break
             if cancel_event.is_set():
-                process.terminate()
+                _signal_subprocess_terminate(process)
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
@@ -905,10 +992,7 @@ def terminate_child_subprocesses(*, grace_seconds: float = 5.0) -> int:
     if not processes:
         return 0
     for process in processes:
-        try:
-            process.terminate()
-        except OSError:
-            pass
+        _signal_subprocess_terminate(process)
     deadline = time.time() + max(0.0, grace_seconds)
     for process in processes:
         remaining = max(0.0, deadline - time.time())
@@ -1005,6 +1089,87 @@ def _staged_build_checkpoint(entry: Path) -> dict[str, Any] | None:
     return data
 
 
+_PRESERVE_COMPONENT_NAMES = ("index_overrides.json", "hashes")
+
+
+def _repair_preserved_components(live_db_dir: str | Path) -> int:
+    """Restore crash-orphaned ``.index_preserve_*`` aside dirs, then clean up.
+
+    ``_publish_staged_index`` moves the live ``index_overrides.json`` and
+    ``hashes/`` aside while it swaps a staged index in, then moves them back.
+    A crash inside that window strands the ONLY copy of those components in
+    the aside dir -- blindly GC-ing it (the old behavior) permanently dropped
+    the index's overrides/hashes. At startup: move any component the live db
+    is missing back into place; an aside dir whose components all already
+    exist in the live db (the publish completed, only its cleanup died) is
+    stale and safe to remove. Returns the number of aside dirs resolved.
+    """
+    parent = Path(live_db_dir).parent
+    live_db = Path(live_db_dir)
+    if not parent.is_dir():
+        return 0
+    resolved = 0
+    try:
+        candidates = [e for e in parent.iterdir() if e.is_dir() and e.name.startswith(".index_preserve_")]
+    except OSError:
+        return 0
+    for aside in candidates:
+        restored_any = False
+        stale = True
+        for component in _PRESERVE_COMPONENT_NAMES:
+            aside_copy = aside / component
+            live_component = live_db / component
+            if not aside_copy.exists():
+                continue
+            if live_component.exists():
+                continue  # live copy present; this aside copy is redundant
+            # The live db is missing a component the aside dir holds: the
+            # crash happened mid-publish. Restore it.
+            try:
+                live_db.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(aside_copy), str(live_component))
+                restored_any = True
+                logger.warning(
+                    "Restored %s from crash-orphaned aside dir %s.", component, aside.name
+                )
+            except OSError:
+                logger.exception(
+                    "Could not restore %s from %s; leaving the aside dir in place.",
+                    component, aside.name,
+                )
+                stale = False
+        if restored_any or stale:
+            try:
+                shutil.rmtree(aside, ignore_errors=True)
+                resolved += 1
+            except OSError:
+                pass
+    return resolved
+
+
+def _warn_stranded_rollover_dirs(live_db_dir: str | Path) -> int:
+    """Log (but never delete) ``.index_rollover_*`` dirs from crashed swaps.
+
+    A rollover dir holds the PREVIOUS live index at the moment a swap died.
+    It may be the only recovery path for a partially-swapped live db, so it
+    is never removed automatically; surface it loudly instead.
+    """
+    parent = Path(live_db_dir).parent
+    if not parent.is_dir():
+        return 0
+    try:
+        stranded = [e.name for e in parent.iterdir() if e.is_dir() and e.name.startswith(".index_rollover_")]
+    except OSError:
+        return 0
+    for name in stranded:
+        logger.warning(
+            "Found %s from an interrupted index swap. The live db may be "
+            "partially swapped; verify queries work, then delete the dir "
+            "manually once confirmed.", name,
+        )
+    return len(stranded)
+
+
 def _gc_staged_build_dirs(live_db_dir: str | Path, *, min_age_seconds: float = STAGED_BUILD_GC_MIN_AGE_SECONDS) -> int:
     """Delete abandoned staged index-build dirs, reclaiming their disk space.
 
@@ -1013,9 +1178,11 @@ def _gc_staged_build_dirs(live_db_dir: str | Path, *, min_age_seconds: float = S
     build (the live repo carried a 217MB one). Runs once at startup, before
     job recovery re-enqueues any builds, so no live build can be swept. A dir
     survives only when it holds a checkpoint with completed files -- i.e. real
-    resumable work. ``.index_preserve_<hex>`` aside-dirs from an interrupted
-    publish are also collected: they are only meaningful to the publish that
-    created them, and that publish is gone by definition at startup.
+    resumable work. ``.index_preserve_<hex>`` aside dirs are handled by
+    :func:`_repair_preserved_components` (they can hold the only copy of the
+    live overrides/hashes after a mid-publish crash) and are NOT deleted here;
+    ``.index_rollover_<hex>`` dirs are only warned about (see
+    :func:`_warn_stranded_rollover_dirs`).
     """
     parent = Path(live_db_dir).parent
     if not parent.is_dir():
@@ -1029,7 +1196,7 @@ def _gc_staged_build_dirs(live_db_dir: str | Path, *, min_age_seconds: float = S
     for entry in candidates:
         if not entry.is_dir():
             continue
-        if not (entry.name.startswith(".index_build_") or entry.name.startswith(".index_preserve_")):
+        if not entry.name.startswith(".index_build_"):
             continue
         try:
             age = now - entry.stat().st_mtime
@@ -1037,7 +1204,7 @@ def _gc_staged_build_dirs(live_db_dir: str | Path, *, min_age_seconds: float = S
             continue
         if age < min_age_seconds:
             continue
-        if entry.name.startswith(".index_build_") and _staged_build_checkpoint(entry) is not None:
+        if _staged_build_checkpoint(entry) is not None:
             # Resumable progress -- leave it for the next build to resume.
             continue
         logger.warning("Removing abandoned staged index dir %s (%.0f min old).", entry.name, age / 60.0)
@@ -2305,7 +2472,7 @@ def vector_search_index_rows(
         working_dir=str(db_dir or DB_DIR),
         asset_dir=str(ASSET_DIR),
         trust_path=str(DOCUMENT_TRUST_PATH),
-        embedding_model=embedding_model or CONFIGURED_EMBEDDING_MODEL,
+        embedding_model=_safe_client_model(embedding_model, fallback=CONFIGURED_EMBEDDING_MODEL),
         embedding_batch_size=embedding_batch_size,
         embedding_timeout=embedding_timeout,
         retrieval_candidate_k=DEFAULT_RETRIEVAL_CANDIDATE_K,
@@ -4004,6 +4171,14 @@ async def lifespan(app: FastAPI):
         setup_job_logging(Path("logs") / "server.log")
     except OSError:
         pass
+    # Recover crash-orphaned publish components BEFORE the GC sweep and
+    # before job recovery re-enqueues interrupted builds, so the repair can
+    # never race a live one.
+    try:
+        _repair_preserved_components(DB_DIR)
+        _warn_stranded_rollover_dirs(DB_DIR)
+    except Exception:  # noqa: BLE001 - repair must never block startup
+        logger.exception("Preserved-component repair failed; continuing.")
     # Reclaim abandoned staged index builds BEFORE job recovery re-enqueues
     # interrupted builds, so the sweep can never race a live one.
     try:
@@ -4064,6 +4239,27 @@ _NON_MUTATING_POST_PATHS = {"/api/chat/stream", "/api/render"}
 # still passes them through, so a fresh single-user deployment is unchanged.
 _SENSITIVE_GET_PATHS = {"/api/index/stream", "/api/metrics"}
 
+# Prefix-gated GETs when auth is configured: these routes expose the corpus
+# (full chunk text, PDF registry, job history). They are fetch-based, so the
+# UI carries its credential in the X-API-Token header and keeps working.
+_SENSITIVE_GET_PREFIXES = ("/api/pdfs", "/api/index", "/api/jobs", "/api/uploads/check-hash")
+# Media navigations (<a href> / <img src>) cannot carry headers, so the
+# download/view/asset routes stay reachable without a credential even when
+# auth is configured. Documented limitation, not an oversight.
+_SENSITIVE_GET_EXEMPT_PREFIXES = ("/api/assets/",)
+
+
+def _is_sensitive_get(path: str) -> bool:
+    if path in _SENSITIVE_GET_PATHS:
+        return True
+    if path.startswith(_SENSITIVE_GET_EXEMPT_PREFIXES):
+        return False
+    if path.startswith("/api/pdfs/"):
+        # Per-PDF media subpaths stay open (see exempt comment above); the
+        # collection route /api/pdfs itself is gated.
+        return not (path.endswith("/download") or path.endswith("/view"))
+    return path.startswith(_SENSITIVE_GET_PREFIXES)
+
 api_authenticator: ApiKeyAuthenticator | None = (
     create_default_authenticator(
         DATA_DIR,
@@ -4077,13 +4273,17 @@ api_authenticator: ApiKeyAuthenticator | None = (
 
 
 def _client_ip(request: Request) -> str | None:
-    """Best-effort client IP for usage attribution. Trusts X-Forwarded-For."""
+    """Client IP for usage attribution.
+
+    ``X-Forwarded-For`` is honored only from loopback clients (a local
+    reverse proxy); a direct LAN client can otherwise spoof another
+    identity's usage attribution.
+    """
     forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
+    client_host = request.client.host if request.client else ""
+    if forwarded and _is_loopback_host(client_host):
         return forwarded.split(",")[0].strip() or None
-    if request.client:
-        return request.client.host
-    return None
+    return client_host or None
 
 
 def _resolve_api_credential(request: Request) -> str:
@@ -4101,12 +4301,16 @@ async def _enforce_api_token(request: Request, call_next):
     # Only /api/* is gated; static assets and the root page are always open.
     if not path.startswith("/api/"):
         return await call_next(request)
-    # Gate state-changing methods plus sensitive GETs (full-corpus index stream,
-    # server-internal metrics). Other GETs and read-only POSTs (chat stream,
-    # render) stay open so the UI loads without a credential. The admin GET
+    # Gate state-changing methods plus sensitive GETs (full-corpus index
+    # stream, metrics, and the fetch-based corpus/job listings -- see
+    # _is_sensitive_get). Health, update status, read-only POSTs (chat stream,
+    # render), and the media navigation routes (<a>/<img>: PDF download/view,
+    # assets) stay open so the UI loads without a credential; the admin GET
     # /api/admin/api-keys is gated inside its own handler (role-restricted).
+    # GETs are only gated WHEN auth is configured: with no master token and an
+    # empty key store the whole middleware is a pass-through (zero-config).
     is_mutating = request.method in _MUTATING_METHODS and path not in _NON_MUTATING_POST_PATHS
-    is_sensitive_get = request.method == "GET" and path in _SENSITIVE_GET_PATHS
+    is_sensitive_get = request.method == "GET" and _is_sensitive_get(path)
     if not (is_mutating or is_sensitive_get):
         return await call_next(request)
 
@@ -4218,7 +4422,7 @@ def root():
     return Response(content=text, media_type="text/html; charset=utf-8")
 
 
-def _require_admin(request: Request) -> JSONResponse | None:
+def _require_admin(request: Request, *, mutation: bool = False) -> JSONResponse | None:
     """Auth gate for admin endpoints. Returns an error response or ``None``.
 
     This is the single GET that requires auth (the middleware only gates
@@ -4226,11 +4430,21 @@ def _require_admin(request: Request) -> JSONResponse | None:
     list live key usage. When auth is fully disabled (no master token, empty
     key store) the endpoint is openly readable -- there is nothing sensitive to
     protect in that zero-config state.
+
+    Mutating admin endpoints (create/disable/delete keys) additionally require
+    a loopback client while auth is unconfigured: a LAN-open deployment would
+    otherwise let any host mint the first admin key and lock the operator out
+    of a system that is now gated by that attacker's key.
     """
     master_token = (globals().get("_API_TOKEN") or "").strip()
     authenticator = globals().get("api_authenticator")
     # Zero-config state: no master token and no key store -> nothing to gate.
     if not master_token and (authenticator is None or not authenticator.store.has_any_key()):
+        if mutation and not _is_local_update_host(request.client.host if request.client else ""):
+            raise HTTPException(
+                status_code=403,
+                detail="Admin key management is restricted to the local machine until an API token or key is configured.",
+            )
         return None
     supplied = _resolve_api_credential(request)
     if authenticator is not None:
@@ -4308,9 +4522,11 @@ def _admin_key_public_record(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _admin_key_context(request: Request, prefix: str) -> tuple[JSONResponse | None, Any, dict[str, Any] | None]:
+def _admin_key_context(
+    request: Request, prefix: str, *, mutation: bool = True
+) -> tuple[JSONResponse | None, Any, dict[str, Any] | None]:
     """Shared gate for per-key admin mutations: admin check + prefix lookup."""
-    denied = _require_admin(request)
+    denied = _require_admin(request, mutation=mutation)
     if denied is not None:
         return denied, None, None
     authenticator = globals().get("api_authenticator")
@@ -4337,7 +4553,7 @@ def admin_create_api_key(request: Request, payload: AdminApiKeyCreateRequest):
     the hash, so a lost secret must be replaced via rotate/re-issue. Label,
     role, expiry, and rate limit mirror ``scripts/manage_api_keys.py create``.
     """
-    denied = _require_admin(request)
+    denied = _require_admin(request, mutation=True)
     if denied is not None:
         return denied
     authenticator = globals().get("api_authenticator")
@@ -4374,14 +4590,16 @@ def admin_create_api_key(request: Request, payload: AdminApiKeyCreateRequest):
 @app.post("/api/admin/api-keys/{prefix}/status")
 def admin_set_api_key_status(request: Request, prefix: str, payload: AdminApiKeyStatusRequest):
     """Enable or disable a key (admin/master only). Disabled keys fail auth."""
+    # Gate before payload validation so unauthenticated callers get a uniform
+    # 401 instead of a 400 that reveals endpoint semantics.
+    denied, authenticator, record = _admin_key_context(request, prefix)
+    if denied is not None:
+        return denied
     if payload.status not in {STATUS_ACTIVE, STATUS_DISABLED}:
         return JSONResponse(
             status_code=400,
             content={"detail": f"Invalid status {payload.status!r}; expected 'active' or 'disabled'."},
         )
-    denied, authenticator, record = _admin_key_context(request, prefix)
-    if denied is not None:
-        return denied
     updated = authenticator.set_status(record["key_id"], payload.status)
     if updated is None:
         return JSONResponse(status_code=404, content={"detail": f"No API key with prefix {prefix!r}."})
@@ -4391,14 +4609,15 @@ def admin_set_api_key_status(request: Request, prefix: str, payload: AdminApiKey
 @app.post("/api/admin/api-keys/{prefix}/role")
 def admin_set_api_key_role(request: Request, prefix: str, payload: AdminApiKeyRoleRequest):
     """Change a key's role (admin/master only). 'admin' grants the admin endpoints."""
+    # Gate before payload validation (uniform 401 for unauthenticated callers).
+    denied, authenticator, record = _admin_key_context(request, prefix)
+    if denied is not None:
+        return denied
     if payload.role not in {ROLE_ADMIN, ROLE_USER}:
         return JSONResponse(
             status_code=400,
             content={"detail": f"Invalid role {payload.role!r}; expected 'user' or 'admin'."},
         )
-    denied, authenticator, record = _admin_key_context(request, prefix)
-    if denied is not None:
-        return denied
     updated = authenticator.set_role(record["key_id"], payload.role)
     if updated is None:
         return JSONResponse(status_code=404, content={"detail": f"No API key with prefix {prefix!r}."})
@@ -4451,7 +4670,10 @@ def health(request: Request):
         },
         "index_exists": index_exists,
         "record_count": record_count,
-        "server": dict(SERVER_CONFIG),
+        # Redacted: /api/health is an open GET, and SERVER_CONFIG carries the
+        # master api_token -- echoing it would hand the credential to every
+        # LAN client able to read this endpoint.
+        "server": {**SERVER_CONFIG, "api_token": "", "api_token_configured": bool(SERVER_CONFIG.get("api_token"))},
         "chat": {
             "context_window": CHAT_CONFIG["context_window"],
             "llm_num_predict": CHAT_CONFIG["llm_num_predict"],
@@ -4571,9 +4793,10 @@ def _embedding_config_snapshot() -> dict[str, Any]:
     constructs an EmbeddingEngine (which would load the model).
     """
     try:
-        from src.config import load_config
-
-        cfg = load_config()
+        # Discovered config (repo config.toml / RAG_PIPELINE_CONFIG), not a
+        # bare load: a bare load returns hardcoded defaults and the snapshot
+        # would report a different model/batch than the engine actually uses.
+        cfg = _pipeline_config()
         emb = cfg.embeddings
         models = cfg.models
         # The same precedence logic as EmbeddingEngine.__init__ (env > config).
@@ -4761,7 +4984,13 @@ def _cached_update_status(*, refresh: bool = False) -> dict[str, Any]:
 
 
 @app.get("/api/update/status")
-def update_status(refresh: bool = False):
+def update_status(request: Request, refresh: bool = False):
+    # refresh=true forces a network git fetch. Restrict that to the local
+    # machine so a LAN client (or a cross-origin page) cannot use the open
+    # endpoint as an unauthenticated egress/amplification knob; everyone else
+    # gets the cached snapshot.
+    if refresh and not _is_local_update_host(request.client.host if request.client else ""):
+        refresh = False
     return _cached_update_status(refresh=refresh)
 
 
@@ -4780,7 +5009,11 @@ def render_markdown(payload: RenderRequest):
 
 def _upload_options_from_form(form: Any) -> dict[str, Any]:
     return {
-        "asset_dir": str(_resolve_root_path(form.get("asset_dir") or INGESTION_CONFIG["asset_dir"])),
+        # Client-supplied paths are contained to the workspace; the executable
+        # path is NEVER client-controlled (it is executed by the OCR backend).
+        "asset_dir": _contained_client_path(
+            form.get("asset_dir"), INGESTION_CONFIG["asset_dir"]
+        ),
         "parser_mode": str(form.get("parser_mode") or INGESTION_CONFIG["parser_mode"]),
         "accelerator": str(form.get("accelerator") or INGESTION_CONFIG["accelerator"]),
         "asset_triggers": str(form.get("asset_triggers") or INGESTION_CONFIG["asset_triggers"]),
@@ -4789,7 +5022,9 @@ def _upload_options_from_form(form: Any) -> dict[str, Any]:
             form.get("formula_enrichment"),
             INGESTION_CONFIG["formula_enrichment"],
         ),
-        "vision_model": str(form.get("vision_model") or INGESTION_CONFIG["vision_model"]),
+        "vision_model": _safe_client_model(
+            form.get("vision_model"), fallback=INGESTION_CONFIG["vision_model"]
+        ),
         "vision_enabled": _bool_value(form.get("vision_enabled"), INGESTION_CONFIG["vision_enabled"]),
         "ocr_backend": str(form.get("ocr_backend") or INGESTION_CONFIG["ocr_backend"]),
         "ocr_langs": _string_list(form.get("ocr_langs"), tuple(INGESTION_CONFIG["ocr_langs"])),
@@ -4802,13 +5037,17 @@ def _upload_options_from_form(form: Any) -> dict[str, Any]:
             INGESTION_CONFIG["ocr_bitmap_area_threshold"],
         ),
         "rapidocr_backend": str(form.get("rapidocr_backend") or INGESTION_CONFIG["rapidocr_backend"]),
-        "tesseract_cmd": str(form.get("tesseract_cmd") or INGESTION_CONFIG["tesseract_cmd"]),
-        "tesseract_data_path": str(form.get("tesseract_data_path") or INGESTION_CONFIG["tesseract_data_path"]),
+        # Server config only: a request-supplied executable path would mean
+        # arbitrary code execution at OCR time.
+        "tesseract_cmd": str(INGESTION_CONFIG["tesseract_cmd"]),
+        "tesseract_data_path": str(INGESTION_CONFIG["tesseract_data_path"]),
         "tesseract_psm": _optional_int(form.get("tesseract_psm"), INGESTION_CONFIG["tesseract_psm"]),
         "max_pages_whole_doc": _nonnegative_int(
             form.get("max_pages_whole_doc"), INGESTION_CONFIG.get("max_pages_whole_doc", 50)
         ),
-        "embedding_model": str(form.get("embedding_model") or CONFIGURED_EMBEDDING_MODEL),
+        "embedding_model": _safe_client_model(
+            form.get("embedding_model"), fallback=CONFIGURED_EMBEDDING_MODEL
+        ),
         "embedding_batch_size": _positive_int(form.get("embedding_batch_size"), DEFAULT_EMBEDDING_BATCH_SIZE),
         "embedding_timeout": _positive_float(form.get("embedding_timeout"), DEFAULT_EMBEDDING_TIMEOUT),
         "index_backend": str(form.get("index_backend") or DEFAULT_INDEX_BACKEND),
@@ -5564,6 +5803,38 @@ async def upload_files_direct(request: Request):
 
 _CHUNK_UPLOADS: dict[str, dict[str, Any]] = {}
 _CHUNK_UPLOADS_LOCK = threading.Lock()
+# One lock per in-flight upload_id: the offset check + append pair must be
+# atomic per upload or two concurrent chunk POSTs can interleave writes and
+# corrupt the .part file.
+_CHUNK_UPLOAD_APPEND_LOCKS: dict[str, threading.Lock] = {}
+
+# upload_id values are server-generated ``uuid4().hex`` tokens. They become
+# path components (<staging>/<upload_id>/...), so anything that is not a bare
+# 32-char hex token is rejected: this is the containment check that keeps a
+# crafted upload_id (``..\\``, an absolute path, ...) from escaping the
+# staging directory.
+_UPLOAD_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _require_upload_id(value: Any) -> str:
+    upload_id = str(value or "").strip().lower()
+    if not _UPLOAD_ID_RE.match(upload_id):
+        raise HTTPException(status_code=400, detail="Invalid upload_id format.")
+    return upload_id
+
+
+def _upload_append_lock(upload_id: str) -> threading.Lock:
+    with _CHUNK_UPLOADS_LOCK:
+        lock = _CHUNK_UPLOAD_APPEND_LOCKS.get(upload_id)
+        if lock is None:
+            lock = threading.Lock()
+            _CHUNK_UPLOAD_APPEND_LOCKS[upload_id] = lock
+        return lock
+
+
+def _drop_upload_append_lock(upload_id: str) -> None:
+    with _CHUNK_UPLOADS_LOCK:
+        _CHUNK_UPLOAD_APPEND_LOCKS.pop(upload_id, None)
 
 
 def _prune_abandoned_uploads(max_age_seconds: float = 86400.0) -> int:
@@ -5577,6 +5848,7 @@ def _prune_abandoned_uploads(max_age_seconds: float = 86400.0) -> int:
         ]
         for uid in expired:
             _CHUNK_UPLOADS.pop(uid, None)
+            _CHUNK_UPLOAD_APPEND_LOCKS.pop(uid, None)
             part = _chunk_part_path(uid)
             try:
                 if part.exists():
@@ -5620,10 +5892,15 @@ async def upload_chunk(request: Request):
     so the client knows where to resume.
     """
     form = await request.form()
-    upload_id = str(form.get("upload_id") or uuid.uuid4().hex)
+    upload_id = _require_upload_id(form.get("upload_id") or uuid.uuid4().hex)
     filename = _safe_filename(str(form.get("filename") or "upload.pdf"))
-    total_size = int(form.get("total_size") or 0)
-    offset = int(form.get("offset") or 0)
+    try:
+        total_size = int(form.get("total_size") or 0)
+        offset = int(form.get("offset") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="total_size and offset must be integers.")
+    if total_size < 0 or offset < 0:
+        raise HTTPException(status_code=400, detail="total_size and offset must be non-negative.")
     chunk_field = form.get("chunk")
     if not isinstance(chunk_field, StarletteUploadFile):
         raise HTTPException(status_code=400, detail="Missing 'chunk' file field.")
@@ -5636,22 +5913,24 @@ async def upload_chunk(request: Request):
 
     part_path = _chunk_part_path(upload_id)
     part_path.parent.mkdir(parents=True, exist_ok=True)
-    current_size = part_path.stat().st_size if part_path.exists() else 0
-    if offset != current_size:
-        # Offset mismatch: client is out of sync. Tell it the real offset.
-        raise HTTPException(
-            status_code=409,
-            detail={"error": "offset_mismatch", "expected_offset": current_size},
-        )
+    # Serialize the offset check + append per upload_id so concurrent chunk
+    # POSTs cannot both pass the size check and interleave writes.
+    with _upload_append_lock(upload_id):
+        current_size = part_path.stat().st_size if part_path.exists() else 0
+        if offset != current_size:
+            # Offset mismatch: client is out of sync. Tell it the real offset.
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "offset_mismatch", "expected_offset": current_size},
+            )
 
-    # Append the chunk in 1 MiB pieces so memory stays flat.
-    chunk_field.file.seek(0)
-    written = 0
-    digest_update = False
-    with part_path.open("ab") as handle:
-        for piece in iter(lambda: chunk_field.file.read(1024 * 1024), b""):
-            handle.write(piece)
-            written += len(piece)
+        # Append the chunk in 1 MiB pieces so memory stays flat.
+        chunk_field.file.seek(0)
+        written = 0
+        with part_path.open("ab") as handle:
+            for piece in iter(lambda: chunk_field.file.read(1024 * 1024), b""):
+                handle.write(piece)
+                written += len(piece)
     await chunk_field.close()
 
     new_size = current_size + written
@@ -5668,6 +5947,7 @@ async def upload_chunk(request: Request):
 @app.get("/api/uploads/chunk_status")
 def chunk_status(upload_id: str):
     """Return the current received offset for a chunked upload (for resume)."""
+    upload_id = _require_upload_id(upload_id)
     part_path = _chunk_part_path(upload_id)
     size = part_path.stat().st_size if part_path.exists() else 0
     meta = _CHUNK_UPLOADS.get(upload_id, {})
@@ -5689,10 +5969,8 @@ async def complete_chunked_upload(request: Request):
     a normal upload (dedupe, registry, ingest/index job).
     """
     payload = await _optional_json(request)
-    upload_id = str(payload.get("upload_id") or "")
+    upload_id = _require_upload_id(payload.get("upload_id"))
     filename = _safe_filename(str(payload.get("filename") or "upload.pdf"))
-    if not upload_id:
-        raise HTTPException(status_code=400, detail="upload_id is required.")
     part_path = _chunk_part_path(upload_id)
     if not part_path.exists():
         raise HTTPException(status_code=404, detail=f"No chunked upload found for {upload_id}.")
@@ -5726,6 +6004,7 @@ async def complete_chunked_upload(request: Request):
     source_group = normalize_source_group(payload.get("source_groups") or "")
     with _CHUNK_UPLOADS_LOCK:
         _CHUNK_UPLOADS.pop(upload_id, None)
+        _CHUNK_UPLOAD_APPEND_LOCKS.pop(upload_id, None)
 
     # Inline registration: dedupe check then register + enqueue. Mirrors the
     # tail of _handle_upload_request but for a single already-on-disk file.
@@ -6341,7 +6620,7 @@ def update_index(payload: IndexUpdateRequest):
         row = update_index_record(
             record_id=payload.record_id,
             content=payload.content,
-            embedding_model=payload.embedding_model,
+            embedding_model=_safe_client_model(payload.embedding_model, fallback=CONFIGURED_EMBEDDING_MODEL),
             embedding_batch_size=payload.embedding_batch_size,
             embedding_timeout=payload.embedding_timeout,
         )
@@ -6406,8 +6685,8 @@ def chat_stream(payload: ChatRequest):
                 working_dir=str(DB_DIR),
                 asset_dir=str(ASSET_DIR),
                 trust_path=str(DOCUMENT_TRUST_PATH),
-                model=payload.llm_model,
-                embedding_model=payload.embedding_model,
+                model=_safe_client_model(payload.llm_model, fallback=CHAT_CONFIG["llm_model"]),
+                embedding_model=_safe_client_model(payload.embedding_model, fallback=CONFIGURED_EMBEDDING_MODEL),
                 embedding_batch_size=payload.embedding_batch_size,
                 embedding_timeout=payload.embedding_timeout,
                 llm_num_predict=payload.llm_num_predict,
@@ -6418,6 +6697,7 @@ def chat_stream(payload: ChatRequest):
                 retrieval_candidate_k=payload.retrieval_candidate_k,
                 retrieval_min_score=payload.retrieval_min_score,
                 retrieval_relative_cutoff=payload.retrieval_relative_cutoff,
+                retrieval_rrf_k=payload.retrieval_rrf_k,
                 context_token_fraction=payload.context_token_fraction,
                 web_search_enabled=payload.web_search_enabled,
                 web_search_timeout=payload.web_search_timeout,
@@ -6425,7 +6705,7 @@ def chat_stream(payload: ChatRequest):
                 ollama_health_check_interval=payload.ollama_health_check_interval,
                 ollama_max_lost_health_checks=payload.ollama_max_lost_health_checks,
                 system_prompt=payload.system_prompt,
-                planner_model=payload.planner_model,
+                planner_model=_safe_client_model(payload.planner_model, fallback=CHAT_CONFIG["planner_model"]),
                 planner_enabled=payload.planner_enabled,
                 planner_max_queries=payload.planner_max_queries,
                 progress_enabled=False,

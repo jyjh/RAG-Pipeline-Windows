@@ -7,7 +7,7 @@ laptop.
 > SoCLAaS API, and the GPU serving job, SSH tunnel, and `Singularity.def` were
 > removed from the repository. Path A is retained below for reference only;
 > use Path B — the CPU cluster runs the ingest-only bulk parse, embeddings run
-> on the workstation (localhosted nomic-embed-text), and chat/vision come from
+> on the workstation (locally hosted all-minilm), and chat/vision come from
 > the SoCLAaS API.
 
 - **CPU-only cluster (free, unlimited):** Path B (recommended).
@@ -140,7 +140,7 @@ See [Copy the index home & run the web app](#copy-the-index-home--run-the-web-ap
 ## Path B — CPU-only cluster (free)
 
 The cluster's only job is the bulk PDF parse (Docling OCR/pypdf extraction into
-`processed_docs/` Markdown). Embeddings are workstation-local (nomic-embed-text
+`processed_docs/` Markdown). Embeddings are workstation-local (all-minilm
 via Ollama), so the index cannot be built on the cluster and is built at home;
 chat runs on the SoCLAaS API.
 
@@ -212,7 +212,7 @@ RAG_PIPELINE_CONFIG=config.cpu.toml qsub ingest_only.pbs
 ```
 
 Bring the Markdown home and build the index locally (local Ollama with
-`nomic-embed-text` pulled). Check the PBS exit status first — a walltime
+the configured embedding model (`all-minilm` by default) pulled). Check the PBS exit status first — a walltime
 kill leaves a partial `processed_docs/` that would otherwise silently index
 an incomplete corpus:
 
@@ -272,7 +272,7 @@ rsync -P --delete nus_hpc:~/<path-to-repo>/db/ ./db/
 ```
 
 Run the web app locally (it reads local `db/`, embeds queries through local
-Ollama `nomic-embed-text`, and chats via the SoCLAaS API):
+Ollama `all-minilm`, and chats via the SoCLAaS API):
 
 ```bash
 python -m src.web_app    # serves on 127.0.0.1:8000

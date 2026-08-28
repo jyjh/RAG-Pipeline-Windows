@@ -132,11 +132,18 @@ class RagJobQueue:
                 self._queue = deque(existing_id for existing_id in self._queue if existing_id != job.id)
                 self._mark_cancelled_locked(job, "Job cancelled by user.")
                 payload = job.to_dict()
+                # The job reached a terminal state here, not in the worker's
+                # terminal path -- remove its ledger entry or startup recovery
+                # would re-enqueue the cancelled job on every restart.
+                cancelled_terminal = True
             else:
                 job.error = "Cancellation requested."
                 payload = job.to_dict()
+                cancelled_terminal = False
             self._condition.notify_all()
 
+        if cancelled_terminal:
+            self._ledger_remove(job)
         if payload["status"] == "cancelled":
             self._record_interrupted(job, "Job cancelled by user.")
         return payload
@@ -339,6 +346,13 @@ class RagJobQueue:
         return self._enqueue(job, auto_start=auto_start)
 
     def _enqueue(self, job: QueueJob, *, auto_start: bool) -> QueueJob:
+        # Persist non-upload jobs BEFORE the job becomes visible to a worker.
+        # Recording after enqueue raced the worker's terminal-state removal: a
+        # fast job (small backup/restore) could finish and de-ledger before
+        # the record landed, leaving a DONE job in the ledger that startup
+        # recovery re-enqueued on every restart. Done outside the condition
+        # lock because the ledger has its own lock and is best-effort.
+        self._ledger_record(job)
         with self._condition:
             self._jobs[job.id] = job
             self._queue.append(job.id)
@@ -347,9 +361,6 @@ class RagJobQueue:
                 self._ensure_worker_locked()
             self._bump_state_version_locked()
             self._condition.notify_all()
-        # Persist non-upload jobs so they survive a crash. Done outside the
-        # condition lock because the ledger has its own lock and is best-effort.
-        self._ledger_record(job)
         return job
 
     def _prune_jobs_locked(self) -> None:
@@ -377,6 +388,24 @@ class RagJobQueue:
             worker.start()
             alive += 1
 
+    def _best_effort_bookkeeping(self, job: "QueueJob", description: str, action) -> None:
+        """Run post-phase bookkeeping without letting a registry/IO failure
+        kill the worker thread.
+
+        ``_record_interrupted`` / ``_ledger_remove`` touch sqlite and the
+        ledger file; a transient lock timeout there used to propagate out of
+        ``_worker_loop``, killing the worker with its job still marked
+        "running" (and the ledger entry never removed). With ``job_workers``
+        = 1 that stalled the whole queue until restart.
+        """
+        try:
+            action()
+        except Exception:  # noqa: BLE001 - a dead worker strands the queue
+            logger.exception(
+                "Job bookkeeping failed (%s) for job %s; worker continuing.",
+                description, job.id,
+            )
+
     def _worker_loop(self) -> None:
         while True:
             with self._condition:
@@ -399,8 +428,10 @@ class RagJobQueue:
                     self._bump_state_version_locked()
 
             if cancelled_before_start:
-                self._record_interrupted(job, "Job cancelled by user.")
-                self._ledger_remove(job)
+                self._best_effort_bookkeeping(
+                    job, "interrupted-status", lambda: self._record_interrupted(job, "Job cancelled by user.")
+                )
+                self._best_effort_bookkeeping(job, "ledger-remove", lambda: self._ledger_remove(job))
                 with self._condition:
                     self._prune_jobs_locked()
                 continue
@@ -410,25 +441,29 @@ class RagJobQueue:
                 self._run_job(job)
             except JobCancelled as exc:
                 message = str(exc) or "Job cancelled by user."
-                self._record_interrupted(job, message)
+                self._best_effort_bookkeeping(job, "interrupted-status", lambda: self._record_interrupted(job, message))
                 with self._condition:
                     self._mark_cancelled_locked(job, message)
                     self._condition.notify_all()
             except Exception as exc:
                 if job.cancel_requested:
                     message = "Job cancelled by user."
-                    self._record_interrupted(job, message)
+                    self._best_effort_bookkeeping(job, "interrupted-status", lambda: self._record_interrupted(job, message))
                     with self._condition:
                         self._mark_cancelled_locked(job, message)
                         self._condition.notify_all()
-                    self._ledger_remove(job)
+                    self._best_effort_bookkeeping(job, "ledger-remove", lambda: self._ledger_remove(job))
                     continue
                 if job.kind == "upload" and job.uploads:
-                    self.registry.mark_job_status(
-                        job_id=job.id,
-                        files=job.uploads,
-                        status="failed",
-                        error=str(exc),
+                    self._best_effort_bookkeeping(
+                        job,
+                        "registry-failed-status",
+                        lambda: self.registry.mark_job_status(
+                            job_id=job.id,
+                            files=job.uploads,
+                            status="failed",
+                            error=str(exc),
+                        ),
                     )
                 with self._condition:
                     job.status = "failed"
@@ -452,10 +487,12 @@ class RagJobQueue:
                     self._bump_state_version_locked()
                     self._condition.notify_all()
                 if record_cancelled:
-                    self._record_interrupted(job, "Job cancelled by user.")
+                    self._best_effort_bookkeeping(
+                        job, "interrupted-status", lambda: self._record_interrupted(job, "Job cancelled by user.")
+                    )
             # Any terminal state (done/failed/cancelled) removes the job from
             # the durable ledger so it is not re-enqueued on the next startup.
-            self._ledger_remove(job)
+            self._best_effort_bookkeeping(job, "ledger-remove", lambda: self._ledger_remove(job))
             with self._condition:
                 self._prune_jobs_locked()
 
@@ -626,10 +663,12 @@ class RagJobQueue:
             self._run_upload_indexing_phase(job)
             return
 
-        # --- Ingestion phase (no index lock) ---
+        # --- Ingestion phase (no index lock, except forced-duplicate cleanup) ---
         # Saving uploads and parsing PDFs only touches data/uploads/ and
         # processed_docs/. Multiple upload jobs can ingest concurrently since
         # each writes to its own job-scoped upload dir and per-file markdown.
+        # _prepare_for_forced_duplicates takes _index_write_lock itself: it is
+        # the one ingestion-phase step that mutates the live index.
         upload_dir = self._ensure_upload_dir(job)
         self._wait_for_no_queries(job, "ingesting")
         self._raise_if_cancelled(job)
@@ -817,35 +856,42 @@ class RagJobQueue:
         hashes = {value for value in job.force_duplicate_hashes if value}
         if not hashes:
             return
-        from src.asset_store import ImageAssetStore
+        # This cleanup MUTATES the live index (records + overrides) and the
+        # shared processed_docs/, so it must serialize against publish /
+        # backup / restore (``_index_write_lock``) even though it runs in the
+        # otherwise lock-free ingestion phase. Forced duplicates are rare, so
+        # the serialization cost is negligible; an unlocked live delete racing
+        # a concurrent backup/publish is not.
+        with self._index_write_lock:
+            from src.asset_store import ImageAssetStore
 
-        asset_store = ImageAssetStore(_resolve_root_path(job.options.get("asset_dir") or _source_module.ASSET_DIR))
-        for source_hash in hashes:
-            asset_store.remove_source_assets(source_hash)
-        clear_overrides_for_sources(self.db_dir, hashes)
-        removed_entries = remove_source_entries_by_hash(self.processed_dir, hashes)
-        legacy_paths: list[str] = []
-        legacy_doc_ids: list[str] = []
-        for entry in removed_entries:
-            for key in ("processed_markdown_path", "source_pdf_path", "source_pdf_name"):
-                value = str(entry.get(key, ""))
-                if value:
-                    legacy_paths.append(value)
-            markdown_path = Path(str(entry.get("processed_markdown_path", "")))
-            if markdown_path.name:
-                from src.sectioning import stable_id
+            asset_store = ImageAssetStore(_resolve_root_path(job.options.get("asset_dir") or _source_module.ASSET_DIR))
+            for source_hash in hashes:
+                asset_store.remove_source_assets(source_hash)
+            clear_overrides_for_sources(self.db_dir, hashes)
+            removed_entries = remove_source_entries_by_hash(self.processed_dir, hashes)
+            legacy_paths: list[str] = []
+            legacy_doc_ids: list[str] = []
+            for entry in removed_entries:
+                for key in ("processed_markdown_path", "source_pdf_path", "source_pdf_name"):
+                    value = str(entry.get(key, ""))
+                    if value:
+                        legacy_paths.append(value)
+                markdown_path = Path(str(entry.get("processed_markdown_path", "")))
+                if markdown_path.name:
+                    from src.sectioning import stable_id
 
-                legacy_doc_ids.append(stable_id("doc", markdown_path.stem))
-                self._delete_processed_markdown(markdown_path)
+                    legacy_doc_ids.append(stable_id("doc", markdown_path.stem))
+                    self._delete_processed_markdown(markdown_path)
 
-        with INDEX_LOCK:
-            store = _index_store(self.db_dir)
-            if store.exists():
-                store.delete_records_by_source_hash(
-                    source_hashes=list(hashes),
-                    legacy_file_paths=legacy_paths,
-                    legacy_doc_ids=legacy_doc_ids,
-                )
+            with INDEX_LOCK:
+                store = _index_store(self.db_dir)
+                if store.exists():
+                    store.delete_records_by_source_hash(
+                        source_hashes=list(hashes),
+                        legacy_file_paths=legacy_paths,
+                        legacy_doc_ids=legacy_doc_ids,
+                    )
 
     def _delete_processed_markdown(self, markdown_path: Path) -> None:
         processed_root = self.processed_dir.resolve()

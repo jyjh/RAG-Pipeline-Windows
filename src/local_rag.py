@@ -157,9 +157,9 @@ _ACTIVE_OLLAMA_HOST: str | None = None
 
 # Ollama keep_alive for local chat/planner payloads. Resolution order:
 # ``LOCAL_RAG_OLLAMA_KEEP_ALIVE`` env > this global (seeded by the web app from
-# its discovered config, mirroring _ACTIVE_OLLAMA_HOST) > bare ``load_config()``
-# (no path = typed defaults, which carry DEFAULT_OLLAMA_KEEP_ALIVE). Empty
-# string = defer to the Ollama server default (5m unload).
+# its discovered config, mirroring _ACTIVE_OLLAMA_HOST) > the discovered
+# config.toml via ``load_config(default_config_path())``. Empty string =
+# defer to the Ollama server default (5m unload).
 _ACTIVE_OLLAMA_KEEP_ALIVE: str | None = None
 
 # Shared host normalization + pull-command hint live in llm_api alongside the
@@ -179,9 +179,9 @@ def _ollama_host() -> str:
         return _normalize_ollama_host(_ACTIVE_OLLAMA_HOST)
 
     try:
-        from src.config import load_config
+        from src.config import default_config_path, load_config
 
-        cfg = load_config()
+        cfg = load_config(default_config_path())
         if cfg.ollama and cfg.ollama.host:
             return _normalize_ollama_host(cfg.ollama.host)
     except Exception:
@@ -200,9 +200,9 @@ def _get_ollama_candidate_hosts() -> list[str]:
     fallback_enabled = True
 
     try:
-        from src.config import load_config
+        from src.config import default_config_path, load_config
 
-        cfg = load_config()
+        cfg = load_config(default_config_path())
         if cfg.ollama:
             if cfg.ollama.host:
                 toml_host = cfg.ollama.host
@@ -253,9 +253,10 @@ def _ollama_keep_alive() -> str:
     if _ACTIVE_OLLAMA_KEEP_ALIVE is not None:
         return _ACTIVE_OLLAMA_KEEP_ALIVE.strip()
     try:
-        from src.config import load_config
+        from src.config import default_config_path, load_config
 
-        return str(load_config().chat.ollama_keep_alive or "").strip()
+        cfg = load_config(default_config_path())
+        return str(cfg.chat.ollama_keep_alive or "").strip()
     except Exception:
         return ""
 

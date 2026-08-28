@@ -8,13 +8,17 @@ import socket
 import threading
 import urllib3
 from collections import OrderedDict
-from pathlib import Path
 from typing import Any
 
 from src import llm_api
 from src.coerce import as_positive_float, as_positive_int
 from src.console import status as _status
 from src.defaults import DEFAULT_EMBEDDING_BATCH_SIZE
+# Re-exported from src.config, which owns the definition now that llm_api and
+# local_rag share it. Kept as a module attribute so existing
+# ``src.embeddings.default_config_path`` consumers -- and tests that patch it
+# to point at fixture configs -- keep working.
+from src.config import default_config_path
 
 _OLLAMA_POOL = urllib3.PoolManager(
     num_pools=4,
@@ -43,7 +47,7 @@ def resolve_embeddings_backend() -> str:
 
     ``[embeddings].backend`` (env ``EMBEDDINGS_BACKEND``) lets a deployment
     keep chat/vision on the SoCLAaS API while embedding locally (the default:
-    ``"ollama"``, a hosted nomic-embed-text), or vice versa. ``""`` follows
+    ``"ollama"``, a hosted all-minilm), or vice versa. ``""`` follows
     ``[llm_api].backend``. ``[models].native_embeddings = true`` still takes
     precedence over both -- it is deliberately not a value here.
 
@@ -80,8 +84,8 @@ def embeddings_use_soclaas() -> bool:
 def configured_embedding_model() -> str:
     """Effective embedding model: ``[models].embedding_model`` > repo default.
 
-    The repo default (nomic-embed-text) matches a fresh deployment, but an
-    instance whose index was built with another model (e.g. all-minilm) must
+    The repo default (all-minilm) matches a fresh deployment, but an instance
+    whose index was built with another model (e.g. nomic-embed-text) must
     keep embedding queries with that same model or retrieval cosines collapse
     to noise. Query-side fallbacks use this instead of DEFAULT_EMBEDDING_MODEL.
     """
@@ -108,22 +112,13 @@ def _embeddings_config():
     return load_config(default_config_path())
 
 
-def default_config_path() -> Path:
-    """Repo ``config.toml``, honoring ``RAG_PIPELINE_CONFIG`` (env override)."""
-    raw = os.environ.get("RAG_PIPELINE_CONFIG")
-    if raw:
-        path = Path(raw)
-        return path if path.is_absolute() else Path(__file__).resolve().parents[1] / raw
-    return Path(__file__).resolve().parents[1] / "config.toml"
-
-
 def resolve_embedding_dim(explicit: int | None = None) -> int:
     """Resolve the embedding dimension: explicit arg > ``[models].embedding_dim``
     > ``DEFAULT_EMBEDDING_DIM``.
 
-    nomic-embed-text is 768-d (bge-m3 is 1024-d); a model/dim change
-    invalidates an existing index (the indexer/query-engine reuse guards
-    enforce a re-index).
+    all-minilm is 384-d (nomic-embed-text is 768-d, bge-m3 1024-d); a
+    model/dim change invalidates an existing index (the indexer/query-engine
+    reuse guards enforce a re-index).
     """
     if explicit is not None:
         return max(1, int(explicit))
@@ -248,6 +243,18 @@ def _resolve_embed_concurrency(config_concurrency: int | None = None) -> int:
     return max(1, value)
 
 
+# SentenceTransformers loads HuggingFace hub ids, while the configured
+# embedding model is an Ollama tag. Map the known tags onto their HF
+# equivalents so [models].native_embeddings = true actually loads a model
+# instead of always failing (unknown repo id) and silently falling back to
+# the Ollama HTTP path. Dims line up: all-MiniLM-L6-v2 is 384-d, nomic v1.5
+# is 768-d -- matching their tags' config dims.
+_NATIVE_HF_MODEL_ALIASES = {
+    "all-minilm": "sentence-transformers/all-MiniLM-L6-v2",
+    "nomic-embed-text": "nomic-ai/nomic-embed-text-v1.5",
+}
+
+
 class EmbeddingEngine:
     """
     Ollama-backed embedding engine with an internal cache.
@@ -260,7 +267,7 @@ class EmbeddingEngine:
 
     def __init__(
         self,
-        model_name="nomic-embed-text",
+        model_name="all-minilm",
         *,
         ollama_batch_size: int | None = None,
         ollama_timeout: float | None = None,
@@ -366,8 +373,10 @@ class EmbeddingEngine:
             from sentence_transformers import SentenceTransformer
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            self._native_model = SentenceTransformer(self.model_name, trust_remote_code=True, device=device)
-            _status(f"Native model loaded on device: {device}")
+            # The configured model is an Ollama tag; resolve its HF hub id.
+            hf_model = _NATIVE_HF_MODEL_ALIASES.get(self.model_name, self.model_name)
+            self._native_model = SentenceTransformer(hf_model, trust_remote_code=True, device=device)
+            _status(f"Native model {hf_model} loaded on device: {device}")
         except Exception as exc:
             _status(f"Failed to load native embedding model: {exc}. Falling back to Ollama.")
             logger.error("Native embedding load failed: %s", exc)
