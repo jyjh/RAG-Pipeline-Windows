@@ -507,14 +507,28 @@ def outline_sections(reader: Any, outline: list[Any], *, page_count: int) -> lis
         stack.append(node)
         all_nodes.append(node)
 
+    # For each node we need the next node (to the right) at the same or
+    # shallower level. The nested forward scan below was O(S^2) -- pathological
+    # for documents with tens of thousands of outline entries. A monotonic
+    # stack (right-to-left, popping deeper levels) answers every node in O(S)
+    # total with identical semantics.
+    stack: list[int] = []
+    next_sibling_or_ancestor: list[int] = [-1] * len(all_nodes)
+    for index in range(len(all_nodes) - 1, -1, -1):
+        level = all_nodes[index].level
+        while stack and all_nodes[stack[-1]].level > level:
+            stack.pop()
+        next_sibling_or_ancestor[index] = stack[-1] if stack else -1
+        stack.append(index)
+
     for index, node in enumerate(all_nodes):
         node.page_end = page_count or node.page_start
         node.next_title = ""
-        for later in all_nodes[index + 1 :]:
-            if later.level <= node.level:
-                node.page_end = max(node.page_start or 1, (later.page_start or 1) - 1)
-                node.next_title = later.title if later.page_start == node.page_start else ""
-                break
+        later_index = next_sibling_or_ancestor[index]
+        if later_index != -1:
+            later = all_nodes[later_index]
+            node.page_end = max(node.page_start or 1, (later.page_start or 1) - 1)
+            node.next_title = later.title if later.page_start == node.page_start else ""
         if node.page_end is None:
             node.page_end = page_count
     return nodes
@@ -548,13 +562,22 @@ def toc_sections_from_pages(pages: list[PageText], *, doc_id_seed: str) -> list[
         stack.append(node)
         nodes.append(node)
     page_count = len(pages)
+    # Same next-shallower-or-equal lookup as the outline path, via a monotonic
+    # stack instead of a nested scan (O(S) total).
+    stack: list[int] = []
+    next_shallower: list[int] = [-1] * len(nodes)
+    for index in range(len(nodes) - 1, -1, -1):
+        while stack and nodes[stack[-1]].level > nodes[index].level:
+            stack.pop()
+        next_shallower[index] = stack[-1] if stack else -1
+        stack.append(index)
     for index, node in enumerate(nodes):
         node.page_end = page_count
-        for later in nodes[index + 1 :]:
-            if later.level <= node.level:
-                node.page_end = max(node.page_start or 1, (later.page_start or 1) - 1)
-                node.next_title = later.title if later.page_start == node.page_start else ""
-                break
+        later_index = next_shallower[index]
+        if later_index != -1:
+            later = nodes[later_index]
+            node.page_end = max(node.page_start or 1, (later.page_start or 1) - 1)
+            node.next_title = later.title if later.page_start == node.page_start else ""
     return roots
 
 

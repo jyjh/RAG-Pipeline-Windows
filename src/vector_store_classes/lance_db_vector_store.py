@@ -288,10 +288,12 @@ class LanceDBVectorStore:
         if not ids:
             raise ValueError("At least one record ID is required.")
         before = self.count()
-        existing = {
-            row.get("id")
-            for row in self._where(" OR ".join(f"id = {sql_string(record_id)}" for record_id in ids))
-        }
+        # Only used as an emptiness probe (raises KeyError when nothing
+        # matches); limit=1 avoids loading the matched rows.
+        existing = self._where(
+            " OR ".join(f"id = {sql_string(record_id)}" for record_id in ids),
+            limit=1,
+        )
         if not existing:
             raise KeyError(", ".join(sorted(ids)))
         self._table().delete(" OR ".join(f"id = {sql_string(record_id)}" for record_id in ids))
@@ -317,7 +319,9 @@ class LanceDBVectorStore:
             return {"deleted": 0, "remaining": self.count()}
         where = " OR ".join(clauses)
         before = self.count()
-        if not self._where(where):
+        # Existence probe only: limit=1 avoids materializing every matched
+        # row (vectors included) just to decide whether a delete is needed.
+        if not self._where(where, limit=1):
             return {"deleted": 0, "remaining": before}
         self._table().delete(where)
         self._invalidate_table()

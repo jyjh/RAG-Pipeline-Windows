@@ -672,8 +672,13 @@ def _run_parallel_ingestion(
             }
             completed = 0
             total_futures = len(futures)
+            # Drain in COMPLETION order (as_completed), not submission order:
+            # blocking on the first-submitted future meant one hung PDF delayed
+            # surfacing (and per-file failure isolation of) every already-
+            # finished document behind it. as_completed yields each future the
+            # moment it settles, so progress and results stay live.
             for future in _iter_with_progress(
-                list(futures.keys()),
+                as_completed(futures),
                 enabled=progress_enabled,
                 total=total_futures,
                 desc="Ingest documents",

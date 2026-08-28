@@ -54,7 +54,14 @@ class QueueJob:
     finished_at: str | None = None
     _cancel_event: Any = field(default_factory=threading.Event, repr=False, compare=False)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_log_tail: bool = True) -> dict[str, Any]:
+        """Serialize for API responses.
+
+        ``include_log_tail=False`` skips joining the (up to 200-line) tail.
+        The list endpoint drops the tail anyway, so leaving it out there saves
+        rebuilding every job's tail on each 2s active-job poll; the detail
+        endpoint keeps it.
+        """
         return {
             "id": self.id,
             "kind": self.kind,
@@ -72,7 +79,7 @@ class QueueJob:
             "options": dict(self.options),
             "cancel_requested": self.cancel_requested,
             "error": self.error,
-            "log_tail": "\n".join(self.log_tail),
+            "log_tail": "\n".join(self.log_tail) if include_log_tail else "",
             "log_line_count": self.log_line_count,
             "progress": dict(self.progress) if self.progress else None,
             "created_at": self.created_at,

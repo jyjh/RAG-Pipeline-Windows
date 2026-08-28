@@ -1292,8 +1292,14 @@ class RagJobQueue:
             return job.to_dict() if job else None
 
     def list_jobs(self) -> list[dict[str, Any]]:
+        # Log tails are excluded: /api/jobs strips them from every row anyway
+        # (the UI hydrates open logs from /api/jobs/{id}), so joining up to
+        # 200 lines per job on every poll is pure waste.
         with self._condition:
-            return [job.to_dict() for job in reversed(list(self._jobs.values()))]
+            return [
+                job.to_dict(include_log_tail=False)
+                for job in reversed(list(self._jobs.values()))
+            ]
 
     def recover_pending_uploads(self, *, auto_start: bool = True) -> dict[str, Any]:
         jobs = self._recovery_jobs_from_registry()

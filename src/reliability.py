@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 from pathlib import Path
@@ -70,12 +71,32 @@ def source_group_is_assignable(value: Any) -> bool:
     return bool(source_group_details(value).get("assignable"))
 
 
+# The query engine is constructed per chat request and reads the trust map
+# each time, so the O(corpdocs) parse runs on the hot retrieval path. Cache
+# the normalized map keyed on the file's (mtime_ns, size) signature -- the
+# same trick the PDF registry and asset manifest use -- so unchanged files
+# cost one stat() per query instead of a full read+parse.
+_SOURCE_GROUP_CACHE_LOCK = threading.Lock()
+_SOURCE_GROUP_CACHE: dict[str, tuple[tuple[int, int], dict[str, dict[str, Any]]]] = {}
+_SOURCE_GROUP_CACHE_MAX = 8
+
+
 def load_source_group_map(path: str | Path | None) -> dict[str, dict[str, Any]]:
     if path is None:
         return {}
     trust_path = Path(path)
-    if not trust_path.exists():
+    key = str(trust_path)
+    try:
+        stat = trust_path.stat()
+    except OSError:
+        with _SOURCE_GROUP_CACHE_LOCK:
+            _SOURCE_GROUP_CACHE.pop(key, None)
         return {}
+    signature = (stat.st_mtime_ns, stat.st_size)
+    with _SOURCE_GROUP_CACHE_LOCK:
+        cached = _SOURCE_GROUP_CACHE.get(key)
+        if cached is not None and cached[0] == signature:
+            return dict(cached[1])
     try:
         payload = json.loads(trust_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -93,4 +114,11 @@ def load_source_group_map(path: str | Path | None) -> dict[str, dict[str, Any]]:
             continue
         details = source_group_details(entry.get("source_group"))
         groups[str(source_hash)] = details
-    return groups
+    with _SOURCE_GROUP_CACHE_LOCK:
+        # Do not cache against a corrupt parse: a later repair must be
+        # observed (an empty parse is a legitimate result, so it may cache).
+        if groups or not documents:
+            _SOURCE_GROUP_CACHE[key] = (signature, groups)
+            while len(_SOURCE_GROUP_CACHE) > _SOURCE_GROUP_CACHE_MAX:
+                _SOURCE_GROUP_CACHE.pop(next(iter(_SOURCE_GROUP_CACHE)))
+    return dict(groups)
