@@ -341,7 +341,7 @@ class LocalVectorIndexer:
             # build. The next checkpoint attempt will overwrite this one.
             pass
 
-    def index_markdown(self, markdown_dir: str, *, resume: bool = False) -> None:
+    def index_markdown(self, markdown_dir: str, *, resume: bool = False, only_sources: set[str] | None = None) -> None:
         """Build the index one Markdown file at a time.
 
         Streaming model: each file is sectioned, embedded, and written
@@ -350,6 +350,12 @@ class LocalVectorIndexer:
         whole corpus. A single file that fails (e.g. an embedding error after
         retries) is recorded in the index summary and skipped; only an all-fail
         run aborts, so the staged build's failure keeps the live index intact.
+
+        ``only_sources`` restricts the build to the Markdown of the given
+        source hashes (first index into a freshly-created category directory:
+        the category must receive ONLY its own sources, never the whole
+        corpus). An empty intersection raises -- silently building an empty
+        index would look like a successful job with missing content.
 
         When ``resume=True`` and a valid checkpoint exists in the working dir
         (written by a prior interrupted run of this same build), files already
@@ -361,6 +367,20 @@ class LocalVectorIndexer:
         """
         os.makedirs(self.working_dir, exist_ok=True)
         files = sorted(Path(markdown_dir).glob("*.md"))
+        if only_sources:
+            from src.pdf_registry import source_entry_for_markdown
+
+            wanted = {str(value).strip() for value in only_sources if str(value).strip()}
+            files = [
+                file_path
+                for file_path in files
+                if str(source_entry_for_markdown(file_path).get("source_hash") or "") in wanted
+            ]
+            if not files:
+                raise RuntimeError(
+                    "No Markdown found for the requested source(s); cannot build a "
+                    "category index with no content."
+                )
         _status(f"Local index: found {len(files)} Markdown file(s).", enabled=self.progress_enabled)
 
         backend = (self.index_backend or "lancedb").lower()
@@ -747,7 +767,12 @@ class LocalVectorIndexer:
         """Replace only selected sources in an existing live LanceDB table.
 
         This is the upload/reindex-source path. A missing table falls back to a
-        full build because there is no unaffected corpus to preserve.
+        scoped first build covering ONLY the requested sources -- for a freshly
+        created category directory this is what seeds it with its own documents
+        (a full-corpus build there would duplicate every other category's
+        content). For the default index the fallback is equivalent to the
+        historical full-build behavior whenever the requested set is the whole
+        corpus; otherwise it, too, stays scoped to the request.
         """
         requested = {str(value).strip() for value in source_hashes if str(value).strip()}
         if not requested:
@@ -755,7 +780,7 @@ class LocalVectorIndexer:
 
         store = LanceDBVectorStore(self.working_dir)
         if not store.exists():
-            self.index_markdown(markdown_dir)
+            self.index_markdown(markdown_dir, only_sources=requested)
             return
 
         self._preflight_embeddings()

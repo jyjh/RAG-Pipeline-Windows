@@ -66,6 +66,14 @@ const state = {
   adminKeysAuthorized: null,
   pdfGroupFilter: "all",
   pdfTrustFilter: "all",
+  // Category ("split databases") state. categoriesCache mirrors /api/categories;
+  // chatSelectedCategories === null means "search all categories", an array is
+  // an explicit subset (possibly empty = none, e.g. web-only answers).
+  categoriesCache: [],
+  categoriesLoaded: false,
+  pdfCategoryFilter: "all",
+  indexCategory: "general",
+  chatSelectedCategories: null,
   chatSequenceKey: "",
   composerSettingsFrame: 0,
   appSidebarCollapsed: false,
@@ -135,6 +143,7 @@ const els = {
   fileInput: document.getElementById("fileInput"),
   selectedFilesLabel: document.getElementById("selectedFilesLabel"),
   uploadGroupsPanel: document.getElementById("uploadGroupsPanel"),
+  uploadCategorySelect: document.getElementById("uploadCategorySelect"),
   uploadButton: document.getElementById("uploadButton"),
   reindexButton: document.getElementById("reindexButton"),
   reingestButton: document.getElementById("reingestButton"),
@@ -154,6 +163,7 @@ const els = {
   pdfSearchButton: document.getElementById("pdfSearchButton"),
   pdfGroupFilterSelect: document.getElementById("pdfGroupFilterSelect"),
   pdfTrustFilterSelect: document.getElementById("pdfTrustFilterSelect"),
+  pdfCategoryFilterSelect: document.getElementById("pdfCategoryFilterSelect"),
   pdfAutoTagButton: document.getElementById("pdfAutoTagButton"),
   reviewerNameInput: document.getElementById("reviewerNameInput"),
   libraryStatus: document.getElementById("libraryStatus"),
@@ -259,7 +269,16 @@ const els = {
   pdfBulkActionBar: document.getElementById("pdfBulkActionBar"),
   pdfBulkCountLabel: document.getElementById("pdfBulkCountLabel"),
   pdfBulkTagButton: document.getElementById("pdfBulkTagButton"),
+  pdfBulkCategorySelect: document.getElementById("pdfBulkCategorySelect"),
+  pdfBulkMoveButton: document.getElementById("pdfBulkMoveButton"),
   pdfBulkClearButton: document.getElementById("pdfBulkClearButton"),
+  indexCategorySelect: document.getElementById("indexCategorySelect"),
+  chatCategoryChips: document.getElementById("chatCategoryChips"),
+  adminCategoriesStatus: document.getElementById("adminCategoriesStatus"),
+  adminCategoryKeyInput: document.getElementById("adminCategoryKeyInput"),
+  adminCategoryCreateButton: document.getElementById("adminCategoryCreateButton"),
+  adminCategoriesRefreshButton: document.getElementById("adminCategoriesRefreshButton"),
+  adminCategoriesBody: document.getElementById("adminCategoriesBody"),
   toastStack: document.getElementById("toastStack"),
 };
 
@@ -575,7 +594,7 @@ function newUploadId() {
 // resumes. Returns the completion response.
 async function uploadFileChunked(
   file,
-  { sourceGroup = "", forceDuplicates = false, forceToken = "", onProgress = null } = {},
+  { sourceGroup = "", category = "", forceDuplicates = false, forceToken = "", onProgress = null } = {},
 ) {
   const totalSize = file.size;
   const chunkSize = CHUNKED_UPLOAD_CHUNK_SIZE;
@@ -612,6 +631,7 @@ async function uploadFileChunked(
 
   const completeBody = { upload_id: uploadId, filename: file.name };
   if (sourceGroup) completeBody.source_groups = sourceGroup;
+  if (category && category !== "general") completeBody.category = category;
   if (forceDuplicates) {
     // Mirrors the single-POST path: without this a forced duplicate of a
     // large file uploads every byte and then fails with 409 at complete.
@@ -2531,6 +2551,7 @@ async function refreshPdfs(options = {}) {
       search: state.pdfSearch,
       source_group: state.pdfGroupFilter || "all",
       trust_status: state.pdfTrustFilter || "all",
+      category: state.pdfCategoryFilter || "all",
     });
     const url = `/api/pdfs?${params}`;
     const data = await requestJson(url);
@@ -2567,6 +2588,235 @@ async function refreshPdfs(options = {}) {
     }
   } catch (error) {
     setStatus(els.libraryStatus, error.message, true);
+  }
+}
+
+async function refreshCategories(options = {}) {
+  // Lightweight registry fetch backing every category control (upload target,
+  // Library facet, Review picker, Ask chips, Admin manager). Failures leave
+  // the current controls alone — category state is an enhancement, never a
+  // hard dependency for the rest of the UI.
+  try {
+    const data = await requestJson("/api/categories");
+    state.categoriesCache = Array.isArray(data.categories) ? data.categories : [];
+    state.categoriesLoaded = true;
+    renderCategoryControls();
+    renderAdminCategories();
+    if (options.onLoaded) options.onLoaded();
+  } catch (error) {
+    if (options.quiet !== false) return;
+    setStatus(els.adminCategoriesStatus, error.message, true);
+  }
+}
+
+function categoryLabel(key) {
+  const entry = state.categoriesCache.find((item) => item.key === key);
+  return entry ? entry.label || entry.key : key;
+}
+
+function customCategoryEntries() {
+  return state.categoriesCache.filter((entry) => entry.key !== "general");
+}
+
+function _populateCategorySelect(select, { value, includeAll = false, allLabel }) {
+  if (!select) return;
+  const previous = value !== undefined ? value : select.value;
+  const options = [];
+  if (includeAll) {
+    options.push({ value: "all", label: allLabel || "All categories" });
+  }
+  options.push({ value: "general", label: "General" });
+  for (const entry of customCategoryEntries()) {
+    options.push({ value: entry.key, label: entry.label || entry.key });
+  }
+  select.replaceChildren(
+    ...options.map((option) => {
+      const node = document.createElement("option");
+      node.value = option.value;
+      node.textContent = option.label;
+      return node;
+    })
+  );
+  const values = new Set(options.map((option) => option.value));
+  select.value = values.has(previous) ? previous : (includeAll ? "all" : "general");
+}
+
+function renderCategoryControls() {
+  _populateCategorySelect(els.uploadCategorySelect, {});
+  _populateCategorySelect(els.pdfCategoryFilterSelect, {
+    value: state.pdfCategoryFilter,
+    includeAll: true,
+    allLabel: "All categories",
+  });
+  _populateCategorySelect(els.pdfBulkCategorySelect, { value: "general" });
+  _populateCategorySelect(els.indexCategorySelect, { value: state.indexCategory });
+  renderChatCategoryChips();
+}
+
+function renderChatCategoryChips() {
+  const container = els.chatCategoryChips;
+  if (!container) return;
+  const custom = customCategoryEntries();
+  if (!custom.length) {
+    container.hidden = true;
+    container.replaceChildren();
+    return;
+  }
+  container.hidden = false;
+  const selected = state.chatSelectedCategories;
+  const chip = (label, title, active, onClick) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `category-chip${active ? " category-chip-active" : ""}`;
+    button.textContent = label;
+    button.title = title;
+    button.addEventListener("click", onClick);
+    return button;
+  };
+  const allActive = !Array.isArray(selected);
+  const nodes = [
+    chip(
+      allActive ? "All categories" : "All",
+      "Search every category (default)",
+      allActive,
+      () => {
+        state.chatSelectedCategories = null;
+        renderChatCategoryChips();
+      },
+    ),
+  ];
+  for (const entry of custom) {
+    const active = Array.isArray(selected) && selected.includes(entry.key);
+    nodes.push(
+      chip(
+        `${active ? "✓ " : ""}${entry.label || entry.key}`,
+        `Toggle searching "${entry.label || entry.key}"`,
+        active,
+        () => {
+          const current = new Set(Array.isArray(state.chatSelectedCategories) ? state.chatSelectedCategories : []);
+          if (current.has(entry.key)) {
+            current.delete(entry.key);
+          } else {
+            current.add(entry.key);
+          }
+          // An empty explicit set would search nothing local; treat "untick
+          // the last one" as back to All instead of a surprising no-context answer.
+          state.chatSelectedCategories = current.size ? Array.from(current) : null;
+          renderChatCategoryChips();
+        },
+      ),
+    );
+  }
+  container.replaceChildren(...nodes);
+}
+
+async function bulkMoveSelectedToCategory() {
+  const hashes = Array.from(state.selectedPdfHashes);
+  const target = (els.pdfBulkCategorySelect && els.pdfBulkCategorySelect.value) || "general";
+  if (!hashes.length) {
+    setStatus(els.libraryStatus, "Select documents to move first.", true);
+    return;
+  }
+  const ok = await confirmAction(
+    `Move ${hashes.length} document(s) to "${categoryLabel(target)}"?`,
+    "Vectors are reused, so moving does not re-embed. The documents become searchable under the new category (and no longer under the old one).",
+    "Move",
+  );
+  if (!ok) {
+    return;
+  }
+  try {
+    els.pdfBulkMoveButton.disabled = true;
+    await requestJson("/api/pdfs/categories/bulk", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_hashes: hashes, category: target }),
+    });
+    showToast(`Moving ${hashes.length} document(s) to ${categoryLabel(target)}.`);
+    clearPdfSelection();
+    state.jobsOffset = 0;
+    await refreshJobs({ force: true });
+    await refreshPdfs({ force: true });
+    await refreshCategories();
+  } catch (error) {
+    setStatus(els.libraryStatus, error.message, true);
+  } finally {
+    els.pdfBulkMoveButton.disabled = false;
+  }
+}
+
+function renderAdminCategories() {
+  const body = els.adminCategoriesBody;
+  if (!body) return;
+  const entries = state.categoriesCache.length
+    ? state.categoriesCache
+    : [{ key: "general", label: "General", source_count: 0, record_count: 0, exists: false }];
+  body.replaceChildren(
+    ...entries.map((entry) => {
+      const row = document.createElement("tr");
+      const isGeneral = entry.key === "general";
+      const embedding = entry.embedding_model
+        ? `${escapeHtml(String(entry.embedding_model))} (${Number(entry.embedding_dim || 0)}d)`
+        : entry.exists
+          ? "unknown"
+          : "—";
+      row.innerHTML = `
+        <td><code>${escapeHtml(entry.key)}</code></td>
+        <td>${escapeHtml(entry.label || entry.key)}</td>
+        <td>${Number(entry.source_count || 0)}</td>
+        <td>${Number(entry.record_count || 0)}</td>
+        <td>${embedding}</td>
+        <td>${
+          isGeneral
+            ? '<span class="hint">default index</span>'
+            : `<button type="button" data-category-action="delete" data-category-key="${escapeHtml(entry.key)}">Delete</button>`
+        }</td>
+      `;
+      return row;
+    })
+  );
+}
+
+async function createCategoryFromAdmin() {
+  const input = els.adminCategoryKeyInput;
+  const name = (input && input.value || "").trim();
+  if (!name) {
+    setStatus(els.adminCategoriesStatus, "Enter a category name first.", true);
+    return;
+  }
+  try {
+    els.adminCategoryCreateButton.disabled = true;
+    await requestJson("/api/categories", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: name, label: name }),
+    });
+    input.value = "";
+    setStatus(els.adminCategoriesStatus, `Created category "${name}".`);
+    await refreshCategories();
+  } catch (error) {
+    setStatus(els.adminCategoriesStatus, error.message, true);
+  } finally {
+    els.adminCategoryCreateButton.disabled = false;
+  }
+}
+
+async function deleteCategoryFromAdmin(key) {
+  const ok = await confirmAction(
+    `Delete category "${categoryLabel(key)}"?`,
+    "Only empty categories can be deleted. Move its documents back to General first (Library → select → Move to). The category's index directory is removed too.",
+    "Delete category",
+    { danger: true, requireText: "DELETE" },
+  );
+  if (!ok) {
+    return;
+  }
+  try {
+    await requestJson(`/api/categories/${encodeURIComponent(key)}`, { method: "DELETE" });
+    setStatus(els.adminCategoriesStatus, `Deleted category "${key}".`);
+    await refreshCategories();
+  } catch (error) {
+    setStatus(els.adminCategoriesStatus, error.message, true);
   }
 }
 
@@ -3112,6 +3362,9 @@ async function uploadFiles(forceDuplicates = false, forceToken = "") {
   if (sourceGroups === null) {
     return;
   }
+  // Whole batch targets one category ("split databases"); General is "".
+  const uploadCategory =
+    (els.uploadCategorySelect && els.uploadCategorySelect.value) || "general";
 
   els.uploadButton.disabled = true;
   els.forceUploadButton.disabled = true;
@@ -3129,6 +3382,9 @@ async function uploadFiles(forceDuplicates = false, forceToken = "") {
     body.append("files", file);
     if (sourceGroups[index]) {
       body.append("source_groups", sourceGroups[index]);
+    }
+    if (uploadCategory && uploadCategory !== "general") {
+      body.append("category", uploadCategory);
     }
     if (isForced) {
       body.append("force_duplicates", "true");
@@ -3148,6 +3404,7 @@ async function uploadFiles(forceDuplicates = false, forceToken = "") {
       if (file.size >= CHUNKED_UPLOAD_THRESHOLD) {
         result = await uploadFileChunked(file, {
           sourceGroup: sourceGroups[index] || "",
+          category: uploadCategory,
           forceDuplicates: isForced,
           forceToken,
           onProgress(progress) {
@@ -3638,6 +3895,7 @@ async function loadIndex() {
     offset: String(state.offset),
     limit: String(state.limit),
     search: state.search,
+    category: state.indexCategory || "general",
   });
   const url = `/api/index/summaries?${params}`;
   try {
@@ -3686,6 +3944,7 @@ async function loadAllIndexSummaries(load) {
     offset: "0",
     limit: "0",
     search: state.search,
+    category: state.indexCategory || "general",
   });
   const url = `/api/index/summaries?${params}`;
 
@@ -4050,6 +4309,7 @@ async function runIndexVectorSearch() {
       body: JSON.stringify({
         query,
         relevance_floor: relevanceFloor,
+        category: state.indexCategory || "general",
       }),
     });
     if (!isActiveIndexLoad(load)) {
@@ -4124,6 +4384,7 @@ async function loadIndexChildren(parentRow, offset = 0, toggleButton = null) {
     offset: String(offset),
     limit: String(INDEX_CHILD_BATCH_SIZE),
     search: state.search,
+    category: state.indexCategory || "general",
   });
   const existingRows = indexRowsForParent(parentId).filter(
     (row) => !row.classList.contains("index-load-more-row")
@@ -5113,6 +5374,10 @@ async function runChatExchange(chat, question, { announceUser = true } = {}) {
         llm_num_predict: Math.trunc(numericSetting(els.maxOutputInput, 4096, 1)),
         retrieval_min_score: numericSetting(els.relevanceFloorInput, 0.5, 0),
         web_search_enabled: Boolean(els.webSearchInput.checked),
+        // Explicit category subset; omitted entirely = search all categories.
+        ...(Array.isArray(state.chatSelectedCategories)
+          ? { categories: state.chatSelectedCategories }
+          : {}),
       }),
     });
     // With API keys configured the chat POST can 401 like any other request;
@@ -5450,6 +5715,11 @@ function activateTab(tabTarget, options = {}) {
     }
     state.uploadDataDirty = false;
   }
+  if (tabTarget === "upload" || tabTarget === "chat") {
+    // Keep category controls current where they are most visible; quiet on
+    // failure so an offline registry never blocks tab use.
+    refreshCategories();
+  }
   if (tabTarget === "admin") {
     refreshAdminPanel({ force: options.forceRefresh === true });
   }
@@ -5683,6 +5953,7 @@ async function refreshAdminApiKeys(options = {}) {
 function refreshAdminPanel(options = {}) {
   refreshOpsDashboard(options);
   refreshAdminApiKeys(options);
+  refreshCategories({ quiet: false });
 }
 
 function showGeneratedKeyDialog(fullKey) {
@@ -6470,6 +6741,38 @@ if (els.pdfTrustFilterSelect) {
     refreshPdfs({ force: true });
   });
 }
+if (els.pdfCategoryFilterSelect) {
+  els.pdfCategoryFilterSelect.addEventListener("change", () => {
+    state.pdfCategoryFilter = els.pdfCategoryFilterSelect.value || "all";
+    state.pdfOffset = 0;
+    refreshPdfs({ force: true });
+  });
+}
+if (els.indexCategorySelect) {
+  els.indexCategorySelect.addEventListener("change", () => {
+    state.indexCategory = els.indexCategorySelect.value || "general";
+    state.offset = 0;
+    loadIndex();
+  });
+}
+if (els.pdfBulkMoveButton) {
+  els.pdfBulkMoveButton.addEventListener("click", bulkMoveSelectedToCategory);
+}
+if (els.adminCategoryCreateButton) {
+  els.adminCategoryCreateButton.addEventListener("click", createCategoryFromAdmin);
+}
+if (els.adminCategoriesRefreshButton) {
+  els.adminCategoriesRefreshButton.addEventListener("click", () => refreshCategories());
+}
+if (els.adminCategoriesBody) {
+  els.adminCategoriesBody.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-category-action]");
+    if (!button) return;
+    if (button.dataset.categoryAction === "delete") {
+      deleteCategoryFromAdmin(button.dataset.categoryKey || "");
+    }
+  });
+}
 if (els.pdfPreviewCloseButton) {
   els.pdfPreviewCloseButton.addEventListener("click", closePdfPreview);
 }
@@ -6801,6 +7104,9 @@ refreshUpdateStatus();
 // Hydrate job state immediately (from any tab) so the global jobs strip and
 // completion tracking are correct on first paint instead of one poll late.
 refreshJobs({ force: true });
+// Category registry backs the upload target, Library facet, Review picker,
+// Ask chips, and the Admin manager.
+refreshCategories();
 scheduleHealthPolling();
 scheduleUpdatePolling();
 scheduleJobsPolling();

@@ -14,6 +14,8 @@ bind_module_namespace(
 
 class IndexVectorSearchRequest(BaseModel):
     query: str = Field(min_length=1)
+    # Which category index to search; empty = the default General index.
+    category: str = ""
     relevance_floor: float = Field(DEFAULT_INDEX_VECTOR_RELEVANCE_FLOOR, ge=0, le=1)
     embedding_model: str | None = CONFIGURED_EMBEDDING_MODEL
     embedding_batch_size: int | None = Field(DEFAULT_EMBEDDING_BATCH_SIZE, ge=1, le=256)

@@ -115,6 +115,14 @@ from src.pdf_registry import (
     sha256_file,
     source_map_state_version,
 )
+from src.categories import (
+    GENERAL_CATEGORY_KEY,
+    CategoryStore,
+    categories_path,
+    category_db_dir,
+    normalize_category_key,
+    slugify_category_key,
+)
 from src import auto_tag
 from src.auto_tag import AutoTagInput
 from src.reliability import (
@@ -774,6 +782,93 @@ def _index_store(db_dir: Path | None = None):
             store = default_store(resolved)
             _INDEX_STORE_CACHE[resolved] = store
         return store
+
+
+# --- Categories ("split databases") -----------------------------------------
+# Each category is an independent LanceDB working directory. General IS DB_DIR;
+# custom categories live at DB_DIR/categories/<key>. The registry (category
+# rows + per-source membership) is SQLite under DATA_DIR. Resolution goes
+# through the module globals at call time so tests can isolate by patching
+# DATA_DIR/DB_DIR.
+
+def _category_store(data_dir: Path | None = None) -> CategoryStore:
+    return CategoryStore(data_dir or DATA_DIR)
+
+
+def _resolve_category_db_dir(key: str, *, anchor_db_dir: Path | None = None) -> Path:
+    """Validate a client-supplied category key and resolve its index directory.
+
+    An empty value (the default for every endpoint) means General and resolves
+    to the anchor without touching the registry, so pre-category clients keep
+    working unchanged. Malformed or unknown non-empty keys raise 400.
+    """
+    text = str(key or "").strip().lower()
+    anchor = Path(anchor_db_dir or DB_DIR)
+    if not text or text == GENERAL_CATEGORY_KEY:
+        return category_db_dir(anchor, GENERAL_CATEGORY_KEY)
+    normalized = normalize_category_key(text)
+    if _category_store().get_category(normalized) is None:
+        raise HTTPException(status_code=400, detail=f"Unknown category: {normalized}")
+    return category_db_dir(anchor, normalized)
+
+
+def _resolve_chat_categories(keys: list[str] | None) -> list[dict[str, Any]]:
+    """Resolve a chat request's category selection into category entries.
+
+    Empty selection (or an explicit "all") searches every category. Selection
+    order is preserved and duplicates collapsed; unknown keys fail the request
+    rather than being silently dropped.
+    """
+    entries = _category_store().list_categories(anchor_db_dir=DB_DIR)
+    requested = [str(value or "").strip().lower() for value in (keys or []) if str(value or "").strip()]
+    if not requested or "all" in requested:
+        return entries
+    by_key = {str(entry["key"]): entry for entry in entries}
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for key in requested:
+        if key not in by_key:
+            raise HTTPException(status_code=400, detail=f"Unknown category: {key}")
+        if key not in seen:
+            seen.add(key)
+            selected.append(by_key[key])
+    return selected
+
+
+def _sanitize_upload_category(raw: Any) -> str:
+    """Validated category key for upload options; '' means General.
+
+    Lenient by design: an invalid or since-deleted category must not fail the
+    upload (options are persisted into the registry and replayed by
+    reprocess/recovery), it degrades to the default index with a warning.
+    """
+    text = str(raw or "").strip().lower()
+    if not text or text == GENERAL_CATEGORY_KEY:
+        return ""
+    try:
+        key = normalize_category_key(text)
+    except ValueError:
+        logger.warning("Ignoring invalid upload category %r; indexing into General.", raw)
+        return ""
+    if _category_store().get_category(key) is None:
+        logger.warning("Ignoring unknown upload category %r; indexing into General.", key)
+        return ""
+    return key
+
+
+def _all_index_db_dirs(anchor_db_dir: Path | None = None) -> list[Path]:
+    """Every category index directory that may hold rows: the anchor plus any
+    category subdirectory present on disk (the scan, not the registry, is the
+    source of truth here so a delete sweeps leftovers too)."""
+    anchor = Path(anchor_db_dir or DB_DIR)
+    dirs = [anchor]
+    custom_root = anchor / "categories"
+    try:
+        if custom_root.exists():
+            dirs.extend(path for path in sorted(custom_root.iterdir()) if path.is_dir())
+    except OSError:
+        pass
+    return dirs
 
 
 def _background_worker_threads() -> int:
@@ -3358,6 +3453,7 @@ def list_pdf_documents(
     limit: int | None = None,
     source_group: str = "",
     trust_status: str = "",
+    category: str = "",
     registry_path: Path | None = None,
     processed_dir: Path | None = None,
     root_dir: Path = ROOT_DIR,
@@ -3368,11 +3464,20 @@ def list_pdf_documents(
     trust_documents = trust_payload.get("documents", {}) if isinstance(trust_payload.get("documents"), dict) else {}
 
     fields = _pdf_source_fields(registry_path=registry_path, processed_dir=processed_dir)
+    # Category membership ("general" when no row exists) resolves once for the
+    # whole corpus so the row field and the facet filter can never disagree.
+    # The store anchors at the module DATA_DIR (call-time global, like
+    # registry_path below) so tests can redirect the workspace.
+    try:
+        category_by_hash = _category_store().memberships_for(list(fields.keys()))
+    except Exception:
+        category_by_hash = {}
 
     rows: list[dict[str, Any]] = []
     trust_by_hash: dict[str, dict[str, Any]] = {}
     for source_hash, item in fields.items():
         row = {"hash": source_hash, **item}
+        row["category"] = category_by_hash.get(source_hash, GENERAL_CATEGORY_KEY)
         if str(row.get("status") or "") == "indexed" and not _index_manifest_stats(row, manifest):
             row["status"] = "not_indexed"
         trust_by_hash[source_hash] = _normalize_trust_entry(source_hash, trust_documents.get(source_hash))
@@ -3412,6 +3517,13 @@ def list_pdf_documents(
             if str(trust_by_hash[str(item.get("hash") or "")].get("review_status") or "unreviewed")
             == status_filter
         ]
+    category_filter = (category or "").strip().lower()
+    if category_filter and category_filter != "all":
+        rows = [
+            item
+            for item in rows
+            if str(item.get("category") or GENERAL_CATEGORY_KEY) == category_filter
+        ]
     page = _page_slice(rows, offset=offset, limit=limit)
 
     # Enrich (path stats, trust, markdown quality) only the rows on the page so
@@ -3435,6 +3547,7 @@ def list_pdf_documents(
             data_dir=data_dir,
         )
         item["trust"] = trust
+        item["category"] = str(row.get("category") or GENERAL_CATEGORY_KEY)
         item["quality"] = _document_quality(item, manifest=manifest, trust=trust, root_dir=root_dir)
         page_rows.append(item)
     return {
@@ -3570,23 +3683,32 @@ def _delete_source_vectors(
 ) -> dict[str, Any]:
     resolved_db_dir = Path(db_dir or DB_DIR)
     legacy_paths, legacy_doc_ids = _legacy_delete_identifiers(source_hash, document, source_entries)
+    # Sweep every category index: a source's rows live in exactly one category
+    # in steady state, but a mid-transfer crash can leave copies in two, and a
+    # delete must not leave either behind.
+    deleted_total = 0
+    remaining_total = 0
     with INDEX_LOCK:
-        store = _index_store(resolved_db_dir)
-        if not store.exists():
-            return {"deleted": 0, "remaining": 0}
-        result = store.delete_records_by_source_hash(
-            source_hashes=[source_hash],
-            legacy_file_paths=legacy_paths,
-            legacy_doc_ids=legacy_doc_ids,
-        )
-        model, dim = store.metadata()
-        update_index_manifest_sources(
-            resolved_db_dir,
-            {source_hash: []},
-            embedding_model=model,
-            embedding_dim=dim,
-        )
-        return result
+        for sweep_dir in _all_index_db_dirs(resolved_db_dir):
+            store = _index_store(sweep_dir)
+            if not store.exists():
+                continue
+            result = store.delete_records_by_source_hash(
+                source_hashes=[source_hash],
+                legacy_file_paths=legacy_paths,
+                legacy_doc_ids=legacy_doc_ids,
+            )
+            if int(result.get("deleted") or 0):
+                model, dim = store.metadata()
+                update_index_manifest_sources(
+                    sweep_dir,
+                    {source_hash: []},
+                    embedding_model=model,
+                    embedding_dim=dim,
+                )
+            deleted_total += int(result.get("deleted") or 0)
+            remaining_total += int(result.get("remaining") or 0)
+    return {"deleted": deleted_total, "remaining": remaining_total}
 
 
 def _delete_processed_markdown_files(
@@ -3729,6 +3851,11 @@ def delete_pdf_document(
         db_dir=db_dir,
     )
     clear_overrides_for_sources(Path(db_dir or DB_DIR), {source_hash})
+    try:
+        # Drop the membership row too; a deleted document belongs to no category.
+        _category_store().set_memberships([source_hash], GENERAL_CATEGORY_KEY)
+    except ValueError:
+        pass
     markdown_deleted = _delete_processed_markdown_files(
         source_entries,
         processed_dir=processed_dir,
@@ -5009,6 +5136,9 @@ def render_markdown(payload: RenderRequest):
 
 def _upload_options_from_form(form: Any) -> dict[str, Any]:
     return {
+        # Target category ("split databases"); "" = General. Validated here so
+        # persisted registry options always carry a known key (or "").
+        "category": _sanitize_upload_category(form.get("category")),
         # Client-supplied paths are contained to the workspace; the executable
         # path is NEVER client-controlled (it is executed by the OCR backend).
         "asset_dir": _contained_client_path(
@@ -6026,6 +6156,8 @@ async def complete_chunked_upload(request: Request):
         "source_group": source_group,
     }]
     options = _default_upload_options()
+    if payload.get("category") is not None:
+        options["category"] = _sanitize_upload_category(payload.get("category"))
     try:
         PdfRegistry(PDF_REGISTRY_PATH).register_queued(
             job_id=job_id,
@@ -6219,6 +6351,149 @@ def cancel_job(job_id: str):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+# --- Categories ("split databases") -----------------------------------------
+
+
+class BulkCategoryMoveRequest(BaseModel):
+    source_hashes: list[str] = Field(min_length=1)
+    category: str
+
+
+def _category_listing() -> dict[str, Any]:
+    """Category rows with per-index stats for the Admin/Library surfaces."""
+    entries = _category_store().list_categories(anchor_db_dir=DB_DIR)
+    counts = _category_store().membership_counts()
+    total_sources = len(_pdf_source_fields(registry_path=PDF_REGISTRY_PATH, processed_dir=PROCESSED_DIR))
+    listing: list[dict[str, Any]] = []
+    with INDEX_LOCK:
+        for entry in entries:
+            item = dict(entry)
+            key = str(item["key"])
+            if key == GENERAL_CATEGORY_KEY:
+                # General membership is the absence of a row.
+                item["source_count"] = max(0, total_sources - sum(int(v) for v in counts.values()))
+            else:
+                item["source_count"] = int(counts.get(key, 0))
+            dir_path = Path(item.get("db_dir") or "")
+            store = _index_store(dir_path)
+            if store.exists():
+                item["record_count"] = store.count()
+                model, dim = store.metadata()
+                item["embedding_model"] = model
+                item["embedding_dim"] = dim
+            else:
+                item["record_count"] = 0
+            listing.append(item)
+    return {"categories": listing, "total_sources": total_sources}
+
+
+@app.get("/api/categories")
+def list_categories(request: Request):
+    seed = _scoped_signature(
+        _signature_from_parts(
+            "cats:" + _category_store().state_version(),
+            "reg:" + registry_state_version(PDF_REGISTRY_PATH),
+            _file_signature(DB_DIR / INDEX_MANIFEST_FILENAME),
+        ),
+    )
+    if not_modified := _not_modified_or_etag(request, seed):
+        return not_modified
+    return _etagged_json(request, _category_listing(), seed)
+
+
+@app.post("/api/categories")
+async def create_category(request: Request):
+    payload = await _optional_json(request)
+    try:
+        # Free-form names are slugged ("Team A" -> "team-a"); the label keeps
+        # the user's original text.
+        entry = _category_store().create_category(
+            slugify_category_key(payload.get("key")), payload.get("label")
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    entry = dict(entry)
+    entry["db_dir"] = str(category_db_dir(DB_DIR, str(entry["key"])))
+    entry["exists"] = False
+    return {"category": entry}
+
+
+@app.post("/api/categories/{key}/label")
+async def rename_category(key: str, request: Request):
+    payload = await _optional_json(request)
+    try:
+        entry = _category_store().rename_category(key, payload.get("label"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"category": entry}
+
+
+@app.delete("/api/categories/{key}")
+def delete_category(key: str):
+    blocker = _index_mutation_blocker()
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
+    try:
+        _category_store().delete_category(key)
+    except ValueError as exc:
+        text = str(exc)
+        status = 404 if text.startswith("Unknown category") else 409
+        raise HTTPException(status_code=status, detail=text) from exc
+    normalized = normalize_category_key(key)
+    dir_path = category_db_dir(DB_DIR, normalized)
+    if dir_path != Path(DB_DIR) and dir_path.exists():
+        try:
+            _remove_path(dir_path)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Category removed from the registry, but its index directory "
+                f"could not be deleted: {exc}",
+            ) from exc
+    with _INDEX_CACHE_LOCK:
+        _INDEX_STORE_CACHE.pop(str(dir_path), None)
+    return {"deleted": True, "key": normalized}
+
+
+@app.post("/api/pdfs/categories/bulk")
+def move_pdf_categories(payload: BulkCategoryMoveRequest):
+    """Queue a transfer of documents into a category (reuses vectors, so a
+    move costs no re-embedding). ``category`` "general" moves back to the
+    default index."""
+    blocker = _index_mutation_blocker()
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
+    try:
+        target_key = normalize_category_key(payload.category)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if target_key != GENERAL_CATEGORY_KEY and _category_store().get_category(target_key) is None:
+        raise HTTPException(status_code=400, detail=f"Unknown category: {target_key}")
+
+    hashes: list[str] = []
+    seen: set[str] = set()
+    failed: list[dict[str, str]] = []
+    for raw_hash in payload.source_hashes:
+        source_hash = str(raw_hash or "").strip()
+        if not source_hash:
+            failed.append({"source_hash": source_hash, "error": "source_hash cannot be empty"})
+            continue
+        if source_hash in seen:
+            continue
+        seen.add(source_hash)
+        if not _pdf_row_for_hash(source_hash):
+            failed.append({"source_hash": source_hash, "error": "Unknown source hash."})
+            continue
+        hashes.append(source_hash)
+    if not hashes:
+        raise HTTPException(status_code=400, detail="At least one known source hash is required.")
+
+    job = job_queue.enqueue_transfer_sources(source_hashes=hashes, target_category=target_key)
+    response = job.to_dict()
+    response["failed"] = failed
+    return response
+
+
 @app.get("/api/pdfs")
 def pdf_documents(
     request: Request,
@@ -6227,16 +6502,19 @@ def pdf_documents(
     limit: int = 10,
     source_group: str = "",
     trust_status: str = "",
+    category: str = "",
 ):
     # The PDF list only changes when ingestion/indexing writes the registry,
     # source map, trust registry, or index manifest. Short-circuit unchanged
     # polls with a conditional 304 instead of rebuilding the whole list.
     # Registry/source-map freshness comes from their SQLite data_version
-    # counters; those two stores are no longer stat-able JSON files.
+    # counters; those two stores are no longer stat-able JSON files. Category
+    # membership contributes its own SQLite version token.
     seed = _scoped_signature(
         _signature_from_parts(
             "reg:" + registry_state_version(PDF_REGISTRY_PATH),
             "srcmap:" + source_map_state_version(PROCESSED_DIR),
+            "cats:" + _category_store().state_version(),
             _file_signature(
                 DOCUMENT_TRUST_PATH,
                 DB_DIR / INDEX_MANIFEST_FILENAME,
@@ -6247,6 +6525,7 @@ def pdf_documents(
         limit=limit,
         source_group=source_group,
         trust_status=trust_status,
+        category=category,
     )
     if not_modified := _not_modified_or_etag(request, seed):
         return not_modified
@@ -6257,6 +6536,7 @@ def pdf_documents(
         limit=resolved_limit,
         source_group=source_group,
         trust_status=trust_status,
+        category=category,
     )
     return _etagged_json(request, payload, seed)
 
@@ -6503,12 +6783,19 @@ def auto_tag_pdfs(payload: AutoTagRequest):
 
 
 @app.get("/api/index")
-def index_rows(request: Request, offset: int = 0, limit: int = 50, search: str = ""):
+def index_rows(
+    request: Request,
+    offset: int = 0,
+    limit: int = 50,
+    search: str = "",
+    category: str = "",
+):
     # Index rows only change when the LanceDB table is rewritten; key the ETag on
     # the table version-hint file so unchanged polls short-circuit to a 304.
-    version_hint = _index_store().table_version_hint_path()
+    category_db_dir_path = _resolve_category_db_dir(category)
+    version_hint = _index_store(category_db_dir_path).table_version_hint_path()
     seed = _scoped_signature(
-        _file_signature(version_hint, DB_DIR / INDEX_MANIFEST_FILENAME, index_overrides_path(DB_DIR)),
+        _file_signature(version_hint, category_db_dir_path / INDEX_MANIFEST_FILENAME, index_overrides_path(category_db_dir_path)),
         offset=offset,
         limit=limit,
         search=search,
@@ -6516,19 +6803,26 @@ def index_rows(request: Request, offset: int = 0, limit: int = 50, search: str =
     if not_modified := _not_modified_or_etag(request, seed):
         return not_modified
     try:
-        payload = list_index_rows(offset=offset, limit=limit, search=search)
+        payload = list_index_rows(offset=offset, limit=limit, search=search, db_dir=category_db_dir_path)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return _etagged_json(request, payload, seed)
 
 
 @app.get("/api/index/summaries")
-def index_summary_rows(request: Request, offset: int = 0, limit: int = 20, search: str = ""):
+def index_summary_rows(
+    request: Request,
+    offset: int = 0,
+    limit: int = 20,
+    search: str = "",
+    category: str = "",
+):
+    category_dir = _resolve_category_db_dir(category)
     seed = _scoped_signature(
         _file_signature(
-            _index_store().table_version_hint_path(),
-            DB_DIR / INDEX_MANIFEST_FILENAME,
-            index_overrides_path(DB_DIR),
+            _index_store(category_dir).table_version_hint_path(),
+            category_dir / INDEX_MANIFEST_FILENAME,
+            index_overrides_path(category_dir),
         ),
         offset=offset,
         limit=limit,
@@ -6537,7 +6831,7 @@ def index_summary_rows(request: Request, offset: int = 0, limit: int = 20, searc
     if not_modified := _not_modified_or_etag(request, seed):
         return not_modified
     try:
-        payload = list_index_summary_rows(offset=offset, limit=limit, search=search)
+        payload = list_index_summary_rows(offset=offset, limit=limit, search=search, db_dir=category_dir)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return _etagged_json(request, payload, seed)
@@ -6550,12 +6844,14 @@ def index_child_rows(
     offset: int = 0,
     limit: int = INDEX_CHILD_DEFAULT_LIMIT,
     search: str = "",
+    category: str = "",
 ):
+    category_dir = _resolve_category_db_dir(category)
     seed = _scoped_signature(
         _file_signature(
-            _index_store().table_version_hint_path(),
-            DB_DIR / INDEX_MANIFEST_FILENAME,
-            index_overrides_path(DB_DIR),
+            _index_store(category_dir).table_version_hint_path(),
+            category_dir / INDEX_MANIFEST_FILENAME,
+            index_overrides_path(category_dir),
         ),
         parent_id=parent_id,
         offset=offset,
@@ -6570,6 +6866,7 @@ def index_child_rows(
             offset=offset,
             limit=limit,
             search=search,
+            db_dir=category_dir,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -6582,9 +6879,11 @@ def index_child_rows(
 def index_rows_stream(
     batch_size: int = INDEX_STREAM_DEFAULT_BATCH_SIZE,
     search: str = "",
+    category: str = "",
 ):
+    category_dir = _resolve_category_db_dir(category)
     try:
-        events = iter_index_row_events(batch_size=batch_size, search=search)
+        events = iter_index_row_events(batch_size=batch_size, search=search, db_dir=category_dir)
         first_event = next(events)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -6623,6 +6922,7 @@ def update_index(payload: IndexUpdateRequest):
             embedding_model=_safe_client_model(payload.embedding_model, fallback=CONFIGURED_EMBEDDING_MODEL),
             embedding_batch_size=payload.embedding_batch_size,
             embedding_timeout=payload.embedding_timeout,
+            db_dir=_resolve_category_db_dir(payload.category),
         )
         return {"row": row}
     except FileNotFoundError as exc:
@@ -6639,7 +6939,10 @@ def delete_index(payload: IndexDeleteRequest):
     if blocker:
         raise HTTPException(status_code=409, detail=blocker)
     try:
-        return delete_index_records(record_ids=payload.record_ids)
+        return delete_index_records(
+            record_ids=payload.record_ids,
+            db_dir=_resolve_category_db_dir(payload.category),
+        )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except KeyError as exc:
@@ -6657,6 +6960,7 @@ def vector_search_index(payload: IndexVectorSearchRequest):
             embedding_model=payload.embedding_model,
             embedding_batch_size=payload.embedding_batch_size,
             embedding_timeout=payload.embedding_timeout,
+            db_dir=_resolve_category_db_dir(payload.category),
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -6670,6 +6974,14 @@ def chat_stream(payload: ChatRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
+    # Resolve the category selection at request time so an unknown key is a
+    # clean 400 instead of a mid-stream error event.
+    selected_categories = _resolve_chat_categories(payload.categories)
+    category_dirs = [str(entry.get("db_dir") or "") for entry in selected_categories]
+    category_labels = [str(entry.get("label") or entry.get("key") or "") for entry in selected_categories]
+    category_dirs = [d for d in category_dirs if d] or [str(DB_DIR)]
+    category_labels = (category_labels[: len(category_dirs)] or [GENERAL_CATEGORY_KEY] * len(category_dirs))
+
     job_queue.begin_query()
 
     def generate():
@@ -6681,8 +6993,13 @@ def chat_stream(payload: ChatRequest):
         try:
             from src.query import QueryEngine
 
+            # Category selection ("split databases"): a single category keeps
+            # the historical single-store engine; several wrap in a
+            # score-merged MultiVectorStore.
             engine = QueryEngine(
-                working_dir=str(DB_DIR),
+                working_dir=str(category_dirs[0]),
+                working_dirs=category_dirs if len(category_dirs) > 1 else None,
+                category_labels=category_labels if len(category_dirs) > 1 else None,
                 asset_dir=str(ASSET_DIR),
                 trust_path=str(DOCUMENT_TRUST_PATH),
                 model=_safe_client_model(payload.llm_model, fallback=CHAT_CONFIG["llm_model"]),

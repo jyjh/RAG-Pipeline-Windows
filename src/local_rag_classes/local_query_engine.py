@@ -27,6 +27,8 @@ class LocalQueryEngine:
         self,
         working_dir: str = "./db",
         *,
+        working_dirs: list[str] | None = None,
+        category_labels: list[str] | None = None,
         asset_dir: str | Path | None = None,
         trust_path: str | Path | None = None,
         model: str = DEFAULT_LLM_MODEL,
@@ -188,27 +190,60 @@ class LocalQueryEngine:
         self.embedding_model = setup.model
         self.embedding_dim = setup.dim
         self.query_prefix = setup.query_prefix
-        self.store = default_store(working_dir, prefer_lancedb=True)
+        # Category selection ("split databases"): ``working_dirs`` lists one
+        # LanceDB working directory per selected category. A single directory
+        # keeps the plain store (identical to the historical behavior); more
+        # than one wraps them in a MultiVectorStore whose search() merges
+        # per-store ANN results by score. ``category_labels`` names each dir
+        # in results (record["category"]).
+        dirs = [str(d) for d in (working_dirs or []) if str(d or "").strip()]
+        if len(dirs) > 1:
+            from src.vector_store import MultiVectorStore
+
+            labels = [str(label) for label in (category_labels or [])]
+            if len(labels) != len(dirs):
+                labels = [f"category{i}" for i in range(len(dirs))]
+            self.store = MultiVectorStore(
+                [default_store(d, prefer_lancedb=True) for d in dirs],
+                labels=labels,
+                keys=dirs,
+            )
+            self.working_dirs = dirs
+        else:
+            self.store = default_store(working_dir, prefer_lancedb=True)
+            self.working_dirs = [str(working_dir)]
+        self.category_labels = list(getattr(self.store, "labels", []) or [])
         self.record_count = self._load_record_count()
 
+    def _iter_stores(self):
+        """Yield ``(label, store)`` for every underlying category store."""
+        stores = getattr(self.store, "stores", None)
+        if stores is None:
+            return [(getattr(self.store, "label", "") or "", self.store)]
+        return list(zip(getattr(self.store, "labels", [""] * len(stores)), stores))
+
     def _ensure_compatible_dim(self) -> None:
-        """Raise a clear re-index error if the index dim != configured dim.
+        """Raise a clear re-index error if any selected index dim mismatches.
 
         A 768-d query vector against a 1024-d index (or vice versa) would error
-        or return garbage; fail loudly with the remedy instead.
+        or return garbage; fail loudly with the remedy instead. With category
+        selection, every selected index must match -- one stale category names
+        itself in the error instead of silently degrading the merged search.
         """
-        try:
-            _model, dim = self.store.metadata()
-        except Exception:
-            return
-        if dim and int(dim) != self.embedding_dim:
-            raise RuntimeError(
-                f"Index embedding dimension ({dim}) does not match the configured "
-                f"dimension ({self.embedding_dim}) for embedding model "
-                f"'{self.embedding_model}'. The index was built with a different "
-                "embedding model/dimension -- a full re-index is required "
-                "(delete db/ and rebuild, or re-run the index job)."
-            )
+        for label, store in self._iter_stores():
+            try:
+                _model, dim = store.metadata()
+            except Exception:
+                continue
+            if dim and int(dim) != self.embedding_dim:
+                where = f" (category '{label}')" if label else ""
+                raise RuntimeError(
+                    f"Index embedding dimension ({dim}) does not match the configured "
+                    f"dimension ({self.embedding_dim}) for embedding model "
+                    f"'{self.embedding_model}'{where}. The index was built with a different "
+                    "embedding model/dimension -- a full re-index is required "
+                    "(delete db/ and rebuild, or re-run the index job)."
+                )
 
     def _reliability_details(self, record: dict[str, Any]) -> dict[str, Any]:
         explicit_group = str(record.get("source_group") or "").strip()
@@ -609,6 +644,11 @@ class LocalQueryEngine:
                 "location": location,
                 "content": str(match.get("content") or ""),
             }
+            # Present only when a multi-category search produced the match;
+            # single-store queries keep the block shape unchanged.
+            category = str(match.get("category") or "")
+            if category:
+                block["category"] = category
             remaining_tokens = result_budget - used_tokens
             fitted, block_truncated, block_tokens = _fit_text_field_to_json_budget(
                 block,

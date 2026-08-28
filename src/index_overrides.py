@@ -152,6 +152,56 @@ def edited_record_ids(db_dir: str | Path) -> set[str]:
     return set(str(record_id) for record_id in load_index_overrides(db_dir).get("edits", {}).keys())
 
 
+def move_overrides_for_sources(
+    source_db_dir: str | Path,
+    target_db_dir: str | Path,
+    source_hashes: set[str],
+) -> dict[str, int]:
+    """Carry one source's overrides to another index and remove them here.
+
+    Used when a document moves between category indexes: hidden-record
+    deletions and manual edits must follow the document, or the target index
+    would resurrect hidden chunks and drop edits on its next re-index. Entries
+    are matched by their stored ``source_hash`` (record ids are identical in
+    both indexes because records derive from the same Markdown). Returns the
+    counts moved.
+    """
+    hashes = {str(value) for value in source_hashes if value}
+    payload = load_index_overrides(source_db_dir)
+    if not hashes:
+        return {"edits": 0, "deletions": 0}
+    moved_edits = {
+        record_id: entry
+        for record_id, entry in payload.get("edits", {}).items()
+        if str(entry.get("source_hash") or "") in hashes
+    }
+    moved_deletions = {
+        record_id: entry
+        for record_id, entry in payload.get("deletions", {}).items()
+        if str(entry.get("source_hash") or "") in hashes
+    }
+    if not moved_edits and not moved_deletions:
+        return {"edits": 0, "deletions": 0}
+
+    target_payload = load_index_overrides(target_db_dir)
+    target_payload["edits"].update(moved_edits)
+    target_payload["deletions"].update(moved_deletions)
+    write_index_overrides(target_db_dir, target_payload)
+
+    payload["edits"] = {
+        record_id: entry
+        for record_id, entry in payload["edits"].items()
+        if record_id not in moved_edits
+    }
+    payload["deletions"] = {
+        record_id: entry
+        for record_id, entry in payload["deletions"].items()
+        if record_id not in moved_deletions
+    }
+    write_index_overrides(source_db_dir, payload)
+    return {"edits": len(moved_edits), "deletions": len(moved_deletions)}
+
+
 def copy_index_overrides(source_db_dir: str | Path, target_db_dir: str | Path) -> None:
     source = index_overrides_path(source_db_dir)
     target = index_overrides_path(target_db_dir)

@@ -14,6 +14,8 @@ bind_module_namespace(
 
 class IndexDeleteRequest(BaseModel):
     record_ids: list[str] = Field(min_length=1)
+    # Which category index the records live in; empty = General.
+    category: str = ""
 
 IndexDeleteRequest.__module__ = _source_module.__name__
 finalize_split_class(_source_module, IndexDeleteRequest)

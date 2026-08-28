@@ -8,6 +8,8 @@ class QueryEngine:
     def __init__(
         self,
         working_dir="./db",
+        working_dirs: list[str] | None = None,
+        category_labels: list[str] | None = None,
         asset_dir: str | None = None,
         trust_path: str | None = None,
         model=DEFAULT_LLM_MODEL,
@@ -39,6 +41,8 @@ class QueryEngine:
 
         self.local_engine = LocalQueryEngine(
             working_dir=working_dir,
+            working_dirs=working_dirs,
+            category_labels=category_labels,
             asset_dir=asset_dir,
             trust_path=trust_path,
             model=model,

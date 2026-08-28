@@ -15,6 +15,8 @@ bind_module_namespace(
 class IndexUpdateRequest(BaseModel):
     record_id: str = Field(min_length=1)
     content: str = Field(min_length=1)
+    # Which category index the record lives in; empty = General.
+    category: str = ""
     embedding_model: str | None = None
     embedding_batch_size: int | None = Field(DEFAULT_EMBEDDING_BATCH_SIZE, ge=1, le=256)
     embedding_timeout: float | None = Field(DEFAULT_EMBEDDING_TIMEOUT, gt=0)

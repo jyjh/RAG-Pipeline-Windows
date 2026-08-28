@@ -2457,3 +2457,37 @@ html[data-theme="dark"] .theme-icon-moon {
     padding: 8px 0;
   }
 }
+
+/* Category chips (Ask tab): toggle which categories a query searches. */
+.category-chips {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.category-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border, #d3d9e0);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.category-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.category-chip-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}

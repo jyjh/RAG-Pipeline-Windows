@@ -14,6 +14,10 @@ bind_module_namespace(
 
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1)
+    # Category selection ("split databases"): keys of the categories to search.
+    # Empty list = all categories. "general" is the default index; unknown keys
+    # are rejected by the endpoint before engine construction.
+    categories: list[str] = Field(default_factory=list)
     llm_model: str = DEFAULT_LLM_MODEL
     embedding_model: str = CONFIGURED_EMBEDDING_MODEL
     embedding_batch_size: int | None = Field(DEFAULT_EMBEDDING_BATCH_SIZE, ge=1, le=256)

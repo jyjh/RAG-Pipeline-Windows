@@ -94,6 +94,12 @@
         <div id="uploadDropZone" class="upload-drop-zone">
           <div class="toolbar">
             <input id="fileInput" type="file" accept="application/pdf,.pdf,.zip,application/zip,application/x-zip-compressed" multiple />
+            <label class="inline-select-label">
+              Category
+              <select id="uploadCategorySelect" aria-label="Target category for the upload">
+                <option value="general" selected>General</option>
+              </select>
+            </label>
             <button id="uploadButton" type="button">Upload + index</button>
             <button id="reindexButton" type="button">Reindex</button>
           </div>
@@ -162,6 +168,13 @@
               <option value="stale">Stale</option>
             </select>
           </label>
+          <label class="inline-select-label">
+            Category
+            <select id="pdfCategoryFilterSelect">
+              <option value="all" selected>All categories</option>
+              <option value="general">General</option>
+            </select>
+          </label>
           <button
             id="pdfAutoTagButton"
             type="button"
@@ -189,6 +202,13 @@
         <div id="pdfBulkActionBar" class="toolbar pdf-bulk-bar" hidden>
           <strong id="pdfBulkCountLabel">0 selected</strong>
           <button id="pdfBulkTagButton" type="button">Tag selected</button>
+          <label class="inline-select-label">
+            Move to
+            <select id="pdfBulkCategorySelect">
+              <option value="general" selected>General</option>
+            </select>
+          </label>
+          <button id="pdfBulkMoveButton" type="button" title="Move the selected documents into the chosen category (reuses existing vectors, no re-embedding)">Move</button>
           <button id="pdfBulkClearButton" type="button">Clear</button>
         </div>
         <div class="toolbar table-pager">
@@ -225,6 +245,12 @@
         <div class="toolbar">
           <input id="searchInput" type="search" placeholder="Search indexed content" />
           <button id="searchButton" type="button">Search</button>
+          <label class="inline-select-label">
+            Category
+            <select id="indexCategorySelect" aria-label="Index category to browse">
+              <option value="general" selected>General</option>
+            </select>
+          </label>
           <label class="inline-select-label">
             Rows
             <select id="indexPageSizeSelect">
@@ -288,6 +314,7 @@
                     <option value="custom">Custom</option>
                   </select>
                 </label>
+                <div id="chatCategoryChips" class="category-chips" role="group" aria-label="Categories to search"></div>
                 <span id="composerSettingsSummary" class="composer-settings-summary" aria-live="off"></span>
               </div>
               <details class="advanced-settings chat-advanced-settings">
@@ -378,6 +405,34 @@
                 </tr>
               </thead>
               <tbody id="adminKeysBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="admin-section">
+          <div class="admin-section-header">
+            <h3>Categories</h3>
+            <span id="adminCategoriesStatus" class="status"></span>
+          </div>
+          <p class="hint">Categories split the corpus into independent indexes — for example general textbooks vs. team design documents. Queries on the Ask tab can target one, several, or all of them, and moving a document between categories reuses its existing vectors (no re-embedding). Backups, rebuild, and compaction currently operate on the General index.</p>
+          <div class="toolbar">
+            <input id="adminCategoryKeyInput" type="text" placeholder="New category name (e.g. Team design docs)" maxlength="120" aria-label="New category name" />
+            <button id="adminCategoryCreateButton" type="button">Create category</button>
+            <button id="adminCategoriesRefreshButton" type="button">Refresh</button>
+          </div>
+          <div class="admin-keys-table-wrap">
+            <table id="adminCategoriesTable" class="data-table admin-categories-table">
+              <thead>
+                <tr>
+                  <th>Key</th>
+                  <th>Label</th>
+                  <th>Documents</th>
+                  <th>Records</th>
+                  <th>Embedding</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="adminCategoriesBody"></tbody>
             </table>
           </div>
         </div>

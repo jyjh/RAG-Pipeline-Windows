@@ -5,6 +5,13 @@ import time
 
 from src._class_module_support import bind_module_namespace, finalize_split_class
 import src.web_app as _source_module
+from src.categories import (
+    GENERAL_CATEGORY_KEY,
+    CategoryStore,
+    category_db_dir,
+    normalize_category_key,
+)
+from src.index_overrides import move_overrides_for_sources
 
 bind_module_namespace(
     _source_module,
@@ -59,6 +66,9 @@ class RagJobQueue:
         self.processed_dir = Path(processed_dir)
         self.db_dir = Path(db_dir)
         registry_path = Path(registry_path)
+        # DATA_DIR equivalent: the categories registry lives beside the PDF
+        # registry (same convention as the job ledger below).
+        self.data_dir = registry_path.parent
         self.registry = PdfRegistry(registry_path)
         # Durable ledger for non-upload jobs (reindex/rebuild/backup/restore).
         # Upload jobs recover via the PDF registry; the ledger covers the rest.
@@ -258,6 +268,38 @@ class RagJobQueue:
             kind="reindex_source",
             source_hashes=[str(value) for value in source_hashes if value],
             options=options or {},
+        )
+        return self._enqueue(job, auto_start=auto_start)
+
+    def enqueue_transfer_sources(
+        self,
+        *,
+        source_hashes: list[str],
+        target_category: str,
+        job_id: str | None = None,
+        options: dict[str, Any] | None = None,
+        auto_start: bool = True,
+    ) -> QueueJob:
+        """Move documents between category indexes without re-embedding.
+
+        The transfer job copies each source's rows into the target category's
+        index (reusing vectors from the source index via ``reuse_db_dir``),
+        carries the source's index overrides along, removes the rows from the
+        source index, and updates the membership registry LAST -- so a crash
+        mid-transfer at worst leaves the document visible in both categories
+        (deduplicated by record id at query time), never in neither.
+        """
+        try:
+            target_key = normalize_category_key(target_category)
+        except ValueError as exc:
+            raise ValueError(f"Invalid target category: {exc}") from exc
+        merged_options = dict(options or {})
+        merged_options["target_category"] = target_key
+        job = QueueJob(
+            id=job_id or uuid.uuid4().hex,
+            kind="transfer_sources",
+            source_hashes=[str(value) for value in source_hashes if value],
+            options=merged_options,
         )
         return self._enqueue(job, auto_start=auto_start)
 
@@ -542,6 +584,83 @@ class RagJobQueue:
         except Exception:
             pass
 
+    def _categories_store(self) -> CategoryStore:
+        return CategoryStore(self.data_dir)
+
+    def _job_category_key(self, job: QueueJob) -> str:
+        """Validated target category for a job's options; '' / unknown options
+        resolve to General. Upload options are pre-validated at the API layer;
+        this re-checks defensively for recovered/replayed jobs."""
+        raw = str((job.options or {}).get("category") or "").strip().lower()
+        if not raw or raw == GENERAL_CATEGORY_KEY:
+            return GENERAL_CATEGORY_KEY
+        try:
+            key = normalize_category_key(raw)
+        except ValueError:
+            return GENERAL_CATEGORY_KEY
+        if self._categories_store().get_category(key) is None:
+            return GENERAL_CATEGORY_KEY
+        return key
+
+    def _category_target_dir(self, key: str) -> Path:
+        return category_db_dir(self.db_dir, key)
+
+    def _group_hashes_by_db_dir(self, source_hashes: list[str]) -> dict[Path, tuple[str, list[str]]]:
+        """Group source hashes by the index directory that owns them (per the
+        membership registry; General when unassigned). Values are
+        ``(category_key, hashes)`` so callers can prune after full builds."""
+        membership = self._categories_store().memberships_for(list(source_hashes))
+        groups: dict[Path, tuple[str, list[str]]] = {}
+        for source_hash in source_hashes:
+            key = membership.get(source_hash) or GENERAL_CATEGORY_KEY
+            entry = groups.setdefault(self._category_target_dir(key), (key, []))
+            entry[1].append(source_hash)
+        return groups
+
+    def _prune_to_membership(self, db_dir: str, category_key: str) -> int:
+        """Drop rows whose source belongs to a DIFFERENT category.
+
+        Full builds (reindex/rebuild/reingest) read the whole processed_docs
+        corpus, so they would copy every categorized document into whichever
+        index they built. Pruning to membership keeps each index exactly its
+        own category's content after such builds. Incremental per-source paths
+        never need this (they only write their requested sources).
+        """
+        membership = self._categories_store().all_memberships()
+        if category_key == GENERAL_CATEGORY_KEY:
+            drop = sorted(h for h, key in membership.items() if key != GENERAL_CATEGORY_KEY)
+        else:
+            drop = sorted(h for h, key in membership.items() if key != category_key)
+        if not drop:
+            return 0
+        store = _index_store(Path(db_dir))
+        if not store.exists():
+            return 0
+        with _source_module.acquire_index_lock(db_dir):
+            result = store.delete_records_by_source_hash(source_hashes=drop)
+            if int(result.get("deleted") or 0):
+                model, dim = store.metadata()
+                _source_module.update_index_manifest_sources(
+                    db_dir,
+                    {source_hash: [] for source_hash in drop},
+                    embedding_model=model,
+                    embedding_dim=dim,
+                )
+                return int(result.get("deleted") or 0)
+        return 0
+
+    def _all_category_db_dirs(self) -> list[Path]:
+        """Anchor dir plus every category subdirectory on disk (the scan is the
+        sweep's source of truth so registry-lagging leftovers are covered)."""
+        dirs = [self.db_dir]
+        custom_root = self.db_dir / "categories"
+        try:
+            if custom_root.exists():
+                dirs.extend(path for path in sorted(custom_root.iterdir()) if path.is_dir())
+        except OSError:
+            pass
+        return dirs
+
     def _run_job(self, job: QueueJob) -> None:
         if job.kind == "upload":
             self._raise_if_cancelled(job)
@@ -557,25 +676,43 @@ class RagJobQueue:
                 self._wait_for_no_queries(job, "indexing")
                 self._raise_if_cancelled(job)
                 self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
+                # Full builds read the whole corpus; drop categorized sources
+                # so they are not duplicated into General.
+                self._prune_to_membership(str(self.db_dir), GENERAL_CATEGORY_KEY)
                 return
 
             if job.kind == "reindex_source":
                 self._wait_for_no_queries(job, "indexing")
                 self._raise_if_cancelled(job)
-                if self._run_indexing_func is not None:
-                    # Keep custom/injected indexers on the historical contract.
-                    self._delete_source_index_records(job.source_hashes)
+                # Each source re-indexes into the category that owns it (a
+                # document must never migrate to General just because it was
+                # re-indexed). Sources are grouped per owning directory.
+                groups = self._group_hashes_by_db_dir(job.source_hashes)
+                for group_dir, (group_key, group_hashes) in groups.items():
                     self._raise_if_cancelled(job)
-                    self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
-                else:
-                    incremental_options = dict(job.options or {})
-                    incremental_options["source_hashes"] = list(job.source_hashes)
-                    self._run_incremental_indexing(
-                        str(self.processed_dir),
-                        str(self.db_dir),
-                        incremental_options,
-                        job=job,
-                    )
+                    if self._run_indexing_func is not None:
+                        # Keep custom/injected indexers on the historical contract.
+                        self._delete_source_index_records(group_hashes)
+                        self._raise_if_cancelled(job)
+                        self._run_indexing(str(self.processed_dir), str(group_dir), job.options, job=job)
+                        # The injected contract is a full build of the corpus
+                        # into group_dir; keep it category-scoped.
+                        self._prune_to_membership(str(group_dir), group_key)
+                    else:
+                        incremental_options = dict(job.options or {})
+                        incremental_options["source_hashes"] = list(group_hashes)
+                        self._run_incremental_indexing(
+                            str(self.processed_dir),
+                            str(group_dir),
+                            incremental_options,
+                            job=job,
+                        )
+                return
+
+            if job.kind == "transfer_sources":
+                self._wait_for_no_queries(job, "transferring")
+                self._raise_if_cancelled(job)
+                self._run_transfer_sources(job)
                 return
 
             if job.kind == "backup":
@@ -598,6 +735,7 @@ class RagJobQueue:
                 # live index we just dropped.
                 rebuild_options["reuse_db_dir"] = None
                 self._run_indexing(str(self.processed_dir), str(self.db_dir), rebuild_options, job=job)
+                self._prune_to_membership(str(self.db_dir), GENERAL_CATEGORY_KEY)
                 return
 
             if job.kind == "restore":
@@ -688,24 +826,41 @@ class RagJobQueue:
 
         Serialized via ``_index_write_lock`` so only one job writes to ``db/``
         at a time. The query-wait happens inside the lock so a second indexing
-        job doesn't start waiting while the first is still publishing.
+        job doesn't start waiting while the first is still publishing. The
+        target is the job's category index (General when unset); membership is
+        recorded only after the rows are durably in place.
         """
         with self._index_write_lock:
             self._wait_for_no_queries(job, "indexing")
             self._raise_if_cancelled(job)
+            category_key = self._job_category_key(job)
+            target_dir = self._category_target_dir(category_key)
+            upload_hashes = [
+                str(item.get("hash") or "") for item in job.uploads if item.get("hash")
+            ]
             if self._run_indexing_func is not None:
-                self._run_indexing(str(self.processed_dir), str(self.db_dir), job.options, job=job)
+                self._run_indexing(str(self.processed_dir), str(target_dir), job.options, job=job)
+                # Full build: keep the target scoped to its category members.
+                self._prune_to_membership(str(target_dir), category_key)
             else:
                 incremental_options = dict(job.options or {})
-                incremental_options["source_hashes"] = [
-                    str(item.get("hash") or "") for item in job.uploads if item.get("hash")
-                ]
+                incremental_options["source_hashes"] = upload_hashes
                 self._run_incremental_indexing(
                     str(self.processed_dir),
-                    str(self.db_dir),
+                    str(target_dir),
                     incremental_options,
                     job=job,
                 )
+            if category_key != GENERAL_CATEGORY_KEY and upload_hashes:
+                try:
+                    self._categories_store().set_memberships(upload_hashes, category_key)
+                except ValueError as exc:
+                    # Membership is the query-time source of truth: without it
+                    # the rows just written would be invisible to the category.
+                    raise RuntimeError(
+                        f"Indexed into category '{category_key}' but could not record "
+                        f"membership: {exc}"
+                    ) from exc
             self.registry.mark_job_status(job_id=job.id, files=job.uploads, status="indexed")
 
     def _wait_for_no_queries(self, job: QueueJob, phase: str) -> None:
@@ -1262,24 +1417,117 @@ class RagJobQueue:
                 summary_mode=options.get("summary_mode", DEFAULT_SUMMARY_MODE),
                 chunk_target_tokens=options.get("chunk_target_tokens", DEFAULT_CHUNK_TARGET_TOKENS),
                 chunk_overlap_tokens=options.get("chunk_overlap_tokens", DEFAULT_CHUNK_OVERLAP_TOKENS),
+                # Transfer jobs point this at the SOURCE category's index so
+                # the moved document's vectors are reused, not re-embedded.
+                # Absent (normal uploads) -> reuse from the target index itself.
+                reuse_db_dir=options.get("reuse_db_dir"),
                 source_hashes=hashes,
             )
         self._raise_if_cancelled(job)
 
-    def _delete_source_index_records(self, source_hashes: list[str]) -> None:
-        """Drop existing vectors for the given sources so re-indexing rebuilds them.
+    def _run_transfer_sources(self, job: QueueJob) -> None:
+        """Move sources into a target category index (vector-reuse transfer).
 
-        Markdown and source-map entries are left intact; only the vector store
-        records are removed. Re-indexing rebuilds a fresh staged index from all
-        processed Markdown, reusing every other source's vectors.
+        Per source group (grouped by the index they currently live in):
+        index into the target with ``reuse_db_dir`` pointed at the source
+        index (no re-embedding), carry overrides across, delete the source
+        rows + manifest entries, then update membership LAST. See
+        :meth:`enqueue_transfer_sources` for the crash-safety reasoning.
+        """
+        if not job.source_hashes:
+            return
+        options = dict(job.options or {})
+        target_key = normalize_category_key(options.get("target_category"))
+        target_dir = self._category_target_dir(target_key)
+        cat_store = self._categories_store()
+        membership = cat_store.memberships_for(job.source_hashes)
+
+        groups: dict[Path, list[str]] = {}
+        skipped: list[str] = []
+        for source_hash in job.source_hashes:
+            current_key = membership.get(source_hash) or GENERAL_CATEGORY_KEY
+            if current_key == target_key:
+                skipped.append(source_hash)
+                continue
+            current_dir = self._category_target_dir(current_key)
+            groups.setdefault(current_dir, []).append(source_hash)
+        if skipped:
+            self._append_job_log(
+                job,
+                f"{len(skipped)} source(s) already in '{target_key}'; membership confirmed.",
+            )
+            if skipped and not groups:
+                cat_store.set_memberships(skipped, target_key)
+                return
+
+        transfer_options = dict(options)
+        transfer_options.pop("target_category", None)
+        moved = 0
+        for source_dir, group_hashes in groups.items():
+            self._raise_if_cancelled(job)
+            self._append_job_log(
+                job,
+                f"Transferring {len(group_hashes)} source(s) from {source_dir.name or 'db'} "
+                f"into '{target_key}' (reusing existing vectors).",
+            )
+            # 1) Copy rows into the target index, reusing the source's vectors.
+            transfer_group_options = dict(transfer_options)
+            transfer_group_options["source_hashes"] = list(group_hashes)
+            transfer_group_options["reuse_db_dir"] = str(source_dir)
+            self._run_incremental_indexing(
+                str(self.processed_dir),
+                str(target_dir),
+                transfer_group_options,
+                job=job,
+            )
+            self._raise_if_cancelled(job)
+            # 2) Hidden-record deletions / manual edits must follow the document.
+            moved_counts = move_overrides_for_sources(source_dir, target_dir, set(group_hashes))
+            # 3) Remove the rows + manifest entries from the source index.
+            with _source_module.acquire_index_lock(source_dir):
+                store = _index_store(source_dir)
+                if store.exists():
+                    store.delete_records_by_source_hash(source_hashes=sorted(group_hashes))
+                    model, dim = store.metadata()
+                    _source_module.update_index_manifest_sources(
+                        str(source_dir),
+                        {source_hash: [] for source_hash in group_hashes},
+                        embedding_model=model,
+                        embedding_dim=dim,
+                    )
+            _source_module._invalidate_index_caches(source_dir)
+            _source_module._invalidate_index_caches(target_dir)
+            moved += len(group_hashes)
+            self._append_job_log(
+                job,
+                f"Moved {len(group_hashes)} source(s) "
+                f"(overrides carried: {moved_counts['edits']} edit(s), "
+                f"{moved_counts['deletions']} deletion(s)).",
+            )
+        # 4) Membership lands last: rows exist in both indexes until this
+        # point, and queries dedupe by record id, so the document was readable
+        # throughout the transfer.
+        cat_store.set_memberships(job.source_hashes, target_key)
+        self._append_job_log(
+            job,
+            f"Transfer complete: {moved} source(s) now in '{target_key}'.",
+        )
+
+    def _delete_source_index_records(self, source_hashes: list[str]) -> None:
+        """Drop existing vectors for the given sources from EVERY category
+        index (General plus all category directories). Rows normally live in
+        one category, but a mid-transfer crash can leave copies in two; a
+        delete/rebuild must never leave either behind. Markdown and source-map
+        entries are left intact; only the vector store records are removed.
         """
         hashes = {str(value) for value in source_hashes or () if value}
         if not hashes:
             return
         with INDEX_LOCK:
-            store = _index_store(self.db_dir)
-            if store.exists():
-                store.delete_records_by_source_hash(source_hashes=sorted(hashes))
+            for db_dir in self._all_category_db_dirs():
+                store = _index_store(db_dir)
+                if store.exists():
+                    store.delete_records_by_source_hash(source_hashes=sorted(hashes))
 
     def _drop_live_index(self) -> None:
         """Remove the live LanceDB directory so a rebuild starts from scratch.

@@ -119,6 +119,85 @@ VectorStore = import_split_class("src.vector_store_classes.vector_store", "Vecto
 VectorStore.__module__ = __name__
 
 
+class MultiVectorStore:
+    """Query-facing union of several per-category ``LanceDBVectorStore`` dirs.
+
+    Implements the subset of the :class:`VectorStore` protocol the query
+    engine uses (``exists/count/metadata/search/child_chunks``). ``search``
+    fans one ANN query out per store and merges by score -- sound across
+    categories because every store must share the configured embedding
+    model/dimension (guarded at query time). Matched records are annotated
+    with ``category`` (the store's label) so results, sources, and child-chunk
+    routing can name the category they came from.
+
+    A single selected category bypasses this wrapper entirely (the engine
+    constructs the plain store), so the union only exists when it is needed.
+    """
+
+    def __init__(
+        self,
+        stores: list[Any],
+        *,
+        labels: list[str] | None = None,
+        keys: list[str] | None = None,
+    ):
+        if not stores:
+            raise ValueError("MultiVectorStore requires at least one store.")
+        self.stores = list(stores)
+        self.labels = list(labels) if labels is not None else [f"store{i}" for i in range(len(stores))]
+        self.keys = list(keys) if keys is not None else [str(index) for index in range(len(stores))]
+        if len(self.labels) != len(self.stores) or len(self.keys) != len(self.stores):
+            raise ValueError("labels/keys must align with stores.")
+
+    def _store_for(self, record: dict[str, Any]):
+        """Route a previously-returned record back to the store it came from."""
+        category = str(record.get("category") or "")
+        if category:
+            for label, store in zip(self.labels, self.stores):
+                if label == category:
+                    return store
+        return self.stores[0]
+
+    def exists(self) -> bool:
+        return any(store.exists() for store in self.stores)
+
+    def count(self) -> int:
+        return sum(store.count() for store in self.stores if store.exists())
+
+    def metadata(self) -> tuple[str, int]:
+        for store in self.stores:
+            if store.exists():
+                return store.metadata()
+        return self.stores[0].metadata()
+
+    def search(self, vector: list[float], *, top_k: int) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for label, store in zip(self.labels, self.stores):
+            for row in store.search(vector, top_k=top_k):
+                record_id = str(row.get("id") or "")
+                if not record_id:
+                    continue
+                # Record ids are content-derived and identical across
+                # categories, so a duplicate here means the same source is
+                # (transiently, mid-transfer) indexed in two stores.
+                if record_id in merged:
+                    continue
+                row = dict(row)
+                row["category"] = label
+                merged[record_id] = row
+        return sorted(
+            merged.values(),
+            key=lambda row: float(row.get("score") or 0.0),
+            reverse=True,
+        )
+
+    def child_chunks(self, parent: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
+        store = self._store_for(parent)
+        rows = store.child_chunks(parent, limit=limit)
+        label = self.labels[self.stores.index(store)] if store in self.stores else ""
+        return [dict(row, category=label) for row in rows]
+
+
 def default_store(working_dir: str | Path, *, prefer_lancedb: bool = True) -> VectorStore:
     return LanceDBVectorStore(working_dir)
 
