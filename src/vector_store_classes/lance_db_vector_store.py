@@ -20,6 +20,23 @@ bind_module_namespace(
 # (e.g. a single common letter) returning an unbounded intermediate set.
 LIST_RECORDS_SEARCH_SCAN_CAP = 50_000
 
+# Lance raises RuntimeError("lance error: Not found: <fragment>.lance") when a
+# query's manifest references a data file that a concurrent publisher's cleanup
+# has already deleted. The version-hint check in _table() normally reopens the
+# table after a publish, but it cannot see a swap that lands between open and
+# scan, and a reader whose hint update was missed would otherwise stay broken
+# until restart.
+_STALE_VERSION_MARKERS = ("not found", "no such file", "cannot find")
+
+
+def _is_stale_version_error(exc: BaseException) -> bool:
+    if isinstance(exc, FileNotFoundError):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    message = str(exc).lower()
+    return any(marker in message for marker in _STALE_VERSION_MARKERS)
+
 
 class LanceDBVectorStore:
     def __init__(self, working_dir: str | Path):
@@ -83,7 +100,7 @@ class LanceDBVectorStore:
     def count(self) -> int:
         if not self.exists():
             return 0
-        return int(self._table().count_rows())
+        return int(self._read_with_publish_retry(lambda table: table.count_rows()))
 
     def write_records(
         self,
@@ -358,9 +375,13 @@ class LanceDBVectorStore:
     def search(self, vector: list[float], *, top_k: int) -> list[dict[str, Any]]:
         if not self.exists():
             return []
-        query = self._table().search(vector).limit(max(1, top_k))
-        query = _apply_ann_search_params(query)
-        rows = query.to_list()
+
+        def run_search(table):
+            query = table.search(vector).limit(max(1, top_k))
+            query = _apply_ann_search_params(query)
+            return query.to_list()
+
+        rows = self._read_with_publish_retry(run_search)
         return [self._normalize_result(row) for row in rows]
 
     def child_chunks(self, parent: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
@@ -577,6 +598,34 @@ class LanceDBVectorStore:
             self._table_signature = signature
             return table
 
+    def _fresh_table(self):
+        """Force-reopen the table at the latest on-disk version."""
+        with self._table_lock:
+            self._table_obj = None
+            self._table_signature = None
+            return self._db().open_table(TABLE_NAME)
+
+    def _read_with_publish_retry(self, run, *, attempts: int = 2):
+        """Execute a table read, surviving concurrent publishes.
+
+        The indexer's publish/cleanup step can delete fragment files between a
+        reader opening a manifest version and its scan executing -- Lance then
+        fails the whole query with ``Not found: <fragment>.lance``. One retry
+        against a freshly opened table heals both that open-to-scan race and a
+        cached handle pinned to a pre-publish version (which the version-hint
+        check normally catches, but only on the NEXT call after the hint lands).
+        """
+        last_error: BaseException | None = None
+        for attempt in range(max(1, attempts)):
+            try:
+                return run(self._fresh_table() if attempt else self._table())
+            except (RuntimeError, FileNotFoundError) as exc:
+                if not _is_stale_version_error(exc):
+                    raise
+                last_error = exc
+        assert last_error is not None
+        raise last_error
+
     def _table_names(self, db=None) -> list[str]:
         db = db or self._db()
         names = db.list_tables()
@@ -589,10 +638,14 @@ class LanceDBVectorStore:
     def _where(self, where: str, *, limit: int | None = None) -> list[dict[str, Any]]:
         if not self.exists():
             return []
-        query = self._table().search().where(where)
-        if limit is not None:
-            query = query.limit(limit)
-        return query.to_list()
+
+        def run_where(table):
+            query = table.search().where(where)
+            if limit is not None:
+                query = query.limit(limit)
+            return query.to_list()
+
+        return self._read_with_publish_retry(run_where)
 
     def _search_records_pushdown(self, search: str) -> list[dict[str, Any]]:
         """Server-side-filtered + Python-post-filtered record search.
@@ -631,13 +684,14 @@ class LanceDBVectorStore:
         for col in columns[1:]:
             clause += f" OR lower({col}) LIKE '%{escaped}%' ESCAPE '\\'"
         try:
-            raw_rows = (
-                self._table()
-                .search()
-                .where(clause)
-                .select(LIST_RECORD_COLUMNS)
-                .limit(LIST_RECORDS_SEARCH_SCAN_CAP)
-                .to_list()
+            raw_rows = self._read_with_publish_retry(
+                lambda table: (
+                    table.search()
+                    .where(clause)
+                    .select(LIST_RECORD_COLUMNS)
+                    .limit(LIST_RECORDS_SEARCH_SCAN_CAP)
+                    .to_list()
+                )
             )
         except Exception:
             # If the LIKE/ESCAPE dialect is unsupported in a future LanceDB
@@ -663,12 +717,16 @@ class LanceDBVectorStore:
         row_limit = count - offset if limit is None else max(0, min(int(limit), count - offset))
         if row_limit <= 0:
             return []
-        query = self._table().search()
-        if columns:
-            query = query.select(columns)
-        if offset:
-            query = query.offset(offset)
-        return query.limit(row_limit).to_list()
+
+        def run_scan(table):
+            query = table.search()
+            if columns:
+                query = query.select(columns)
+            if offset:
+                query = query.offset(offset)
+            return query.limit(row_limit).to_list()
+
+        return self._read_with_publish_retry(run_scan)
 
     def _raw_record_batches(self, *, batch_size: int) -> Iterator[list[dict[str, Any]]]:
         count = self.count()

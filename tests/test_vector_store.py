@@ -440,3 +440,55 @@ def test_apply_indexing_config_is_safe_noop_on_empty_or_invalid():
         assert vs.ANN_RETRAIN_THRESHOLD == original[3]
     finally:
         vs.ANN_MIN_ROWS, vs.ANN_NPROBES, vs.ANN_REFINE_FACTOR, vs.ANN_RETRAIN_THRESHOLD = original
+
+
+def test_read_with_publish_retry_reopens_after_stale_version_error():
+    """A lance 'Not found' (fragment deleted by a concurrent publish) heals by
+    reopening the table once instead of failing the request."""
+    import tempfile
+
+    from src.vector_store_classes.lance_db_vector_store import (
+        _is_stale_version_error,
+    )
+
+    db_dir = Path(tempfile.gettempdir()) / f"rag_test_retry_{uuid.uuid4().hex}"
+    db_dir.mkdir(parents=True)
+    try:
+        store = LanceDBVectorStore(db_dir)
+        store.write_records(_source_records(), embedding_model="fake-embed", embedding_dim=3)
+
+        assert _is_stale_version_error(RuntimeError("lance error: Not found: x.lance, local.rs:133:40"))
+        assert not _is_stale_version_error(RuntimeError("unrelated explosion"))
+        assert not _is_stale_version_error(ValueError("Not found"))
+
+        reopen_calls = {"count": 0}
+        poisoned = "poisoned"
+
+        def run_with_first_read_poisoned(table):
+            # Simulate the open-to-scan race: whichever table object is handed
+            # to the FIRST attempt raises the stale-version lance error; the
+            # retry must hand back a fresh, working table.
+            if table == poisoned:
+                raise RuntimeError("lance error: Not found: 111.lance, local.rs:133:40")
+            return int(table.count_rows())
+
+        original_fresh_table = store._fresh_table
+
+        def counting_fresh_table():
+            reopen_calls["count"] += 1
+            return original_fresh_table()
+
+        monkeypoison = None
+        # First attempt reads through _table(); point it at the poisoned marker
+        # so the retry path is exercised deterministically.
+        store._table_obj = poisoned
+        store._table_signature = store._read_table_signature()
+        store._fresh_table = counting_fresh_table
+
+        rows = store._read_with_publish_retry(run_with_first_read_poisoned)
+
+        assert rows == 3  # fresh table reports the written records
+        assert reopen_calls["count"] == 1
+        assert store._table_obj is not poisoned
+    finally:
+        shutil.rmtree(db_dir, ignore_errors=True)

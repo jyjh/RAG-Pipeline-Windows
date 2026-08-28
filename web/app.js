@@ -55,6 +55,16 @@ const state = {
   walkthroughIndex: -1,
   pendingSiteVersion: "",
   pendingVersionPrompt: false,
+  // id -> last seen status, used to detect job completions for toasts.
+  jobWatch: new Map(),
+  adminDashboardLoaded: false,
+  adminKeysAuthorized: null,
+  pdfGroupFilter: "all",
+  pdfTrustFilter: "all",
+  chatSequenceKey: "",
+  composerSettingsFrame: 0,
+  appSidebarCollapsed: false,
+  themePreference: "auto",
 };
 
 const LIVE_RENDER_INTERVAL_MS = 200;
@@ -64,6 +74,10 @@ const UPDATE_POLL_INTERVAL_MS = 5 * 60 * 1000;
 const RESTART_POLL_INTERVAL_MS = 1000;
 const RESTART_POLL_TIMEOUT_MS = 120000;
 const JOBS_ACTIVE_POLL_INTERVAL_MS = 2000;
+// Must match TERMINAL_JOB_STATUSES in rag_job_queue.py.
+const TERMINAL_JOB_STATUSES = new Set(["done", "failed", "cancelled"]);
+const ACTIVE_JOB_STATUSES = new Set(["queued", "running", "paused_for_queries"]);
+const JOB_WATCH_LIMIT = 300;
 // Lower bound for server-configured poll intervals (see positiveInterval).
 const MIN_SERVER_POLL_INTERVAL_MS = 2000;
 const INDEX_STREAM_BATCH_SIZE = 250;
@@ -80,7 +94,17 @@ const TUTORIAL_SEEN_COOKIE = "rag_tutorial_seen";
 const SITE_VERSION_COOKIE = "rag_site_version";
 const REVIEWER_NAME_COOKIE = "rag_reviewer_name";
 const DEBUG_MODE_COOKIE = "debug_mode";
+const ANSWER_PRESET_STORAGE_KEY = "rag.answerPreset.v1";
+const THEME_STORAGE_KEY = "rag.theme.v1";
+const SIDEBAR_COLLAPSED_STORAGE_KEY = "rag.sidebarCollapsed.v1";
 const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
+// Answer-mode presets: friendly names over the raw sampler knobs. "custom" is
+// never applied — it only marks that the user edited a value by hand.
+const ANSWER_PRESETS = {
+  precise: { temperature: 0.2, max_k: 30, context_window: 8192, llm_num_predict: 4096, retrieval_min_score: 0.6, web_search_enabled: false },
+  balanced: { temperature: 0.3, max_k: 40, context_window: 8192, llm_num_predict: 4096, retrieval_min_score: 0.5, web_search_enabled: true },
+  deep: { temperature: 0.4, max_k: 80, context_window: 16384, llm_num_predict: 8192, retrieval_min_score: 0.35, web_search_enabled: true },
+};
 // Maps each assistant message DOM node to its streaming parts object, so
 // citation clicks can resolve the matching source panel.
 const assistantMessageParts = new WeakMap();
@@ -123,8 +147,31 @@ const els = {
   forceUploadButton: document.getElementById("forceUploadButton"),
   pdfSearchInput: document.getElementById("pdfSearchInput"),
   pdfSearchButton: document.getElementById("pdfSearchButton"),
+  pdfGroupFilterSelect: document.getElementById("pdfGroupFilterSelect"),
+  pdfTrustFilterSelect: document.getElementById("pdfTrustFilterSelect"),
   pdfAutoTagButton: document.getElementById("pdfAutoTagButton"),
   reviewerNameInput: document.getElementById("reviewerNameInput"),
+  libraryStatus: document.getElementById("libraryStatus"),
+  pdfPreviewOverlay: document.getElementById("pdfPreviewOverlay"),
+  pdfPreviewTitle: document.getElementById("pdfPreviewTitle"),
+  pdfPreviewFrame: document.getElementById("pdfPreviewFrame"),
+  pdfPreviewFallback: document.getElementById("pdfPreviewFallback"),
+  pdfPreviewDownloadLink: document.getElementById("pdfPreviewDownloadLink"),
+  pdfPreviewCloseButton: document.getElementById("pdfPreviewCloseButton"),
+  appSidebar: document.getElementById("appSidebar"),
+  sidebarCollapseButton: document.getElementById("sidebarCollapseButton"),
+  themeToggleButton: document.getElementById("themeToggleButton"),
+  themeToggleLabel: document.getElementById("themeToggleLabel"),
+  themeSelect: document.getElementById("themeSelect"),
+  answerPresetSelect: document.getElementById("answerPresetSelect"),
+  composerSettingsSummary: document.getElementById("composerSettingsSummary"),
+  settingsButton: document.getElementById("settingsButton"),
+  settingsOverlay: document.getElementById("settingsOverlay"),
+  settingsCloseButton: document.getElementById("settingsCloseButton"),
+  settingsStartTourButton: document.getElementById("settingsStartTourButton"),
+  shortcutsOverlay: document.getElementById("shortcutsOverlay"),
+  shortcutsCloseButton: document.getElementById("shortcutsCloseButton"),
+  citationPopover: document.getElementById("citationPopover"),
   prevPdfPageButton: document.getElementById("prevPdfPageButton"),
   pdfPageLabel: document.getElementById("pdfPageLabel"),
   nextPdfPageButton: document.getElementById("nextPdfPageButton"),
@@ -137,6 +184,20 @@ const els = {
   jobSearchInput: document.getElementById("jobSearchInput"),
   jobSearchButton: document.getElementById("jobSearchButton"),
   jobsBody: document.getElementById("jobsBody"),
+  enableJobNotificationsButton: document.getElementById("enableJobNotificationsButton"),
+  jobsStrip: document.getElementById("jobsStrip"),
+  jobsStripText: document.getElementById("jobsStripText"),
+  jobsStripViewButton: document.getElementById("jobsStripViewButton"),
+  refreshAdminButton: document.getElementById("refreshAdminButton"),
+  adminDashboard: document.getElementById("adminDashboard"),
+  adminKeysStatus: document.getElementById("adminKeysStatus"),
+  adminKeysHint: document.getElementById("adminKeysHint"),
+  adminKeysBody: document.getElementById("adminKeysBody"),
+  adminKeyLabelInput: document.getElementById("adminKeyLabelInput"),
+  adminKeyRoleSelect: document.getElementById("adminKeyRoleSelect"),
+  adminKeyExpiresInput: document.getElementById("adminKeyExpiresInput"),
+  adminKeyRateInput: document.getElementById("adminKeyRateInput"),
+  adminKeyCreateButton: document.getElementById("adminKeyCreateButton"),
   searchInput: document.getElementById("searchInput"),
   searchButton: document.getElementById("searchButton"),
   vectorSearchInput: document.getElementById("vectorSearchInput"),
@@ -194,6 +255,7 @@ const els = {
   pdfBulkCountLabel: document.getElementById("pdfBulkCountLabel"),
   pdfBulkTagButton: document.getElementById("pdfBulkTagButton"),
   pdfBulkClearButton: document.getElementById("pdfBulkClearButton"),
+  toastStack: document.getElementById("toastStack"),
 };
 
 const walkthroughSteps = [
@@ -208,13 +270,6 @@ const walkthroughSteps = [
     target: "#jobsTable",
     title: "Track ingestion and indexing",
     text: "The Jobs table shows queued, running, paused, completed, and failed work. Long jobs continue in the background while the published index remains available.",
-  },
-  {
-    tab: "upload",
-    target: "#walkthroughFakePdfRow [data-pdf-action='tag-group']",
-    title: "Tag source reliability",
-    text: "Untagged PDFs are highlighted at the top of the table. Use Tag group to mark each source as Official, Student Research, or Unofficial before relying on retrieval ranking.",
-    fakePdf: true,
   },
   {
     tab: "index",
@@ -240,12 +295,86 @@ const walkthroughSteps = [
     title: "Keep investigation threads",
     text: "Saved chats stay in this browser. Use separate chats for separate design questions, source audits, or debugging sessions.",
   },
+  {
+    tab: "library",
+    target: "#walkthroughFakePdfRow [data-pdf-action='tag-group']",
+    title: "Tag source reliability",
+    text: "The Library tab lists every uploaded PDF. Untagged sources are highlighted at the top. Use Tag group to mark each source as Official, Student Research, or Unofficial before relying on retrieval ranking.",
+    fakePdf: true,
+  },
+  {
+    tab: "admin",
+    target: "#adminDashboard",
+    title: "Admin controls",
+    text: "Administrators monitor the queue, index size, and LLM backend here, manage API keys, and run guarded maintenance actions such as backup, restore, and rebuild.",
+  },
 ];
 
 function setStatus(element, text, isError = false) {
   element.textContent = text || "";
   element.classList.toggle("error", Boolean(isError));
 }
+
+// -- toasts -----------------------------------------------------------------
+// Stacked transient notifications for action results. Inline .status lines stay
+// for context that belongs to a specific panel; anything a user just DID (or
+// that finished in the background) reports here so it is visible from any tab.
+
+const TOAST_DEFAULT_TIMEOUT_MS = 6000;
+const TOAST_MAX_VISIBLE = 6;
+
+function showToast(text, { kind = "info", timeoutMs = null, onClick = null } = {}) {
+  const stack = els.toastStack;
+  if (!stack || !text) {
+    return;
+  }
+  while (stack.children.length >= TOAST_MAX_VISIBLE) {
+    stack.firstElementChild.remove();
+  }
+  const toast = document.createElement("div");
+  toast.className = `toast toast-${kind}`;
+  toast.setAttribute("role", kind === "error" ? "alert" : "status");
+  const message = document.createElement("span");
+  message.className = "toast-message";
+  message.textContent = text;
+  toast.appendChild(message);
+  const closeButton = document.createElement("button");
+  closeButton.type = "button";
+  closeButton.className = "toast-close";
+  closeButton.setAttribute("aria-label", "Dismiss notification");
+  closeButton.textContent = "×";
+  toast.appendChild(closeButton);
+  const dismiss = () => {
+    toast.classList.add("toast-leaving");
+    setTimeout(() => toast.remove(), 180);
+  };
+  closeButton.addEventListener("click", dismiss);
+  if (typeof onClick === "function") {
+    toast.classList.add("toast-clickable");
+    toast.addEventListener("click", (event) => {
+      if (event.target === closeButton) {
+        return;
+      }
+      onClick();
+      dismiss();
+    });
+  }
+  stack.appendChild(toast);
+  const effectiveTimeout =
+    timeoutMs === null ? (kind === "error" ? 0 : TOAST_DEFAULT_TIMEOUT_MS) : timeoutMs;
+  if (effectiveTimeout > 0) {
+    setTimeout(() => {
+      if (toast.isConnected) {
+        dismiss();
+      }
+    }, effectiveTimeout);
+  }
+}
+
+function toastError(error) {
+  showToast(error && error.message ? error.message : String(error), { kind: "error" });
+}
+
 
 function escapeHtml(value) {
   return String(value)
@@ -708,18 +837,21 @@ function loadApiKey() {
   }
 }
 
-function ensureReviewerName() {
+async function ensureReviewerName() {
   let reviewer = saveReviewerName(els.reviewerNameInput.value || getCookie(REVIEWER_NAME_COOKIE));
   if (reviewer) {
     return reviewer;
   }
-  const prompted = window.prompt("Enter your name to record who approved or flagged this source:", "");
+  const prompted = await promptText("Reviewer name", {
+    body: "Record who approved or flagged this source.",
+    placeholder: "Your name",
+  });
   if (prompted === null) {
     return "";
   }
   reviewer = saveReviewerName(prompted);
   if (!reviewer) {
-    setStatus(els.uploadStatus, "Enter a reviewer name before approving or flagging sources.", true);
+    setStatus(els.libraryStatus, "Enter a reviewer name before approving or flagging sources.", true);
   }
   return reviewer;
 }
@@ -1185,7 +1317,7 @@ function selectChat(chatId) {
   renderActiveChat();
 }
 
-function renameChat(chatId) {
+async function renameChat(chatId) {
   if (state.streamingChatId) {
     return;
   }
@@ -1193,7 +1325,10 @@ function renameChat(chatId) {
   if (!chat) {
     return;
   }
-  const nextTitle = window.prompt("Rename chat", chat.title || "New chat");
+  const nextTitle = await promptText("Rename chat", {
+    placeholder: "Chat name",
+    initialValue: chat.title || "New chat",
+  });
   if (nextTitle === null) {
     return;
   }
@@ -1208,12 +1343,21 @@ function renameChat(chatId) {
   renderSavedChats();
 }
 
-function deleteChat(chatId) {
+async function deleteChat(chatId) {
   if (state.streamingChatId) {
     return;
   }
   const chat = state.chats.find((item) => item.id === chatId);
-  if (!chat || !window.confirm(`Delete "${chat.title || "New chat"}"?`)) {
+  if (!chat) {
+    return;
+  }
+  const confirmed = await confirmAction(
+    "Delete this chat?",
+    `“${chat.title || "New chat"}” and its messages are removed from this browser. This cannot be undone.`,
+    "Delete chat",
+    { danger: true },
+  );
+  if (!confirmed) {
     return;
   }
   state.chats = state.chats.filter((item) => item.id !== chatId);
@@ -1261,13 +1405,18 @@ function renderActiveChat() {
   if (!chat) {
     return;
   }
-  for (const message of chat.messages) {
+  chat.messages.forEach((message, index) => {
     if (message.role === "assistant") {
-      addSavedAssistantMessage(message);
+      const parts = addSavedAssistantMessage(message);
+      const messageEl = parts.body.closest(".message");
+      if (messageEl) {
+        attachAssistantMessageActions(messageEl, chat);
+      }
     } else {
-      addMessage("You", message.text || "");
+      const body = addMessage("You", message.text || "");
+      attachUserMessageActions(body.closest(".message"), chat, index);
     }
-  }
+  });
   scrollChatToBottom(true);
 }
 
@@ -1302,6 +1451,77 @@ function applyChatConfig(config) {
     els.relevanceFloorInput.value = String(config.retrieval_min_score);
     els.relevanceFloorInput.dataset.configApplied = "true";
   }
+  updateComposerSettingsSummary();
+}
+
+// -- answer-mode presets ------------------------------------------------------
+// Friendly names over the raw sampler knobs. Manual edits flip the select to
+// "custom" without overwriting the persisted preset, so a reload returns to
+// the mode the user actually chose.
+
+const ANSWER_PRESET_LABELS = {
+  precise: "Precise",
+  balanced: "Balanced",
+  deep: "Deep research",
+  custom: "Custom",
+};
+
+function applyAnswerPreset(presetId) {
+  const preset = ANSWER_PRESETS[presetId];
+  if (!preset) {
+    return;
+  }
+  els.temperatureInput.value = String(preset.temperature);
+  els.maxKInput.value = String(preset.max_k);
+  els.contextWindowInput.value = String(preset.context_window);
+  els.maxOutputInput.value = String(preset.llm_num_predict);
+  els.relevanceFloorInput.value = String(preset.retrieval_min_score);
+  els.webSearchInput.checked = Boolean(preset.web_search_enabled);
+  // An explicitly chosen mode beats the server's one-time defaults; mark the
+  // server-configurable inputs as applied so the health poll leaves them be.
+  for (const input of [els.contextWindowInput, els.maxOutputInput, els.relevanceFloorInput]) {
+    input.dataset.configApplied = "true";
+  }
+  try {
+    localStorage.setItem(ANSWER_PRESET_STORAGE_KEY, presetId);
+  } catch (_) {
+    // Storage can be unavailable (private mode); the select still works live.
+  }
+  updateComposerSettingsSummary();
+}
+
+function restoreAnswerPreset() {
+  let saved = "";
+  try {
+    saved = localStorage.getItem(ANSWER_PRESET_STORAGE_KEY) || "";
+  } catch (_) {
+    saved = "";
+  }
+  if (ANSWER_PRESETS[saved]) {
+    els.answerPresetSelect.value = saved;
+    applyAnswerPreset(saved);
+    return;
+  }
+  updateComposerSettingsSummary();
+}
+
+function markComposerSettingsCustom() {
+  if (els.answerPresetSelect.value !== "custom") {
+    els.answerPresetSelect.value = "custom";
+  }
+  updateComposerSettingsSummary();
+}
+
+function updateComposerSettingsSummary() {
+  if (!els.composerSettingsSummary) {
+    return;
+  }
+  const presetId = els.answerPresetSelect.value;
+  const label = ANSWER_PRESET_LABELS[presetId] || presetId;
+  const temp = numericSetting(els.temperatureInput, 0.3, 0);
+  const topK = Math.trunc(numericSetting(els.maxKInput, 40, 1));
+  const web = els.webSearchInput.checked ? "web on" : "web off";
+  els.composerSettingsSummary.textContent = `${label} · temp ${temp} · top-k ${topK} · ${web}`;
 }
 
 function positiveInterval(value, fallback) {
@@ -1677,12 +1897,14 @@ async function applyBulkTagGroup() {
     const failures = (result.failed || []).map((item) => `${String(item.source_hash || "").slice(0, 8)}: ${item.error}`);
     const summary = `Tagged ${successCount} PDF${successCount === 1 ? "" : "s"} as ${label}.`;
     if (failures.length) {
-      setStatus(els.uploadStatus, `${summary} ${failures.length} failed: ${failures.join("; ")}`, true);
+      showToast(`${summary} ${failures.length} failed: ${failures.join("; ")}`, { kind: "error" });
+      setStatus(els.libraryStatus, `${summary} ${failures.length} failed: ${failures.join("; ")}`, true);
     } else {
-      setStatus(els.uploadStatus, summary);
+      showToast(summary, { kind: "success" });
+      setStatus(els.libraryStatus, summary);
     }
   } catch (error) {
-    setStatus(els.uploadStatus, error.message, true);
+    setStatus(els.libraryStatus, error.message, true);
   }
   await refreshPdfs({ force: true });
 }
@@ -1694,7 +1916,7 @@ async function runAutoTagSweep() {
   try {
     const selected = Array.from(state.selectedPdfHashes);
     const body = selected.length ? { source_hashes: selected } : {};
-    setStatus(els.uploadStatus, "Asking the LLM to sort ungrouped PDFs...");
+    setStatus(els.libraryStatus, "Asking the LLM to sort ungrouped PDFs...");
     const result = await requestJson("/api/pdfs/trust/auto-tag", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1702,13 +1924,13 @@ async function runAutoTagSweep() {
     });
     const queued = Array.isArray(result.queued) ? result.queued : [];
     if (!queued.length) {
-      setStatus(els.uploadStatus, result.message || "No ungrouped PDFs to tag.");
+      showToast(result.message || "No ungrouped PDFs to tag.", { kind: "info" });
+      setStatus(els.libraryStatus, result.message || "No ungrouped PDFs to tag.");
       return;
     }
-    setStatus(
-      els.uploadStatus,
-      `Auto-tagging ${queued.length} PDF${queued.length === 1 ? "" : "s"} with ${result.model || "the LLM"}. Rows update as decisions land.`
-    );
+    const autoTagMessage = `Auto-tagging ${queued.length} PDF${queued.length === 1 ? "" : "s"} with ${result.model || "the LLM"}. Rows update as decisions land.`;
+    setStatus(els.libraryStatus, autoTagMessage);
+    showToast(autoTagMessage, { kind: "info" });
     // Decisions are written to the trust registry as the model answers;
     // poll a few times so rows flip to their auto tag without a manual reload.
     for (const delay of [4000, 12000, 30000]) {
@@ -1717,7 +1939,7 @@ async function runAutoTagSweep() {
       }, delay);
     }
   } catch (error) {
-    setStatus(els.uploadStatus, error.message, true);
+    setStatus(els.libraryStatus, error.message, true);
   } finally {
     if (els.pdfAutoTagButton) {
       els.pdfAutoTagButton.disabled = false;
@@ -1794,6 +2016,7 @@ function renderPdfActions(item) {
     : "";
   return `
     <div class="pdf-actions">
+      <button type="button" data-pdf-action="preview" data-source-hash="${sourceHash}" title="Open the PDF in an in-app preview"${item.can_download ? "" : " disabled"}>Preview</button>
       ${tagGroupButton}
       <button type="button" data-pdf-action="approve" data-source-hash="${sourceHash}">Approve</button>
       <button type="button" data-pdf-action="stale" data-source-hash="${sourceHash}">Flag stale</button>
@@ -1919,10 +2142,10 @@ function formatJobProgress(job) {
   const phase = escapeHtml(String(p.phase || ""));
   const rate = Number(p.rate_per_min || 0);
   const eta = Number(p.eta_seconds || 0);
+  const pct = total > 0 ? Math.max(0, Math.min(100, Math.round((done / total) * 100))) : null;
   const parts = [];
   if (phase) parts.push(phase);
   if (total > 0) {
-    const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
     parts.push(`${done.toLocaleString()}/${total.toLocaleString()} ${unit} (${pct}%)`);
   } else if (done > 0) {
     parts.push(`${done.toLocaleString()} ${unit}`);
@@ -1932,7 +2155,125 @@ function formatJobProgress(job) {
   // Surface cumulative record counters from the indexer's `extra` payload so a
   // long indexing run shows records written/embedded alongside file progress.
   const extra = p.records_written != null ? ` | ${Number(p.records_written).toLocaleString()} recs` : "";
-  return parts.length ? `<div class="job-progress">${parts.join(" · ")}${extra}</div>` : "";
+  const text = parts.join(" · ") + extra;
+  if (!text.trim()) {
+    return "";
+  }
+  const bar = pct === null
+    ? '<div class="progress-track progress-indeterminate" aria-hidden="true"><div class="progress-fill"></div></div>'
+    : `<div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}" aria-label="Job progress"><div class="progress-fill" style="width: ${pct}%"></div></div>`;
+  return `<div class="job-progress">${bar}<div class="progress-text">${text}</div></div>`;
+}
+
+// Compact single-line variant for the global jobs strip (no HTML bar).
+function formatJobProgressText(job) {
+  const p = job && job.progress;
+  if (!p || typeof p !== "object") {
+    return "";
+  }
+  const done = Number(p.done || 0);
+  const total = Number(p.total || 0);
+  const unit = String(p.unit || "items");
+  const eta = Number(p.eta_seconds || 0);
+  const parts = [];
+  if (total > 0) {
+    const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+    parts.push(`${done.toLocaleString()}/${total.toLocaleString()} ${unit} (${pct}%)`);
+  } else if (done > 0) {
+    parts.push(`${done.toLocaleString()} ${unit}`);
+  }
+  if (eta > 0) parts.push(`ETA ${formatEta(eta)}`);
+  return parts.join(" · ");
+}
+
+// -- job outcome notifications ----------------------------------------------
+// Diff each poll's job statuses against the last seen state and toast (plus
+// desktop-notify when the page is hidden) on transitions to a terminal state.
+
+function trackJobTransitions(jobs) {
+  for (const job of jobs || []) {
+    const jobId = String(job.id || "");
+    const status = String(job.status || "");
+    if (!jobId || !status) {
+      continue;
+    }
+    const previous = state.jobWatch.get(jobId);
+    state.jobWatch.set(jobId, status);
+    if (previous && previous !== status && TERMINAL_JOB_STATUSES.has(status) && !TERMINAL_JOB_STATUSES.has(previous)) {
+      notifyJobOutcome(jobId, status, job);
+    }
+  }
+  // Pagination means jobs rotate out of the fetched page; cap the map so it
+  // cannot grow without bound across a long-lived tab.
+  if (state.jobWatch.size > JOB_WATCH_LIMIT) {
+    const excess = state.jobWatch.size - JOB_WATCH_LIMIT;
+    let dropped = 0;
+    for (const key of state.jobWatch.keys()) {
+      if (dropped >= excess) {
+        break;
+      }
+      state.jobWatch.delete(key);
+      dropped += 1;
+    }
+  }
+}
+
+function notifyJobOutcome(jobId, status, job) {
+  const shortId = jobId.slice(0, 8);
+  const names = Array.isArray(job.filenames) ? job.filenames.filter(Boolean) : [];
+  const label = names.length ? names.slice(0, 2).join(", ") + (names.length > 2 ? ` +${names.length - 2}` : "") : `Job ${shortId}`;
+  if (status === "done") {
+    showToast(`${label} finished.`, { kind: "success", onClick: () => activateTab("upload") });
+  } else if (status === "failed") {
+    const firstErrorLine = String(job.error || "").split("\n")[0].slice(0, 160);
+    showToast(`${label} failed${firstErrorLine ? `: ${firstErrorLine}` : ""}.`, {
+      kind: "error",
+      onClick: () => activateTab("upload"),
+    });
+  } else if (status === "cancelled") {
+    showToast(`${label} was cancelled.`, { kind: "info" });
+  }
+  // Desktop notification only matters while the tab is in the background;
+  // the toast above already covers the visible case.
+  if (document.hidden && "Notification" in window && Notification.permission === "granted") {
+    try {
+      const title = status === "done" ? "Job finished" : status === "failed" ? "Job failed" : "Job cancelled";
+      const bodyText = status === "failed" && firstErrorText(job) ? firstErrorText(job) : label;
+      new Notification(`Local FSAE RAG — ${title}`, { body: bodyText });
+    } catch (_) {
+      // Notification construction can throw (e.g. closed permissions UI); ignore.
+    }
+  }
+}
+
+function firstErrorText(job) {
+  return String(job.error || "").split("\n")[0].slice(0, 160);
+}
+
+// -- global jobs strip -------------------------------------------------------
+// Slim banner under the header that stays visible on every tab while any
+// ingestion/indexing work is active, with a shortcut to the Documents tab.
+
+function updateJobsStrip(jobs, activeCount) {
+  const strip = els.jobsStrip;
+  if (!strip) {
+    return;
+  }
+  const activeJobs = (jobs || []).filter((job) => ACTIVE_JOB_STATUSES.has(String(job.status || "")));
+  if (!activeCount && !activeJobs.length) {
+    strip.hidden = true;
+    return;
+  }
+  const running =
+    activeJobs.find((job) => String(job.status) === "running") ||
+    activeJobs.find((job) => String(job.status) === "paused_for_queries") ||
+    activeJobs[0];
+  const phase = String((running && running.phase) || running.status || "working");
+  const progressText = running ? formatJobProgressText(running) : "";
+  const extraCount = Math.max(0, (Number(activeCount) || activeJobs.length) - 1);
+  const extraLabel = extraCount > 0 ? ` · +${extraCount} more job${extraCount === 1 ? "" : "s"}` : "";
+  els.jobsStripText.textContent = `${phase}${progressText ? ` — ${progressText}` : ""}${extraLabel}`;
+  strip.hidden = false;
 }
 
 function createJobRow(job) {
@@ -2015,20 +2356,29 @@ function renderJobRows(jobs) {
 }
 
 async function refreshJobs(options = {}) {
-  if (state.activeTab !== "upload" && !options.force) {
+  const onUpload = state.activeTab === "upload";
+  // Off the Documents tab: stay quiet unless jobs are active — the 2s active
+  // poll keeps the global jobs strip and completion toasts fresh from any tab.
+  if (!onUpload && !options.force && !state.jobsActive) {
     state.uploadDataDirty = true;
     return;
   }
+  const renderTable = onUpload || options.force;
   // Stale-response token: a newer call (rapid paging, forced refresh) must
   // keep an older slow response from overwriting the fresher table state.
   const fetchSeq = ++state.jobsFetchSeq;
   try {
     const isAll = state.jobsPageSize === "all";
     state.jobsLimit = isAll ? 0 : (Number(state.jobsPageSize) || 10);
+    // Background polling always watches the newest page so completions are
+    // detected regardless of which page the table was left on.
+    const offset = renderTable ? state.jobsOffset : 0;
+    const limit = renderTable ? state.jobsLimit : 10;
+    const search = renderTable ? state.jobSearch : "";
     const params = new URLSearchParams({
-      offset: String(state.jobsOffset),
-      limit: String(state.jobsLimit),
-      search: state.jobSearch,
+      offset: String(offset),
+      limit: String(limit),
+      search,
     });
     const url = `/api/jobs?${params}`;
     const data = await requestJson(url);
@@ -2036,13 +2386,25 @@ async function refreshJobs(options = {}) {
       return;
     }
     state.jobsLoaded = true;
+    const wasActive = state.jobsActive;
+    state.jobsActive = Number(data.active_count || 0) > 0;
     if (data.notModified && state.jobsRenderedUrl === url) {
-      hydrateJobLogs();
+      if (renderTable) {
+        hydrateJobLogs();
+      }
+      return;
+    }
+    trackJobTransitions(data.jobs || []);
+    updateJobsStrip(data.jobs || [], Number(data.active_count || 0));
+    if (!renderTable) {
+      // Table state is refetched when the user returns to Documents.
+      state.uploadDataDirty = true;
+      if (wasActive !== state.jobsActive) {
+        scheduleJobsPolling();
+      }
       return;
     }
     state.jobsTotal = data.total || 0;
-    const wasActive = state.jobsActive;
-    state.jobsActive = Number(data.active_count || 0) > 0;
     if (!isAll && state.jobsOffset >= state.jobsTotal && state.jobsOffset > 0) {
       state.jobsOffset = Math.max(0, Math.floor((state.jobsTotal - 1) / state.jobsLimit) * state.jobsLimit);
       return refreshJobs({ force: true });
@@ -2098,7 +2460,13 @@ async function handleJobAction(event) {
   if (action !== "cancel" || !jobId) {
     return;
   }
-  if (!window.confirm("Cancel this job?")) {
+  const confirmed = await confirmAction(
+    "Cancel this job?",
+    "Queued work that has not started yet is removed; a running job is asked to stop at the next safe checkpoint.",
+    "Cancel job",
+    { danger: true },
+  );
+  if (!confirmed) {
     return;
   }
   button.disabled = true;
@@ -2106,19 +2474,19 @@ async function handleJobAction(event) {
     const job = await requestJson(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
       method: "POST",
     });
-    setStatus(els.uploadStatus, `Cancelled job ${String(job.id || jobId).slice(0, 8)}.`);
+    showToast(`Cancelled job ${String(job.id || jobId).slice(0, 8)}.`, { kind: "success" });
     markIndexDirty();
     await refreshJobs({ force: true });
     await refreshPdfs({ force: true });
   } catch (error) {
-    setStatus(els.uploadStatus, error.message, true);
+    toastError(error);
   } finally {
     button.disabled = false;
   }
 }
 
 async function refreshPdfs(options = {}) {
-  if (state.activeTab !== "upload" && !options.force) {
+  if (state.activeTab !== "library" && !options.force) {
     state.uploadDataDirty = true;
     return;
   }
@@ -2131,6 +2499,8 @@ async function refreshPdfs(options = {}) {
       offset: String(state.pdfOffset),
       limit: String(state.pdfLimit),
       search: state.pdfSearch,
+      source_group: state.pdfGroupFilter || "all",
+      trust_status: state.pdfTrustFilter || "all",
     });
     const url = `/api/pdfs?${params}`;
     const data = await requestJson(url);
@@ -2166,7 +2536,7 @@ async function refreshPdfs(options = {}) {
       });
     }
   } catch (error) {
-    setStatus(els.uploadStatus, error.message, true);
+    setStatus(els.libraryStatus, error.message, true);
   }
 }
 
@@ -2181,7 +2551,13 @@ async function handlePdfAction(event) {
     return;
   }
   if (sourceHash === WALKTHROUGH_FAKE_PDF_HASH) {
-    setStatus(els.uploadStatus, "This walkthrough row is a local preview and is removed after the step.");
+    showToast("This walkthrough row is a local preview and is removed after the step.");
+    return;
+  }
+  if (action === "preview") {
+    const row = button.closest("tr");
+    const filename = row?.querySelector("strong")?.textContent || sourceHash.slice(0, 12);
+    openPdfPreview(sourceHash, filename);
     return;
   }
   const body = {};
@@ -2195,24 +2571,40 @@ async function handlePdfAction(event) {
     body.source_group = sourceGroup;
   } else if (action === "stale") {
     body.review_status = "stale";
-    body.notes = window.prompt("Why is this source stale?", "") || "";
+    body.notes = (await promptText("Why is this source stale?", { placeholder: "Notes for future reviewers" })) || "";
   } else if (action === "reprocess") {
-    if (!window.confirm("Re-run ingestion and indexing for this source?")) {
+    const ok = await confirmAction(
+      "Re-run this source?",
+      "Re-runs ingestion (PDF extraction) and then indexing for this one source as a background job.",
+      "Re-run",
+    );
+    if (!ok) {
       return;
     }
   } else if (action === "reindex") {
-    if (!window.confirm("Re-index this source without re-running ingestion?")) {
+    const ok = await confirmAction(
+      "Re-index this source?",
+      "Re-runs indexing without re-running ingestion (reuses the extracted Markdown).",
+      "Re-index",
+    );
+    if (!ok) {
       return;
     }
   } else if (action === "delete") {
-    if (!window.confirm("Delete this source, including its PDF, processed Markdown, assets, and index records?")) {
+    const ok = await confirmAction(
+      "Delete this source?",
+      "Permanently removes the uploaded PDF, its processed Markdown, extracted assets, and all of its index records. This cannot be undone.",
+      "Delete source",
+      { danger: true, requireText: "DELETE" },
+    );
+    if (!ok) {
       return;
     }
   } else {
     return;
   }
   if (action === "approve" || action === "stale") {
-    const reviewer = ensureReviewerName();
+    const reviewer = await ensureReviewerName();
     if (!reviewer) {
       return;
     }
@@ -2224,7 +2616,7 @@ async function handlePdfAction(event) {
       const job = await requestJson(`/api/pdfs/${encodeURIComponent(sourceHash)}/reprocess`, {
         method: "POST",
       });
-      setStatus(els.uploadStatus, `Queued re-run job ${String(job.id || "").slice(0, 8)}.`);
+      showToast(`Re-run queued (job ${String(job.id || "").slice(0, 8)}).`, { kind: "success" });
       markIndexDirty();
       await refreshJobs({ force: true });
       await refreshPdfs({ force: true });
@@ -2232,7 +2624,7 @@ async function handlePdfAction(event) {
       const job = await requestJson(`/api/pdfs/${encodeURIComponent(sourceHash)}/reindex`, {
         method: "POST",
       });
-      setStatus(els.uploadStatus, `Queued re-index job ${String(job.id || "").slice(0, 8)}.`);
+      showToast(`Re-index queued (job ${String(job.id || "").slice(0, 8)}).`, { kind: "success" });
       markIndexDirty();
       await refreshJobs({ force: true });
       await refreshPdfs({ force: true });
@@ -2241,7 +2633,10 @@ async function handlePdfAction(event) {
         method: "DELETE",
       });
       const deletedVectors = Number(result.vectors?.deleted || 0);
-      setStatus(els.uploadStatus, `Deleted source ${sourceHash.slice(0, 8)} and ${deletedVectors} index record${deletedVectors === 1 ? "" : "s"}.`);
+      showToast(
+        `Deleted source ${sourceHash.slice(0, 8)} and ${deletedVectors} index record${deletedVectors === 1 ? "" : "s"}.`,
+        { kind: "success" },
+      );
       markIndexDirty();
       await refreshJobs({ force: true });
       await refreshPdfs({ force: true });
@@ -2254,12 +2649,18 @@ async function handlePdfAction(event) {
       if (result.pdf) {
         patchPdfRow(result.pdf);
       }
+      if (action === "approve") {
+        showToast(`Marked “${result.pdf?.filename || sourceHash.slice(0, 8)}” as approved.`, { kind: "success" });
+      } else if (action === "stale") {
+        showToast(`Flagged “${result.pdf?.filename || sourceHash.slice(0, 8)}” as stale.`, { kind: "success" });
+      }
       if (action === "tag-group") {
         await refreshPdfs({ force: true });
       }
     }
   } catch (error) {
-    setStatus(els.uploadStatus, error.message, true);
+    toastError(error);
+    setStatus(els.libraryStatus, error.message, true);
   } finally {
     button.disabled = false;
   }
@@ -2797,6 +3198,7 @@ async function enqueueReingest() {
       "Use it after changing OCR/parser/vision settings or when extracted text looks wrong across many documents. " +
       "It runs as a background job and may take a while.",
     "Re-ingest all",
+    { danger: true, requireText: "REINGEST" },
   );
   if (!confirmed) {
     if (els.reingestButton) {
@@ -2808,6 +3210,7 @@ async function enqueueReingest() {
   try {
     const job = await requestJson("/api/reingest", { method: "POST" });
     setMaintenanceStatus(`Queued re-ingest job ${job.id.slice(0, 8)}.`);
+    showToast(`Full re-ingest queued (job ${job.id.slice(0, 8)}).`, { kind: "info" });
     state.jobsOffset = 0;
     markIndexDirty();
     await refreshJobs({ force: true });
@@ -2821,7 +3224,7 @@ async function enqueueReingest() {
   }
 }
 
-function confirmAction(title, body, confirmLabel = "Confirm") {
+function confirmAction(title, body, confirmLabel = "Confirm", options = {}) {
   return new Promise((resolve) => {
     const overlay = document.createElement("div");
     overlay.className = "modal-overlay";
@@ -2838,12 +3241,27 @@ function confirmAction(title, body, confirmLabel = "Confirm") {
       paragraph.textContent = body;
       dialog.appendChild(paragraph);
     }
+    // requireText gates irreversible/corpus-wide actions: the confirm button
+    // stays disabled until the operator types the exact token (e.g. REBUILD).
+    const requireText = String(options.requireText || "").trim();
+    let typedInput = null;
+    if (requireText) {
+      const label = document.createElement("label");
+      label.className = "confirm-type-label";
+      label.appendChild(document.createTextNode(`Type ${requireText} to confirm`));
+      typedInput = document.createElement("input");
+      typedInput.type = "text";
+      typedInput.autocomplete = "off";
+      typedInput.spellcheck = false;
+      label.appendChild(typedInput);
+      dialog.appendChild(label);
+    }
     const actions = document.createElement("div");
     actions.className = "modal-actions";
     const confirmButton = document.createElement("button");
     confirmButton.type = "button";
     confirmButton.textContent = confirmLabel;
-    if (confirmLabel.toLowerCase().includes("rebuild") || confirmLabel.toLowerCase().includes("restore")) {
+    if (options.danger || requireText) {
       confirmButton.className = "danger";
     }
     const cancelButton = document.createElement("button");
@@ -2855,6 +3273,13 @@ function confirmAction(title, body, confirmLabel = "Confirm") {
     overlay.appendChild(dialog);
     document.body.appendChild(overlay);
 
+    if (requireText) {
+      confirmButton.disabled = true;
+      typedInput.addEventListener("input", () => {
+        confirmButton.disabled = typedInput.value.trim() !== requireText;
+      });
+    }
+
     const close = (result) => {
       overlay.remove();
       document.removeEventListener("keydown", onKey);
@@ -2863,7 +3288,7 @@ function confirmAction(title, body, confirmLabel = "Confirm") {
     const onKey = (event) => {
       if (event.key === "Escape") {
         close(false);
-      } else if (event.key === "Enter") {
+      } else if (event.key === "Enter" && !confirmButton.disabled) {
         close(true);
       }
     };
@@ -2875,7 +3300,78 @@ function confirmAction(title, body, confirmLabel = "Confirm") {
       }
     });
     document.addEventListener("keydown", onKey);
-    setTimeout(() => confirmButton.focus(), 0);
+    setTimeout(() => (typedInput || confirmButton).focus(), 0);
+  });
+}
+
+function promptText(title, { body = "", placeholder = "", initialValue = "" } = {}) {
+  // Styled replacement for window.prompt (used for chat renames and stale
+  // notes). Resolves with the trimmed value, or null when cancelled.
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.hidden = false;
+    const dialog = document.createElement("div");
+    dialog.className = "modal-dialog";
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    const heading = document.createElement("h2");
+    heading.textContent = title;
+    dialog.appendChild(heading);
+    if (body) {
+      const paragraph = document.createElement("p");
+      paragraph.textContent = body;
+      dialog.appendChild(paragraph);
+    }
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = initialValue;
+    input.placeholder = placeholder;
+    input.autocomplete = "off";
+    dialog.appendChild(input);
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const okButton = document.createElement("button");
+    okButton.type = "button";
+    okButton.textContent = "Save";
+    const cancelButton = document.createElement("button");
+    cancelButton.type = "button";
+    cancelButton.textContent = "Cancel";
+    actions.appendChild(cancelButton);
+    actions.appendChild(okButton);
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    const close = (result) => {
+      overlay.remove();
+      document.removeEventListener("keydown", onKey);
+      resolve(result);
+    };
+    const submit = () => {
+      const value = input.value.trim();
+      close(value ? value : null);
+    };
+    const onKey = (event) => {
+      if (event.key === "Escape") {
+        close(null);
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        submit();
+      }
+    };
+    okButton.addEventListener("click", submit);
+    cancelButton.addEventListener("click", () => close(null));
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) {
+        close(null);
+      }
+    });
+    document.addEventListener("keydown", onKey);
+    setTimeout(() => {
+      input.focus();
+      input.select();
+    }, 0);
   });
 }
 
@@ -2915,6 +3411,7 @@ async function enqueueRebuild() {
       "It runs as a background job and the index stays queryable until the rebuild publishes. " +
       "Use this if the index is corrupted.",
     "Re-build index",
+    { danger: true, requireText: "REBUILD" },
   );
   if (!confirmed) {
     if (els.rebuildIndexButton) {
@@ -2926,6 +3423,7 @@ async function enqueueRebuild() {
   try {
     const job = await requestJson("/api/index/rebuild", { method: "POST" });
     setMaintenanceStatus(`Queued index rebuild job ${job.id.slice(0, 8)}.`);
+    showToast(`Index rebuild queued (job ${job.id.slice(0, 8)}).`, { kind: "info" });
     state.jobsOffset = 0;
     markIndexDirty();
     await refreshJobs({ force: true });
@@ -3045,6 +3543,7 @@ async function handleBackupAction(event) {
     "Restore this index backup?",
     `The current live index will be swapped out for “${backupName}”. A safety backup of the current index is taken first so this is reversible.`,
     "Restore index",
+    { danger: true, requireText: "RESTORE" },
   );
   if (!confirmed) {
     return;
@@ -3266,21 +3765,119 @@ function createIndexRow(item, options = {}) {
         </div>
       </td>
       <td class="index-content-cell">
-        <textarea class="content-edit" spellcheck="false"></textarea>
+        <div class="index-content-text"></div>
+        <div class="index-inline-editor">
+          <textarea class="inline-edit-textarea" spellcheck="false" aria-label="Edit record content"></textarea>
+          <div class="inline-edit-preview rendered" hidden></div>
+          <div class="inline-edit-actions">
+            <button type="button" data-action="preview-toggle" title="Render the Markdown to check formatting">Preview</button>
+            <span class="inline-edit-status status"></span>
+            <button type="button" data-action="cancel-edit">Cancel</button>
+            <button type="button" data-action="save-edit">Save</button>
+          </div>
+        </div>
       </td>
       <td>
         <div class="row-actions">
-          <button type="button" data-action="save">Save</button>
+          <button type="button" data-action="edit" title="Edit this record in place">Edit</button>
         </div>
       </td>
     `;
-  row.querySelector("textarea").value = item.content || "";
+  const contentCell = row.querySelector(".index-content-text");
+  contentCell.textContent = item.content || "";
+  indexRowContent.set(row, item.content || "");
   appendAssetPreviewGrid(row.querySelector(".index-content-cell"), item.assets, {
     className: "source-assets index-assets",
     itemClassName: "index-asset",
     fallbackAlt: "Extracted source image",
   });
   return row;
+}
+
+// Row -> original content, so in-place editing can restore and diff against
+// the last published text without pulling it back through the DOM.
+const indexRowContent = new WeakMap();
+
+// -- in-place index row editing ----------------------------------------------
+// Editing happens directly in the row: Edit swaps the read-only content cell
+// for a textarea (with an optional Markdown preview toggle), Save/Cancel sit
+// under it, and Esc cancels. No popup, no separate panel.
+
+function beginInlineEdit(row) {
+  if (row.dataset.editing === "true") {
+    return;
+  }
+  row.dataset.editing = "true";
+  row.classList.add("index-row-editing");
+  const textarea = row.querySelector(".inline-edit-textarea");
+  textarea.value = indexRowContent.get(row) || "";
+  const preview = row.querySelector(".inline-edit-preview");
+  preview.hidden = true;
+  preview.innerHTML = "";
+  row.querySelector("[data-action='preview-toggle']").textContent = "Preview";
+  textarea.focus();
+}
+
+function endInlineEdit(row) {
+  delete row.dataset.editing;
+  row.classList.remove("index-row-editing");
+}
+
+function toggleInlineEditPreview(row) {
+  const textarea = row.querySelector(".inline-edit-textarea");
+  const preview = row.querySelector(".inline-edit-preview");
+  const button = row.querySelector("[data-action='preview-toggle']");
+  if (!preview.hidden) {
+    preview.hidden = true;
+    textarea.hidden = false;
+    button.textContent = "Preview";
+    return;
+  }
+  button.disabled = true;
+  requestJson("/api/render", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: textarea.value }),
+  })
+    .then((data) => {
+      preview.innerHTML = data.html || "";
+    })
+    .catch(() => {
+      preview.textContent = textarea.value;
+    })
+    .finally(() => {
+      preview.hidden = false;
+      textarea.hidden = true;
+      button.textContent = "Edit text";
+      button.disabled = false;
+    });
+}
+
+async function saveInlineEdit(row) {
+  const recordId = row.dataset.recordId || "";
+  const content = row.querySelector(".inline-edit-textarea").value;
+  const saveButton = row.querySelector("[data-action='save-edit']");
+  const status = row.querySelector(".inline-edit-status");
+  saveButton.disabled = true;
+  try {
+    await requestJson("/api/index/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ record_id: recordId, content }),
+    });
+    indexRowContent.set(row, content);
+    row.querySelector(".index-content-text").textContent = content;
+    showToast(`Saved record ${recordId}.`, { kind: "success" });
+    endInlineEdit(row);
+    markIndexDirty();
+  } catch (error) {
+    toastError(error);
+    if (status) {
+      setStatus(status, error.message, true);
+    }
+  } finally {
+    saveButton.disabled = false;
+  }
 }
 
 function createIndexLoadMoreRow(parentId, nextOffset, total) {
@@ -3554,25 +4151,21 @@ async function handleIndexAction(event) {
     await loadMoreIndexChildren(button);
     return;
   }
-
-  const recordId = row.dataset.recordId;
-  const textarea = row.querySelector("textarea");
-  button.disabled = true;
-
-  try {
-    if (action === "save") {
-      await requestJson("/api/index/update", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ record_id: recordId, content: textarea.value }),
-      });
-      setStatus(els.indexStatus, `Saved ${recordId}.`);
-    }
-
-  } catch (error) {
-    setStatus(els.indexStatus, error.message, true);
-  } finally {
-    button.disabled = false;
+  if (action === "edit") {
+    beginInlineEdit(row);
+    return;
+  }
+  if (action === "cancel-edit") {
+    endInlineEdit(row);
+    return;
+  }
+  if (action === "preview-toggle") {
+    toggleInlineEditPreview(row);
+    return;
+  }
+  if (action === "save-edit") {
+    await saveInlineEdit(row);
+    return;
   }
 }
 
@@ -3770,9 +4363,52 @@ function createAssetPreviewGrid(assets, options = {}) {
     const caption = document.createElement("span");
     caption.textContent = [asset.page_no ? `page ${asset.page_no}` : "", captionAction].filter(Boolean).join(" | ");
     link.appendChild(caption);
+    // Lightbox keeps the user in-context instead of bouncing to a new tab;
+    // the lightbox itself still offers an open-original link.
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      openImageLightbox(asset.url, asset.description || fallbackAlt);
+    });
     assetGrid.appendChild(link);
   }
   return assetGrid;
+}
+
+function openImageLightbox(url, description) {
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay lightbox-overlay";
+  overlay.hidden = false;
+  const figure = document.createElement("figure");
+  figure.className = "lightbox-figure";
+  const image = document.createElement("img");
+  image.src = url;
+  image.alt = description || "Source image";
+  const caption = document.createElement("figcaption");
+  const text = document.createElement("span");
+  text.textContent = description || "";
+  const openOriginal = document.createElement("a");
+  openOriginal.href = url;
+  openOriginal.target = "_blank";
+  openOriginal.rel = "noreferrer";
+  openOriginal.textContent = "Open original";
+  caption.append(text, openOriginal);
+  figure.append(image, caption);
+  overlay.appendChild(figure);
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) {
+      close();
+    }
+  });
+  const onKey = (event) => {
+    if (event.key === "Escape") {
+      close();
+      document.removeEventListener("keydown", onKey);
+    }
+  };
+  document.addEventListener("keydown", onKey);
+  figure.addEventListener("click", close);
 }
 
 function appendAssetPreviewGrid(container, assets, options = {}) {
@@ -3816,8 +4452,12 @@ function renderSourcePanel(parts) {
     const reliability = source.kind === "local"
       ? `${sourceGroupTitle(source.source_group)} | weight ${Number(source.reliability_modifier || sourceGroupWeight(source.source_group)).toFixed(2)}`
       : "";
+    const groupKey = String(source.source_group || "ungrouped");
+    const groupBadge = source.kind === "local"
+      ? `<span class="source-group-badge group-${escapeHtml(groupKey)}">${escapeHtml(sourceGroupTitle(groupKey))}</span>`
+      : "";
     item.innerHTML = `
-      <strong>${escapeHtml(source.label || source.id || "")} ${escapeHtml(sourceTitle(source))}</strong>
+      <strong>${escapeHtml(source.label || source.id || "")} ${escapeHtml(sourceTitle(source))} ${groupBadge}</strong>
       <span>${escapeHtml([sourceLocation(source), reliability, score].filter(Boolean).join(" | "))}</span>
       <span>${escapeHtml(source.snippet || "")}</span>
       <span class="source-links">${links.join("")}</span>
@@ -3910,6 +4550,80 @@ function focusSourceForCitation(parts, label) {
   } else {
     panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
+}
+
+// Hover preview for [S1]/[W1] citation links: shows the cited chunk's snippet
+// next to the reference so readers can weigh evidence without scrolling away.
+function showCitationPopover(link, parts) {
+  const popover = els.citationPopover;
+  if (!popover || !parts) {
+    return;
+  }
+  const label = String(link.dataset.citation || "").trim();
+  const source = (Array.isArray(parts.sources) ? parts.sources : []).find(
+    (item) => String(item.label || item.id || "").trim() === label,
+  );
+  if (!source) {
+    return;
+  }
+  popover.innerHTML = "";
+  const title = document.createElement("strong");
+  title.textContent = `${label} ${sourceTitle(source)}`;
+  const metaParts = [
+    sourceLocation(source),
+    source.kind === "local" && Number.isFinite(Number(source.score))
+      ? `score ${Number(source.score).toFixed(3)}`
+      : "",
+    source.kind === "local" ? sourceGroupTitle(source.source_group || "ungrouped") : "",
+  ].filter(Boolean);
+  const meta = document.createElement("span");
+  meta.className = "citation-popover-meta";
+  meta.textContent = metaParts.join(" | ");
+  const snippetText = String(source.snippet || "").trim();
+  const snippet = document.createElement("div");
+  snippet.className = "citation-popover-snippet";
+  snippet.textContent = snippetText.length > 420 ? `${snippetText.slice(0, 420)}…` : snippetText || "(no preview text)";
+  popover.append(title, meta, snippet);
+  popover.hidden = false;
+  const linkRect = link.getBoundingClientRect();
+  const popRect = popover.getBoundingClientRect();
+  const scrollX = window.scrollX;
+  let left = linkRect.left + scrollX;
+  const maxLeft = scrollX + document.documentElement.clientWidth - popRect.width - 12;
+  left = Math.max(scrollX + 8, Math.min(left, Math.max(8, maxLeft)));
+  popover.style.left = `${Math.round(left)}px`;
+  popover.style.top = `${Math.round(linkRect.bottom + window.scrollY + 6)}px`;
+}
+
+function hideCitationPopover() {
+  if (els.citationPopover) {
+    els.citationPopover.hidden = true;
+  }
+}
+
+// In-app PDF preview: renders the stored PDF in an iframe so reviewers can
+// verify a source without leaving the Library or downloading the file.
+function openPdfPreview(sourceHash, filename) {
+  if (!els.pdfPreviewOverlay) {
+    return;
+  }
+  const viewUrl = `/api/pdfs/${encodeURIComponent(sourceHash)}/view`;
+  els.pdfPreviewTitle.textContent = `Preview — ${filename}`;
+  els.pdfPreviewDownloadLink.href = `/api/pdfs/${encodeURIComponent(sourceHash)}/download`;
+  els.pdfPreviewFrame.src = viewUrl;
+  els.pdfPreviewFrame.hidden = false;
+  els.pdfPreviewFallback.hidden = true;
+  els.pdfPreviewOverlay.hidden = false;
+}
+
+function closePdfPreview() {
+  if (!els.pdfPreviewOverlay || els.pdfPreviewOverlay.hidden) {
+    return;
+  }
+  // Drop the document from the iframe so a hidden multi-MB PDF is not kept.
+  els.pdfPreviewFrame.src = "about:blank";
+  els.pdfPreviewFrame.hidden = true;
+  els.pdfPreviewOverlay.hidden = true;
 }
 
 function normalizeToolResultEvent(event) {
@@ -4295,25 +5009,23 @@ async function formatAssistantMessage(parts) {
   }
 }
 
-async function sendQuestion(event) {
-  event.preventDefault();
+// Streaming core shared by the composer, regenerate, and edit-and-resend.
+// announceUser=false re-asks an existing history entry without duplicating the
+// user bubble (regenerate) — the caller has already set up chat.messages.
+async function runChatExchange(chat, question, { announceUser = true } = {}) {
   if (state.streamingChatId) {
     return;
   }
-  const question = els.questionInput.value.trim();
-  if (!question) {
-    return;
-  }
-
-  const chat = activeChat() || createChat({ activate: true });
   state.activeChatId = chat.id;
   state.streamingChatId = chat.id;
   const abortController = new AbortController();
   state.chatAbortController = abortController;
-  addUserMessageToChat(chat, question);
-  addMessage("You", question);
+  if (announceUser) {
+    addUserMessageToChat(chat, question);
+    const userBody = addMessage("You", question);
+    attachUserMessageActions(userBody.closest(".message"), chat, chat.messages.length - 1);
+  }
   const assistantParts = addAssistantMessage();
-  els.questionInput.value = "";
   setSendButtonStreaming(true);
   renderSavedChats();
 
@@ -4379,10 +5091,221 @@ async function sendQuestion(event) {
     if (state.chatAbortController === abortController) {
       state.chatAbortController = null;
     }
+    const messageEl = assistantParts.body.closest(".message");
+    if (messageEl) {
+      attachAssistantMessageActions(messageEl, chat);
+    }
     setSendButtonStreaming(false);
     renderSavedChats();
     await refreshHealth();
   }
+}
+
+async function sendQuestion(event) {
+  event.preventDefault();
+  if (state.streamingChatId) {
+    return;
+  }
+  const question = els.questionInput.value.trim();
+  if (!question) {
+    return;
+  }
+  const chat = activeChat() || createChat({ activate: true });
+  els.questionInput.value = "";
+  await runChatExchange(chat, question);
+}
+
+// -- per-message actions (copy / regenerate / edit-and-resend) ---------------
+
+async function copyTextToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast("Copied to clipboard.", { kind: "success", timeoutMs: 2500 });
+  } catch (_) {
+    // Clipboard can be denied (non-secure context); fall back to a selection.
+    const scratch = document.createElement("textarea");
+    scratch.value = text;
+    scratch.style.position = "fixed";
+    scratch.style.opacity = "0";
+    document.body.appendChild(scratch);
+    scratch.select();
+    const copied = document.execCommand("copy");
+    scratch.remove();
+    if (copied) {
+      showToast("Copied to clipboard.", { kind: "success", timeoutMs: 2500 });
+    } else {
+      showToast("Copy failed — select the text manually.", { kind: "error" });
+    }
+  }
+}
+
+function buildMessageActions(actions) {
+  const bar = document.createElement("div");
+  bar.className = "message-actions";
+  for (const action of actions) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = action.label;
+    button.title = action.title || action.label;
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      action.onClick();
+    });
+    bar.appendChild(button);
+  }
+  return bar;
+}
+
+function attachAssistantMessageActions(messageEl, chat) {
+  if (!messageEl || messageEl.querySelector(".message-actions")) {
+    return;
+  }
+  const parts = assistantMessageParts.get(messageEl);
+  const actions = [
+    {
+      label: "Copy",
+      title: "Copy the answer as Markdown",
+      onClick: () => copyTextToClipboard(parts ? parts.rawAnswer : ""),
+    },
+  ];
+  // Regenerate re-asks the last exchange, so it only makes sense on the most
+  // recent assistant message.
+  const messages = chat.messages;
+  if (messages.length && messages[messages.length - 1].role === "assistant") {
+    actions.push({
+      label: "Regenerate",
+      title: "Re-ask the previous question",
+      onClick: () => regenerateLastAnswer(chat),
+    });
+  }
+  messageEl.appendChild(buildMessageActions(actions));
+}
+
+function attachUserMessageActions(messageEl, chat, messageIndex) {
+  if (!messageEl || messageEl.querySelector(".message-actions")) {
+    return;
+  }
+  messageEl.appendChild(
+    buildMessageActions([
+      {
+        label: "Copy",
+        onClick: () => copyTextToClipboard(chat.messages[messageIndex]?.text || ""),
+      },
+      {
+        label: "Edit",
+        title: "Edit in place — everything after this message is removed on resend",
+        onClick: () => beginInlineMessageEdit(messageEl, chat, messageIndex),
+      },
+    ]),
+  );
+}
+
+// In-place edit of a sent message: the bubble swaps to a textarea with
+// Cancel / Save & resend. Saving truncates the conversation at this message
+// and re-asks with the new wording.
+function beginInlineMessageEdit(messageEl, chat, messageIndex) {
+  const body = messageEl.querySelector(".body");
+  if (!body || messageEl.dataset.editing === "true") {
+    return;
+  }
+  const original = chat.messages[messageIndex]?.text || "";
+  messageEl.dataset.editing = "true";
+  messageEl.classList.add("message-editing");
+
+  const editor = document.createElement("div");
+  editor.className = "message-inline-edit";
+  const textarea = document.createElement("textarea");
+  textarea.className = "message-inline-edit-textarea";
+  textarea.value = original;
+  textarea.rows = Math.min(10, original.split("\n").length + 2);
+  const actions = document.createElement("div");
+  actions.className = "message-inline-edit-actions";
+  const cancelButton = document.createElement("button");
+  cancelButton.type = "button";
+  cancelButton.textContent = "Cancel";
+  cancelButton.addEventListener("click", () => cancelInlineMessageEdit(messageEl));
+  const resendButton = document.createElement("button");
+  resendButton.type = "button";
+  resendButton.textContent = "Save & resend";
+  resendButton.addEventListener("click", () => {
+    const edited = textarea.value.trim();
+    if (!edited || edited === original) {
+      cancelInlineMessageEdit(messageEl);
+      return;
+    }
+    if (state.streamingChatId) {
+      showToast("Wait for the current answer to finish first.", { kind: "info" });
+      return;
+    }
+    editAndResendUserMessage(chat, messageIndex, edited);
+  });
+  textarea.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.stopPropagation();
+      cancelInlineMessageEdit(messageEl);
+    } else if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      resendButton.click();
+    }
+  });
+  actions.append(cancelButton, resendButton);
+  editor.append(textarea, actions);
+  body.replaceWith(editor);
+  textarea.focus();
+  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+}
+
+function cancelInlineMessageEdit(messageEl) {
+  if (!messageEl || messageEl.dataset.editing !== "true") {
+    return;
+  }
+  // A full re-render is the cheapest consistent restore: state and DOM stay
+  // in sync even if history shifted while editing.
+  renderActiveChat();
+}
+
+function regenerateLastAnswer(chat) {
+  if (state.streamingChatId) {
+    showToast("Wait for the current answer to finish first.", { kind: "info" });
+    return;
+  }
+  const messages = chat.messages;
+  if (!messages.length || messages[messages.length - 1].role !== "assistant") {
+    return;
+  }
+  // Drop the answer being regenerated, then find the question before it.
+  messages.pop();
+  let question = "";
+  while (messages.length && messages[messages.length - 1].role !== "user") {
+    messages.pop();
+  }
+  if (messages.length && messages[messages.length - 1].role === "user") {
+    question = messages[messages.length - 1].text || "";
+    messages.pop();
+  }
+  if (!question) {
+    return;
+  }
+  persistChatState();
+  renderSavedChats();
+  renderActiveChat();
+  runChatExchange(chat, question);
+}
+
+function editAndResendUserMessage(chat, messageIndex, editedText) {
+  if (state.streamingChatId) {
+    showToast("Wait for the current answer to finish first.", { kind: "info" });
+    return;
+  }
+  if (messageIndex < 0 || messageIndex >= chat.messages.length) {
+    return;
+  }
+  // Truncate the conversation at the edited message (inclusive) and re-ask.
+  chat.messages = chat.messages.slice(0, messageIndex);
+  persistChatState();
+  renderSavedChats();
+  renderActiveChat();
+  runChatExchange(chat, editedText);
 }
 
 function activateTab(tabTarget, options = {}) {
@@ -4404,13 +5327,419 @@ function activateTab(tabTarget, options = {}) {
     abortIndexLoad();
   }
   if (tabTarget === "upload" && options.refreshUpload !== false) {
-    if (options.forceRefresh || state.uploadDataDirty || !state.pdfsLoaded) {
-      refreshPdfs({ force: true });
-    }
     if (options.forceRefresh || state.uploadDataDirty || !state.jobsLoaded) {
       refreshJobs({ force: true });
     }
     state.uploadDataDirty = false;
+  }
+  if (tabTarget === "library" && options.refreshUpload !== false) {
+    if (options.forceRefresh || state.uploadDataDirty || !state.pdfsLoaded) {
+      refreshPdfs({ force: true });
+    }
+    state.uploadDataDirty = false;
+  }
+  if (tabTarget === "admin") {
+    refreshAdminPanel({ force: options.forceRefresh === true });
+  }
+}
+
+// -- admin tab ---------------------------------------------------------------
+
+// The admin endpoints (key list, ops metrics) are credential-gated GETs; the
+// default requestJson path never sends the key on GETs, so admin surfaces
+// attach it explicitly.
+function adminApiHeaders() {
+  const headers = {};
+  const key = getApiKey();
+  if (key) {
+    headers["X-API-Token"] = key;
+  }
+  return headers;
+}
+
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value >= 1024 ** 3) {
+    return `${(value / 1024 ** 3).toFixed(2)} GB`;
+  }
+  if (value >= 1024 * 1024) {
+    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (value >= 1024) {
+    return `${(value / 1024).toFixed(0)} KB`;
+  }
+  return `${value} B`;
+}
+
+function adminMetricRow(label, value) {
+  return `
+    <div class="admin-metric">
+      <span class="admin-metric-label">${escapeHtml(label)}</span>
+      <span class="admin-metric-value">${value}</span>
+    </div>
+  `;
+}
+
+function adminCard(title, bodyHtml, extraClass = "") {
+  return `
+    <div class="admin-card ${extraClass}">
+      <h3>${escapeHtml(title)}</h3>
+      ${bodyHtml}
+    </div>
+  `;
+}
+
+function adminStatusBadge(ok, okText, badText) {
+  return `<span class="status-badge ${ok ? "status-good" : "status-bad"}">${escapeHtml(ok ? okText : badText)}</span>`;
+}
+
+function renderOpsDashboard(health, metrics) {
+  const dashboard = els.adminDashboard;
+  if (!dashboard) {
+    return;
+  }
+  const queue = (metrics && metrics.queue) || (health && health.queue) || {};
+  // llm_* keys live on /api/health; /api/metrics carries the ollama_* snapshot.
+  const ollamaSnap = (metrics && metrics.ollama) || {};
+  const llmBackend = String(health?.llm_backend ?? ollamaSnap.llm_backend ?? "unknown");
+  const llmReachable = Boolean(health?.llm_reachable ?? ollamaSnap.reachable);
+  const llmUrl = String(
+    health?.llm_base_url ?? ollamaSnap.llm_base_url ?? ollamaSnap.ollama_active_host ?? "—",
+  );
+  const embedding = (metrics && metrics.embedding_config) || {};
+  const embeddingRows = embedding.error
+    ? adminMetricRow("config", `<span class="admin-metric-error">${escapeHtml(embedding.error)}</span>`)
+    : [
+        adminMetricRow("backend", escapeHtml(String(embedding.backend || "—"))),
+        adminMetricRow("model", escapeHtml(String(embedding.model || "—"))),
+        adminMetricRow("batch size", escapeHtml(String(embedding.batch_size ?? "—"))),
+        adminMetricRow("replicas", escapeHtml(String(embedding.replica_count ?? "—"))),
+        adminMetricRow("concurrency", escapeHtml(String(embedding.concurrency ?? "—"))),
+      ].join("");
+  const cards = [
+    adminCard(
+      "Index",
+      [
+        adminMetricRow("records", escapeHtml(Number(metrics?.record_count ?? health?.record_count ?? 0).toLocaleString())),
+        adminMetricRow("documents", escapeHtml(Number(metrics?.document_count ?? 0).toLocaleString())),
+        adminMetricRow("on disk", escapeHtml(formatBytes(metrics?.index_bytes || 0))),
+        adminMetricRow(
+          "embedded / reused",
+          escapeHtml(
+            `${Number(metrics?.embedded_records || 0).toLocaleString()} / ${Number(metrics?.reused_records || 0).toLocaleString()}`,
+          ),
+        ),
+      ].join(""),
+    ),
+    adminCard(
+      "Job queue",
+      [
+        adminMetricRow("active jobs", escapeHtml(String(queue.active_job_count ?? queue.active_count ?? "—"))),
+        adminMetricRow("queued", escapeHtml(String(queue.queued_count ?? "—"))),
+        adminMetricRow("active queries", escapeHtml(String(queue.active_query_count ?? "—"))),
+      ].join(""),
+    ),
+    adminCard(
+      "LLM backend",
+      [
+        adminMetricRow("backend", escapeHtml(llmBackend)),
+        adminMetricRow("status", adminStatusBadge(llmReachable, "reachable", "unreachable")),
+        adminMetricRow("endpoint", escapeHtml(llmUrl)),
+      ].join(""),
+      llmReachable ? "" : "admin-card-warning",
+    ),
+    adminCard("Embeddings", embeddingRows),
+  ];
+  dashboard.innerHTML = cards.join("");
+}
+
+async function refreshOpsDashboard(options = {}) {
+  const dashboard = els.adminDashboard;
+  if (!dashboard) {
+    return;
+  }
+  if (!options.force && state.adminDashboardLoaded) {
+    return;
+  }
+  // /api/metrics is a sensitive GET: it is credential-gated when auth is
+  // enabled, so attach the stored key (mutations get this automatically).
+  const adminHeaders = adminApiHeaders();
+  const results = await Promise.allSettled([
+    requestJson("/api/health", { headers: adminHeaders }),
+    requestJson("/api/metrics", { headers: adminHeaders }),
+  ]);
+  const health = results[0].status === "fulfilled" ? results[0].value : null;
+  const metrics = results[1].status === "fulfilled" ? results[1].value : null;
+  if (!health && !metrics) {
+    const reason = results[0].status === "rejected" ? results[0].reason : results[1].reason;
+    dashboard.innerHTML = adminCard(
+      "Dashboard unavailable",
+      `<p class="admin-metric-error">${escapeHtml(reason && reason.message ? reason.message : String(reason))}</p>`,
+    );
+    return;
+  }
+  state.adminDashboardLoaded = true;
+  renderOpsDashboard(health, metrics);
+}
+
+// -- admin API key manager ---------------------------------------------------
+
+function formatKeyTimestamp(value) {
+  if (!value) {
+    return "—";
+  }
+  return formatBrowserTimestamp(value);
+}
+
+function formatKeyUsage(usage) {
+  const data = usage && typeof usage === "object" ? usage : {};
+  const requests = Number(data.requests || 0);
+  return `${requests.toLocaleString()} req`;
+}
+
+function renderAdminApiKeys(keys, masterConfigured) {
+  const body = els.adminKeysBody;
+  if (!body) {
+    return;
+  }
+  if (!keys.length) {
+    body.innerHTML =
+      '<tr class="admin-keys-empty"><td colspan="8">No API keys issued yet. Create one above — auth stays disabled until a key or master token exists.</td></tr>';
+    return;
+  }
+  body.innerHTML = keys
+    .map((key) => {
+      const prefix = String(key.prefix || "");
+      const status = String(key.status || "active");
+      const role = String(key.role || "user");
+      const expires = key.expires_at ? formatKeyTimestamp(key.expires_at) : "never";
+      const usage = formatKeyUsage(key.usage);
+      const lastUsed = key.usage && key.usage.last_used_at ? formatKeyTimestamp(key.usage.last_used_at) : "—";
+      const statusToggleLabel = status === "active" ? "Disable" : "Enable";
+      const statusToggleStatus = status === "active" ? "disabled" : "active";
+      return `
+        <tr data-key-prefix="${escapeHtml(prefix)}">
+          <td class="admin-key-prefix">${escapeHtml(prefix)}</td>
+          <td>${escapeHtml(String(key.label || ""))}</td>
+          <td>
+            <select data-admin-key-action="set-role" class="admin-key-role-select" aria-label="Role for ${escapeHtml(prefix)}">
+              <option value="user"${role === "user" ? " selected" : ""}>user</option>
+              <option value="admin"${role === "admin" ? " selected" : ""}>admin</option>
+            </select>
+          </td>
+          <td><span class="status-badge ${status === "active" ? "status-good" : "status-bad"}">${escapeHtml(status)}</span></td>
+          <td>${escapeHtml(expires)}</td>
+          <td>${escapeHtml(usage)}</td>
+          <td>${escapeHtml(lastUsed)}</td>
+          <td>
+            <div class="admin-key-actions">
+              <button type="button" data-admin-key-action="toggle-status" data-status="${statusToggleStatus}">${statusToggleLabel}</button>
+              <button type="button" class="danger" data-admin-key-action="delete">Delete</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
+async function refreshAdminApiKeys(options = {}) {
+  const status = els.adminKeysStatus;
+  try {
+    const data = await requestJson("/api/admin/api-keys", { headers: adminApiHeaders() });
+    state.adminKeysAuthorized = true;
+    if (status) {
+      setStatus(status, "");
+    }
+    if (els.adminKeysHint) {
+      els.adminKeysHint.hidden = false;
+    }
+    renderAdminApiKeys(data.keys || [], data.master_configured);
+  } catch (error) {
+    state.adminKeysAuthorized = false;
+    renderAdminApiKeys([], false);
+    if (status) {
+      const hint = error.status === 401 || error.status === 403
+        ? "Admin role required. Set an admin API key below-left (API key box on the Documents tab) or configure the master token."
+        : error.message;
+      setStatus(status, hint, true);
+    }
+  }
+}
+
+function refreshAdminPanel(options = {}) {
+  refreshOpsDashboard(options);
+  refreshAdminApiKeys(options);
+}
+
+function showGeneratedKeyDialog(fullKey) {
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.hidden = false;
+  const dialog = document.createElement("div");
+  dialog.className = "modal-dialog";
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  const heading = document.createElement("h2");
+  heading.textContent = "API key created";
+  dialog.appendChild(heading);
+  const warning = document.createElement("p");
+  warning.textContent =
+    "Copy this secret now — it is stored hashed and cannot be shown again after this dialog closes.";
+  dialog.appendChild(warning);
+  const row = document.createElement("div");
+  row.className = "generated-key-row";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.readOnly = true;
+  input.value = fullKey;
+  input.setAttribute("aria-label", "New API key");
+  const copyButton = document.createElement("button");
+  copyButton.type = "button";
+  copyButton.textContent = "Copy";
+  row.appendChild(input);
+  row.appendChild(copyButton);
+  dialog.appendChild(row);
+  const actions = document.createElement("div");
+  actions.className = "modal-actions";
+  const doneButton = document.createElement("button");
+  doneButton.type = "button";
+  doneButton.textContent = "Done";
+  actions.appendChild(doneButton);
+  dialog.appendChild(actions);
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+
+  const close = () => {
+    // Best effort: drop the plaintext from the input before removal.
+    input.value = "";
+    overlay.remove();
+  };
+  copyButton.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(fullKey);
+      copyButton.textContent = "Copied";
+    } catch (_) {
+      // Clipboard can be denied (non-secure context); the input is selectable.
+      input.select();
+      copyButton.textContent = "Select + copy";
+    }
+    setTimeout(() => {
+      copyButton.textContent = "Copy";
+    }, 1500);
+  });
+  doneButton.addEventListener("click", close);
+  setTimeout(() => {
+    input.focus();
+    input.select();
+  }, 0);
+}
+
+async function createAdminApiKey() {
+  const label = (els.adminKeyLabelInput?.value || "").trim();
+  const role = els.adminKeyRoleSelect?.value || "user";
+  const expiresRaw = (els.adminKeyExpiresInput?.value || "").trim();
+  const rateRaw = (els.adminKeyRateInput?.value || "").trim();
+  const payload = { label, role };
+  if (expiresRaw) {
+    payload.expires_in_days = Number(expiresRaw);
+  }
+  if (rateRaw) {
+    payload.rate_limit_per_minute = Number(rateRaw);
+  }
+  if (els.adminKeyCreateButton) {
+    els.adminKeyCreateButton.disabled = true;
+  }
+  try {
+    const data = await requestJson("/api/admin/api-keys", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    showToast(`API key created for “${label || "unlabeled"}”.`, { kind: "success" });
+    if (els.adminKeyLabelInput) {
+      els.adminKeyLabelInput.value = "";
+    }
+    if (els.adminKeyExpiresInput) {
+      els.adminKeyExpiresInput.value = "";
+    }
+    if (els.adminKeyRateInput) {
+      els.adminKeyRateInput.value = "";
+    }
+    showGeneratedKeyDialog(String(data.key || ""));
+    await refreshAdminApiKeys();
+  } catch (error) {
+    toastError(error);
+    setStatus(els.adminKeysStatus, error.message, true);
+  } finally {
+    if (els.adminKeyCreateButton) {
+      els.adminKeyCreateButton.disabled = false;
+    }
+  }
+}
+
+async function handleAdminKeyAction(event) {
+  const control = event.target.closest("[data-admin-key-action]");
+  if (!control) {
+    return;
+  }
+  if (control.tagName === "BUTTON" && control.disabled) {
+    return;
+  }
+  const action = control.dataset.adminKeyAction || "";
+  const row = control.closest("tr[data-key-prefix]");
+  const prefix = row?.dataset.keyPrefix || "";
+  if (!prefix) {
+    return;
+  }
+  if (action === "set-role") {
+    // Fires on the select's change event; re-render below refreshes options.
+    try {
+      await requestJson(`/api/admin/api-keys/${encodeURIComponent(prefix)}/role`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role: control.value }),
+      });
+      showToast(`Role for ${prefix} set to ${control.value}.`, { kind: "success" });
+    } catch (error) {
+      toastError(error);
+    }
+    await refreshAdminApiKeys();
+    return;
+  }
+  if (action === "toggle-status") {
+    const nextStatus = control.dataset.status || "disabled";
+    try {
+      await requestJson(`/api/admin/api-keys/${encodeURIComponent(prefix)}/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: nextStatus }),
+      });
+      showToast(`${prefix} is now ${nextStatus}.`, { kind: "success" });
+    } catch (error) {
+      toastError(error);
+    }
+    await refreshAdminApiKeys();
+    return;
+  }
+  if (action === "delete") {
+    const confirmed = await confirmAction(
+      "Delete this API key?",
+      `Key ${prefix} stops working immediately. Any browser or script holding this secret must be re-issued a new key.`,
+      "Delete key",
+      { danger: true },
+    );
+    if (!confirmed) {
+      return;
+    }
+    try {
+      await requestJson(`/api/admin/api-keys/${encodeURIComponent(prefix)}`, { method: "DELETE" });
+      showToast(`Deleted key ${prefix}.`, { kind: "success" });
+    } catch (error) {
+      toastError(error);
+    }
+    await refreshAdminApiKeys();
   }
 }
 
@@ -4694,6 +6023,35 @@ document.addEventListener("keydown", (event) => {
     closeSourceGroupPrompt("");
     return;
   }
+  if (event.key === "Escape" && els.shortcutsOverlay && !els.shortcutsOverlay.hidden) {
+    els.shortcutsOverlay.hidden = true;
+    return;
+  }
+  if (event.key === "Escape" && els.settingsOverlay && !els.settingsOverlay.hidden) {
+    els.settingsOverlay.hidden = true;
+    return;
+  }
+  if (event.key === "Escape" && els.pdfPreviewOverlay && !els.pdfPreviewOverlay.hidden) {
+    closePdfPreview();
+    return;
+  }
+  if (event.key === "Escape" && els.citationPopover && !els.citationPopover.hidden) {
+    hideCitationPopover();
+    return;
+  }
+  // An in-flight inline edit (review row or chat bubble) cancels on Esc.
+  if (event.key === "Escape") {
+    const editingRow = document.querySelector("#indexBody tr[data-editing='true']");
+    if (editingRow) {
+      endInlineEdit(editingRow);
+      return;
+    }
+    const editingMessage = document.querySelector("#chatMessages .message[data-editing='true']");
+    if (editingMessage) {
+      cancelInlineMessageEdit(editingMessage);
+      return;
+    }
+  }
   if (els.sourceGroupPromptOverlay && !els.sourceGroupPromptOverlay.hidden && (event.ctrlKey || event.metaKey)) {
     const HOTKEY_SOURCE_GROUPS = { "1": "official", "2": "student_research", "3": "unofficial" };
     const choice = HOTKEY_SOURCE_GROUPS[event.key];
@@ -4701,8 +6059,200 @@ document.addEventListener("keydown", (event) => {
       event.preventDefault();
       closeSourceGroupPrompt(parseSourceGroupInput(choice));
     }
+    return;
   }
+  handleGlobalShortcut(event);
 });
+
+// -- global keyboard shortcuts ------------------------------------------------
+// "?", "/", "n", and two-key "g <tab>" sequences. Typing contexts (inputs,
+// textareas, selects, contenteditable) are exempt so shortcuts never swallow
+// user text; plain dialog keys above already returned before this runs.
+
+const SHORTCUT_SEQUENCE_TIMEOUT_MS = 1200;
+
+function shortcutTargetIsEditable(event) {
+  const target = event.target;
+  if (!target) {
+    return false;
+  }
+  const tag = String(target.tagName || "").toLowerCase();
+  return tag === "input" || tag === "textarea" || tag === "select" || target.isContentEditable;
+}
+
+function handleGlobalShortcut(event) {
+  if (event.ctrlKey || event.metaKey || event.altKey) {
+    return;
+  }
+  const overlayOpen =
+    (els.walkthroughOverlay && !els.walkthroughOverlay.hidden) ||
+    (els.settingsOverlay && !els.settingsOverlay.hidden) ||
+    (els.shortcutsOverlay && !els.shortcutsOverlay.hidden) ||
+    (els.welcomeTutorialOverlay && !els.welcomeTutorialOverlay.hidden) ||
+    (els.pdfPreviewOverlay && !els.pdfPreviewOverlay.hidden);
+  if (overlayOpen) {
+    return;
+  }
+  if (shortcutTargetIsEditable(event)) {
+    state.chatSequenceKey = "";
+    return;
+  }
+  if (event.key === "?") {
+    event.preventDefault();
+    els.shortcutsOverlay.hidden = !els.shortcutsOverlay.hidden;
+    return;
+  }
+  if (state.chatSequenceKey === "g") {
+    const targets = { d: "upload", l: "library", r: "index", a: "chat", m: "admin", g: "guide" };
+    const target = targets[event.key.toLowerCase()];
+    state.chatSequenceKey = "";
+    if (target) {
+      event.preventDefault();
+      activateTab(target);
+      return;
+    }
+  }
+  if (event.key === "g" || event.key === "G") {
+    state.chatSequenceKey = "g";
+    setTimeout(() => {
+      state.chatSequenceKey = "";
+    }, SHORTCUT_SEQUENCE_TIMEOUT_MS);
+    return;
+  }
+  state.chatSequenceKey = "";
+  if (event.key === "/") {
+    event.preventDefault();
+    focusSearchForActiveTab();
+    return;
+  }
+  if ((event.key === "n" || event.key === "N") && state.activeTab === "chat") {
+    if (state.streamingChatId) {
+      return;
+    }
+    event.preventDefault();
+    createChat({ activate: true });
+    els.questionInput.focus();
+  }
+}
+
+function focusSearchForActiveTab() {
+  const byTab = {
+    upload: els.jobSearchInput,
+    library: els.pdfSearchInput,
+    index: els.searchInput,
+    chat: els.questionInput,
+  };
+  const target = byTab[state.activeTab];
+  if (target) {
+    target.focus();
+    target.select();
+  }
+}
+
+// -- settings dialog -----------------------------------------------------------
+
+function openSettingsDialog() {
+  if (!els.settingsOverlay) {
+    return;
+  }
+  if (els.themeSelect) {
+    els.themeSelect.value = state.themePreference;
+  }
+  els.settingsOverlay.hidden = false;
+}
+
+function closeSettingsDialog() {
+  if (els.settingsOverlay) {
+    els.settingsOverlay.hidden = true;
+  }
+}
+
+// -- theme (light / dark / system) ---------------------------------------------
+// The resolved theme lands on <html data-theme> before first paint via a tiny
+// inline script in index.html; this engine handles runtime changes.
+
+function themeMediaDark() {
+  return window.matchMedia("(prefers-color-scheme: dark)").matches;
+}
+
+function resolveTheme(pref) {
+  if (pref === "dark" || pref === "light") {
+    return pref;
+  }
+  return themeMediaDark() ? "dark" : "light";
+}
+
+function applyTheme() {
+  document.documentElement.dataset.theme = resolveTheme(state.themePreference);
+  syncThemeControls();
+}
+
+function setThemePreference(pref, { persist = true } = {}) {
+  state.themePreference = pref === "dark" || pref === "light" ? pref : "auto";
+  if (persist) {
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, state.themePreference);
+    } catch (_) {
+      // Private mode: theme still applies for this session.
+    }
+  }
+  applyTheme();
+}
+
+function syncThemeControls() {
+  const resolved = resolveTheme(state.themePreference);
+  if (els.themeSelect) {
+    els.themeSelect.value = state.themePreference;
+  }
+  if (els.themeToggleLabel) {
+    // The toggle always offers the opposite of what is on screen.
+    els.themeToggleLabel.textContent = resolved === "dark" ? "Light mode" : "Dark mode";
+  }
+  if (els.themeToggleButton) {
+    els.themeToggleButton.title =
+      resolved === "dark" ? "Switch to light mode" : "Switch to dark mode";
+  }
+}
+
+function loadThemePreference() {
+  let pref = "auto";
+  try {
+    pref = localStorage.getItem(THEME_STORAGE_KEY) || "auto";
+  } catch (_) {
+    pref = "auto";
+  }
+  state.themePreference = pref === "dark" || pref === "light" ? pref : "auto";
+  applyTheme();
+}
+
+// -- sidebar collapse -------------------------------------------------------------
+
+function setAppSidebarCollapsed(collapsed, { persist = true } = {}) {
+  state.appSidebarCollapsed = Boolean(collapsed);
+  document.body.classList.toggle("sidebar-collapsed", state.appSidebarCollapsed);
+  if (els.sidebarCollapseButton) {
+    els.sidebarCollapseButton.title = state.appSidebarCollapsed
+      ? "Expand sidebar"
+      : "Collapse sidebar";
+  }
+  if (persist) {
+    try {
+      localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, state.appSidebarCollapsed ? "1" : "0");
+    } catch (_) {
+      // Ignore storage failures; collapse is a visual preference only.
+    }
+  }
+}
+
+function loadAppSidebarCollapsed() {
+  let collapsed = false;
+  try {
+    collapsed = localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === "1";
+  } catch (_) {
+    collapsed = false;
+  }
+  setAppSidebarCollapsed(collapsed, { persist: false });
+}
 els.cachePromptReloadButton.addEventListener("click", reloadAfterCacheClear);
 els.cachePromptDoneButton.addEventListener("click", () => closeCachePrompt());
 els.sourceGroupPromptOverlay.addEventListener("click", (event) => {
@@ -4768,6 +6318,123 @@ els.pdfSearchInput.addEventListener("keydown", (event) => {
     refreshPdfs({ force: true });
   }
 });
+if (els.pdfGroupFilterSelect) {
+  els.pdfGroupFilterSelect.addEventListener("change", () => {
+    state.pdfGroupFilter = els.pdfGroupFilterSelect.value || "all";
+    state.pdfOffset = 0;
+    refreshPdfs({ force: true });
+  });
+}
+if (els.pdfTrustFilterSelect) {
+  els.pdfTrustFilterSelect.addEventListener("change", () => {
+    state.pdfTrustFilter = els.pdfTrustFilterSelect.value || "all";
+    state.pdfOffset = 0;
+    refreshPdfs({ force: true });
+  });
+}
+if (els.pdfPreviewCloseButton) {
+  els.pdfPreviewCloseButton.addEventListener("click", closePdfPreview);
+}
+if (els.pdfPreviewOverlay) {
+  els.pdfPreviewOverlay.addEventListener("click", (event) => {
+    if (event.target === els.pdfPreviewOverlay) {
+      closePdfPreview();
+    }
+  });
+}
+if (els.sidebarCollapseButton) {
+  els.sidebarCollapseButton.addEventListener("click", () => {
+    setAppSidebarCollapsed(!state.appSidebarCollapsed);
+  });
+}
+if (els.themeToggleButton) {
+  els.themeToggleButton.addEventListener("click", () => {
+    setThemePreference(resolveTheme(state.themePreference) === "dark" ? "light" : "dark");
+  });
+}
+if (els.themeSelect) {
+  els.themeSelect.addEventListener("change", () => {
+    setThemePreference(els.themeSelect.value);
+  });
+}
+// Follow live OS theme changes while on "System".
+if (window.matchMedia) {
+  const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+  const onSchemeChange = () => {
+    if (state.themePreference === "auto") {
+      applyTheme();
+    }
+  };
+  if (darkQuery.addEventListener) {
+    darkQuery.addEventListener("change", onSchemeChange);
+  } else if (darkQuery.addListener) {
+    darkQuery.addListener(onSchemeChange);
+  }
+}
+if (els.settingsButton) {
+  els.settingsButton.addEventListener("click", openSettingsDialog);
+}
+if (els.settingsCloseButton) {
+  els.settingsCloseButton.addEventListener("click", closeSettingsDialog);
+}
+if (els.settingsOverlay) {
+  els.settingsOverlay.addEventListener("click", (event) => {
+    if (event.target === els.settingsOverlay) {
+      closeSettingsDialog();
+    }
+  });
+}
+if (els.settingsStartTourButton) {
+  els.settingsStartTourButton.addEventListener("click", () => {
+    closeSettingsDialog();
+    startWalkthrough();
+  });
+}
+if (els.shortcutsCloseButton) {
+  els.shortcutsCloseButton.addEventListener("click", () => {
+    els.shortcutsOverlay.hidden = true;
+  });
+}
+if (els.answerPresetSelect) {
+  els.answerPresetSelect.addEventListener("change", () => {
+    const presetId = els.answerPresetSelect.value;
+    if (ANSWER_PRESETS[presetId]) {
+      applyAnswerPreset(presetId);
+    } else {
+      updateComposerSettingsSummary();
+    }
+  });
+}
+for (const samplerInput of [
+  els.temperatureInput,
+  els.maxKInput,
+  els.contextWindowInput,
+  els.maxOutputInput,
+  els.relevanceFloorInput,
+  els.webSearchInput,
+]) {
+  if (samplerInput) {
+    samplerInput.addEventListener("change", markComposerSettingsCustom);
+  }
+}
+// Citation hover previews: one delegated pair covers every rendered answer.
+els.chatMessages.addEventListener("mouseover", (event) => {
+  const link = event.target.closest(".citation-link");
+  if (!link) {
+    return;
+  }
+  const message = link.closest(".assistant-message");
+  const parts = message ? assistantMessageParts.get(message) : null;
+  showCitationPopover(link, parts);
+});
+els.chatMessages.addEventListener("mouseout", (event) => {
+  if (event.target.closest(".citation-link")) {
+    hideCitationPopover();
+  }
+});
+if (els.citationPopover) {
+  els.citationPopover.addEventListener("mouseleave", hideCitationPopover);
+}
 els.reviewerNameInput.addEventListener("change", () => saveReviewerName(els.reviewerNameInput.value));
 els.reviewerNameInput.addEventListener("blur", () => saveReviewerName(els.reviewerNameInput.value));
 els.reviewerNameInput.addEventListener("keydown", (event) => {
@@ -4827,6 +6494,37 @@ if (els.pdfBulkClearButton) {
   els.pdfBulkClearButton.addEventListener("click", clearPdfSelection);
 }
 els.jobsBody.addEventListener("click", handleJobAction);
+els.jobsStripViewButton.addEventListener("click", () => activateTab("upload"));
+if (els.enableJobNotificationsButton) {
+  const syncNotificationButton = () => {
+    const supported = "Notification" in window;
+    const granted = supported && Notification.permission === "granted";
+    els.enableJobNotificationsButton.hidden = !supported || granted;
+  };
+  syncNotificationButton();
+  els.enableJobNotificationsButton.addEventListener("click", async () => {
+    if (!("Notification" in window)) {
+      return;
+    }
+    try {
+      await Notification.requestPermission();
+    } catch (_) {
+      // Permission prompt can fail (e.g. dismissed); the button state refresh
+      // below reflects whatever was decided.
+    }
+    syncNotificationButton();
+  });
+}
+if (els.refreshAdminButton) {
+  els.refreshAdminButton.addEventListener("click", () => refreshAdminPanel({ force: true }));
+}
+if (els.adminKeyCreateButton) {
+  els.adminKeyCreateButton.addEventListener("click", createAdminApiKey);
+}
+if (els.adminKeysBody) {
+  els.adminKeysBody.addEventListener("click", handleAdminKeyAction);
+  els.adminKeysBody.addEventListener("change", handleAdminKeyAction);
+}
 els.jobSearchButton.addEventListener("click", () => {
   state.jobSearch = els.jobSearchInput.value.trim();
   state.jobsOffset = 0;
@@ -4951,7 +6649,10 @@ els.chatMessages.addEventListener("click", (event) => {
 
 loadReviewerName();
 loadApiKey();
+loadThemePreference();
+loadAppSidebarCollapsed();
 loadChatState();
+restoreAnswerPreset();
 setChatSidebarCollapsed(state.chatSidebarCollapsed);
 renderSavedChats();
 renderActiveChat();
@@ -4959,6 +6660,9 @@ persistChatState();
 maybeStartFirstVisitWalkthrough();
 refreshHealth();
 refreshUpdateStatus();
+// Hydrate job state immediately (from any tab) so the global jobs strip and
+// completion tracking are correct on first paint instead of one poll late.
+refreshJobs({ force: true });
 scheduleHealthPolling();
 scheduleUpdatePolling();
 scheduleJobsPolling();

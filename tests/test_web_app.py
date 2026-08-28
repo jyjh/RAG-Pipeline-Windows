@@ -4239,3 +4239,182 @@ def test_metrics_endpoint_returns_operational_snapshot(monkeypatch):
     assert body["reused_records"] == 3345
     assert body["queue"]["active_query_count"] == 2
     assert body["ollama"]["reachable"] is True
+
+
+# ---------------------------------------------------------------------------
+# Admin API key management endpoints (/api/admin/api-keys ...)
+# ---------------------------------------------------------------------------
+
+
+def _install_admin_auth(monkeypatch, safe_tmp_path):
+    """Fresh key store + master token so admin endpoint tests are hermetic."""
+    from src.api_key_auth import ApiKeyAuthenticator, KeyStore
+
+    store = KeyStore(Path(safe_tmp_path) / ".api_keys.json")
+    authenticator = ApiKeyAuthenticator(store, default_rate_limit=60, persist_interval=999)
+    monkeypatch.setattr(web_app, "api_authenticator", authenticator)
+    monkeypatch.setattr(web_app, "_API_TOKEN", "master-token-1")
+    return authenticator
+
+
+def test_admin_api_key_lifecycle(monkeypatch, safe_tmp_path):
+    """Create -> list -> disable -> re-enable -> role change -> delete."""
+    authenticator = _install_admin_auth(monkeypatch, safe_tmp_path)
+    client = TestClient(web_app.app)
+    master = {"X-API-Token": "master-token-1"}
+
+    created = client.post(
+        "/api/admin/api-keys",
+        headers=master,
+        json={"label": "review laptop", "role": "user", "expires_in_days": 30, "rate_limit_per_minute": 42},
+    )
+    assert created.status_code == 200, created.text
+    payload = created.json()
+    # The plaintext secret is returned exactly once and is never stored.
+    assert payload["key"].startswith("rag_")
+    assert payload["record"]["label"] == "review laptop"
+    assert payload["record"]["role"] == "user"
+    assert payload["record"]["rate_limit_per_minute"] == 42
+    assert payload["record"]["expires_at"]
+    prefix = payload["record"]["prefix"]
+
+    listed = client.get("/api/admin/api-keys", headers=master).json()
+    assert [key["prefix"] for key in listed["keys"]] == [prefix]
+    assert "key" not in listed["keys"][0]
+
+    disabled = client.post(
+        f"/api/admin/api-keys/{prefix}/status", headers=master, json={"status": "disabled"}
+    )
+    assert disabled.status_code == 200
+    assert disabled.json()["record"]["status"] == "disabled"
+
+    enabled = client.post(
+        f"/api/admin/api-keys/{prefix}/status", headers=master, json={"status": "active"}
+    )
+    assert enabled.json()["record"]["status"] == "active"
+
+    promoted = client.post(
+        f"/api/admin/api-keys/{prefix}/role", headers=master, json={"role": "admin"}
+    )
+    assert promoted.json()["record"]["role"] == "admin"
+
+    deleted = client.delete(f"/api/admin/api-keys/{prefix}", headers=master)
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+    assert authenticator.store.list_keys() == []
+
+
+def test_admin_api_key_endpoints_require_admin_role(monkeypatch, safe_tmp_path):
+    """A user-role key can authenticate but gets 403 on admin endpoints."""
+    authenticator = _install_admin_auth(monkeypatch, safe_tmp_path)
+    client = TestClient(web_app.app)
+
+    user_key, _record = authenticator.create_key(label="plain user", role="user")
+    user_headers = {"X-API-Token": user_key}
+
+    denied = client.get("/api/admin/api-keys", headers=user_headers)
+    assert denied.status_code == 403
+    assert "admin" in denied.json()["detail"].lower()
+
+    denied_create = client.post(
+        "/api/admin/api-keys", headers=user_headers, json={"label": "sneaky", "role": "admin"}
+    )
+    assert denied_create.status_code == 403
+
+    # No credential at all -> 401.
+    assert client.get("/api/admin/api-keys").status_code == 401
+
+
+def test_admin_api_key_validation_errors(monkeypatch, safe_tmp_path):
+    """Invalid role/expiry and unknown prefixes return 4xx, not 500."""
+    _install_admin_auth(monkeypatch, safe_tmp_path)
+    client = TestClient(web_app.app)
+    master = {"X-API-Token": "master-token-1"}
+
+    bad_role = client.post(
+        "/api/admin/api-keys", headers=master, json={"label": "x", "role": "superuser"}
+    )
+    assert bad_role.status_code == 400
+
+    bad_expiry = client.post(
+        "/api/admin/api-keys",
+        headers=master,
+        json={"label": "x", "role": "user", "expires_at": "not-a-date"},
+    )
+    assert bad_expiry.status_code == 400
+
+    missing = client.post(
+        "/api/admin/api-keys/rag_zzz-none/status", headers=master, json={"status": "disabled"}
+    )
+    assert missing.status_code == 404
+
+    missing_delete = client.delete("/api/admin/api-keys/rag_zzz-none", headers=master)
+    assert missing_delete.status_code == 404
+
+
+def test_admin_api_key_endpoints_open_in_zero_config(monkeypatch, safe_tmp_path):
+    """No master token + empty store: auth is disabled, endpoints stay open (400 for create)."""
+    from src.api_key_auth import ApiKeyAuthenticator, KeyStore
+
+    store = KeyStore(Path(safe_tmp_path) / ".api_keys.json")
+    authenticator = ApiKeyAuthenticator(store, default_rate_limit=60, persist_interval=999)
+    monkeypatch.setattr(web_app, "api_authenticator", authenticator)
+    monkeypatch.setattr(web_app, "_API_TOKEN", "")
+
+    client = TestClient(web_app.app)
+    assert client.get("/api/admin/api-keys").status_code == 200
+    # Creating keys is refused while the authenticator exists but auth config
+    # is enabled=False at import; if it exists it is usable, so expect either
+    # a successful create or a clean 400, never a 500.
+    response = client.post(
+        "/api/admin/api-keys", json={"label": "first", "role": "user"}
+    )
+    assert response.status_code in {200, 400}
+
+
+def test_pdf_documents_endpoint_filters_by_group_and_trust(monkeypatch, workspace_tmp):
+    """source_group/trust_status facets filter rows server-side before paging."""
+    registry_path = workspace_tmp / "registry.json"
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    trust_path = workspace_tmp / "trust.json"
+    web_app.PdfRegistry(registry_path).register_queued(
+        job_id="job",
+        files=[
+            {"filename": "approved-official.pdf", "hash": "hash-a", "staging_path": ""},
+            {"filename": "approved-stale.pdf", "hash": "hash-b", "staging_path": ""},
+            {"filename": "unreviewed.pdf", "hash": "hash-c", "staging_path": ""},
+        ],
+    )
+    web_app._write_trust_registry(
+        {
+            "documents": {
+                "hash-a": {"review_status": "approved", "source_group": "official"},
+                "hash-b": {"review_status": "stale", "source_group": "student_research"},
+            }
+        },
+        trust_path,
+    )
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", registry_path)
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", trust_path)
+    monkeypatch.setattr(web_app, "DB_DIR", workspace_tmp / "db")
+
+    client = TestClient(web_app.app)
+    by_group = client.get("/api/pdfs", params={"source_group": "official"}).json()
+    assert [pdf["hash"] for pdf in by_group["pdfs"]] == ["hash-a"]
+    assert by_group["total"] == 1
+
+    by_status = client.get("/api/pdfs", params={"trust_status": "stale"}).json()
+    assert [pdf["hash"] for pdf in by_status["pdfs"]] == ["hash-b"]
+
+    unreviewed = client.get("/api/pdfs", params={"trust_status": "unreviewed"}).json()
+    assert [pdf["hash"] for pdf in unreviewed["pdfs"]] == ["hash-c"]
+
+    combined = client.get(
+        "/api/pdfs", params={"source_group": "official", "trust_status": "stale"}
+    ).json()
+    assert combined["pdfs"] == []
+
+    everything = client.get("/api/pdfs", params={"source_group": "all"}).json()
+    assert everything["total"] == 3

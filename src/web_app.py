@@ -21,7 +21,7 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -38,6 +38,10 @@ from src.atomic_io import write_json_atomic
 from src.api_key_auth import (
     MASTER_KEY_ID,
     RATE_WINDOW_SECONDS,
+    ROLE_ADMIN,
+    ROLE_USER,
+    STATUS_ACTIVE,
+    STATUS_DISABLED,
     ApiKeyAuthenticator,
     RateLimitExceeded,
     create_default_authenticator,
@@ -3185,6 +3189,8 @@ def list_pdf_documents(
     search: str = "",
     offset: int = 0,
     limit: int | None = None,
+    source_group: str = "",
+    trust_status: str = "",
     registry_path: Path | None = None,
     processed_dir: Path | None = None,
     root_dir: Path = ROOT_DIR,
@@ -3219,6 +3225,25 @@ def list_pdf_documents(
             for item in rows
             if query in str(item.get("filename", "")).lower()
             or query in str(item.get("hash", "")).lower()
+        ]
+    # Trust facet filters resolve against the same normalized trust entries the
+    # response rows carry, so the Library filters and the rendered badges can
+    # never disagree. Untagged rows expose review_status "unreviewed".
+    group_filter = (source_group or "").strip().lower()
+    if group_filter and group_filter != "all":
+        rows = [
+            item
+            for item in rows
+            if str(trust_by_hash[str(item.get("hash") or "")].get("source_group") or SOURCE_GROUP_UNGROUPED)
+            == group_filter
+        ]
+    status_filter = (trust_status or "").strip().lower()
+    if status_filter and status_filter != "all":
+        rows = [
+            item
+            for item in rows
+            if str(trust_by_hash[str(item.get("hash") or "")].get("review_status") or "unreviewed")
+            == status_filter
         ]
     page = _page_slice(rows, offset=offset, limit=limit)
 
@@ -3833,6 +3858,18 @@ AutoTagRequest = import_split_class("src.web_app_classes.auto_tag_request", "Aut
 AutoTagRequest.__module__ = __name__
 
 
+AdminApiKeyCreateRequest = import_split_class("src.web_app_classes.admin_api_key_request", "AdminApiKeyCreateRequest")
+AdminApiKeyCreateRequest.__module__ = __name__
+
+
+AdminApiKeyStatusRequest = import_split_class("src.web_app_classes.admin_api_key_request", "AdminApiKeyStatusRequest")
+AdminApiKeyStatusRequest.__module__ = __name__
+
+
+AdminApiKeyRoleRequest = import_split_class("src.web_app_classes.admin_api_key_request", "AdminApiKeyRoleRequest")
+AdminApiKeyRoleRequest.__module__ = __name__
+
+
 class BulkDocumentTrustRequest(BaseModel):
     source_hashes: list[str] = Field(default_factory=list)
     source_group: str
@@ -4255,6 +4292,130 @@ def admin_list_api_keys(request: Request):
                 }
             )
     return {"keys": keys, "master_configured": bool((globals().get("_API_TOKEN") or "").strip())}
+
+
+def _admin_key_public_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Non-secret view of a key record for admin listings and mutation results."""
+    return {
+        "prefix": record.get("prefix", ""),
+        "label": record.get("label", ""),
+        "role": record.get("role", ROLE_USER),
+        "status": record.get("status", STATUS_ACTIVE),
+        "created_at": record.get("created_at"),
+        "expires_at": record.get("expires_at"),
+        "rate_limit_per_minute": record.get("rate_limit_per_minute"),
+        "usage": record.get("usage", {}),
+    }
+
+
+def _admin_key_context(request: Request, prefix: str) -> tuple[JSONResponse | None, Any, dict[str, Any] | None]:
+    """Shared gate for per-key admin mutations: admin check + prefix lookup."""
+    denied = _require_admin(request)
+    if denied is not None:
+        return denied, None, None
+    authenticator = globals().get("api_authenticator")
+    if authenticator is None:
+        return (
+            JSONResponse(
+                status_code=400,
+                content={"detail": "API key auth is disabled in this deployment ([api_keys] enabled = false)."},
+            ),
+            None,
+            None,
+        )
+    record = authenticator.store.find_by_prefix(prefix)
+    if record is None:
+        return JSONResponse(status_code=404, content={"detail": f"No API key with prefix {prefix!r}."}), None, None
+    return None, authenticator, record
+
+
+@app.post("/api/admin/api-keys")
+def admin_create_api_key(request: Request, payload: AdminApiKeyCreateRequest):
+    """Issue a new API key (admin/master only).
+
+    The plaintext secret is returned here exactly once -- the store keeps only
+    the hash, so a lost secret must be replaced via rotate/re-issue. Label,
+    role, expiry, and rate limit mirror ``scripts/manage_api_keys.py create``.
+    """
+    denied = _require_admin(request)
+    if denied is not None:
+        return denied
+    authenticator = globals().get("api_authenticator")
+    if authenticator is None:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "API key auth is disabled in this deployment ([api_keys] enabled = false)."},
+        )
+    if payload.role not in {ROLE_ADMIN, ROLE_USER}:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"Invalid role {payload.role!r}; expected 'user' or 'admin'."},
+        )
+    expires_at: str | None = None
+    try:
+        if payload.expires_in_days is not None:
+            expires_at = (
+                datetime.now(timezone.utc) + timedelta(days=float(payload.expires_in_days))
+            ).isoformat(timespec="seconds")
+        elif payload.expires_at:
+            expires_at = payload.expires_at
+        full_key, record = authenticator.create_key(
+            label=payload.label[:120],
+            role=payload.role,
+            expires_at=expires_at,
+            rate_limit_per_minute=payload.rate_limit_per_minute,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+    log_event("admin.api_key_created", prefix=record.get("prefix", ""), role=payload.role)
+    return {"key": full_key, "record": _admin_key_public_record(record)}
+
+
+@app.post("/api/admin/api-keys/{prefix}/status")
+def admin_set_api_key_status(request: Request, prefix: str, payload: AdminApiKeyStatusRequest):
+    """Enable or disable a key (admin/master only). Disabled keys fail auth."""
+    if payload.status not in {STATUS_ACTIVE, STATUS_DISABLED}:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"Invalid status {payload.status!r}; expected 'active' or 'disabled'."},
+        )
+    denied, authenticator, record = _admin_key_context(request, prefix)
+    if denied is not None:
+        return denied
+    updated = authenticator.set_status(record["key_id"], payload.status)
+    if updated is None:
+        return JSONResponse(status_code=404, content={"detail": f"No API key with prefix {prefix!r}."})
+    return {"record": _admin_key_public_record(updated)}
+
+
+@app.post("/api/admin/api-keys/{prefix}/role")
+def admin_set_api_key_role(request: Request, prefix: str, payload: AdminApiKeyRoleRequest):
+    """Change a key's role (admin/master only). 'admin' grants the admin endpoints."""
+    if payload.role not in {ROLE_ADMIN, ROLE_USER}:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"Invalid role {payload.role!r}; expected 'user' or 'admin'."},
+        )
+    denied, authenticator, record = _admin_key_context(request, prefix)
+    if denied is not None:
+        return denied
+    updated = authenticator.set_role(record["key_id"], payload.role)
+    if updated is None:
+        return JSONResponse(status_code=404, content={"detail": f"No API key with prefix {prefix!r}."})
+    return {"record": _admin_key_public_record(updated)}
+
+
+@app.delete("/api/admin/api-keys/{prefix}")
+def admin_delete_api_key(request: Request, prefix: str):
+    """Permanently remove a key (admin/master only). The secret stops working."""
+    denied, authenticator, record = _admin_key_context(request, prefix)
+    if denied is not None:
+        return denied
+    deleted = authenticator.delete_key(record["key_id"])
+    if not deleted:
+        return JSONResponse(status_code=404, content={"detail": f"No API key with prefix {prefix!r}."})
+    log_event("admin.api_key_deleted", prefix=record.get("prefix", ""))
+    return {"deleted": True}
 
 
 @app.get("/api/health")
@@ -5780,7 +5941,14 @@ def cancel_job(job_id: str):
 
 
 @app.get("/api/pdfs")
-def pdf_documents(request: Request, search: str = "", offset: int = 0, limit: int = 10):
+def pdf_documents(
+    request: Request,
+    search: str = "",
+    offset: int = 0,
+    limit: int = 10,
+    source_group: str = "",
+    trust_status: str = "",
+):
     # The PDF list only changes when ingestion/indexing writes the registry,
     # source map, trust registry, or index manifest. Short-circuit unchanged
     # polls with a conditional 304 instead of rebuilding the whole list.
@@ -5798,11 +5966,19 @@ def pdf_documents(request: Request, search: str = "", offset: int = 0, limit: in
         search=search,
         offset=offset,
         limit=limit,
+        source_group=source_group,
+        trust_status=trust_status,
     )
     if not_modified := _not_modified_or_etag(request, seed):
         return not_modified
     resolved_limit = PDFS_MAX_PAGE_SIZE if limit <= 0 else min(limit, PDFS_MAX_PAGE_SIZE)
-    payload = list_pdf_documents(search=search, offset=offset, limit=resolved_limit)
+    payload = list_pdf_documents(
+        search=search,
+        offset=offset,
+        limit=resolved_limit,
+        source_group=source_group,
+        trust_status=trust_status,
+    )
     return _etagged_json(request, payload, seed)
 
 

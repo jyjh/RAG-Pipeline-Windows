@@ -4,28 +4,92 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Local FSAE RAG</title>
+    <script>
+      // Resolve the theme before first paint so a dark-mode reload never
+      // flashes the light palette.
+      (function () {
+        try {
+          var pref = localStorage.getItem("rag.theme.v1") || "auto";
+          var dark =
+            pref === "dark" ||
+            (pref !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.dataset.theme = dark ? "dark" : "light";
+        } catch (_) {
+          document.documentElement.dataset.theme = "light";
+        }
+      })();
+    </script>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <header class="app-header">
-      <div>
-        <h1>Local FSAE RAG</h1>
-        <p id="statusLine">Checking local index...</p>
-      </div>
-      <div class="app-header-actions">
-        <nav class="tabs" aria-label="Views">
-          <button class="tab" data-tab-target="upload">Documents</button>
-          <button class="tab" data-tab-target="index">Review</button>
-          <button class="tab active" data-tab-target="chat">Ask</button>
-          <button class="tab" data-tab-target="guide">Guide</button>
+    <div class="app-shell">
+      <aside id="appSidebar" class="app-sidebar" aria-label="Navigation">
+        <div class="sidebar-brand">
+          <span class="sidebar-logo" aria-hidden="true">◈</span>
+          <span class="sidebar-text">FSAE RAG</span>
+        </div>
+        <nav class="sidebar-nav">
+          <button class="tab" data-tab-target="upload" title="Documents">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0l-4 4m4-4l4 4M4 20h16" /></svg>
+            <span class="sidebar-text">Documents</span>
+          </button>
+          <button class="tab" data-tab-target="library" title="Library">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20M4 19.5A2.5 2.5 0 0 0 6.5 22H20V2H6.5A2.5 2.5 0 0 0 4 4.5z" /></svg>
+            <span class="sidebar-text">Library</span>
+          </button>
+          <button class="tab" data-tab-target="index" title="Review">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" /></svg>
+            <span class="sidebar-text">Review</span>
+          </button>
+          <button class="tab active" data-tab-target="chat" title="Ask">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8z" /></svg>
+            <span class="sidebar-text">Ask</span>
+          </button>
+          <button class="tab" data-tab-target="admin" title="Admin">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /></svg>
+            <span class="sidebar-text">Admin</span>
+          </button>
+          <button class="tab" data-tab-target="guide" title="Guide">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3M12 17h.01" /></svg>
+            <span class="sidebar-text">Guide</span>
+          </button>
         </nav>
-        <button id="updateButton" class="update-button update-checking" type="button" title="Checking for updates">
-          Checking
-        </button>
-      </div>
-    </header>
+        <div class="sidebar-footer">
+          <button id="themeToggleButton" type="button" title="Toggle light / dark">
+            <svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" /></svg>
+            <svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10zM12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" /></svg>
+            <span class="sidebar-text" id="themeToggleLabel">Dark mode</span>
+          </button>
+          <button id="settingsButton" type="button" title="Settings">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6" /></svg>
+            <span class="sidebar-text">Settings</span>
+          </button>
+          <button id="sidebarCollapseButton" type="button" title="Collapse sidebar">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 17l-5-5 5-5M18 17l-5-5 5-5" /></svg>
+            <span class="sidebar-text">Collapse</span>
+          </button>
+        </div>
+      </aside>
+      <div class="app-main">
+        <header class="app-header">
+          <div class="app-header-title">
+            <h1>Local FSAE RAG</h1>
+            <p id="statusLine">Checking local index...</p>
+          </div>
+          <div class="app-header-actions">
+            <button id="updateButton" class="update-button update-checking" type="button" title="Checking for updates">
+              Checking
+            </button>
+          </div>
+        </header>
 
-    <main>
+        <div id="jobsStrip" class="jobs-strip" hidden>
+          <span class="jobs-strip-spinner" aria-hidden="true"></span>
+          <span id="jobsStripText" class="jobs-strip-text"></span>
+          <button id="jobsStripViewButton" type="button">View jobs</button>
+        </div>
+
+        <main>
       <section id="upload" class="panel">
         <div id="uploadDropZone" class="upload-drop-zone">
           <div class="toolbar">
@@ -36,88 +100,16 @@
           <div id="selectedFilesLabel" class="selected-files-label">Drop PDFs or a .zip of PDFs</div>
           <div id="uploadGroupsPanel" class="upload-groups-panel" hidden></div>
         </div>
-        <div class="toolbar maintenance-bar">
-          <strong>Index maintenance</strong>
-          <button id="reingestButton" class="danger" type="button" title="Re-run PDF extraction (ingestion) and indexing for every registered PDF">Re-ingest all</button>
-          <button id="backupIndexButton" type="button" title="Snapshot the current LanceDB index into db/backups">Backup index</button>
-          <button id="rebuildIndexButton" class="danger" type="button" title="Drop the current index and rebuild it from processed Markdown">Re-build index</button>
-          <button id="toggleRestorePanelButton" type="button" title="Show saved index backups">Restore…</button>
-          <span id="maintenanceStatus" class="status"></span>
-        </div>
-        <div id="restoreIndexPanel" class="restore-panel" hidden>
-          <div class="restore-panel-header">
-            <strong>Saved index backups</strong>
-            <button id="refreshBackupsButton" type="button">Refresh</button>
-            <button id="closeRestorePanelButton" type="button">Close</button>
-          </div>
-          <div id="restoreBackupsList" class="restore-backups-list"></div>
-        </div>
         <div id="uploadStatus" class="status"></div>
         <div id="duplicatePrompt" class="duplicate-prompt" hidden>
           <div id="duplicatePromptText"></div>
           <button id="forceUploadButton" class="danger" type="button" disabled>Force upload</button>
         </div>
         <div class="toolbar">
-          <input id="pdfSearchInput" type="search" placeholder="Search PDFs by title or hash" />
-          <button id="pdfSearchButton" type="button">Search PDFs</button>
-          <button
-            id="pdfAutoTagButton"
-            type="button"
-            title="Ask the LLM to sort ungrouped PDFs into Official, Student Research, or Unofficial. Automatically tagged PDFs are flagged for review; a manual tag always overrides them."
-          >
-            Auto-tag ungrouped
-          </button>
-          <label class="inline-select-label reviewer-label">
-            Reviewer
-            <input id="reviewerNameInput" type="text" autocomplete="name" placeholder="Your name" />
-          </label>
-        </div>
-        <details class="advanced-settings api-key-settings">
-          <summary>API key</summary>
-          <div class="toolbar api-key-toolbar">
-            <input id="apiKeyInput" type="password" autocomplete="off" placeholder="rag_... (leave blank if your deployment is open)" aria-label="API key" />
-            <button id="apiKeyClearButton" type="button">Clear</button>
-          </div>
-          <p id="apiKeyStatus" class="status">No API key set</p>
-          <p class="hint">Required only when an administrator has issued API keys or set a master token. Stored on this browser only.</p>
-        </details>
-        <div class="toolbar table-pager">
-          <strong>PDFs</strong>
-          <label class="inline-select-label">
-            Rows
-            <select id="pdfPageSizeSelect">
-              <option value="10" selected>10</option>
-              <option value="20">20</option>
-              <option value="50">50</option>
-              <option value="100">100</option>
-              <option value="all">All</option>
-            </select>
-          </label>
-          <button id="prevPdfPageButton" type="button">Prev</button>
-          <span id="pdfPageLabel"></span>
-          <button id="nextPdfPageButton" type="button">Next</button>
-        </div>
-        <div id="pdfBulkActionBar" class="toolbar pdf-bulk-bar" hidden>
-          <strong id="pdfBulkCountLabel">0 selected</strong>
-          <button id="pdfBulkTagButton" type="button">Tag selected</button>
-          <button id="pdfBulkClearButton" type="button">Clear</button>
-        </div>
-        <table id="pdfsTable" class="data-table pdf-table">
-          <thead>
-            <tr>
-              <th class="pdf-select-col"><input id="pdfSelectAllCheckbox" type="checkbox" title="Select all untagged PDFs on this page" /></th>
-              <th>PDF</th>
-              <th>Status</th>
-              <th>Quality</th>
-              <th>Download</th>
-            </tr>
-          </thead>
-          <tbody id="pdfsBody"></tbody>
-        </table>
-        <div class="toolbar table-pager">
           <strong>Jobs</strong>
           <input id="jobSearchInput" type="search" placeholder="Search jobs" />
           <button id="jobSearchButton" type="button">Search</button>
+          <button id="enableJobNotificationsButton" type="button" hidden title="Show a desktop notification when a background job finishes or fails">Notify on completion</button>
           <label class="inline-select-label">
             Rows
             <select id="jobsPageSizeSelect">
@@ -144,6 +136,88 @@
             </tr>
           </thead>
           <tbody id="jobsBody"></tbody>
+        </table>
+      </section>
+
+      <section id="library" class="panel">
+        <div class="toolbar">
+          <input id="pdfSearchInput" type="search" placeholder="Search PDFs by title or hash" />
+          <button id="pdfSearchButton" type="button">Search PDFs</button>
+          <label class="inline-select-label">
+            Group
+            <select id="pdfGroupFilterSelect">
+              <option value="all" selected>All groups</option>
+              <option value="official">Official</option>
+              <option value="student_research">Student Research</option>
+              <option value="unofficial">Unofficial</option>
+              <option value="ungrouped">Ungrouped</option>
+            </select>
+          </label>
+          <label class="inline-select-label">
+            Trust
+            <select id="pdfTrustFilterSelect">
+              <option value="all" selected>All trust</option>
+              <option value="unreviewed">Unreviewed</option>
+              <option value="approved">Approved</option>
+              <option value="stale">Stale</option>
+            </select>
+          </label>
+          <button
+            id="pdfAutoTagButton"
+            type="button"
+            title="Ask the LLM to sort ungrouped PDFs into Official, Student Research, or Unofficial. Automatically tagged PDFs are flagged for review; a manual tag always overrides them."
+          >
+            Auto-tag ungrouped
+          </button>
+          <label class="inline-select-label reviewer-label">
+            Reviewer
+            <input id="reviewerNameInput" type="text" autocomplete="name" placeholder="Your name" />
+          </label>
+        </div>
+        <details class="advanced-settings library-legend">
+          <summary>Badge legend</summary>
+          <div class="legend-grid">
+            <span class="quality-badge quality-ready">Ready</span><span>Extracted text looks complete; safe to rely on.</span>
+            <span class="quality-badge quality-review">Needs review</span><span>Extraction quality flagged — check before citing.</span>
+            <span class="quality-badge quality-not_ready">Not ready</span><span>Little usable text (scan, OCR failure). Consider re-run.</span>
+            <span class="quality-badge quality-untagged">Untagged</span><span>No source group yet — retrieval weights it lowest.</span>
+            <span class="quality-badge quality-auto-tagged">Auto-tagged</span><span>Group chosen by the LLM; a manual tag overrides it.</span>
+            <span><strong>Trust: approved / unreviewed / stale</strong></span><span>Review status recorded by a named reviewer.</span>
+          </div>
+        </details>
+        <div id="libraryStatus" class="status"></div>
+        <div id="pdfBulkActionBar" class="toolbar pdf-bulk-bar" hidden>
+          <strong id="pdfBulkCountLabel">0 selected</strong>
+          <button id="pdfBulkTagButton" type="button">Tag selected</button>
+          <button id="pdfBulkClearButton" type="button">Clear</button>
+        </div>
+        <div class="toolbar table-pager">
+          <strong>PDFs</strong>
+          <label class="inline-select-label">
+            Rows
+            <select id="pdfPageSizeSelect">
+              <option value="10" selected>10</option>
+              <option value="20">20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+              <option value="all">All</option>
+            </select>
+          </label>
+          <button id="prevPdfPageButton" type="button">Prev</button>
+          <span id="pdfPageLabel"></span>
+          <button id="nextPdfPageButton" type="button">Next</button>
+        </div>
+        <table id="pdfsTable" class="data-table pdf-table">
+          <thead>
+            <tr>
+              <th class="pdf-select-col"><input id="pdfSelectAllCheckbox" type="checkbox" title="Select all untagged PDFs on this page" /></th>
+              <th>PDF</th>
+              <th>Status</th>
+              <th>Quality</th>
+              <th>Download</th>
+            </tr>
+          </thead>
+          <tbody id="pdfsBody"></tbody>
         </table>
       </section>
 
@@ -204,6 +278,18 @@
             </div>
             <div id="chatMessages" class="chat-messages" aria-live="polite"></div>
             <form id="chatForm" class="chat-form">
+              <div class="composer-settings-row">
+                <label class="inline-select-label">
+                  Mode
+                  <select id="answerPresetSelect" aria-label="Answer mode">
+                    <option value="precise">Precise</option>
+                    <option value="balanced" selected>Balanced</option>
+                    <option value="deep">Deep research</option>
+                    <option value="custom">Custom</option>
+                  </select>
+                </label>
+                <span id="composerSettingsSummary" class="composer-settings-summary" aria-live="off"></span>
+              </div>
               <details class="advanced-settings chat-advanced-settings">
                 <summary>Advanced answer settings</summary>
                 <div class="sampler-settings" aria-label="Sampler settings">
@@ -240,6 +326,84 @@
         </div>
       </section>
 
+      <section id="admin" class="panel">
+        <div class="admin-header">
+          <h2>Admin</h2>
+          <p>Operational dashboard, API keys, and index maintenance. Destructive actions require typed confirmation.</p>
+          <button id="refreshAdminButton" type="button">Refresh</button>
+        </div>
+
+        <div id="adminDashboard" class="admin-dashboard" aria-label="Operations dashboard"></div>
+
+        <div class="admin-section">
+          <div class="admin-section-header">
+            <h3>API keys</h3>
+            <span id="adminKeysStatus" class="status"></span>
+          </div>
+          <p class="hint" id="adminKeysHint">Keys authenticate mutations and admin endpoints. The plaintext secret is shown once at creation. Requires an admin-role key or the master token.</p>
+          <details class="advanced-settings admin-key-create">
+            <summary>Issue new key</summary>
+            <div class="toolbar admin-key-create-toolbar">
+              <input id="adminKeyLabelInput" type="text" placeholder="Label (e.g. laptop-alice)" maxlength="120" aria-label="Key label" />
+              <label class="inline-select-label">
+                Role
+                <select id="adminKeyRoleSelect">
+                  <option value="user" selected>user</option>
+                  <option value="admin">admin</option>
+                </select>
+              </label>
+              <label class="inline-select-label">
+                Expires (days)
+                <input id="adminKeyExpiresInput" type="number" min="0.5" step="1" placeholder="never" />
+              </label>
+              <label class="inline-select-label">
+                Rate/min
+                <input id="adminKeyRateInput" type="number" min="1" step="1" placeholder="default" />
+              </label>
+              <button id="adminKeyCreateButton" type="button">Create key</button>
+            </div>
+          </details>
+          <div class="admin-keys-table-wrap">
+            <table id="adminKeysTable" class="data-table admin-keys-table">
+              <thead>
+                <tr>
+                  <th>Prefix</th>
+                  <th>Label</th>
+                  <th>Role</th>
+                  <th>Status</th>
+                  <th>Expires</th>
+                  <th>Usage</th>
+                  <th>Last used</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="adminKeysBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="admin-section">
+          <div class="admin-section-header">
+            <h3>Index maintenance</h3>
+            <span id="maintenanceStatus" class="status"></span>
+          </div>
+          <div class="toolbar maintenance-bar">
+            <button id="backupIndexButton" type="button" title="Snapshot the current LanceDB index into db/backups">Backup index</button>
+            <button id="toggleRestorePanelButton" type="button" title="Show saved index backups">Restore…</button>
+            <button id="reingestButton" class="danger" type="button" title="Re-run PDF extraction (ingestion) and indexing for every registered PDF">Re-ingest all</button>
+            <button id="rebuildIndexButton" class="danger" type="button" title="Drop the current index and rebuild it from processed Markdown">Re-build index</button>
+          </div>
+          <div id="restoreIndexPanel" class="restore-panel" hidden>
+            <div class="restore-panel-header">
+              <strong>Saved index backups</strong>
+              <button id="refreshBackupsButton" type="button">Refresh</button>
+              <button id="closeRestorePanelButton" type="button">Close</button>
+            </div>
+            <div id="restoreBackupsList" class="restore-backups-list"></div>
+          </div>
+        </div>
+      </section>
+
       <section id="guide" class="panel guide-panel">
         <div class="guide-header">
           <div>
@@ -258,19 +422,19 @@
             <ol class="guide-steps">
               <li>
                 <strong>Add PDFs</strong>
-                <span>Upload team reports, textbooks, notes, papers, or standards and choose a reliability group for each PDF. You can also drop a <code>.zip</code> of PDFs — subfolders are flattened automatically.</span>
+                <span>On the Documents tab, upload team reports, textbooks, notes, papers, or standards and choose a reliability group for each PDF. You can also drop a <code>.zip</code> of PDFs — subfolders are flattened automatically.</span>
               </li>
               <li>
                 <strong>Wait for jobs</strong>
-                <span>Ingestion extracts Markdown and assets; indexing builds the retrieval database in the background.</span>
+                <span>The Documents tab tracks every background job with live progress. A banner at the top of any tab shows the active job; ingestion extracts Markdown and assets, and indexing builds the retrieval database in the background.</span>
               </li>
               <li>
                 <strong>Review sources</strong>
-                <span>Tag highlighted ungrouped PDFs, check quality badges, trust status, downloads, and extracted index rows before relying on answers.</span>
+                <span>On the Library tab, tag highlighted ungrouped PDFs, check quality badges, trust status, downloads, and extracted index rows before relying on answers.</span>
               </li>
               <li>
                 <strong>Ask questions</strong>
-                <span>Use the chat panel for evidence-backed answers, then inspect Sources and Tool results.</span>
+                <span>Use the Ask tab for evidence-backed answers, then inspect Sources and Tool results.</span>
               </li>
             </ol>
           </section>
@@ -300,12 +464,90 @@
             <ul class="guide-list">
               <li>Long ingestion and indexing jobs run in the background; chat can still use the last published index.</li>
               <li>Index edits are disabled while indexing is active to avoid writing into a changing database.</li>
+              <li>Administrators manage API keys and index maintenance (backup, restore, rebuild) from the Admin tab.</li>
               <li>Saved chats live in this browser only and are useful for recurring investigation threads.</li>
             </ul>
           </section>
         </div>
       </section>
-    </main>
+        </main>
+      </div>
+    </div>
+
+    <div id="citationPopover" class="citation-popover" hidden></div>
+
+    <div id="pdfPreviewOverlay" class="modal-overlay" hidden>
+      <div class="modal-dialog pdf-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="pdfPreviewTitle">
+        <div class="pdf-preview-header">
+          <strong id="pdfPreviewTitle">PDF preview</strong>
+          <div class="pdf-preview-header-actions">
+            <a id="pdfPreviewDownloadLink" href="#" download>Download</a>
+            <button id="pdfPreviewCloseButton" type="button">Close</button>
+          </div>
+        </div>
+        <iframe id="pdfPreviewFrame" title="PDF preview" hidden></iframe>
+        <p id="pdfPreviewFallback" class="status" hidden>Preview unavailable — use the download link above.</p>
+      </div>
+    </div>
+
+    <div id="settingsOverlay" class="modal-overlay" hidden>
+      <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+        <h2 id="settingsTitle">Settings</h2>
+        <div class="settings-section">
+          <strong>API key</strong>
+          <div class="toolbar api-key-toolbar">
+            <input id="apiKeyInput" type="password" autocomplete="off" placeholder="rag_... (leave blank if your deployment is open)" aria-label="API key" />
+            <button id="apiKeyClearButton" type="button">Clear</button>
+          </div>
+          <p id="apiKeyStatus" class="status">No API key set</p>
+          <p class="hint">Required only when an administrator has issued API keys or set a master token. Stored on this browser only.</p>
+        </div>
+        <div class="settings-section">
+          <strong>Appearance</strong>
+          <label class="inline-select-label">
+            Theme
+            <select id="themeSelect" aria-label="Theme">
+              <option value="auto" selected>System</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </label>
+          <p class="hint">System follows your OS light/dark preference.</p>
+        </div>
+        <div class="settings-section">
+          <strong>Tour</strong>
+          <p class="hint">Replay the new-user walkthrough.</p>
+          <button id="settingsStartTourButton" type="button">Start walkthrough</button>
+        </div>
+        <div class="modal-actions">
+          <button id="settingsCloseButton" type="button">Done</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="shortcutsOverlay" class="modal-overlay" hidden>
+      <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcutsTitle">
+        <h2 id="shortcutsTitle">Keyboard shortcuts</h2>
+        <div class="shortcuts-grid">
+          <span><kbd>?</kbd></span><span>Show or hide this help</span>
+          <span><kbd>g</kbd> then <kbd>d</kbd></span><span>Documents tab</span>
+          <span><kbd>g</kbd> then <kbd>l</kbd></span><span>Library tab</span>
+          <span><kbd>g</kbd> then <kbd>r</kbd></span><span>Review tab</span>
+          <span><kbd>g</kbd> then <kbd>a</kbd></span><span>Ask tab</span>
+          <span><kbd>g</kbd> then <kbd>m</kbd></span><span>Admin tab</span>
+          <span><kbd>/</kbd></span><span>Focus the search box of the current tab</span>
+          <span><kbd>n</kbd></span><span>New chat (Ask tab)</span>
+          <span><kbd>Esc</kbd></span><span>Close dialogs</span>
+        </div>
+        <div class="modal-actions">
+          <button id="shortcutsCloseButton" type="button">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="citationPopover" class="citation-popover" hidden></div>
+
+    <div id="toastStack" class="toast-stack" aria-live="polite"></div>
 
     <div id="walkthroughOverlay" class="walkthrough-overlay" hidden>
       <div class="walkthrough-dialog" role="dialog" aria-modal="true" aria-labelledby="walkthroughTitle">
