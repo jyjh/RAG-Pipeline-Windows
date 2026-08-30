@@ -179,8 +179,15 @@ class MultiVectorStore:
                     continue
                 # Record ids are content-derived and identical across
                 # categories, so a duplicate here means the same source is
-                # (transiently, mid-transfer) indexed in two stores.
+                # (transiently, mid-transfer) indexed in two stores. Keep the
+                # higher-scoring copy so ranking and the score cutoff are not
+                # dragged down by a stale lower-scoring index.
                 if record_id in merged:
+                    if float(row.get("score") or 0.0) <= float(merged[record_id].get("score") or 0.0):
+                        continue
+                    row = dict(row)
+                    row["category"] = label
+                    merged[record_id] = row
                     continue
                 row = dict(row)
                 row["category"] = label

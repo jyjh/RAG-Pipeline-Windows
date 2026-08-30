@@ -1,0 +1,622 @@
+// Admin tab: ops dashboard, API key management, index maintenance.
+
+import { confirmAction, els, escapeHtml, formatKeyTimestamp, formatKeyUsage, getApiKey, markIndexDirty, refreshOpsDashboard, requestJson, setStatus, showGeneratedKeyDialog, showToast, state, toastError } from "./core.js";
+import { applyUpdate, refreshJobs } from "./status.js";
+import { refreshPdfs } from "./library.js";
+import { refreshCategories } from "./categories.js";
+
+async function enqueueReingest() {
+  if (els.reingestButton) {
+    els.reingestButton.disabled = true;
+  }
+  const confirmed = await confirmAction(
+    "Re-ingest all PDFs?",
+    "This re-runs PDF extraction (ingestion) and indexing for every registered PDF. " +
+      "Use it after changing OCR/parser/vision settings or when extracted text looks wrong across many documents. " +
+      "It runs as a background job and may take a while.",
+    "Re-ingest all",
+    { danger: true, requireText: "REINGEST" },
+  );
+  if (!confirmed) {
+    if (els.reingestButton) {
+      els.reingestButton.disabled = false;
+    }
+    return;
+  }
+  setMaintenanceStatus("Queueing full re-ingest...");
+  try {
+    const job = await requestJson("/api/reingest", { method: "POST" });
+    setMaintenanceStatus(`Queued re-ingest job ${job.id.slice(0, 8)}.`);
+    showToast(`Full re-ingest queued (job ${job.id.slice(0, 8)}).`, { kind: "info" });
+    state.jobsOffset = 0;
+    markIndexDirty();
+    await refreshJobs({ force: true });
+    await refreshPdfs({ force: true });
+  } catch (error) {
+    setMaintenanceStatus(error.message, true);
+  } finally {
+    if (els.reingestButton) {
+      els.reingestButton.disabled = false;
+    }
+  }
+}
+
+
+function setMaintenanceStatus(text, isError = false) {
+  if (els.maintenanceStatus) {
+    setStatus(els.maintenanceStatus, text, isError);
+  }
+}
+
+
+async function enqueueBackup() {
+  if (els.backupIndexButton) {
+    els.backupIndexButton.disabled = true;
+  }
+  setMaintenanceStatus("Queueing index backup...");
+  try {
+    const job = await requestJson("/api/index/backup", { method: "POST" });
+    setMaintenanceStatus(`Queued index backup job ${job.id.slice(0, 8)}.`);
+    state.jobsOffset = 0;
+    await refreshJobs({ force: true });
+    await loadIndexBackups();
+  } catch (error) {
+    setMaintenanceStatus(error.message, true);
+  } finally {
+    if (els.backupIndexButton) {
+      els.backupIndexButton.disabled = false;
+    }
+  }
+}
+
+
+async function enqueueRebuild() {
+  if (els.rebuildIndexButton) {
+    els.rebuildIndexButton.disabled = true;
+  }
+  const confirmed = await confirmAction(
+    "Re-build the LanceDB index?",
+    "This drops the current index and rebuilds it from the processed Markdown. " +
+      "It runs as a background job and the index stays queryable until the rebuild publishes. " +
+      "Use this if the index is corrupted.",
+    "Re-build index",
+    { danger: true, requireText: "REBUILD" },
+  );
+  if (!confirmed) {
+    if (els.rebuildIndexButton) {
+      els.rebuildIndexButton.disabled = false;
+    }
+    return;
+  }
+  setMaintenanceStatus("Queueing index rebuild...");
+  try {
+    const job = await requestJson("/api/index/rebuild", { method: "POST" });
+    setMaintenanceStatus(`Queued index rebuild job ${job.id.slice(0, 8)}.`);
+    showToast(`Index rebuild queued (job ${job.id.slice(0, 8)}).`, { kind: "info" });
+    state.jobsOffset = 0;
+    markIndexDirty();
+    await refreshJobs({ force: true });
+    await refreshPdfs({ force: true });
+  } catch (error) {
+    setMaintenanceStatus(error.message, true);
+  } finally {
+    if (els.rebuildIndexButton) {
+      els.rebuildIndexButton.disabled = false;
+    }
+  }
+}
+
+
+function toggleRestorePanel(forceOpen = null) {
+  if (!els.restoreIndexPanel) {
+    return;
+  }
+  const willOpen = forceOpen === null ? els.restoreIndexPanel.hidden : forceOpen;
+  els.restoreIndexPanel.hidden = !willOpen;
+  if (willOpen) {
+    loadIndexBackups();
+  }
+}
+
+
+function formatBackupSize(bytes) {
+  const value = Number(bytes || 0);
+  if (value >= 1024 * 1024) {
+    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (value >= 1024) {
+    return `${(value / 1024).toFixed(0)} KB`;
+  }
+  return `${value} B`;
+}
+
+
+function formatBackupTimestamp(value) {
+  if (!value) {
+    return "Unknown date";
+  }
+  try {
+    const date = new Date(String(value).replace(" ", "T"));
+    if (Number.isNaN(date.getTime())) {
+      return String(value);
+    }
+    return date.toLocaleString();
+  } catch (_) {
+    return String(value);
+  }
+}
+
+
+async function loadIndexBackups() {
+  if (!els.restoreBackupsList) {
+    return;
+  }
+  els.restoreBackupsList.innerHTML = '<p class="restore-empty">Loading backups…</p>';
+  try {
+    const data = await requestJson("/api/index/backups");
+    renderIndexBackups(data.backups || [], data.keep);
+  } catch (error) {
+    els.restoreBackupsList.innerHTML = `<p class="restore-empty error">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+
+function renderIndexBackups(backups, keep) {
+  if (!els.restoreBackupsList) {
+    return;
+  }
+  if (!backups.length) {
+    els.restoreBackupsList.innerHTML =
+      '<p class="restore-empty">No index backups yet. Use “Backup index” to create one.</p>';
+    return;
+  }
+  const rows = backups
+    .map((backup) => {
+      const name = escapeHtml(backup.name || "");
+      const date = escapeHtml(formatBackupTimestamp(backup.created_at));
+      const recordCount =
+        backup.record_count === null || backup.record_count === undefined
+          ? "—"
+          : `${backup.record_count} records`;
+      const size = escapeHtml(formatBackupSize(backup.size_bytes));
+      const corrupt = backup.lancedb_present === false;
+      const note = corrupt
+        ? '<span class="restore-tag danger">missing LanceDB</span>'
+        : "";
+      const restoreDisabled = corrupt ? " disabled" : "";
+      return (
+        `<div class="backup-row" data-backup-name="${name}">` +
+          `<div class="backup-row-main">` +
+            `<div class="backup-row-title">${name}</div>` +
+            `<div class="backup-row-meta">${date} · ${escapeHtml(recordCount)} · ${size} ${note}</div>` +
+          `</div>` +
+          `<div class="backup-row-actions">` +
+            `<button type="button" class="danger" data-backup-action="restore" data-backup-name="${name}"${restoreDisabled}>Restore</button>` +
+          `</div>` +
+        `</div>`
+      );
+    })
+    .join("");
+  const footer = keep
+    ? `<p class="restore-footnote">The ${keep} most recent backups are kept automatically.</p>`
+    : "";
+  els.restoreBackupsList.innerHTML = rows + footer;
+}
+
+
+async function handleBackupAction(event) {
+  const button = event.target.closest("button[data-backup-action]");
+  if (!button) {
+    return;
+  }
+  const action = button.dataset.backupAction;
+  const backupName = button.dataset.backupName || "";
+  if (action !== "restore" || !backupName) {
+    return;
+  }
+  const confirmed = await confirmAction(
+    "Restore this index backup?",
+    `The current live index will be swapped out for “${backupName}”. A safety backup of the current index is taken first so this is reversible.`,
+    "Restore index",
+    { danger: true, requireText: "RESTORE" },
+  );
+  if (!confirmed) {
+    return;
+  }
+  setMaintenanceStatus("Queueing index restore...");
+  try {
+    const job = await requestJson("/api/index/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ backup_name: backupName }),
+    });
+    setMaintenanceStatus(`Queued index restore job ${job.id.slice(0, 8)}.`);
+    state.jobsOffset = 0;
+    markIndexDirty();
+    await refreshJobs({ force: true });
+    await refreshPdfs({ force: true });
+  } catch (error) {
+    setMaintenanceStatus(error.message, true);
+  }
+}
+
+
+function adminApiHeaders() {
+  const headers = {};
+  const key = getApiKey();
+  if (key) {
+    headers["X-API-Token"] = key;
+  }
+  return headers;
+}
+
+
+
+function adminMetricRow(label, value) {
+  return `
+    <div class="admin-metric">
+      <span class="admin-metric-label">${escapeHtml(label)}</span>
+      <span class="admin-metric-value">${value}</span>
+    </div>
+  `;
+}
+
+
+function adminCard(title, bodyHtml, extraClass = "") {
+  return `
+    <div class="admin-card ${extraClass}">
+      <h3>${escapeHtml(title)}</h3>
+      ${bodyHtml}
+    </div>
+  `;
+}
+
+
+function adminStatusBadge(ok, okText, badText) {
+  return `<span class="status-badge ${ok ? "status-good" : "status-bad"}">${escapeHtml(ok ? okText : badText)}</span>`;
+}
+
+
+function renderAdminApiKeys(keys, masterConfigured) {
+  const body = els.adminKeysBody;
+  if (!body) {
+    return;
+  }
+  if (!keys.length) {
+    body.innerHTML =
+      '<tr class="admin-keys-empty"><td colspan="8">No API keys issued yet. Create one above — auth stays disabled until a key or master token exists.</td></tr>';
+    return;
+  }
+  body.innerHTML = keys
+    .map((key) => {
+      const prefix = String(key.prefix || "");
+      const status = String(key.status || "active");
+      const role = String(key.role || "user");
+      const expires = key.expires_at ? formatKeyTimestamp(key.expires_at) : "never";
+      const usage = formatKeyUsage(key.usage);
+      const lastUsed = key.usage && key.usage.last_used_at ? formatKeyTimestamp(key.usage.last_used_at) : "—";
+      const statusToggleLabel = status === "active" ? "Disable" : "Enable";
+      const statusToggleStatus = status === "active" ? "disabled" : "active";
+      return `
+        <tr data-key-prefix="${escapeHtml(prefix)}">
+          <td class="admin-key-prefix">${escapeHtml(prefix)}</td>
+          <td>${escapeHtml(String(key.label || ""))}</td>
+          <td>
+            <select data-admin-key-action="set-role" class="admin-key-role-select" aria-label="Role for ${escapeHtml(prefix)}">
+              <option value="user"${role === "user" ? " selected" : ""}>user</option>
+              <option value="admin"${role === "admin" ? " selected" : ""}>admin</option>
+            </select>
+          </td>
+          <td><span class="status-badge ${status === "active" ? "status-good" : "status-bad"}">${escapeHtml(status)}</span></td>
+          <td>${escapeHtml(expires)}</td>
+          <td>${escapeHtml(usage)}</td>
+          <td>${escapeHtml(lastUsed)}</td>
+          <td>
+            <div class="admin-key-actions">
+              <button type="button" data-admin-key-action="toggle-status" data-status="${statusToggleStatus}">${statusToggleLabel}</button>
+              <button type="button" class="danger" data-admin-key-action="delete">Delete</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
+
+async function refreshAdminApiKeys(options = {}) {
+  const status = els.adminKeysStatus;
+  try {
+    const data = await requestJson("/api/admin/api-keys", { headers: adminApiHeaders() });
+    state.adminKeysAuthorized = true;
+    if (status) {
+      setStatus(status, "");
+    }
+    if (els.adminKeysHint) {
+      els.adminKeysHint.hidden = false;
+    }
+    renderAdminApiKeys(data.keys || [], data.master_configured);
+  } catch (error) {
+    state.adminKeysAuthorized = false;
+    renderAdminApiKeys([], false);
+    if (status) {
+      const hint = error.status === 401 || error.status === 403
+        ? "Admin role required. Set an admin API key below-left (API key box on the Documents tab) or configure the master token."
+        : error.message;
+      setStatus(status, hint, true);
+    }
+  }
+}
+
+
+function refreshAdminPanel(options = {}) {
+  refreshOpsDashboard(options);
+  refreshAdminApiKeys(options);
+  refreshCategories({ quiet: false });
+  refreshUpdatePanel();
+  scheduleAdminAutoRefresh();
+}
+
+
+async function createAdminApiKey() {
+  const label = (els.adminKeyLabelInput?.value || "").trim();
+  const role = els.adminKeyRoleSelect?.value || "user";
+  const expiresRaw = (els.adminKeyExpiresInput?.value || "").trim();
+  const rateRaw = (els.adminKeyRateInput?.value || "").trim();
+  const payload = { label, role };
+  if (expiresRaw) {
+    payload.expires_in_days = Number(expiresRaw);
+  }
+  if (rateRaw) {
+    payload.rate_limit_per_minute = Number(rateRaw);
+  }
+  if (els.adminKeyCreateButton) {
+    els.adminKeyCreateButton.disabled = true;
+  }
+  try {
+    const data = await requestJson("/api/admin/api-keys", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    showToast(`API key created for “${label || "unlabeled"}”.`, { kind: "success" });
+    if (els.adminKeyLabelInput) {
+      els.adminKeyLabelInput.value = "";
+    }
+    if (els.adminKeyExpiresInput) {
+      els.adminKeyExpiresInput.value = "";
+    }
+    if (els.adminKeyRateInput) {
+      els.adminKeyRateInput.value = "";
+    }
+    showGeneratedKeyDialog(String(data.key || ""));
+    await refreshAdminApiKeys();
+  } catch (error) {
+    toastError(error);
+    setStatus(els.adminKeysStatus, error.message, true);
+  } finally {
+    if (els.adminKeyCreateButton) {
+      els.adminKeyCreateButton.disabled = false;
+    }
+  }
+}
+
+
+async function handleAdminKeyAction(event) {
+  const control = event.target.closest("[data-admin-key-action]");
+  if (!control) {
+    return;
+  }
+  // The body listener fires for both click and change; a <select> must only
+  // act on change. On click it would POST the CURRENT role immediately and
+  // the subsequent re-render would destroy the open dropdown.
+  if (event.type === "click" && control.tagName === "SELECT") {
+    return;
+  }
+  if (control.tagName === "BUTTON" && control.disabled) {
+    return;
+  }
+  const action = control.dataset.adminKeyAction || "";
+  const row = control.closest("tr[data-key-prefix]");
+  const prefix = row?.dataset.keyPrefix || "";
+  if (!prefix) {
+    return;
+  }
+  if (action === "set-role") {
+    // Fires on the select's change event; re-render below refreshes options.
+    try {
+      await requestJson(`/api/admin/api-keys/${encodeURIComponent(prefix)}/role`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role: control.value }),
+      });
+      showToast(`Role for ${prefix} set to ${control.value}.`, { kind: "success" });
+    } catch (error) {
+      toastError(error);
+    }
+    await refreshAdminApiKeys();
+    return;
+  }
+  if (action === "toggle-status") {
+    const nextStatus = control.dataset.status || "disabled";
+    try {
+      await requestJson(`/api/admin/api-keys/${encodeURIComponent(prefix)}/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: nextStatus }),
+      });
+      showToast(`${prefix} is now ${nextStatus}.`, { kind: "success" });
+    } catch (error) {
+      toastError(error);
+    }
+    await refreshAdminApiKeys();
+    return;
+  }
+  if (action === "delete") {
+    const confirmed = await confirmAction(
+      "Delete this API key?",
+      `Key ${prefix} stops working immediately. Any browser or script holding this secret must be re-issued a new key.`,
+      "Delete key",
+      { danger: true },
+    );
+    if (!confirmed) {
+      return;
+    }
+    try {
+      await requestJson(`/api/admin/api-keys/${encodeURIComponent(prefix)}`, { method: "DELETE" });
+      showToast(`Deleted key ${prefix}.`, { kind: "success" });
+    } catch (error) {
+      toastError(error);
+    }
+    await refreshAdminApiKeys();
+  }
+}
+
+export {
+  adminApiHeaders,
+  adminCard,
+  adminMetricRow,
+  adminStatusBadge,
+  createAdminApiKey,
+  enqueueBackup,
+  enqueueRebuild,
+  enqueueReingest,
+  formatBackupSize,
+  formatBackupTimestamp,
+  handleAdminKeyAction,
+  handleBackupAction,
+  loadIndexBackups,
+  refreshAdminApiKeys,
+  refreshAdminPanel,
+  renderAdminApiKeys,
+  renderIndexBackups,
+  setMaintenanceStatus,
+  toggleRestorePanel,
+};
+
+// -- updates panel + auto-refresh --------------------------------------------
+// The header pill stays a compact status; this panel shows the full picture:
+// current vs. target commit, the exact blocking reason, and branch state.
+
+let adminAutoRefreshTimer = null;
+
+function renderUpdatePanel(status) {
+  const body = document.getElementById("updatePanelBody");
+  if (!body) {
+    return;
+  }
+  const state = String(status?.state || "unknown");
+  const rows = [
+    ["Branch", `${status?.current_branch || "?"} (target ${status?.target_remote || "?"}/${status?.target_branch || "?"})`],
+    ["Current commit", (status?.current_sha || "?").slice(0, 9)],
+    ["Latest on target", status?.latest_sha ? String(status.latest_sha).slice(0, 9) : "—"],
+    ["State", `<span class="status-badge ${state === "current" ? "status-good" : state === "error" || state === "blocked" ? "status-bad" : ""}">${escapeHtml(state)}</span>`],
+  ]
+    .map(([label, value]) => `<div class="admin-metric"><span class="admin-metric-label">${label}</span><span class="admin-metric-value">${value}</span></div>`)
+    .join("");
+  const message = status?.message
+    ? `<p class="hint" style="margin:8px 0 0">${escapeHtml(String(status.message))}</p>`
+    : "";
+  const action = status?.can_update
+    ? '<button type="button" id="updateNowButton" style="margin-top:10px">Update now</button>'
+    : "";
+  body.innerHTML = `<div class="admin-metric-list">${rows}</div>${message}${action}`;
+  body.querySelector("#updateNowButton")?.addEventListener("click", () => applyUpdate());
+  const refreshedAt = document.getElementById("updatePanelRefreshedAt");
+  if (refreshedAt) {
+    refreshedAt.textContent = `Checked ${new Date().toLocaleTimeString()}`;
+  }
+}
+
+export async function refreshUpdatePanel() {
+  const body = document.getElementById("updatePanelBody");
+  if (!body) {
+    return;
+  }
+  try {
+    const status = await requestJson("/api/update/status");
+    renderUpdatePanel(status);
+  } catch (error) {
+    body.innerHTML = `<p class="admin-metric-error">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+export function scheduleAdminAutoRefresh() {
+  cancelAdminAutoRefresh();
+  adminAutoRefreshTimer = window.setInterval(() => {
+    if (state.activeTab === "admin" && !document.hidden) {
+      refreshOpsDashboard({ force: true });
+      refreshUpdatePanel();
+    }
+  }, 30000);
+}
+
+export function cancelAdminAutoRefresh() {
+  if (adminAutoRefreshTimer) {
+    window.clearInterval(adminAutoRefreshTimer);
+    adminAutoRefreshTimer = null;
+  }
+}
+
+// Compaction reclaims space from tombstoned rows after incremental reindexes.
+export async function enqueueCompact() {
+  if (els.compactIndexButton) {
+    els.compactIndexButton.disabled = true;
+  }
+  const confirmed = await confirmAction(
+    "Compact the index?",
+    "Merges LanceDB fragments and drops rows left behind by incremental reindexes. Queries pause briefly while compaction runs.",
+    "Compact",
+    { danger: false },
+  );
+  if (!confirmed) {
+    if (els.compactIndexButton) {
+      els.compactIndexButton.disabled = false;
+    }
+    return;
+  }
+  setMaintenanceStatus("Queueing index compaction...");
+  try {
+    const job = await requestJson("/api/index/compact", { method: "POST" });
+    setMaintenanceStatus(`Queued compaction job ${String(job.id || "").slice(0, 8)}.`);
+    showToast(`Index compaction queued (job ${String(job.id || "").slice(0, 8)}).`, { kind: "info" });
+    await refreshJobs({ force: true });
+  } catch (error) {
+    setMaintenanceStatus(error.message, true);
+  } finally {
+    if (els.compactIndexButton) {
+      els.compactIndexButton.disabled = false;
+    }
+  }
+}
+
+// Re-trains the ANN index (no re-embedding) after many incremental reindexes.
+export async function enqueueRebuildVectorIndex() {
+  if (els.rebuildVectorIndexButton) {
+    els.rebuildVectorIndexButton.disabled = true;
+  }
+  const confirmed = await confirmAction(
+    "Rebuild the vector index?",
+    "Re-trains the ANN partitions without re-embedding. Cheaper than a full rebuild but briefly blocks queries.",
+    "Rebuild vector index",
+  );
+  if (!confirmed) {
+    if (els.rebuildVectorIndexButton) {
+      els.rebuildVectorIndexButton.disabled = false;
+    }
+    return;
+  }
+  setMaintenanceStatus("Queueing vector index rebuild...");
+  try {
+    const job = await requestJson("/api/index/rebuild_vector_index", { method: "POST" });
+    setMaintenanceStatus(`Queued vector index rebuild job ${String(job.id || "").slice(0, 8)}.`);
+    showToast(`Vector index rebuild queued (job ${String(job.id || "").slice(0, 8)}).`, { kind: "info" });
+    await refreshJobs({ force: true });
+  } catch (error) {
+    setMaintenanceStatus(error.message, true);
+  } finally {
+    if (els.rebuildVectorIndexButton) {
+      els.rebuildVectorIndexButton.disabled = false;
+    }
+  }
+}

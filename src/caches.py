@@ -75,19 +75,28 @@ class BoundedLRU:
                 self._evict_if_needed()
 
     def __contains__(self, key: object) -> bool:
-        return key in self._data
+        with self._lock:
+            return key in self._data
 
     def __delitem__(self, key: Hashable) -> None:
-        del self._data[key]
+        with self._lock:
+            del self._data[key]
 
     def __len__(self) -> int:
-        return len(self._data)
+        with self._lock:
+            return len(self._data)
 
     def __iter__(self) -> Iterator[Hashable]:
-        return iter(self._data)
+        # Iterate over a snapshot: iterating the live OrderedDict under lock
+        # would raise "dictionary changed size during iteration" if another
+        # thread writes mid-iteration (and holding the lock across a generator
+        # is not possible with this shape).
+        with self._lock:
+            return iter(list(self._data))
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return f"BoundedLRU(maxsize={self._maxsize}, len={len(self._data)})"
+        with self._lock:
+            return f"BoundedLRU(maxsize={self._maxsize}, len={len(self._data)})"
 
     def get(self, key: Hashable, default: Any = None) -> Any:
         """Return the cached value (bumping recency) or ``default`` on miss.
@@ -115,20 +124,26 @@ class BoundedLRU:
                 return default
 
     def clear(self) -> None:
-        self._data.clear()
+        with self._lock:
+            self._data.clear()
 
     def keys(self):
-        return self._data.keys()
+        with self._lock:
+            return list(self._data.keys())
 
     def values(self):
-        return self._data.values()
+        with self._lock:
+            return list(self._data.values())
 
     def items(self):
-        return self._data.items()
+        with self._lock:
+            return list(self._data.items())
 
     def setdefault(self, key: Hashable, default: Any = None) -> Any:
-        if key in self._data:
-            self._bump(key)
-            return self._data[key]
-        self[key] = default
-        return default
+        with self._lock:
+            if key in self._data:
+                self._bump(key)
+                return self._data[key]
+            self._data[key] = default
+            self._evict_if_needed()
+            return default

@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import socket
 import sys
@@ -427,13 +428,17 @@ def _request(url: str, *, headers: dict[str, str], body: Any = None,
 
 
 def _is_transient(exc: SoclaasError) -> bool:
+    # Classify HTTP-status failures by status code alone: the error text also
+    # embeds the response body, so free-text matching there would retry 4xx
+    # responses that merely mention "connection" or "timeout".
+    status_match = re.search(r"HTTP (\d{3})", str(exc))
+    if status_match:
+        return int(status_match.group(1)) in {429, 500, 502, 503, 504}
+    # No HTTP status -> connection-level failure (timeout, refused, reset).
     msg = str(exc).lower()
-    if "timed out" in msg or "timeout" in msg:
-        return True
-    if any(tag in msg for tag in ("urlopen", "connection", "reset", "unreachable", "refused")):
-        return True
-    # HTTP 429 (rate limit) and 5xx are retryable; 4xx (auth/shape) are not.
-    return any(code in msg for code in ("http 429", "http 500", "http 502", "http 503", "http 504"))
+    return "timed out" in msg or "timeout" in msg or any(
+        tag in msg for tag in ("urlopen", "connection", "reset", "unreachable", "refused")
+    )
 
 
 def retry_with_backoff(
@@ -494,9 +499,66 @@ def _chat_url() -> str:
     return _base_url() + get_llm_api_config().chat_path
 
 
+def _normalize_openai_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert Ollama-shaped tool-call history into OpenAI-compatible shape.
+
+    The query engine builds assistant ``tool_calls`` without ``id`` (and with
+    ``arguments`` as a JSON object) and tool results keyed by ``tool_name``,
+    which is how Ollama pairs them up. OpenAI-shaped chat endpoints instead
+    require a unique ``id`` (plus ``type``) on every tool_call and a matching
+    ``tool_call_id`` on every tool message; without them the second request of
+    any tool loop is rejected with HTTP 400. Mint deterministic ids and pair
+    each tool result with the earliest outstanding call (by name when known,
+    otherwise in order).
+    """
+    normalized: list[dict[str, Any]] = []
+    pending_ids: list[tuple[str, str]] = []  # (tool_name, tool_call_id), in order
+    for index, message in enumerate(messages):
+        msg = dict(message) if isinstance(message, dict) else message
+        if isinstance(msg, dict) and msg.get("role") == "assistant" and isinstance(msg.get("tool_calls"), list):
+            calls: list[dict[str, Any]] = []
+            for call_index, call in enumerate(msg["tool_calls"]):
+                if not isinstance(call, dict):
+                    calls.append(call)
+                    continue
+                call = dict(call)
+                call.setdefault("type", "function")
+                call_id = str(call.get("id") or f"call_{index}_{call_index}")
+                call["id"] = call_id
+                function = dict(call.get("function") or {})
+                name = str(function.get("name") or "")
+                if not isinstance(function.get("arguments"), str):
+                    function["arguments"] = json.dumps(function.get("arguments") or {}, ensure_ascii=False)
+                call["function"] = function
+                calls.append(call)
+                pending_ids.append((name, call_id))
+            msg = {**msg, "tool_calls": calls}
+        elif (
+            isinstance(msg, dict)
+            and msg.get("role") == "tool"
+            and not msg.get("tool_call_id")
+            and pending_ids
+        ):
+            tool_name = str(msg.get("tool_name") or "")
+            matched_id = next(
+                (call_id for name, call_id in pending_ids if not tool_name or name == tool_name),
+                None,
+            )
+            if matched_id is None:
+                matched_id = pending_ids[0][1]
+            msg = {**msg, "tool_call_id": matched_id}
+            pending_ids = [(name, call_id) for name, call_id in pending_ids if call_id != matched_id]
+        normalized.append(msg)
+    return normalized
+
+
 def _build_chat_payload(model: str, messages: list[dict[str, Any]], *,
                         options: dict[str, Any] | None, tools, stream: bool) -> dict[str, Any]:
-    payload: dict[str, Any] = {"model": model, "messages": messages, "stream": bool(stream)}
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": _normalize_openai_tool_messages(messages),
+        "stream": bool(stream),
+    }
     payload.update(map_chat_options(options))
     if tools:
         payload["tools"] = tools

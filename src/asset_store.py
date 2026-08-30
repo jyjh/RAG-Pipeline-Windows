@@ -168,20 +168,28 @@ class ImageAssetStore:
             for asset_id, entry in batch_assets.items()
             if asset_id not in base or base[asset_id] != entry
         }
-        with acquire_asset_lock(self.asset_dir):
-            fresh = _shared_manifest_payload(
-                self.manifest_path,
-                {"version": ASSET_MANIFEST_VERSION, "assets": {}},
-            )
-            merged_assets = {
-                asset_id: entry
-                for asset_id, entry in (fresh.get("assets") or {}).items()
-                if asset_id not in removed
-            }
-            merged_assets.update(changed)
-            payload = dict(fresh)
-            payload["assets"] = merged_assets
-            _write_json(self.manifest_path, payload)
+        try:
+            with acquire_asset_lock(self.asset_dir):
+                fresh = _shared_manifest_payload(
+                    self.manifest_path,
+                    {"version": ASSET_MANIFEST_VERSION, "assets": {}},
+                )
+                merged_assets = {
+                    asset_id: entry
+                    for asset_id, entry in (fresh.get("assets") or {}).items()
+                    if asset_id not in removed
+                }
+                merged_assets.update(changed)
+                payload = dict(fresh)
+                payload["assets"] = merged_assets
+                _write_json(self.manifest_path, payload)
+        except (TimeoutError, OSError):
+            # The image FILES for this batch are already on disk; losing their
+            # manifest entries would strand them unretrievable. Re-arm the
+            # batch so the next begin/commit on this store retries the flush.
+            self._batch_manifest = batch
+            self._batch_base = base
+            raise
 
     def abort_batch(self) -> None:
         """Discard any pending batched manifest without writing."""

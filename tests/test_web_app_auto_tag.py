@@ -61,6 +61,10 @@ def trust_env(monkeypatch, workspace_tmp):
         web_app._AUTO_TAG_STATE.update(
             {"running": False, "started_at": "", "finished_at": "", "queued": 0, "tagged": 0, "last_error": ""}
         )
+    # Real threads scheduled by upload tests in other files may still be
+    # queued/in-flight in this process; the exclusivity guard reads the live
+    # run count, so isolate it per test.
+    monkeypatch.setattr(web_app, "_AUTO_TAG_ACTIVE_RUNS", 0)
     return trust_path
 
 

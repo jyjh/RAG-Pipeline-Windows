@@ -76,3 +76,23 @@ def _inert_llm_auto_tag(monkeypatch):
     from src import auto_tag
 
     monkeypatch.setattr(auto_tag, "classify_documents", lambda items, **kwargs: {})
+
+
+@pytest.fixture(autouse=True)
+def _isolated_local_model_cache():
+    """Start every test with a cold /api/tags cache.
+
+    A developer machine often runs a live Ollama: any test that resolves a
+    model name without stubbing the tags fetch performs a real lookup and
+    populates the process-wide TTL cache with that server's model sizes.
+    Later tests stub ``_ollama_tags`` (names) but then read REAL sizes from
+    the leaked cache, so size-aware substitution gates on models that exist
+    only on this machine. Clearing the cache per test keeps results
+    deterministic regardless of test ordering and of whether a local Ollama
+    is running.
+    """
+    from src import llm_api
+
+    llm_api.reset_local_model_cache()
+    yield
+    llm_api.reset_local_model_cache()

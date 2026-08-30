@@ -81,6 +81,7 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_ollama_tool_calls",
     "generate_search_queries",
     "_split_think_tag_events",
+    "_partial_think_tag_suffix",
     "estimate_context_tokens",
     "estimate_text_tokens",
     "estimate_json_tokens",
@@ -433,6 +434,7 @@ def _ollama_chat_stream(
     def events():
         retries_after_recovery = 0
         while True:
+            emitted = False
             try:
                 with urllib.request.urlopen(_ollama_chat_request(payload), timeout=timeout) as response:
                     for raw_line in response:
@@ -442,9 +444,20 @@ def _ollama_chat_stream(
                         event = json.loads(line)
                         if event.get("error"):
                             raise RuntimeError(str(event["error"]))
+                        emitted = True
                         yield event
                     return
             except (TimeoutError, socket.timeout, urllib.error.URLError, OSError) as exc:
+                if emitted:
+                    # A partially streamed answer must never restart from the
+                    # beginning: the consumer has already forwarded the earlier
+                    # events, so re-streaming would duplicate the answer text.
+                    # Match the SoCLAaS stream behavior and propagate instead.
+                    raise _connection_lost_error(
+                        "chat stream",
+                        exc,
+                        max_lost_health_checks=max_lost_health_checks,
+                    ) from exc
                 recovered = _wait_for_ollama_recovery(
                     health_check_interval=health_check_interval,
                     max_lost_health_checks=max_lost_health_checks,
@@ -543,6 +556,25 @@ def _ollama_tool_calls(response: Any) -> list[dict[str, Any]]:
     return [dict(call) for call in calls if isinstance(call, dict)]
 
 
+_THINK_OPEN_TAG = "<think>"
+_THINK_CLOSE_TAG = "</think>"
+
+
+def _partial_think_tag_suffix(text: str) -> str:
+    """Return the longest suffix of ``text`` that is a proper prefix of a
+    ``<think>``/``</think>`` tag ("" when the tail cannot start a tag).
+
+    Used by stream consumers to hold back a trailing partial tag split across
+    chunks (e.g. ``"<thi"``) so it is re-joined on the next chunk instead of
+    leaking literally into the answer.
+    """
+    for tag in (_THINK_CLOSE_TAG, _THINK_OPEN_TAG):
+        for length in range(min(len(tag) - 1, len(text)), 0, -1):
+            if text.endswith(tag[:length]):
+                return text[-length:]
+    return ""
+
+
 def _split_think_tag_events(content: str, *, in_thinking: bool) -> tuple[list[dict[str, str]], bool]:
     events: list[dict[str, str]] = []
     text = content
@@ -615,6 +647,7 @@ def generate_search_queries(
     max_queries: int,
     timeout: float,
     temperature: float = DEFAULT_PLANNER_TEMPERATURE,
+    history: list[dict[str, str]] | None = None,
 ) -> list[str]:
     """Expand a user question into several diverse retrieval queries.
 
@@ -635,10 +668,24 @@ def generate_search_queries(
         "and the key technical terms from the question. Do not answer the "
         'question. Reply with ONLY a JSON array of short query strings.'
     )
+    recent = [turn for turn in (history or []) if (turn or {}).get("content")][-6:]
+    transcript = ""
+    if recent:
+        lines = []
+        for turn in recent:
+            who = "User" if turn.get("role") == "user" else "Assistant"
+            lines.append(who + ": " + str(turn.get("content") or ""))
+        transcript = (
+            "Conversation so far (the question may reference it):"
+            + chr(10).join([""] + lines + [""]) 
+        )
     user_prompt = (
-        f"Question: {question}\n\n"
-        f"Return up to {max_queries} diverse search queries as a JSON array of "
-        'strings, e.g. ["query one", "query two"]. No prose, no explanation.'
+        transcript
+        + "Follow-up question: " + question + "\n\n"
+        "Return up to {n} diverse search queries as a JSON array of "
+        'strings, e.g. ["query one", "query two"]. Resolve pronouns and '
+        "vague references against the conversation so each query stands "
+        "alone. No prose, no explanation.".format(n=max_queries)
     )
     messages = [
         {"role": "system", "content": system_prompt},
@@ -1343,7 +1390,12 @@ def normalize_search_url(url: str) -> str:
     parsed = urllib.parse.urlparse(raw)
     query = urllib.parse.parse_qs(parsed.query)
     if "uddg" in query and query["uddg"]:
-        return urllib.parse.unquote(query["uddg"][0])
+        raw = urllib.parse.unquote(query["uddg"][0])
+        parsed = urllib.parse.urlparse(raw)
+    # Scheme allow-list: result URLs are rendered as links by the web UI, so a
+    # javascript:/data: URL from the remote results page must not flow through.
+    if parsed.scheme not in ("http", "https"):
+        return ""
     return raw
 
 

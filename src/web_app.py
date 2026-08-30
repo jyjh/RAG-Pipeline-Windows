@@ -96,6 +96,7 @@ from src.defaults import (
 from src.local_rag import (
     DEFAULT_QUERY_SYSTEM_PROMPT,
     INDEX_MANIFEST_FILENAME,
+    _manifest_source_key,
     update_index_manifest_sources,
     write_index_manifest,
 )
@@ -279,14 +280,6 @@ _CLASS_MODULE_PROXY_FUNCTIONS = (
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT_DIR / "data"
-UPLOAD_DIR = DATA_DIR / "uploads"
-STAGING_DIR = DATA_DIR / ".upload_queue"
-PDF_REGISTRY_PATH = DATA_DIR / ".pdf_upload_registry.json"
-JOB_LEDGER_PATH = DATA_DIR / ".job_ledger.json"
-DOCUMENT_TRUST_PATH = DATA_DIR / ".document_trust.json"
-PROCESSED_DIR = ROOT_DIR / "processed_docs"
-DB_DIR = ROOT_DIR / "db"
 WEB_DIR = ROOT_DIR / "web"
 
 
@@ -294,6 +287,46 @@ def _resolve_root_path(raw_path: Any, *, default: str | Path | None = None) -> P
     value = raw_path if raw_path not in (None, "") else default
     path = Path(str(value or ""))
     return path if path.is_absolute() else ROOT_DIR / path
+
+
+def _web_data_paths() -> tuple[Path, Path, Path]:
+    """Resolve (data_dir, processed_dir, db_dir) from the [paths] config.
+
+    Previously these were hardcoded to the repo-root defaults, which made the
+    [paths] section decorative for the web app and impossible to run a second
+    hermetic instance. Falls back to the historical locations on any config
+    problem so a broken config file can never keep the UI from booting.
+    """
+    try:
+        from src.config import load_config
+
+        configured = os.environ.get("RAG_PIPELINE_CONFIG", "").strip()
+        if configured:
+            config_path = Path(configured).expanduser()
+            if not config_path.is_absolute():
+                config_path = ROOT_DIR / config_path
+        else:
+            config_path = ROOT_DIR / "config.toml"
+        paths = load_config(config_path).paths
+        return (
+            _resolve_root_path(paths.data_dir, default="data"),
+            _resolve_root_path(paths.processed_dir, default="processed_docs"),
+            _resolve_root_path(paths.db_dir, default="db"),
+        )
+    except Exception:
+        return (
+            ROOT_DIR / "data",
+            ROOT_DIR / "processed_docs",
+            ROOT_DIR / "db",
+        )
+
+
+DATA_DIR, PROCESSED_DIR, DB_DIR = _web_data_paths()
+UPLOAD_DIR = DATA_DIR / "uploads"
+STAGING_DIR = DATA_DIR / ".upload_queue"
+PDF_REGISTRY_PATH = DATA_DIR / ".pdf_upload_registry.json"
+JOB_LEDGER_PATH = DATA_DIR / ".job_ledger.json"
+DOCUMENT_TRUST_PATH = DATA_DIR / ".document_trust.json"
 
 
 def _contained_client_path(raw_path: Any, default: str) -> str:
@@ -444,6 +477,11 @@ MAX_REQUEST_BYTES: int | None = None
 # Cap on the number of PDF entries extracted from a single uploaded zip. Guards
 # against a zip-bomb of tiny entries exhausting the staging dir.
 MAX_ZIP_ENTRIES = 10_000
+# Aggregate decompressed-bytes ceiling for a single uploaded zip, as a multiple
+# of the per-file cap. Without it, a ~34 MB request (single-shot path) could
+# expand to tens of GB on disk (DEFLATE ratios reach ~1000:1) before any job
+# starts. Ignored when max_bytes is 0 (unlimited per-file cap).
+MAX_ZIP_TOTAL_RATIO = 20
 RECOVERABLE_UPLOAD_STATUSES = {"queued", "saving_uploads", "ingesting", "ingested"}
 UPLOAD_RESUME_STATUS_ORDER = {
     "queued": 0,
@@ -524,14 +562,23 @@ PDFS_MAX_PAGE_SIZE = 500
 INDEX_SUMMARIES_MAX_PAGE_SIZE = 2000
 
 
-def _page_slice(rows: list[dict[str, Any]], *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
+def _page_slice(
+    rows: list[dict[str, Any]],
+    *,
+    offset: int = 0,
+    limit: int | None = None,
+    cap: int = 100,
+) -> dict[str, Any]:
     total = len(rows)
     offset = max(0, int(offset))
     if limit is None:
         page = rows[offset:]
         resolved_limit = len(page)
     else:
-        resolved_limit = min(max(1, int(limit)), 100)
+        # ``cap`` is the caller's bounded-"All" ceiling (JOBS_MAX_PAGE_SIZE,
+        # PDFS_MAX_PAGE_SIZE, ...). The old hardcoded 100 silently truncated
+        # every endpoint's All mode below its advertised ceiling.
+        resolved_limit = min(max(1, int(limit)), max(1, int(cap)))
         page = rows[offset : offset + resolved_limit]
     return {
         "rows": page,
@@ -1158,7 +1205,14 @@ def _find_resumable_staged_dir(live_db_dir: str | Path) -> Path | None:
     if not candidates:
         return None
     # Most recently modified wins (ties broken by name for determinism).
-    candidates.sort(key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
+    def _mtime_key(path: Path) -> tuple[int, str]:
+        try:
+            return (path.stat().st_mtime_ns, path.name)
+        except OSError:
+            # Vanished between the listing and now (concurrent GC); sort first.
+            return (0, path.name)
+
+    candidates.sort(key=_mtime_key, reverse=True)
     return candidates[0]
 
 
@@ -1589,7 +1643,9 @@ def _swap_index_into(
 
     The current live components are moved aside into a ``.index_rollover_<hex>``
     directory first so a failed swap can roll back, mirroring the safe-swap logic
-    already used by ``_publish_staged_index``.
+    already used by ``_publish_staged_index``. Live-only overrides/hashes (the
+    source has none) are preserved aside instead of being rolled away, so
+    restoring an older snapshot never drops edits made after it.
 
     When ``copy_mode`` is False (the default for staged builds), the source
     components are *moved* (renamed) into place -- atomic and cheap. When
@@ -1604,6 +1660,26 @@ def _swap_index_into(
 
     live_db.mkdir(parents=True, exist_ok=True)
     with acquire_index_lock(live_db):
+        # Live components the source does not carry must survive the swap:
+        # rolling them into the rollover dir (which is deleted on success)
+        # would silently drop manual edits / hash sidecars created after the
+        # snapshot being restored. Park them aside instead and move them back
+        # afterwards -- the same scheme _publish_staged_index uses. Crash
+        # recovery for the aside dirs is _repair_preserved_components.
+        preserved: list[tuple[Path, Path]] = []
+        aside_dir = live_db.parent / f".index_preserve_{uuid.uuid4().hex}"
+        for source_component, live_component in zip(source_components, live_components):
+            source_has = source_component.exists()
+            if (
+                live_component.name in _PRESERVE_COMPONENT_NAMES
+                and not source_has
+                and live_component.exists()
+            ):
+                aside_dir.mkdir(parents=True, exist_ok=True)
+                aside = aside_dir / live_component.name
+                shutil.move(str(live_component), str(aside))
+                preserved.append((aside, live_component))
+
         rollover = live_db.parent / f".index_rollover_{uuid.uuid4().hex}"
         rollover.mkdir(parents=True, exist_ok=False)
         rollover_targets = [rollover / component.name for component in live_components]
@@ -1622,15 +1698,22 @@ def _swap_index_into(
                             shutil.copy2(source_component, live_component)
                     else:
                         shutil.move(str(source_component), str(live_component))
+            for aside, live_component in preserved:
+                if not live_component.exists():
+                    shutil.move(str(aside), str(live_component))
         except Exception:
             for live_component, rollover_target in zip(live_components, rollover_targets):
                 _remove_path(live_component)
                 if rollover_target.exists():
                     shutil.move(str(rollover_target), str(live_component))
+            for aside, live_component in preserved:
+                if not live_component.exists() and aside.exists():
+                    shutil.move(str(aside), str(live_component))
             _remove_path(rollover)
             raise
         finally:
             _remove_path(rollover)
+            _remove_path(aside_dir)
 
         _invalidate_index_caches(live_db)
 
@@ -2195,6 +2278,59 @@ def _index_child_candidates(
     ]
 
 
+def _index_children_by_parent(
+    rows: list[dict[str, Any]],
+    by_id: dict[str, dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Group every row under each parent it can belong to, in one pass.
+
+    Equivalent to calling :func:`_index_child_candidates` for every candidate
+    parent, but O(N x depth) once instead of O(top_rows x N): when the index
+    has no document summaries, the fallback makes EVERY row a top row and the
+    per-parent scans degenerated to a quadratic sweep over up to the full
+    snapshot per request.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    seen_by_parent: dict[str, set[str]] = {}
+
+    def _add(parent_id: str, row: dict[str, Any], row_id: str) -> None:
+        # A row can reach the same parent through both routes (the doc summary
+        # is usually the root of the parent chain); keep it once, matching the
+        # old per-parent branch behavior.
+        if not parent_id or parent_id == row_id:
+            return
+        seen = seen_by_parent.setdefault(parent_id, set())
+        if row_id in seen:
+            return
+        seen.add(row_id)
+        grouped.setdefault(parent_id, []).append(row)
+
+    doc_summary_by_doc: dict[str, str] = {}
+    for row in rows:
+        if str(row.get("node_type") or "") == "document_summary":
+            doc_id = str(row.get("doc_id") or "")
+            if doc_id:
+                doc_summary_by_doc[doc_id] = str(row.get("id") or "")
+
+    for row in rows:
+        row_id = str(row.get("id") or "")
+        # Document-summary children: every row sharing the summary's doc_id.
+        doc_id = str(row.get("doc_id") or "")
+        if doc_id:
+            summary_id = doc_summary_by_doc.get(doc_id)
+            if summary_id:
+                _add(summary_id, row, row_id)
+        # Section/chunk children: every row whose parent chain contains the
+        # parent id (cycle-guarded, same walk as _index_descends_from).
+        seen: set[str] = set()
+        current_id = str(row.get("parent_id") or "")
+        while current_id and current_id not in seen:
+            _add(current_id, row, row_id)
+            seen.add(current_id)
+            current_id = str(by_id.get(current_id, {}).get("parent_id") or "")
+    return grouped
+
+
 def _index_section_depth(row: dict[str, Any], parent: dict[str, Any]) -> int:
     parent_parts = [part.strip() for part in str(parent.get("section_path") or "").split(">") if part.strip()]
     row_parts = [part.strip() for part in str(row.get("section_path") or "").split(">") if part.strip()]
@@ -2266,22 +2402,26 @@ def list_index_summary_rows(
         return payload
 
     by_id = {str(row.get("id") or ""): row for row in rows if row.get("id")}
+    children_by_parent = _index_children_by_parent(rows, by_id)
     top_rows = _index_top_summary_rows(rows)
     if query:
         top_rows = [
             row
             for row in top_rows
             if record_matches(row, query)
-            or any(record_matches(child, query) for child in _index_child_candidates(row, rows, by_id))
+            or any(
+                record_matches(child, query)
+                for child in children_by_parent.get(str(row.get("id") or ""), [])
+            )
         ]
     top_rows = sorted(top_rows, key=_index_sort_key)
-    page = _page_slice(top_rows, offset=offset, limit=resolved_limit)
+    page = _page_slice(top_rows, offset=offset, limit=resolved_limit, cap=INDEX_SUMMARIES_MAX_PAGE_SIZE)
     page_rows = [
         _with_index_hierarchy_metadata(
             row,
             children=[
                 child
-                for child in _index_child_candidates(row, rows, by_id)
+                for child in children_by_parent.get(str(row.get("id") or ""), [])
                 if not query or record_matches(child, query)
             ],
         )
@@ -2339,7 +2479,7 @@ def list_index_child_rows(
     if query:
         children = [row for row in children if record_matches(row, query)]
     children = sorted(children, key=_index_sort_key)
-    page = _page_slice(children, offset=offset, limit=resolved_limit)
+    page = _page_slice(children, offset=offset, limit=resolved_limit, cap=INDEX_CHILD_MAX_LIMIT)
     return {
         "parent_id": parent_id,
         "offset": page["offset"],
@@ -2373,16 +2513,38 @@ def _list_index_child_rows_degraded(
     with INDEX_LOCK:
         try:
             parent = store.get_record(parent_id)
-        except (KeyError, Exception) as exc:
-            raise KeyError(parent_id) from exc
-        model, dim = store.metadata()
-        # Fetch children server-side. Use a generous fetch cap then page in Python.
-        fetch_cap = max(limit * 4, INDEX_CHILD_MAX_LIMIT)
-        children = store.child_chunks(parent, limit=fetch_cap)
+        except KeyError:
+            raise
+        except Exception as exc:
+            # A store failure (locked/corrupt table) is not "record not
+            # found"; surface the real error instead of a misleading 404.
+            raise HTTPException(
+                status_code=503,
+                detail=f"Index store error while fetching parent {parent_id}: {exc}",
+            ) from exc
+        try:
+            model, dim = store.metadata()
+            # Fetch children server-side. Use a generous fetch cap then page in Python.
+            fetch_cap = max(limit * 4, INDEX_CHILD_MAX_LIMIT)
+            children = store.child_chunks(parent, limit=fetch_cap)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Index store error while fetching children of {parent_id}: {exc}",
+            ) from exc
+    if len(children) >= fetch_cap:
+        # The fetch cap can truncate a document with more children than the
+        # cap; report it so the UI knows `total` is a lower bound.
+        logger.warning(
+            "Degraded child fetch hit its cap (%d) for parent %s; results are truncated.",
+            fetch_cap, parent_id,
+        )
     if search:
         children = [row for row in children if record_matches(row, search)]
     children = sorted(children, key=_index_sort_key)
-    page = _page_slice(children, offset=offset, limit=limit)
+    page = _page_slice(children, offset=offset, limit=limit, cap=INDEX_CHILD_MAX_LIMIT)
     return {
         "parent_id": parent_id,
         "offset": page["offset"],
@@ -2482,6 +2644,15 @@ def update_index_record(
 
     with INDEX_LOCK:
         store = _index_store(resolved_db_dir)
+        # Re-fetch under the write lock: the embedding ran unlocked, and the
+        # record may have been deleted in between. Editing a stale record
+        # would resurrect rows/manifest entries for a deleted source.
+        try:
+            record = store.get_record(record_id)
+        except KeyError as exc:
+            raise KeyError(
+                f"Record was deleted while the edit was being prepared: {record_id}"
+            ) from exc
         row = store.update_record(
             record_id=record_id,
             content=content,
@@ -2492,13 +2663,18 @@ def update_index_record(
         persist_index_edit(resolved_db_dir, record, content)
         manifest_model, manifest_dim = store.metadata()
         source_hash = str(record.get("source_hash") or "")
-        source_key = source_hash or str(record.get("file_path") or "")
+        if source_hash:
+            source_key = source_hash
+            source_records = store.records_by_source_hash([source_hash])
+        else:
+            # Legacy records (no source_hash) are keyed in the manifest by
+            # _manifest_source_key: source_pdf_path when set, else file_path.
+            # Deriving the key here from file_path alone would write a second,
+            # wrong-keyed manifest entry (or delete the real one) and the
+            # Library would show stale stats or "not_indexed" for the source.
+            source_key = _manifest_source_key(record)
+            source_records = store.records_by_file_path(str(record.get("file_path") or ""))
         if source_key:
-            source_records = (
-                store.records_by_source_hash([source_hash])
-                if source_hash
-                else store.records_by_file_path(str(record.get("file_path") or ""))
-            )
             update_index_manifest_sources(
                 resolved_db_dir,
                 {source_key: source_records},
@@ -2529,14 +2705,17 @@ def delete_index_records(*, record_ids: list[str], db_dir: Path | None = None) -
         source_updates: dict[str, list[dict[str, Any]]] = {}
         for record in records_to_tombstone:
             source_hash = str(record.get("source_hash") or "")
-            file_path = str(record.get("file_path") or "")
-            source_key = source_hash or file_path
-            if source_key:
-                source_updates[source_key] = (
-                    store.records_by_source_hash([source_hash])
-                    if source_hash
-                    else store.records_by_file_path(file_path)
-                )
+            if source_hash:
+                source_key = source_hash
+                source_updates[source_key] = store.records_by_source_hash([source_hash])
+            else:
+                # Legacy records: key the manifest update the same way the
+                # manifest itself does (see update_index_record above).
+                source_key = _manifest_source_key(record)
+                if source_key:
+                    source_updates[source_key] = store.records_by_file_path(
+                        str(record.get("file_path") or "")
+                    )
         if source_updates:
             update_index_manifest_sources(
                 resolved_db_dir,
@@ -2619,20 +2798,76 @@ def vector_search_index_rows(
     }
 
 
-def _resolve_pdf_path(raw_path: str, *, root_dir: Path = ROOT_DIR, data_dir: Path = DATA_DIR) -> Path:
+def _allowed_corpus_roots() -> list[Path]:
+    """Roots a served source file may live under.
+
+    data_dir plus the repo root were historically the only allowed roots, which
+    locked out bulk-ingested corpora on other volumes (every download reported
+    ``unsafe_path``). The db/processed roots are always allowed, and extra
+    corpus roots come from [paths]. corpus_roots in config.toml.
+    """
+    roots = [DATA_DIR, ROOT_DIR, DB_DIR, PROCESSED_DIR]
+    try:
+        from src.config import load_config
+
+        for raw in load_config(_default_config_path()).paths.corpus_roots or []:
+            roots.append(_resolve_root_path(raw))
+    except Exception:
+        pass
+    resolved = []
+    for root in roots:
+        try:
+            resolved.append(Path(root).resolve())
+        except OSError:
+            continue
+    return resolved
+
+
+def _resolve_data_file_path(
+    raw_path: str,
+    *,
+    suffixes: tuple[str, ...],
+    root_dir: Path = ROOT_DIR,
+    data_dir: Path = DATA_DIR,
+) -> Path:
     if not raw_path:
-        raise FileNotFoundError("PDF path is missing.")
+        raise FileNotFoundError("File path is missing.")
     path = Path(raw_path)
     candidate = path if path.is_absolute() else root_dir / path
     resolved = candidate.resolve()
-    data_root = data_dir.resolve()
-    try:
-        resolved.relative_to(data_root)
-    except ValueError as exc:
-        raise PermissionError(f"PDF path is outside the data directory: {resolved}") from exc
-    if resolved.suffix.lower() != ".pdf":
-        raise PermissionError(f"Download path is not a PDF: {resolved}")
+    # The caller's root_dir/data_dir participate in the containment check too:
+    # tests and redirected workspaces pass overrides here, and validating only
+    # against the module globals would enforce the wrong boundary.
+    roots = [root_dir, data_dir, *_allowed_corpus_roots()]
+    resolved_roots = []
+    for root in roots:
+        try:
+            resolved_roots.append(Path(root).resolve())
+        except OSError:
+            continue
+    for root in resolved_roots:
+        try:
+            resolved.relative_to(root)
+            break
+        except ValueError:
+            continue
+    else:
+        raise PermissionError(f"Path is outside the configured corpus roots: {resolved}")
+    if suffixes and resolved.suffix.lower() not in suffixes:
+        raise PermissionError(f"Unsupported file type for serving: {resolved}")
     return resolved
+
+
+def _resolve_pdf_path(raw_path: str, *, root_dir: Path = ROOT_DIR, data_dir: Path = DATA_DIR) -> Path:
+    return _resolve_data_file_path(
+        raw_path, suffixes=(".pdf",), root_dir=root_dir, data_dir=data_dir
+    )
+
+
+def _resolve_markdown_path(raw_path: str, *, root_dir: Path = ROOT_DIR, data_dir: Path = DATA_DIR) -> Path:
+    return _resolve_data_file_path(
+        raw_path, suffixes=(".md", ".markdown"), root_dir=root_dir, data_dir=data_dir
+    )
 
 
 def _pdf_download_url(source_hash: str) -> str:
@@ -2642,6 +2877,10 @@ def _pdf_download_url(source_hash: str) -> str:
 def _load_trust_registry(path: Path | None = None) -> dict[str, Any]:
     trust_path = path or DOCUMENT_TRUST_PATH
     payload = _cached_json_load(trust_path, default={"version": 1, "documents": {}})
+    # Detach from the shared cache object: callers mutate the payload in place
+    # before writing, and a failed write must not leave phantom state in memory
+    # (the cache would keep showing an update that never reached disk).
+    payload = json.loads(json.dumps(payload))
     payload.setdefault("version", 1)
     payload.setdefault("documents", {})
     if not isinstance(payload["documents"], dict):
@@ -2916,6 +3155,11 @@ _AUTO_TAG_STATE: dict[str, Any] = {
     "tagged": 0,
     "last_error": "",
 }
+# Count of scheduled-but-not-finished runs (ALL kinds), guarded by
+# _AUTO_TAG_LOCK. The manual-sweep exclusivity guard reads THIS, not the
+# informational "running" flag: a queued-behind-the-semaphore upload run
+# must still block a second full-corpus sweep.
+_AUTO_TAG_ACTIVE_RUNS = 0
 
 
 def _auto_tag_settings() -> dict[str, Any]:
@@ -2981,9 +3225,12 @@ def _run_auto_tag(items: list[dict[str, Any]]) -> None:
         if decisions:
             apply_auto_tag_decisions(decisions, model=settings["model"])
         with _AUTO_TAG_LOCK:
+            # -1: THIS run is still counted until the slot-bound wrapper's
+            # finally runs after we return, so the final status must reflect
+            # whether any OTHER run remains in flight.
             _AUTO_TAG_STATE.update(
                 {
-                    "running": False,
+                    "running": _AUTO_TAG_ACTIVE_RUNS - 1 > 0,
                     "finished_at": _utcnow(),
                     "tagged": len(decisions),
                     "queued": len(items),
@@ -2994,7 +3241,11 @@ def _run_auto_tag(items: list[dict[str, Any]]) -> None:
         logger.warning("Auto-tag run failed: %s", exc, exc_info=True)
         with _AUTO_TAG_LOCK:
             _AUTO_TAG_STATE.update(
-                {"running": False, "finished_at": _utcnow(), "last_error": str(exc)}
+                {
+                    "running": _AUTO_TAG_ACTIVE_RUNS - 1 > 0,
+                    "finished_at": _utcnow(),
+                    "last_error": str(exc),
+                }
             )
 
 
@@ -3003,15 +3254,18 @@ def _schedule_auto_tag(items: list[dict[str, Any]], *, exclusive: bool = False) 
 
     Upload-triggered runs (``exclusive=False``) always start: they are small,
     and every trust write is guarded by the registry lock anyway. Manual
-    sweeps (``exclusive=True``) refuse to stack on a running sweep so one
-    click cannot queue the same corpus twice.
+    sweeps (``exclusive=True``) refuse to stack on ANY in-flight run (the
+    shared ``_AUTO_TAG_ACTIVE_RUNS`` counter) so one click cannot queue the
+    same corpus twice.
     """
+    global _AUTO_TAG_ACTIVE_RUNS
     if not items:
         return False
-    if exclusive:
-        with _AUTO_TAG_LOCK:
-            if _AUTO_TAG_STATE.get("running"):
-                return False
+    with _AUTO_TAG_LOCK:
+        if exclusive and _AUTO_TAG_ACTIVE_RUNS > 0:
+            return False
+        _AUTO_TAG_ACTIVE_RUNS += 1
+        if exclusive:
             _AUTO_TAG_STATE.update(
                 {
                     "running": True,
@@ -3023,13 +3277,26 @@ def _schedule_auto_tag(items: list[dict[str, Any]], *, exclusive: bool = False) 
             )
 
     def _run_with_slot_bound() -> None:
-        # Blocking acquire: excess runs wait here (threads are cheap) instead
-        # of stampeding the LLM backend concurrently.
-        with _AUTO_TAG_RUN_SLOTS:
-            _run_auto_tag(items)
+        global _AUTO_TAG_ACTIVE_RUNS
+        try:
+            # Blocking acquire: excess runs wait here (threads are cheap) instead
+            # of stampeding the LLM backend concurrently.
+            with _AUTO_TAG_RUN_SLOTS:
+                _run_auto_tag(items)
+        finally:
+            with _AUTO_TAG_LOCK:
+                _AUTO_TAG_ACTIVE_RUNS = max(0, _AUTO_TAG_ACTIVE_RUNS - 1)
 
     thread = threading.Thread(target=_run_with_slot_bound, args=(), daemon=True, name="auto-tag")
-    thread.start()
+    try:
+        thread.start()
+    except Exception as exc:
+        # Without a started thread the finally above never runs; release the
+        # count or manual sweeps stay locked out until restart.
+        with _AUTO_TAG_LOCK:
+            _AUTO_TAG_ACTIVE_RUNS = max(0, _AUTO_TAG_ACTIVE_RUNS - 1)
+            _AUTO_TAG_STATE.update({"running": _AUTO_TAG_ACTIVE_RUNS > 0, "last_error": str(exc)})
+        return False
     return True
 
 
@@ -3151,10 +3418,12 @@ def _cached_json_load(
         return cached[1]
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        # Real corruption: return the fallback but do NOT cache it, so a repair
-        # (rewriting the file, even with the same mtime/size edge case) is
-        # observed on the next read instead of masked by a stale cache entry.
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # Real corruption (invalid JSON, or a non-UTF-8 rewrite by a manual
+        # edit / another tool): return the fallback but do NOT cache it, so a
+        # repair (rewriting the file, even with the same mtime/size edge case)
+        # is observed on the next read instead of masked by a stale cache
+        # entry. UnicodeDecodeError is a ValueError, not a JSONDecodeError.
         return on_decode_error if on_decode_error is not _UNSET_SENTINEL else default
     except OSError:
         return default
@@ -3211,6 +3480,9 @@ _MARKDOWN_QUALITY_CACHE = BoundedLRU(maxsize=8192)
 # skip re-reading and regex-scanning every processed markdown file.
 _MARKDOWN_QUALITY_PERSIST_LOCK = threading.Lock()
 _MARKDOWN_QUALITY_PERSIST: dict[Path, dict[str, list[Any]]] = {}
+# One entry per distinct markdown path ever quality-scored; without a cap the
+# payload (memory + the rewritten JSON blob) grows for the process lifetime.
+_MARKDOWN_QUALITY_PERSIST_MAX_ENTRIES = 20_000
 _MARKDOWN_QUALITY_PERSIST_DIRTY = 0
 _MARKDOWN_QUALITY_PERSIST_LAST_WRITE = 0.0
 _MARKDOWN_QUALITY_PERSIST_FLUSH_DIRTY = 64
@@ -3252,6 +3524,14 @@ def _markdown_quality_persist_store(cache_path: Path, cache_key: str, signature:
     with _MARKDOWN_QUALITY_PERSIST_LOCK:
         payload = _markdown_quality_persist_payload(cache_path)
         payload[cache_key] = [signature, dict(result)]
+        # Bound the payload: entries are keyed per markdown path ever seen and
+        # are never invalidated on delete/reprocess, so an unbounded dict grows
+        # for the process lifetime and rewrites a bigger JSON blob on every
+        # flush. Evict the oldest quarter when over the cap (dicts preserve
+        # insertion order, so oldest = first inserted).
+        if len(payload) > _MARKDOWN_QUALITY_PERSIST_MAX_ENTRIES:
+            for stale_key in list(payload)[: len(payload) // 4]:
+                payload.pop(stale_key, None)
         _MARKDOWN_QUALITY_PERSIST_DIRTY += 1
         now = time.monotonic()
         if (
@@ -3287,7 +3567,9 @@ def _markdown_quality(processed_markdown_path: str, *, root_dir: Path = ROOT_DIR
         return dict(persisted)
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # A non-UTF-8 markdown file (manual edit, disk damage) must degrade to
+        # "no quality data" rather than 500 the whole Library listing.
         return {"markdown_exists": False, "markdown_char_count": 0, "page_markers": 0, "enrichment_markers": 0}
     result = {
         "markdown_exists": True,
@@ -3364,6 +3646,7 @@ def _pdf_entry_for_response(
 ) -> dict[str, Any]:
     raw_path = upload_path or source_pdf_path
     can_download = False
+    markdown_available = False
     path_error = ""
     if raw_path:
         try:
@@ -3374,6 +3657,13 @@ def _pdf_entry_for_response(
             path_error = "unsafe_path"
         except OSError:
             path_error = "invalid_path"
+    if processed_markdown_path:
+        try:
+            markdown_available = _resolve_markdown_path(
+                processed_markdown_path, root_dir=root_dir, data_dir=data_dir
+            ).exists()
+        except (FileNotFoundError, PermissionError, OSError):
+            markdown_available = False
     return {
         "hash": source_hash,
         "filename": filename or Path(raw_path).name,
@@ -3386,6 +3676,7 @@ def _pdf_entry_for_response(
         "last_interrupted_job_id": last_interrupted_job_id,
         "last_error": last_error,
         "can_download": can_download,
+        "markdown_available": markdown_available,
         "download_url": _pdf_download_url(source_hash) if can_download else "",
         "path_error": path_error,
     }
@@ -3454,10 +3745,12 @@ def list_pdf_documents(
     source_group: str = "",
     trust_status: str = "",
     category: str = "",
+    sort: str = "",
     registry_path: Path | None = None,
     processed_dir: Path | None = None,
     root_dir: Path = ROOT_DIR,
     data_dir: Path = DATA_DIR,
+    enrich: bool = True,
 ) -> dict[str, Any]:
     manifest = _load_index_manifest(DB_DIR)
     trust_payload = _load_trust_registry()
@@ -3473,23 +3766,61 @@ def list_pdf_documents(
     except Exception:
         category_by_hash = {}
 
+    # Per-category manifests: a category-indexed document's stats live in its
+    # category dir's manifest, not the General one; checking only the General
+    # manifest flipped every category document to "not_indexed" in the Library.
+    # Loaded lazily per category actually present in the corpus.
+    category_manifests: dict[str, dict[str, Any]] = {}
+
+    def _manifest_for(row: dict[str, Any]) -> dict[str, Any]:
+        cat = str(row.get("category") or GENERAL_CATEGORY_KEY)
+        if cat == GENERAL_CATEGORY_KEY:
+            return manifest
+        if cat not in category_manifests:
+            category_manifests[cat] = _load_index_manifest(category_db_dir(DB_DIR, cat))
+        return category_manifests[cat]
+
     rows: list[dict[str, Any]] = []
     trust_by_hash: dict[str, dict[str, Any]] = {}
     for source_hash, item in fields.items():
         row = {"hash": source_hash, **item}
         row["category"] = category_by_hash.get(source_hash, GENERAL_CATEGORY_KEY)
-        if str(row.get("status") or "") == "indexed" and not _index_manifest_stats(row, manifest):
+        if str(row.get("status") or "") == "indexed" and not _index_manifest_stats(row, _manifest_for(row)):
             row["status"] = "not_indexed"
         trust_by_hash[source_hash] = _normalize_trust_entry(source_hash, trust_documents.get(source_hash))
         rows.append(row)
 
-    rows.sort(
-        key=lambda item: (
-            0 if str(trust_by_hash[str(item.get("hash") or "")].get("source_group") or "") == SOURCE_GROUP_UNGROUPED else 1,
-            str(item.get("filename") or ""),
-            str(item.get("hash") or ""),
+    def _trust_value(item: dict[str, Any], key: str) -> str:
+        return str(trust_by_hash[str(item.get("hash") or "")].get(key) or "")
+
+    # Default order keeps ungrouped rows first (the review queue); explicit
+    # sorts take over from the Library column headers. "-x" reverses.
+    sort_key = (sort or "").strip()
+    reverse = sort_key.startswith("-")
+    if reverse:
+        sort_key = sort_key[1:]
+    if sort_key == "filename":
+        rows.sort(key=lambda item: str(item.get("filename") or "").lower(), reverse=reverse)
+    elif sort_key == "updated":
+        rows.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=reverse)
+    elif sort_key == "group":
+        rows.sort(
+            key=lambda item: _trust_value(item, "source_group") or SOURCE_GROUP_UNGROUPED,
+            reverse=reverse,
         )
-    )
+    elif sort_key == "trust":
+        rows.sort(
+            key=lambda item: _trust_value(item, "review_status") or "unreviewed",
+            reverse=reverse,
+        )
+    else:
+        rows.sort(
+            key=lambda item: (
+                0 if _trust_value(item, "source_group") == SOURCE_GROUP_UNGROUPED else 1,
+                str(item.get("filename") or ""),
+                str(item.get("hash") or ""),
+            )
+        )
     query = search.strip().lower()
     if query:
         rows = [
@@ -3524,12 +3855,17 @@ def list_pdf_documents(
             for item in rows
             if str(item.get("category") or GENERAL_CATEGORY_KEY) == category_filter
         ]
-    page = _page_slice(rows, offset=offset, limit=limit)
+    page = _page_slice(rows, offset=offset, limit=limit, cap=PDFS_MAX_PAGE_SIZE)
 
     # Enrich (path stats, trust, markdown quality) only the rows on the page so
     # listing cost stays O(page) in disk I/O instead of O(total documents).
+    # enrich=False returns the raw rows untouched for internal callers that
+    # only need registry/source-map fields (paths, status, filename).
     page_rows: list[dict[str, Any]] = []
     for row in page["rows"]:
+        if not enrich:
+            page_rows.append(dict(row))
+            continue
         source_hash = str(row.get("hash") or "")
         trust = trust_by_hash.get(source_hash) or _normalize_trust_entry(source_hash, trust_documents.get(source_hash))
         item = _pdf_entry_for_response(
@@ -3576,7 +3912,7 @@ def list_job_rows(*, offset: int = 0, limit: int | None = 10, search: str = "") 
             or query in str(job.get("error", "")).lower()
             or query in ", ".join(str(name) for name in (job.get("filenames") or [])).lower()
         ]
-    page = _page_slice(jobs, offset=offset, limit=limit)
+    page = _page_slice(jobs, offset=offset, limit=limit, cap=JOBS_MAX_PAGE_SIZE)
     # log_tail (200 lines per job) is excluded from the list response: the 2s
     # active-job poll used to re-ship every visible job's whole tail. The UI
     # hydrates open log panels from GET /api/jobs/{id} instead.
@@ -3629,6 +3965,10 @@ def _pdf_document_by_hash(
         processed_dir=processed_dir,
         root_dir=root_dir,
         data_dir=data_dir,
+        # Raw rows: the delete path only reads registry/source-map fields, and
+        # enriching the WHOLE corpus (markdown quality reads + path stats per
+        # document) just to delete one document is O(corpus) disk I/O.
+        enrich=False,
     )["pdfs"]
     match = next((item for item in documents if item.get("hash") == source_hash), None)
     if match is None:
@@ -3735,7 +4075,18 @@ def _delete_processed_markdown_files(
         try:
             resolved.unlink()
         except PermissionError:
-            resolved.write_text("", encoding="utf-8")
+            # Windows: the file may be held open (editor/AV/indexer), which
+            # typically denies write sharing too -- the truncation fallback
+            # then raises as well and would abort the whole delete mid-way
+            # (vectors already gone, registry/trust cleanup never runs).
+            # Best-effort truncation keeps the delete traceable in logs
+            # without failing the request.
+            try:
+                resolved.write_text("", encoding="utf-8")
+            except OSError:
+                logger.warning("Could not delete or truncate locked markdown %s", resolved)
+        except OSError:
+            continue
         # The page-text sidecar is derived data and must not accumulate after
         # deleting/replacing a source PDF.
         sidecar = resolved.with_suffix(".pages.json")
@@ -4125,6 +4476,10 @@ ChatRequest = import_split_class("src.web_app_classes.chat_request", "ChatReques
 ChatRequest.__module__ = __name__
 
 
+ChatTurn = import_split_class("src.web_app_classes.chat_request", "ChatTurn")
+ChatTurn.__module__ = __name__
+
+
 IndexUpdateRequest = import_split_class("src.web_app_classes.index_update_request", "IndexUpdateRequest")
 IndexUpdateRequest.__module__ = __name__
 
@@ -4205,11 +4560,15 @@ def render_markdown_text(text: str) -> str:
     _ensure_markdown_renderer()
 
     math_blocks: list[str] = []
+    # Per-call random token so a document that literally contains a
+    # placeholder-shaped string ("@@RAG_MATH_0@@") cannot hijack the
+    # substitution loop and swap in a different formula.
+    token = uuid.uuid4().hex[:8]
 
     def replace_math(match: re.Match[str]) -> str:
         latex = next(group for group in match.groups() if group is not None)
         display = "block" if match.group(1) is not None or match.group(2) is not None else "inline"
-        placeholder = f"@@RAG_MATH_{len(math_blocks)}@@"
+        placeholder = f"@@RAG_MATH_{token}_{len(math_blocks)}@@"
         try:
             math_blocks.append(_LATEX_TO_MATHML(latex.strip(), display=display))
         except Exception:
@@ -4219,7 +4578,7 @@ def render_markdown_text(text: str) -> str:
     protected = _MATH_PATTERN.sub(replace_math, text)
     rendered = _MARKDOWN_RENDERER.render(protected)
     for index, math_html in enumerate(math_blocks):
-        rendered = rendered.replace(f"@@RAG_MATH_{index}@@", math_html)
+        rendered = rendered.replace(f"@@RAG_MATH_{token}_{index}@@", math_html)
     return rendered
 
 
@@ -4274,7 +4633,8 @@ def _start_local_chat_model_warmup() -> None:
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
-                urllib.request.urlopen(request, timeout=600.0).read()
+                with urllib.request.urlopen(request, timeout=600.0) as response:
+                    response.read()
             except Exception:
                 logger.debug("Local chat model warm-up skipped/failed", exc_info=True)
 
@@ -4289,13 +4649,130 @@ def _start_local_chat_model_warmup() -> None:
         logger.debug("Could not start local chat model warm-up", exc_info=True)
 
 
+def _acquire_web_ui_instance_lock():
+    """Hold an exclusive lock file for this web-UI process's whole lifetime.
+
+    Two uvicorn instances sharing one data directory is not supported: both
+    run job-recovery and both spawn queue workers, which is how concurrent
+    indexing/publish races (and stale reader handles) happened historically.
+    Set RAG_ALLOW_MULTIPLE_WEB_INSTANCES=1 to opt out explicitly.
+    """
+    import portalocker
+
+    if os.environ.get("RAG_ALLOW_MULTIPLE_WEB_INSTANCES", "").strip() == "1":
+        return None
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = DATA_DIR / ".web_ui_instance.lock"
+    handle = open(lock_path, "a+", encoding="utf-8")
+    lock = portalocker.Lock(str(lock_path), timeout=0, flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING)
+    try:
+        lock.acquire()
+    except Exception:
+        handle.close()
+        return None
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()} started={datetime.now(timezone.utc).isoformat()}")
+        handle.flush()
+    except OSError:
+        pass
+    return {"lock": lock, "handle": handle}
+
+
+_STARTUP_NOTICES: list[str] = []
+_METRICS_SAMPLER_STOP = threading.Event()
+_BACKUP_SCHEDULER_STOP = threading.Event()
+
+
+def _collect_startup_notices() -> None:
+    """Record leftover interrupted-swap components for the Admin dashboard.
+
+    Startup already repairs these automatically; surfacing them tells the
+    operator the index needed repair instead of hiding the event in a log.
+    """
+    try:
+        for candidate in Path(DB_DIR).parent.glob(".index_rollover_*"):
+            _STARTUP_NOTICES.append(
+                f"Interrupted index swap recovered from {candidate.name}; "
+                "verify retrieval works, then delete the directory."
+            )
+            break
+    except OSError:
+        pass
+
+
+def _sweep_old_job_logs(*, keep_days: int = 30) -> int:
+    """Delete job log files older than keep_days. Returns removed count."""
+    removed = 0
+    cutoff = time.time() - keep_days * 86400
+    try:
+        for log_file in (ROOT_DIR / "logs").glob("job_*.log"):
+            try:
+                if log_file.stat().st_mtime < cutoff:
+                    log_file.unlink()
+                    removed += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return removed
+
+
+def _newest_backup_age_hours() -> float | None:
+    backups_dir = DB_DIR / "backups"
+    try:
+        candidates = [entry for entry in backups_dir.iterdir() if entry.is_dir()]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    # A concurrently pruned/renamed backup can vanish between iterdir() and
+    # stat(); skipping vanished entries keeps this a snapshot instead of a
+    # FileNotFoundError that would kill the scheduler thread (auto-backup
+    # would then stay silently disabled until restart).
+    mtimes: list[float] = []
+    for entry in candidates:
+        try:
+            mtimes.append(entry.stat().st_mtime)
+        except OSError:
+            continue
+    if not mtimes:
+        return None
+    return (time.time() - max(mtimes)) / 3600.0
+
+
+def _backup_scheduler_loop(stop_event: threading.Event, interval_hours: int) -> None:
+    # Check hourly; enqueue a backup when the newest one is older than the
+    # configured interval. enqueue_backup applies its own blockers (active work).
+    while not stop_event.is_set():
+        stop_event.wait(3600)
+        if stop_event.is_set() or interval_hours <= 0:
+            continue
+        try:
+            age = _newest_backup_age_hours()
+            if age is not None and age < interval_hours:
+                continue
+            job = job_queue.enqueue_backup()
+            logger.info("Auto-backup enqueued: job %s", getattr(job, "id", "?"))
+        except Exception:  # noqa: BLE001 - scheduler must never crash the app
+            logger.exception("Auto-backup enqueue failed; will retry next hour.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    instance_lock = _acquire_web_ui_instance_lock()
+    if instance_lock is None and os.environ.get("RAG_ALLOW_MULTIPLE_WEB_INSTANCES", "").strip() != "1":
+        raise RuntimeError(
+            "Another web UI instance already holds the lock on this data directory "
+            f"({DATA_DIR / '.web_ui_instance.lock'}). Stop it first, or set "
+            "RAG_ALLOW_MULTIPLE_WEB_INSTANCES=1 to opt out of the guard."
+        )
     # Configure a persistent server log so background-worker errors and
     # startup recovery are diagnosable after a crash (the in-memory job-log
     # tail is lost on restart). Best-effort: a read-only workspace won't fail.
     try:
-        setup_job_logging(Path("logs") / "server.log")
+        setup_job_logging(ROOT_DIR / "logs" / "server.log")
     except OSError:
         pass
     # Recover crash-orphaned publish components BEFORE the GC sweep and
@@ -4304,8 +4781,12 @@ async def lifespan(app: FastAPI):
     try:
         _repair_preserved_components(DB_DIR)
         _warn_stranded_rollover_dirs(DB_DIR)
+        _collect_startup_notices()
     except Exception:  # noqa: BLE001 - repair must never block startup
         logger.exception("Preserved-component repair failed; continuing.")
+    removed_logs = _sweep_old_job_logs()
+    if removed_logs:
+        logger.info("Swept %d job log(s) older than 30 days.", removed_logs)
     # Reclaim abandoned staged index builds BEFORE job recovery re-enqueues
     # interrupted builds, so the sweep can never race a live one.
     try:
@@ -4314,7 +4795,31 @@ async def lifespan(app: FastAPI):
         logger.exception("Staged index dir GC failed; continuing.")
     recover_pending_upload_jobs_on_startup()
     _start_local_chat_model_warmup()
+    _METRICS_SAMPLER_STOP.clear()
+    threading.Thread(
+        target=_metrics_sampler_loop, args=(_METRICS_SAMPLER_STOP,), daemon=True
+    ).start()
+
+    try:
+        from src.config import load_config
+
+        auto_backup_hours = int(
+            getattr(load_config(_default_config_path()).backups, "auto_backup_hours", 0) or 0
+        )
+    except Exception:
+        auto_backup_hours = 0
+    _BACKUP_SCHEDULER_STOP.clear()
+    if auto_backup_hours > 0:
+        threading.Thread(
+            target=_backup_scheduler_loop,
+            args=(_BACKUP_SCHEDULER_STOP, auto_backup_hours),
+            daemon=True,
+        ).start()
+        logger.info("Auto-backup enabled: every %d h (when the newest is older).", auto_backup_hours)
+
     yield
+    _METRICS_SAMPLER_STOP.set()
+    _BACKUP_SCHEDULER_STOP.set()
     # Persist any in-flight API-key usage counters so a restart does not lose
     # the tail of usage accounting (the tracker only flushes on a throttle).
     authenticator = globals().get("api_authenticator")
@@ -4326,7 +4831,23 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Local FSAE RAG Pipeline", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+class _RevalidatingStaticFiles(StaticFiles):
+    """StaticFiles that always revalidate in the browser.
+
+    Without Cache-Control, Chromium heuristic-caches JS/CSS for minutes to
+    hours, so working-tree edits (and any deploy not changing the git sha)
+    serve stale modules that the site-version prompt cannot detect. no-cache
+    keeps the efficient 304 revalidation via ETag/Last-Modified while never
+    hiding fresh content -- the right trade for a single-host local app.
+    """
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/static", _RevalidatingStaticFiles(directory=WEB_DIR), name="static")
 
 
 # API-token / API-key auth middleware.
@@ -4344,9 +4865,13 @@ app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 # (POST/PUT/DELETE/PATCH) to /api/* are gated; all GETs and the root/static
 # paths stay open so the UI loads and health/poll endpoints work. The only GET
 # that requires auth is the admin endpoint ``GET /api/admin/api-keys``, which is
-# gated explicitly inside its handler. ``/api/chat/stream`` + ``/api/render``
-# stay exempt (they are POST but read-only, and the browser can't easily inject
-# headers into the SSE stream).
+# gated explicitly inside its handler. ``/api/render`` stays exempt (it is POST
+# but read-only). ``/api/chat/stream`` IS gated: it is the most expensive
+# endpoint in the app (LLM + GPU + corpus answers), the browser fetch that
+# establishes the stream carries the X-API-Token header just fine
+# (web/js/chat.js applyApiKeyHeaders), and leaving it open would let any
+# reachable host burn model compute and read corpus-derived answers while
+# bypassing the per-key rate limiter.
 #
 # Fresh-deploy no-op: when ``[server] api_token`` is empty AND the key store has
 # no keys, ``api_authenticator.authenticate`` returns ``(None, None)`` and the
@@ -4354,22 +4879,31 @@ app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 # single-user / Tailscale-only deployment.
 _API_TOKEN = str(SERVER_CONFIG.get("api_token") or "").strip()
 _MUTATING_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
-# POST routes treated as read-only (chat streaming + Markdown render). They read
-# the index and never mutate server state, and the browser fetch path can't
-# easily attach headers to the SSE stream -- so they stay ungated.
-_NON_MUTATING_POST_PATHS = {"/api/chat/stream", "/api/render"}
+# POST routes treated as read-only (Markdown render). They read nothing
+# sensitive and never mutate server state, so they stay ungated even when auth
+# is configured.
+_NON_MUTATING_POST_PATHS = {"/api/render"}
 # GET routes that exfiltrate bulk data or server internals and so must be gated
 # when auth is configured. Most GETs (document lists, health, jobs, index rows)
 # stay open so the UI loads without a token; these stream the entire index or
 # expose filesystem paths/config and are full-corpus or server-recon surfaces.
 # Like mutating requests, the no-op path (no master token AND empty key store)
 # still passes them through, so a fresh single-user deployment is unchanged.
-_SENSITIVE_GET_PATHS = {"/api/index/stream", "/api/metrics"}
+_SENSITIVE_GET_PATHS = {"/api/index/stream", "/api/metrics", "/api/metrics/history"}
 
 # Prefix-gated GETs when auth is configured: these routes expose the corpus
 # (full chunk text, PDF registry, job history). They are fetch-based, so the
 # UI carries its credential in the X-API-Token header and keeps working.
-_SENSITIVE_GET_PREFIXES = ("/api/pdfs", "/api/index", "/api/jobs", "/api/uploads/check-hash")
+_SENSITIVE_GET_PREFIXES = (
+    "/api/pdfs",
+    "/api/index",
+    "/api/jobs",
+    "/api/uploads/check-hash",
+    # Categories expose labels plus absolute per-category db_dir paths, and
+    # chunk_status discloses staged filenames for a known upload id.
+    "/api/categories",
+    "/api/uploads/chunk_status",
+)
 # Media navigations (<a href> / <img src>) cannot carry headers, so the
 # download/view/asset routes stay reachable without a credential even when
 # auth is configured. Documented limitation, not an oversight.
@@ -4414,11 +4948,56 @@ def _client_ip(request: Request) -> str | None:
 
 
 def _resolve_api_credential(request: Request) -> str:
-    """Extract the supplied credential from the header or ``?token=`` query."""
+    """Extract the supplied credential from the header or ``?token=`` query.
+
+    The query fallback exists for EventSource-style consumers that cannot set
+    headers; those are GET-only, so mutating methods must present the header.
+    (A token embedded in a URL also leaks into access logs and browser
+    history, so it is never accepted for state-changing requests.)
+    """
+    header = request.headers.get("X-API-Token")
+    if header:
+        return header
+    if request.method in {"GET", "HEAD"}:
+        return request.query_params.get("token") or ""
+    return ""
+
+
+def _origin_allowed(origin: str | None, request: Request) -> bool:
+    """Same-origin check for state-changing browser requests (CSRF guard).
+
+    A malicious page can fire bodyless ``fetch(..., {mode: "no-cors"})`` POSTs
+    at loopback endpoints with no preflight, so the auth middleware is the only
+    line of defense in the zero-config state; its loopback checks cannot help
+    because a CSRF POST arrives FROM the victim's browser on 127.0.0.1.
+    Browsers attach an ``Origin`` header to cross-site POSTs, and same-origin
+    fetches carry the server's own origin, so rejecting mismatches closes the
+    hole. Non-browser clients (curl, scripts, reverse-proxied same-origin
+    traffic) send no ``Origin`` and are unaffected.
+    """
+    if not origin:
+        return True
+    try:
+        parts = urllib.parse.urlsplit(origin)
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return False
+    host_header = (request.headers.get("host") or "").strip().lower()
+    if not host_header:
+        return False
+    origin_netloc = (parts.netloc or "").lower()
+
+    def _strip_default_port(netloc: str, scheme: str) -> str:
+        if scheme == "http" and netloc.endswith(":80"):
+            return netloc[:-3]
+        if scheme == "https" and netloc.endswith(":443"):
+            return netloc[:-4]
+        return netloc
+
     return (
-        request.headers.get("X-API-Token")
-        or request.query_params.get("token")
-        or ""
+        _strip_default_port(origin_netloc, parts.scheme)
+        == _strip_default_port(host_header, parts.scheme)
     )
 
 
@@ -4429,15 +5008,25 @@ async def _enforce_api_token(request: Request, call_next):
     if not path.startswith("/api/"):
         return await call_next(request)
     # Gate state-changing methods plus sensitive GETs (full-corpus index
-    # stream, metrics, and the fetch-based corpus/job listings -- see
-    # _is_sensitive_get). Health, update status, read-only POSTs (chat stream,
-    # render), and the media navigation routes (<a>/<img>: PDF download/view,
-    # assets) stay open so the UI loads without a credential; the admin GET
-    # /api/admin/api-keys is gated inside its own handler (role-restricted).
+    # stream, metrics + history, and the fetch-based corpus/job listings -- see
+    # _is_sensitive_get). Health, update status, the read-only POST
+    # (/api/render), and the media navigation routes (<a>/<img>: PDF
+    # download/view, assets) stay open so the UI loads without a credential;
+    # the admin GET /api/admin/api-keys is gated inside its own handler
+    # (role-restricted). Chat streaming is a POST, so it is gated like every
+    # other state-changing route.
     # GETs are only gated WHEN auth is configured: with no master token and an
     # empty key store the whole middleware is a pass-through (zero-config).
     is_mutating = request.method in _MUTATING_METHODS and path not in _NON_MUTATING_POST_PATHS
     is_sensitive_get = request.method == "GET" and _is_sensitive_get(path)
+    # CSRF guard: a cross-origin browser request must never reach a
+    # state-changing endpoint, regardless of auth state (the zero-config
+    # pass-through below would otherwise wave it through).
+    if is_mutating and not _origin_allowed(request.headers.get("origin"), request):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Cross-origin request rejected."},
+        )
     if not (is_mutating or is_sensitive_get):
         return await call_next(request)
 
@@ -4449,7 +5038,9 @@ async def _enforce_api_token(request: Request, call_next):
         # Still honor a bare master-token check for the legacy single-token case.
         if master_token:
             supplied = _resolve_api_credential(request)
-            if not hmac.compare_digest(supplied, master_token):
+            # Byte comparison: str inputs to compare_digest must be ASCII-only,
+            # and a non-ASCII credential must yield a clean 401, not a 500.
+            if not hmac.compare_digest(supplied.encode("utf-8"), master_token.encode("utf-8")):
                 return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token."})
         return await call_next(request)
 
@@ -4592,7 +5183,7 @@ def _require_admin(request: Request, *, mutation: bool = False) -> JSONResponse 
         if result is not None:
             return JSONResponse(status_code=403, content={"detail": "Admin role required."})
     elif master_token:
-        if hmac.compare_digest(supplied, master_token):
+        if hmac.compare_digest(supplied.encode("utf-8"), master_token.encode("utf-8")):
             return None
         return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token."})
     return JSONResponse(status_code=401, content={"detail": "Admin authentication required."})
@@ -4785,8 +5376,22 @@ def health(request: Request):
         except Exception:
             record_count = 0
     ollama_snap = _llm_status_snapshot()
+    try:
+        auth_enabled = bool(
+            (globals().get("_API_TOKEN") or "").strip()
+            or (
+                globals().get("api_authenticator") is not None
+                and globals()["api_authenticator"].store.has_any_key()
+            )
+        )
+    except Exception:
+        auth_enabled = False
+    bind_all = bool(SERVER_CONFIG.get("bind_all") or SERVER_CONFIG.get("host") == "0.0.0.0")
+
     payload = {
         "ok": True,
+        "security": {"auth_enabled": auth_enabled, "bind_all": bind_all},
+        "startup_notices": list(_STARTUP_NOTICES),
         "paths": {
             "data_dir": str(DATA_DIR),
             "upload_dir": str(UPLOAD_DIR),
@@ -4844,6 +5449,48 @@ def _cached_index_disk_bytes(store: Any) -> int:
     return total
 
 
+# Rolling operational history (timestamp, records, index bytes, queued, active)
+# sampled by a daemon thread so the Admin dashboard can chart trends across a
+# multi-day ingest rather than only showing the current snapshot.
+_METRICS_HISTORY: deque = deque(maxlen=1440)
+_METRICS_SAMPLE_SECONDS = 60.0
+
+
+def _sample_metrics_once() -> None:
+    try:
+        store = _index_store()
+        record_count = store.count() if store.exists() else 0
+    except Exception:
+        record_count = 0
+    try:
+        queue_summary = job_queue.summary()
+        queued = int(queue_summary.get("queued_count") or 0)
+        active = int(queue_summary.get("active_job_count") or 0)
+    except Exception:
+        queued = 0
+        active = 0
+    _METRICS_HISTORY.append(
+        {
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "records": record_count,
+            "queued": queued,
+            "active": active,
+        }
+    )
+
+
+def _metrics_sampler_loop(stop_event: threading.Event) -> None:
+    stop_event.wait(_METRICS_SAMPLE_SECONDS)
+    while not stop_event.is_set():
+        _sample_metrics_once()
+        stop_event.wait(_METRICS_SAMPLE_SECONDS)
+
+
+@app.get("/api/metrics/history")
+def metrics_history():
+    return {"samples": list(_METRICS_HISTORY), "interval_seconds": _METRICS_SAMPLE_SECONDS}
+
+
 @app.get("/api/metrics")
 def metrics(request: Request):
     """Lightweight operational metrics for monitoring a multi-day ingest.
@@ -4891,8 +5538,25 @@ def metrics(request: Request):
     # concurrency, native vs Ollama). This is the primary scale-out lever.
     embedding_config = _embedding_config_snapshot()
     ollama_snap = _ollama_status_snapshot()
+    disk_volumes = []
+    for label, volume_path in (("data", DATA_DIR), ("db", DB_DIR), ("processed", PROCESSED_DIR)):
+        try:
+            usage = shutil.disk_usage(Path(volume_path).resolve())
+            disk_volumes.append(
+                {
+                    "label": label,
+                    "path": str(volume_path),
+                    "free_bytes": int(usage.free),
+                    "total_bytes": int(usage.total),
+                }
+            )
+        except OSError:
+            continue
+
     payload = {
         "ok": True,
+        "disk": disk_volumes,
+        "history": list(_METRICS_HISTORY),
         "index_exists": index_exists,
         "record_count": record_count,
         "document_count": document_count,
@@ -5504,6 +6168,7 @@ def _extract_pdfs_from_zip(
     import zipfile
 
     results: list[tuple[str, str]] = []
+    total_decompressed = 0
     try:
         with zipfile.ZipFile(zip_path) as archive:
             infos = [info for info in archive.infolist() if not info.is_dir()]
@@ -5537,6 +6202,7 @@ def _extract_pdfs_from_zip(
                         if not chunk:
                             break
                         total += len(chunk)
+                        total_decompressed += len(chunk)
                         if max_bytes and total > max_bytes:
                             dst.close()
                             try:
@@ -5546,6 +6212,17 @@ def _extract_pdfs_from_zip(
                             raise ValueError(
                                 f"Zip entry '{name}' exceeds the per-file size limit "
                                 f"({total} > {max_bytes} bytes)."
+                            )
+                        if max_bytes and total_decompressed > max_bytes * MAX_ZIP_TOTAL_RATIO:
+                            dst.close()
+                            try:
+                                destination.unlink()
+                            except OSError:
+                                pass
+                            raise ValueError(
+                                f"Zip decompresses to more than "
+                                f"{max_bytes * MAX_ZIP_TOTAL_RATIO} bytes in total; "
+                                "refusing (possible zip bomb)."
                             )
                         digest.update(chunk)
                         dst.write(chunk)
@@ -5680,6 +6357,46 @@ def _duplicate_entries_for_hash(file_hash: str) -> list[dict[str, Any]]:
     if not _is_sha256_hash(file_hash):
         raise HTTPException(status_code=400, detail="hash must be a 64-character SHA-256 hex string.")
     return _blocking_duplicate_entries([{"filename": "", "hash": str(file_hash or "").strip().lower()}])
+
+
+# Corpus-cap check ([uploads] max_corpus_bytes). Sizing the corpus walks the
+# db/ + processed/ trees, which is far too slow per upload on a large corpus,
+# so the measurement is cached briefly; a just-finished job's growth is picked
+# up at most one TTL later.
+_CORPUS_BYTES_TTL_SECONDS = 300.0
+_CORPUS_BYTES_CACHE: list[Any] = [0.0, 0]  # [monotonic_at_last_measure, bytes]
+
+
+def _corpus_bytes_cached() -> int:
+    now = time.monotonic()
+    if _CORPUS_BYTES_CACHE[0] and now - _CORPUS_BYTES_CACHE[0] < _CORPUS_BYTES_TTL_SECONDS:
+        return int(_CORPUS_BYTES_CACHE[1])
+    total = estimate_dir_bytes(DB_DIR) + estimate_dir_bytes(PROCESSED_DIR)
+    _CORPUS_BYTES_CACHE[0] = now
+    _CORPUS_BYTES_CACHE[1] = int(total)
+    return int(total)
+
+
+def _check_corpus_capacity(incoming_bytes: int) -> None:
+    """Reject an upload that would exceed the configured corpus cap.
+
+    ``[uploads] max_corpus_bytes`` is documented as a shared-deployment cap;
+    enforce it at the two upload entry points (multipart staging and the
+    chunked-complete finalize). 0 disables.
+    """
+    max_corpus = UPLOADS_CONFIG["max_corpus_bytes"]
+    if max_corpus <= 0 or incoming_bytes <= 0:
+        return
+    corpus_bytes = _corpus_bytes_cached()
+    if corpus_bytes + incoming_bytes > max_corpus:
+        raise HTTPException(
+            status_code=507,
+            detail=(
+                f"Upload refused: the corpus cap would be exceeded "
+                f"({corpus_bytes + incoming_bytes} > {max_corpus} bytes, "
+                "[uploads] max_corpus_bytes)."
+            ),
+        )
 
 
 async def _handle_upload_request(request: Request, *, require_source_groups: bool) -> dict[str, Any]:
@@ -5850,6 +6567,15 @@ async def _handle_upload_request(request: Request, *, require_source_groups: boo
         forced_hashes = {entry["hash"] for entry in duplicate_entries} if force_token_valid else set()
         options = _upload_options_from_form(form)
         _apply_upload_source_groups(uploads)
+        # Enforce the corpus cap before anything is registered/queued: the
+        # staged bytes are known exactly here.
+        staged_bytes = 0
+        for upload in uploads:
+            try:
+                staged_bytes += Path(str(upload["staging_path"])).stat().st_size
+            except OSError:
+                continue
+        _check_corpus_capacity(staged_bytes)
         file_uploads = [
             {
                 "filename": str(upload["filename"]),
@@ -5935,8 +6661,11 @@ _CHUNK_UPLOADS: dict[str, dict[str, Any]] = {}
 _CHUNK_UPLOADS_LOCK = threading.Lock()
 # One lock per in-flight upload_id: the offset check + append pair must be
 # atomic per upload or two concurrent chunk POSTs can interleave writes and
-# corrupt the .part file.
-_CHUNK_UPLOAD_APPEND_LOCKS: dict[str, threading.Lock] = {}
+# corrupt the .part file. Entries are reference-counted (see
+# _upload_append_lock) so a waiter can never be left serializing on an
+# orphaned lock object that a concurrent completer/pruner removed from the
+# registry while a third caller created a fresh entry.
+_CHUNK_UPLOAD_APPEND_LOCKS: dict[str, tuple[threading.Lock, int]] = {}
 
 # upload_id values are server-generated ``uuid4().hex`` tokens. They become
 # path components (<staging>/<upload_id>/...), so anything that is not a bare
@@ -5954,40 +6683,77 @@ def _require_upload_id(value: Any) -> str:
 
 
 def _upload_append_lock(upload_id: str) -> threading.Lock:
+    """Create-or-get the per-upload lock and register this caller as a user.
+
+    The reference count is taken under the global lock BEFORE the caller
+    blocks on the per-upload lock, so any concurrent user is always visible
+    in the registry; the entry is dropped only when the last registered user
+    releases.
+    """
     with _CHUNK_UPLOADS_LOCK:
-        lock = _CHUNK_UPLOAD_APPEND_LOCKS.get(upload_id)
-        if lock is None:
-            lock = threading.Lock()
-            _CHUNK_UPLOAD_APPEND_LOCKS[upload_id] = lock
+        entry = _CHUNK_UPLOAD_APPEND_LOCKS.get(upload_id)
+        if entry is None:
+            entry = (threading.Lock(), 0)
+            _CHUNK_UPLOAD_APPEND_LOCKS[upload_id] = entry
+        lock, refs = entry
+        _CHUNK_UPLOAD_APPEND_LOCKS[upload_id] = (lock, refs + 1)
         return lock
 
 
-def _drop_upload_append_lock(upload_id: str) -> None:
+def _drop_upload_append_lock(upload_id: str, lock: threading.Lock | None = None) -> None:
+    """Release this caller's reference; remove the entry at zero refs."""
     with _CHUNK_UPLOADS_LOCK:
-        _CHUNK_UPLOAD_APPEND_LOCKS.pop(upload_id, None)
+        entry = _CHUNK_UPLOAD_APPEND_LOCKS.get(upload_id)
+        if entry is None:
+            return
+        if lock is not None and entry[0] is not lock:
+            # A newer entry replaced the one this caller holds (should not
+            # happen with correct refcounting); leave the registry alone.
+            return
+        refs = entry[1] - 1
+        if refs <= 0:
+            _CHUNK_UPLOAD_APPEND_LOCKS.pop(upload_id, None)
+        else:
+            _CHUNK_UPLOAD_APPEND_LOCKS[upload_id] = (entry[0], refs)
 
 
 def _prune_abandoned_uploads(max_age_seconds: float = 86400.0) -> int:
     """Remove chunked upload state and .part files older than *max_age_seconds*."""
     now = datetime.now(timezone.utc)
-    pruned = 0
     with _CHUNK_UPLOADS_LOCK:
         expired = [
             uid for uid, meta in _CHUNK_UPLOADS.items()
             if (now - datetime.fromisoformat(meta.get("started_at", now.isoformat()))).total_seconds() > max_age_seconds
         ]
-        for uid in expired:
-            _CHUNK_UPLOADS.pop(uid, None)
-            _CHUNK_UPLOAD_APPEND_LOCKS.pop(uid, None)
-            part = _chunk_part_path(uid)
-            try:
-                if part.exists():
-                    part.unlink()
-                if part.parent.exists() and not any(part.parent.iterdir()):
-                    part.parent.rmdir()
-            except OSError:
-                pass
-            pruned += 1
+    pruned = 0
+    for uid in expired:
+        # Take the per-upload append lock so a chunk POST cannot be mid-append
+        # while the .part is removed. The lock reference is held by THIS caller
+        # until the drop below, so the registry entry cannot vanish mid-use.
+        append_lock = _upload_append_lock(uid)
+        try:
+            with append_lock:
+                with _CHUNK_UPLOADS_LOCK:
+                    meta = _CHUNK_UPLOADS.get(uid)
+                    if meta is None:
+                        continue
+                    still_old = (
+                        now - datetime.fromisoformat(meta.get("started_at", now.isoformat()))
+                    ).total_seconds() > max_age_seconds
+                    if not still_old:
+                        continue  # a chunk landed since the snapshot; keep it
+                    _CHUNK_UPLOADS.pop(uid, None)
+                part = _chunk_part_path(uid)
+                try:
+                    if part.exists():
+                        part.unlink()
+                    if part.parent.exists() and not any(part.parent.iterdir()):
+                        part.parent.rmdir()
+                except OSError:
+                    pass
+        finally:
+            _drop_upload_append_lock(uid, append_lock)
+        pruned += 1
     return pruned
 
 
@@ -6045,22 +6811,45 @@ async def upload_chunk(request: Request):
     part_path.parent.mkdir(parents=True, exist_ok=True)
     # Serialize the offset check + append per upload_id so concurrent chunk
     # POSTs cannot both pass the size check and interleave writes.
-    with _upload_append_lock(upload_id):
-        current_size = part_path.stat().st_size if part_path.exists() else 0
-        if offset != current_size:
-            # Offset mismatch: client is out of sync. Tell it the real offset.
-            raise HTTPException(
-                status_code=409,
-                detail={"error": "offset_mismatch", "expected_offset": current_size},
-            )
+    append_lock = _upload_append_lock(upload_id)
+    try:
+        with append_lock:
+            current_size = part_path.stat().st_size if part_path.exists() else 0
+            if offset != current_size:
+                # Offset mismatch: client is out of sync. Tell it the real offset.
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "offset_mismatch", "expected_offset": current_size},
+                )
 
-        # Append the chunk in 1 MiB pieces so memory stays flat.
-        chunk_field.file.seek(0)
-        written = 0
-        with part_path.open("ab") as handle:
-            for piece in iter(lambda: chunk_field.file.read(1024 * 1024), b""):
-                handle.write(piece)
-                written += len(piece)
+            # Append the chunk in 1 MiB pieces so memory stays flat. The client-
+            # declared total_size is advisory only; the append is hard-capped at
+            # max_upload against the REAL file size, or a crafted client could
+            # declare a tiny total_size per chunk and grow the .part forever.
+            chunk_field.file.seek(0)
+            written = 0
+            over_limit = False
+            with part_path.open("ab") as handle:
+                for piece in iter(lambda: chunk_field.file.read(1024 * 1024), b""):
+                    if max_upload and current_size + written + len(piece) > max_upload:
+                        over_limit = True
+                        break
+                    handle.write(piece)
+                    written += len(piece)
+            if over_limit:
+                # Roll the partial append back so the stored offset stays
+                # consistent for whoever inspects it next.
+                try:
+                    with part_path.open("r+b") as handle:
+                        handle.truncate(current_size)
+                except OSError:
+                    pass
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File exceeds size limit ({max_upload} bytes).",
+                )
+    finally:
+        _drop_upload_append_lock(upload_id, append_lock)
     await chunk_field.close()
 
     new_size = current_size + written
@@ -6094,9 +6883,11 @@ def chunk_status(upload_id: str):
 async def complete_chunked_upload(request: Request):
     """Finalize a chunked upload: rename .part, hash, and enqueue as an upload job.
 
-    Accepts JSON: ``{upload_id, filename, source_groups?, force_duplicates?}``.
-    The .part file is renamed to its final filename and processed exactly like
-    a normal upload (dedupe, registry, ingest/index job).
+    Accepts JSON: ``{upload_id, filename, source_groups?, force_duplicates?,
+    force_token?, category?}``. The .part file is renamed to its final filename
+    and processed exactly like a normal upload (dedupe, registry, ingest/index
+    job). Forcing a duplicate requires the signed force token issued with the
+    409, same as the multipart path.
     """
     payload = await _optional_json(request)
     upload_id = _require_upload_id(payload.get("upload_id"))
@@ -6107,20 +6898,53 @@ async def complete_chunked_upload(request: Request):
     if Path(filename).suffix.lower() not in {".pdf", ".zip"}:
         raise HTTPException(status_code=400, detail=f"Only PDF or ZIP uploads are supported: {filename}")
 
+    # The .part file IS the whole upload, so this is the true per-file size.
+    # The per-chunk endpoint can only check the client-declared total_size;
+    # enforce the real cap here before anything is copied.
+    max_upload = UPLOADS_CONFIG["max_upload_bytes"]
+    part_size = part_path.stat().st_size
+    if max_upload and part_size > max_upload:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds size limit ({part_size} > {max_upload} bytes).",
+        )
+    _check_corpus_capacity(part_size)
+
     job_id = uuid.uuid4().hex
     staging_dir = STAGING_DIR / job_id
     staging_dir.mkdir(parents=True, exist_ok=True)
 
-    digest = hashlib.sha256()
-    final_path = staging_dir / filename
-    with part_path.open("rb") as src, final_path.open("wb") as dst:
-        for piece in iter(lambda: src.read(1024 * 1024), b""):
-            digest.update(piece)
-            dst.write(piece)
+    # Hold the per-upload append lock across copy + delete + state cleanup so a
+    # late chunk POST cannot append to the .part while it is being finalized,
+    # and so this completion cannot swap the append lock out from under an
+    # in-flight append. The existence check is INSIDE the lock: checking
+    # outside would race a concurrent complete/prune that consumes the .part
+    # between the check and the open (an unhandled FileNotFoundError -> 500).
+    append_lock = _upload_append_lock(upload_id)
     try:
-        part_path.unlink()
-    except OSError:
-        pass
+        with append_lock:
+            if not part_path.exists():
+                raise HTTPException(status_code=404, detail=f"No chunked upload found for {upload_id}.")
+            digest = hashlib.sha256()
+            final_path = staging_dir / filename
+            try:
+                with part_path.open("rb") as src, final_path.open("wb") as dst:
+                    for piece in iter(lambda: src.read(1024 * 1024), b""):
+                        digest.update(piece)
+                        dst.write(piece)
+            except FileNotFoundError as exc:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No chunked upload found for {upload_id}.",
+                ) from exc
+            try:
+                part_path.unlink()
+            except OSError:
+                pass
+            with _CHUNK_UPLOADS_LOCK:
+                _CHUNK_UPLOADS.pop(upload_id, None)
+    finally:
+        _drop_upload_append_lock(upload_id, append_lock)
 
     file_hash = digest.hexdigest()
     uploads = [{
@@ -6132,14 +6956,24 @@ async def complete_chunked_upload(request: Request):
     }]
     force_duplicates = str(payload.get("force_duplicates") or "").lower() in {"1", "true", "yes", "on"}
     source_group = normalize_source_group(payload.get("source_groups") or "")
-    with _CHUNK_UPLOADS_LOCK:
-        _CHUNK_UPLOADS.pop(upload_id, None)
-        _CHUNK_UPLOAD_APPEND_LOCKS.pop(upload_id, None)
 
     # Inline registration: dedupe check then register + enqueue. Mirrors the
     # tail of _handle_upload_request but for a single already-on-disk file.
+    # Forcing a duplicate requires the same signed, TTL-bound force token the
+    # multipart path demands -- the boolean alone is not sufficient.
     duplicate_entries = await run_in_threadpool(_blocking_duplicate_entries, uploads)
-    if duplicate_entries and not force_duplicates:
+    force_token = str(payload.get("force_token") or "")
+    force_token_valid = (
+        force_duplicates
+        and bool(duplicate_entries)
+        and _force_upload_token_valid(
+            force_token,
+            upload_hashes=_upload_hashes(uploads),
+            duplicate_hashes=_duplicate_hashes(duplicate_entries),
+        )
+    )
+    if duplicate_entries and not force_token_valid:
+        shutil.rmtree(staging_dir, ignore_errors=True)
         raise HTTPException(
             status_code=409,
             detail=_duplicate_response_detail(
@@ -6148,13 +6982,17 @@ async def complete_chunked_upload(request: Request):
                 files=uploads,
             ),
         )
-    forced_hashes = {entry["hash"] for entry in duplicate_entries} if force_duplicates else set()
+    forced_hashes = {entry["hash"] for entry in duplicate_entries} if force_token_valid else set()
     file_uploads = [{
         "filename": filename,
         "hash": file_hash,
         "staging_path": str(final_path),
         "source_group": source_group,
     }]
+    # Persist the requested source group into the trust registry now, like the
+    # multipart path does -- the registry entry alone is invisible to the
+    # Library listing and to the auto-tagger's ungrouped filter.
+    _apply_upload_source_groups(file_uploads)
     options = _default_upload_options()
     if payload.get("category") is not None:
         options["category"] = _sanitize_upload_category(payload.get("category"))
@@ -6173,11 +7011,6 @@ async def complete_chunked_upload(request: Request):
             job_id=job_id,
             options=options,
         )
-        response = job.to_dict()
-        response["jobs"] = [response]
-        response["job_count"] = 1
-        response["filenames"] = [filename]
-        return response
     except Exception:
         PdfRegistry(PDF_REGISTRY_PATH).mark_job_status(
             job_id=job_id,
@@ -6187,6 +7020,18 @@ async def complete_chunked_upload(request: Request):
         )
         shutil.rmtree(staging_dir, ignore_errors=True)
         raise
+    # Background LLM tagging for ungrouped uploads, same as the multipart
+    # path. Non-blocking: the job queue is unaffected.
+    _schedule_upload_auto_tag(file_uploads)
+    # Copy before embedding the response in its own "jobs" list -- assigning
+    # the dict into itself makes the response cyclic and the JSON encoder
+    # RecursionErrors (a queued job whose client saw a 500).
+    payload = job.to_dict()
+    response = dict(payload)
+    response["jobs"] = [payload]
+    response["job_count"] = 1
+    response["filenames"] = [filename]
+    return response
 
 
 async def _optional_json(request: Request) -> dict[str, Any]:
@@ -6377,10 +7222,20 @@ def _category_listing() -> dict[str, Any]:
             dir_path = Path(item.get("db_dir") or "")
             store = _index_store(dir_path)
             if store.exists():
-                item["record_count"] = store.count()
-                model, dim = store.metadata()
-                item["embedding_model"] = model
-                item["embedding_dim"] = dim
+                try:
+                    item["record_count"] = store.count()
+                    model, dim = store.metadata()
+                    item["embedding_model"] = model
+                    item["embedding_dim"] = dim
+                except Exception as exc:
+                    # A category directory can vanish mid-poll (concurrent
+                    # delete) or hold a locked/corrupt index; a routine listing
+                    # poll must degrade, not 500. Keep the row shape complete
+                    # so the UI never sees undefined fields.
+                    logger.warning("Category index %s unreadable: %s", dir_path, exc)
+                    item["record_count"] = 0
+                    item.setdefault("embedding_model", "")
+                    item.setdefault("embedding_dim", 0)
             else:
                 item["record_count"] = 0
             listing.append(item)
@@ -6442,16 +7297,28 @@ def delete_category(key: str):
     normalized = normalize_category_key(key)
     dir_path = category_db_dir(DB_DIR, normalized)
     if dir_path != Path(DB_DIR) and dir_path.exists():
-        try:
-            _remove_path(dir_path)
-        except OSError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Category removed from the registry, but its index directory "
-                f"could not be deleted: {exc}",
-            ) from exc
-    with _INDEX_CACHE_LOCK:
-        _INDEX_STORE_CACHE.pop(str(dir_path), None)
+        # Drop the cached LanceDB store BEFORE removing the directory and
+        # under INDEX_LOCK: on Windows an open (memory-mapped) dataset makes
+        # the rmtree fail with a sharing violation, and because the registry
+        # row is already gone a retry would 404 -- leaving the directory
+        # permanently orphaned and undeletable through the API.
+        with INDEX_LOCK:
+            with _INDEX_CACHE_LOCK:
+                _INDEX_STORE_CACHE.pop(str(dir_path), None)
+            import gc as _gc
+
+            _gc.collect()  # release lingering handles on the dropped store
+            try:
+                _remove_path(dir_path)
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Category removed from the registry, but its index directory "
+                    f"could not be deleted: {exc}",
+                ) from exc
+    else:
+        with _INDEX_CACHE_LOCK:
+            _INDEX_STORE_CACHE.pop(str(dir_path), None)
     return {"deleted": True, "key": normalized}
 
 
@@ -6473,6 +7340,10 @@ def move_pdf_categories(payload: BulkCategoryMoveRequest):
     hashes: list[str] = []
     seen: set[str] = set()
     failed: list[dict[str, str]] = []
+    # One full-corpus listing shared by every hash in the request; per-hash
+    # listings would be O(len(source_hashes) x corpus) on the merged
+    # registry+source-map view (the UI's "select all" sends thousands).
+    known_rows = _pdf_rows_by_hash()
     for raw_hash in payload.source_hashes:
         source_hash = str(raw_hash or "").strip()
         if not source_hash:
@@ -6481,7 +7352,7 @@ def move_pdf_categories(payload: BulkCategoryMoveRequest):
         if source_hash in seen:
             continue
         seen.add(source_hash)
-        if not _pdf_row_for_hash(source_hash):
+        if source_hash not in known_rows:
             failed.append({"source_hash": source_hash, "error": "Unknown source hash."})
             continue
         hashes.append(source_hash)
@@ -6503,6 +7374,7 @@ def pdf_documents(
     source_group: str = "",
     trust_status: str = "",
     category: str = "",
+    sort: str = "",
 ):
     # The PDF list only changes when ingestion/indexing writes the registry,
     # source map, trust registry, or index manifest. Short-circuit unchanged
@@ -6525,6 +7397,7 @@ def pdf_documents(
         limit=limit,
         source_group=source_group,
         trust_status=trust_status,
+        sort=sort,
         category=category,
     )
     if not_modified := _not_modified_or_etag(request, seed):
@@ -6536,6 +7409,7 @@ def pdf_documents(
         limit=resolved_limit,
         source_group=source_group,
         trust_status=trust_status,
+        sort=sort,
         category=category,
     )
     return _etagged_json(request, payload, seed)
@@ -6579,6 +7453,17 @@ def image_asset(asset_id: str):
     )
 
 
+def _markdown_path_for_hash(source_hash: str) -> tuple[Path, str]:
+    row = _pdf_row_for_hash(source_hash)
+    raw_path = str(row.get("processed_markdown_path") or "") if row else ""
+    if not raw_path:
+        raise FileNotFoundError(f"No processed Markdown registered for {source_hash}.")
+    path = _resolve_markdown_path(raw_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Processed Markdown is missing: {path}")
+    return path, str(row.get("filename") or source_hash)
+
+
 def _pdf_file_response(source_hash: str, *, inline: bool) -> FileResponse:
     try:
         path, filename = resolve_pdf_download_path(source_hash)
@@ -6602,6 +7487,27 @@ def download_pdf(source_hash: str):
 @app.get("/api/pdfs/{source_hash}/view")
 def view_pdf(source_hash: str):
     return _pdf_file_response(source_hash, inline=True)
+
+
+@app.get("/api/pdfs/{source_hash}/markdown")
+def pdf_markdown_text(source_hash: str):
+    """Serve the processed Markdown for a source, for in-app text preview.
+
+    Review must not depend on the original PDF being reachable (bulk corpora
+    often live on another volume); the extracted Markdown is always the
+    canonical reviewed artifact.
+    """
+    try:
+        path, _filename = _markdown_path_for_hash(source_hash)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Processed Markdown is unreadable.") from exc
+    return {"markdown": text}
 
 
 @app.delete("/api/pdfs/{source_hash}")
@@ -6968,11 +7874,55 @@ def vector_search_index(payload: IndexVectorSearchRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+MAX_CHAT_HISTORY_TURNS = 12
+
+
+def _sanitize_chat_history(history: list[Any]) -> list[dict[str, str]]:
+    """Normalize client-sent history: recent turns only, bounded size."""
+    turns = []
+    for turn in list(history or [])[-MAX_CHAT_HISTORY_TURNS:]:
+        role = str(getattr(turn, "role", "") or "")
+        content = str(getattr(turn, "content", "") or "").strip()
+        if role in {"user", "assistant"} and content:
+            turns.append({"role": role, "content": content[:4000]})
+    return turns
+
+
+@app.get("/api/index/document_records")
+def index_document_records(request: Request, source_hash: str, offset: int = 0, limit: int = 50):
+    """One document's index records for document-first Review browsing.
+
+    Ordered summary-first, then by chunk order, so expanding a document reads
+    top-to-bottom regardless of physical row order.
+    """
+    source_hash = str(source_hash or "").strip()
+    if not source_hash:
+        raise HTTPException(status_code=400, detail="source_hash is required.")
+    limit = max(1, min(int(limit), 500))
+    offset = max(0, int(offset))
+    db_dir = _resolve_category_db_dir(request.query_params.get("category") or "")
+    store = _index_store(db_dir=db_dir)
+    if not store.exists():
+        raise HTTPException(status_code=404, detail="Index does not exist.")
+    rows = store.records_by_source_hash([source_hash])
+    rows.sort(key=_index_sort_key)
+    total = len(rows)
+    page = rows[offset : offset + limit]
+    return {
+        "source_hash": source_hash,
+        "offset": offset,
+        "limit": limit,
+        "total": total,
+        "rows": page,
+    }
+
+
 @app.post("/api/chat/stream")
 def chat_stream(payload: ChatRequest):
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    history = _sanitize_chat_history(payload.history)
 
     # Resolve the category selection at request time so an unknown key is a
     # clean 400 instead of a mid-stream error event.
@@ -6982,9 +7932,14 @@ def chat_stream(payload: ChatRequest):
     category_dirs = [d for d in category_dirs if d] or [str(DB_DIR)]
     category_labels = (category_labels[: len(category_dirs)] or [GENERAL_CATEGORY_KEY] * len(category_dirs))
 
-    job_queue.begin_query()
-
     def generate():
+        # Counted here (not in the handler) so the query drain-guard pairs
+        # strictly with the generator's finally: if the client disconnects
+        # before the generator ever starts, begin/finish both simply never
+        # run, instead of begin running and finish never running (which used
+        # to wedge index-mutating jobs until the watchdog timeout).
+        job_queue.begin_query()
+
         def encode_event(event: dict[str, Any]) -> str:
             payload = dict(event)
             payload["type"] = str(payload.get("type") or "answer")
@@ -7028,7 +7983,7 @@ def chat_stream(payload: ChatRequest):
                 progress_enabled=False,
             )
             if hasattr(engine, "ask_stream_events"):
-                for event in engine.ask_stream_events(question):
+                for event in engine.ask_stream_events(question, history=history):
                     if event.get("text") or event.get("sources") or event.get("result") or event.get("content"):
                         yield encode_event(event)
             else:
@@ -7043,9 +7998,42 @@ def chat_stream(payload: ChatRequest):
     return StreamingResponse(generate(), media_type="application/x-ndjson; charset=utf-8")
 
 
+class _TokenRedactingLogFilter(logging.Filter):
+    """Redact ``token=<secret>`` query strings from access-log records.
+
+    ``?token=`` is a documented credential transport for GET consumers that
+    cannot set headers; uvicorn's default access logging prints the full
+    request line, which would write the secret into the console/log capture.
+    """
+
+    _TOKEN_PATTERN = re.compile(r"([?&])token=[^&\s]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if record.args:
+                record.args = tuple(
+                    self._TOKEN_PATTERN.sub(r"\1token=***", str(arg)) if isinstance(arg, str) else arg
+                    for arg in record.args
+                )
+            message = record.getMessage()
+            if "token=" in message:
+                record.msg = self._TOKEN_PATTERN.sub(r"\1token=***", message)
+                record.args = None
+        except Exception:
+            pass
+        return True
+
+
+def _install_access_log_token_redaction() -> None:
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(existing, _TokenRedactingLogFilter) for existing in access_logger.filters):
+        access_logger.addFilter(_TokenRedactingLogFilter())
+
+
 def run_server() -> None:
     import uvicorn
 
+    _install_access_log_token_redaction()
     # Request body size is capped by the _enforce_request_body_limit middleware
     # (see above); uvicorn has no equivalent option.
     uvicorn.run(

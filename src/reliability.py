@@ -42,6 +42,27 @@ SOURCE_GROUP_METADATA: dict[str, dict[str, Any]] = {
 }
 
 
+# Review status multiplies the group weight in retrieval ranking: a stale-
+# flagged source should not compete equally with an approved one inside the
+# same group, since the review workflow exists precisely to record that risk.
+TRUST_STATUS_WEIGHTS: dict[str, float] = {
+    "approved": 1.0,
+    "unreviewed": 0.95,
+    "stale": 0.6,
+}
+
+TRUST_STATUS_DEFAULT_WEIGHT = TRUST_STATUS_WEIGHTS["unreviewed"]
+
+
+def normalize_review_status(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in TRUST_STATUS_WEIGHTS else "unreviewed"
+
+
+def review_status_weight(value: Any) -> float:
+    return TRUST_STATUS_WEIGHTS.get(normalize_review_status(value), TRUST_STATUS_DEFAULT_WEIGHT)
+
+
 def valid_assignable_source_groups() -> tuple[str, ...]:
     return tuple(
         key
@@ -102,7 +123,10 @@ def load_source_group_map(path: str | Path | None) -> dict[str, dict[str, Any]]:
     except json.JSONDecodeError as exc:
         logger.error("Failed to parse trust map %s: %s", trust_path, exc)
         return {}
-    except OSError:
+    except (OSError, UnicodeDecodeError, ValueError):
+        # UnicodeDecodeError is a ValueError but not a JSONDecodeError; a
+        # non-UTF-8 file (manual edit, other tool) must degrade to "no trust
+        # data" instead of 500-ing every chat request that loads the map.
         return {}
     documents = payload.get("documents", {}) if isinstance(payload, dict) else {}
     if not isinstance(documents, dict):
@@ -113,6 +137,15 @@ def load_source_group_map(path: str | Path | None) -> dict[str, dict[str, Any]]:
         if not isinstance(entry, dict):
             continue
         details = source_group_details(entry.get("source_group"))
+        review_status = normalize_review_status(entry.get("review_status"))
+        # Fold the review status into the effective weight the query engine
+        # applies, and expose it so citations can warn when a stale source is
+        # used in an answer.
+        details = {
+            **details,
+            "review_status": review_status,
+            "weight": round(float(details.get("weight") or 0.0) * review_status_weight(review_status), 4),
+        }
         groups[str(source_hash)] = details
     with _SOURCE_GROUP_CACHE_LOCK:
         # Do not cache against a corrupt parse: a later repair must be

@@ -154,11 +154,18 @@ class ScannedPageImageParser:
         try:
             # Real PIL images get downscaled for the vision model; non-PIL image
             # objects (e.g. docling wrappers or test doubles without .size) fall
-            # back to a plain PNG encode of whatever ``.save`` produces.
+            # back to a plain re-encode of whatever ``.save`` produces. The
+            # payload is labeled image/jpeg downstream, so encode JPEG here too.
             if hasattr(source_image, "size") and callable(getattr(source_image, "resize", None)):
                 return _png_bytes_for_vision(source_image)
             buffered = io.BytesIO()
-            source_image.save(buffered, format="PNG")
+            try:
+                if source_image.mode in ("RGBA", "P", "LA"):
+                    source_image = source_image.convert("RGB")
+                source_image.save(buffered, format="JPEG", quality=85)
+            except Exception:  # noqa: BLE001 - exotic modes some encoders reject
+                buffered = io.BytesIO()
+                source_image.save(buffered, format="PNG")
             return buffered.getvalue()
         finally:
             if opened:

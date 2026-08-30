@@ -16,7 +16,10 @@ class AdminApiKeyCreateRequest(BaseModel):
     label: str = ""
     role: str = "user"
     expires_at: str | None = None
-    expires_in_days: float | None = Field(default=None, gt=0)
+    # Upper bound: timedelta/datetime arithmetic overflows at ~999999999 days
+    # (and much earlier against datetime.max), which surfaced as an unhandled
+    # 500 instead of a 422 on the admin endpoint.
+    expires_in_days: float | None = Field(default=None, gt=0, le=36500)
     rate_limit_per_minute: int | None = Field(default=None, gt=0)
 
 

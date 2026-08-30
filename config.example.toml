@@ -3,6 +3,8 @@ data_dir = "data"
 processed_dir = "processed_docs"
 db_dir = "db"
 asset_dir = "db/assets"
+# Extra roots the web UI may serve source PDFs from (bulk corpora on other volumes).
+corpus_roots = []
 
 [models]
 # Chat (gemma4:26b) and vision (qwen3-vl:32b) run on the hosted SoCLAaS API

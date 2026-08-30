@@ -1,0 +1,14 @@
+[
+  {
+    "question": "How is welding aluminum differently treated from steel welding?",
+    "expected": ["Welding of Aluminum"]
+  },
+  {
+    "question": "What mechanical components are illustrated in the sourcebook?",
+    "expected": ["Mechanical Components", "Sourcebook"]
+  },
+  {
+    "question": "What does downforce do to tire grip in corners?",
+    "expected": ["downforce"]
+  }
+]

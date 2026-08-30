@@ -436,9 +436,9 @@ def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):
         # Cloud-tagged name maps onto the installed local tag.
         assert calls[0]["model"] == "gemma4:latest"
         assert calls[0]["tools"][0]["function"]["name"] == "search_local_context"
-        assert calls[0]["timeout"] is None
+        assert calls[0]["timeout"] == engine.llm_timeout
         assert calls[-1]["stream"] is True
-        assert calls[-1]["timeout"] is None
+        assert calls[-1]["timeout"] == engine.llm_timeout
         assert calls[-1]["options"]["temperature"] == 0.3
         assert calls[-1]["options"]["top_k"] == 40
         assert calls[-1]["options"]["num_ctx"] == 8192
@@ -502,7 +502,7 @@ def test_local_query_engine_streams_ollama_chunks(monkeypatch):
 
         assert chunks == ["chunk ", "two [S1]"]
         assert calls[-1]["stream"] is True
-        assert calls[-1]["timeout"] is None
+        assert calls[-1]["timeout"] == engine.llm_timeout
         assert calls[-1]["options"]["temperature"] == 0.3
         assert calls[-1]["options"]["top_k"] == 40
         assert calls[-1]["options"]["num_ctx"] == 8192

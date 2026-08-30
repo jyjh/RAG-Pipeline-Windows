@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 
@@ -553,6 +554,10 @@ class RagJobQueue:
             "restore",
             "rebuild_vector_index",
             "compact",
+            # Crash mid-transfer can leave a source pruned but membership not
+            # yet updated; tracking it here is what makes the enqueue-time
+            # "never in neither" guarantee hold across restarts.
+            "transfer_sources",
         }:
             return
         try:
@@ -577,6 +582,7 @@ class RagJobQueue:
             "restore",
             "rebuild_vector_index",
             "compact",
+            "transfer_sources",
         }:
             return
         try:
@@ -876,11 +882,18 @@ class RagJobQueue:
         with self._condition:
             self._raise_if_cancelled(job)
             job.phase = phase
+            bumped_paused_version = False
             while self.active_query_count > 0:
                 self._raise_if_cancelled(job)
                 job.status = "paused_for_queries"
                 job.phase = phase
-                self._bump_state_version_locked()
+                # Bump the state version once on the transition INTO the paused
+                # state, not per 0.2s wait iteration: bumping per iteration
+                # churns the /api/jobs ETag for the whole pause (up to 30 min)
+                # and forces full re-serialization on every poll.
+                if not bumped_paused_version:
+                    self._bump_state_version_locked()
+                    bumped_paused_version = True
                 self._condition.notify_all()
                 if deadline is not None and time.monotonic() >= deadline:
                     logger.error(
@@ -1039,7 +1052,7 @@ class RagJobQueue:
                     legacy_doc_ids.append(stable_id("doc", markdown_path.stem))
                     self._delete_processed_markdown(markdown_path)
 
-            with INDEX_LOCK:
+            with INDEX_LOCK, _source_module.acquire_index_lock(self.db_dir):
                 store = _index_store(self.db_dir)
                 if store.exists():
                     store.delete_records_by_source_hash(
@@ -1085,7 +1098,21 @@ class RagJobQueue:
             _source_module._run_job_subprocess(command, worker_threads=worker_threads)
             return
         self._raise_if_cancelled(job)
+        # Probe the callable's signature at call time (tests and future refactors
+        # may swap in a variant without the callback kwargs) instead of catching
+        # a TypeError whose message merely mentions a keyword name: a genuine
+        # TypeError from inside the pipeline that happens to contain e.g.
+        # "cancel_event" would otherwise be swallowed and the whole command
+        # silently re-run without cancellation support.
+        supports_callbacks = False
         try:
+            parameters = inspect.signature(_source_module._run_job_subprocess).parameters
+            supports_callbacks = all(
+                name in parameters for name in ("cancel_event", "log_callback", "progress_callback")
+            )
+        except (TypeError, ValueError):  # pragma: no cover - unusual callables
+            supports_callbacks = False
+        if supports_callbacks:
             _source_module._run_job_subprocess(
                 command,
                 worker_threads=worker_threads,
@@ -1093,9 +1120,7 @@ class RagJobQueue:
                 log_callback=lambda line: self._append_job_log(job, line),
                 progress_callback=lambda payload: self._set_job_progress(job, payload),
             )
-        except TypeError as exc:
-            if "cancel_event" not in str(exc) and "log_callback" not in str(exc) and "progress_callback" not in str(exc):
-                raise
+        else:
             self._raise_if_cancelled(job)
             _source_module._run_job_subprocess(command, worker_threads=worker_threads)
         self._raise_if_cancelled(job)
@@ -1227,6 +1252,28 @@ class RagJobQueue:
             skipped = []
         if not isinstance(failed, list):
             failed = []
+        # The result file is shared by every job ingesting into processed_docs/,
+        # so a concurrent job's summary can overwrite this one's between its
+        # write and this read. Attribute entries to THIS job by its upload
+        # filenames: entries naming files this job never uploaded belong to
+        # another run and must not pollute this job's log.
+        expected = {
+            str(upload.get("filename") or "").strip().lower()
+            for upload in (job.uploads or [])
+            if str(upload.get("filename") or "").strip()
+        }
+        if expected:
+            def _mine(entries):
+                return [
+                    entry
+                    for entry in entries
+                    if isinstance(entry, dict)
+                    and str(entry.get("file") or "").strip().lower() in expected
+                ]
+
+            processed = _mine(processed)
+            skipped = _mine(skipped)
+            failed = _mine(failed)
         self._append_job_log(
             job,
             f"Ingest summary: {len(processed)} processed, {len(skipped)} skipped, "
@@ -1525,9 +1572,12 @@ class RagJobQueue:
             return
         with INDEX_LOCK:
             for db_dir in self._all_category_db_dirs():
-                store = _index_store(db_dir)
-                if store.exists():
-                    store.delete_records_by_source_hash(source_hashes=sorted(hashes))
+                # Cross-process lock: a manual CLI indexing run may touch the
+                # same live index directory while the server deletes from it.
+                with _source_module.acquire_index_lock(db_dir):
+                    store = _index_store(db_dir)
+                    if store.exists():
+                        store.delete_records_by_source_hash(source_hashes=sorted(hashes))
 
     def _drop_live_index(self) -> None:
         """Remove the live LanceDB directory so a rebuild starts from scratch.

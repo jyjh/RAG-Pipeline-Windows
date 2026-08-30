@@ -69,8 +69,20 @@ def test_make_prefix_redacts_middle():
     prefix = aka.make_prefix("rag_abcdefgh")
     assert prefix.endswith("efgh")
     assert "…" in prefix
-    # The full secret should not appear verbatim in the display prefix.
-    assert prefix != "rag_abcdefgh"
+    # Only the key-prefix head and the last 4 chars may appear: the middle of
+    # the secret must not be recoverable from the display value.
+    assert prefix == "rag_…efgh"
+    assert "abcd" not in prefix
+
+
+def test_make_prefix_custom_prefix_head():
+    prefix = aka.make_prefix("team_A1b2C3d4", prefix="team_")
+    assert prefix == "team_…C3d4"
+    assert "A1b2" not in prefix
+    # A key that does not start with the given prefix still never shows more
+    # than a short head.
+    fallback = aka.make_prefix("rag_abcdefgh", prefix="zzz_")
+    assert fallback == "rag_…efgh"
 
 
 def test_make_prefix_handles_short_input():
@@ -100,6 +112,48 @@ def test_create_key_returns_plaintext_and_stores_hash(authenticator):
     stored = authenticator.store.get_by_hash(aka.hash_key(full_key))
     assert stored is not None
     assert stored["label"] == "alice"
+
+
+def test_repair_leaked_prefixes_rewrites_verifiable_records(authenticator, safe_tmp_path):
+    """Legacy stores recorded <secret[:-4]>…<secret[-4:]> as the display
+    prefix, which contained the entire secret. The repair must rewrite those
+    (verifiable via the record's hash id) to the redacted form -- and leave
+    anything it cannot verify alone."""
+    import json
+
+    full_key, record = _make_key(authenticator, label="legacy")
+    key_hash = record["key_id"]
+    # Simulate the legacy leaked form.
+    store_path = safe_tmp_path / aka.STORE_FILENAME
+    payload = json.loads(store_path.read_text())
+    leaked = full_key[:-4] + "…" + full_key[-4:]
+    assert leaked.replace("…", "") == full_key  # the leak really is the key
+    payload["keys"][key_hash]["prefix"] = leaked
+    # An unverifiable entry with the same shape must be left untouched.
+    payload["keys"]["0" * 64] = {
+        "label": "foreign",
+        "prefix": "rag_deadbeef…beef",
+        "status": "active",
+        "role": "user",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "expires_at": None,
+        "rate_limit_per_minute": None,
+        "usage": {"requests": 0, "last_used_at": None, "last_used_ip": None},
+    }
+    store_path.write_text(json.dumps(payload))
+
+    repaired = authenticator.store.repair_leaked_prefixes()
+
+    assert repaired == 1
+    on_disk = json.loads(store_path.read_text())
+    fixed = on_disk["keys"][key_hash]["prefix"]
+    assert fixed == aka.make_prefix(full_key)
+    assert full_key not in json.dumps(on_disk)
+    # The foreign record could not be verified, so it survives verbatim.
+    assert on_disk["keys"]["0" * 64]["prefix"] == "rag_deadbeef…beef"
+    # The key itself still authenticates after the rewrite.
+    result, rejection = authenticator.authenticate(full_key, master_token="", track=False)
+    assert result is not None and rejection is None
 
 
 def test_plaintext_secret_is_never_stored(authenticator, safe_tmp_path):
@@ -496,6 +550,12 @@ def _stub_queue(monkeypatch):
         def summary(self):
             return {"indexing_job_ids": []}
 
+        def state_version(self):
+            return "stub-1"
+
+        def list_jobs(self, **kwargs):
+            return []
+
     monkeypatch.setattr(web_app, "job_queue", StubQueue())
 
 
@@ -523,10 +583,21 @@ def test_middleware_accepts_valid_key(patched_authenticator, monkeypatch):
 
 
 def test_middleware_accepts_key_via_query_param(patched_authenticator, monkeypatch):
+    """The ?token= transport exists for GET consumers that cannot set headers
+    (EventSource/media), so gated GETs accept it -- but mutating requests must
+    present the header: a credential in a URL leaks into access logs and
+    browser history, so it is never accepted for state changes."""
     full_key, _ = patched_authenticator.create_key(label="alice")
     _stub_queue(monkeypatch)
-    response = TestClient(web_app.app).post(f"/api/reindex?token={full_key}")
-    assert response.status_code != 401
+    client = TestClient(web_app.app)
+    # Gated GET: query param authenticates.
+    get_response = client.get(f"/api/jobs?token={full_key}")
+    assert get_response.status_code == 200
+    # Mutating request: query param alone is rejected; the header works.
+    post_response = client.post(f"/api/reindex?token={full_key}")
+    assert post_response.status_code == 401
+    header_response = client.post("/api/reindex", headers={"X-API-Token": full_key})
+    assert header_response.status_code != 401
 
 
 def test_middleware_rejects_disabled_key(patched_authenticator):
@@ -581,15 +652,33 @@ def test_sensitive_gets_open_when_no_auth_configured(patched_authenticator):
     assert r_metrics.status_code != 401
 
 
-def test_middleware_chat_stream_exempt(patched_authenticator):
-    # /api/chat/stream is a POST but read-only -> not gated by the middleware.
+def test_metrics_history_gated_when_auth_configured(patched_authenticator):
+    # /api/metrics/history exposes the same operational data as /api/metrics;
+    # it must be gated exactly like /api/metrics (it was missed by the
+    # exact-match sensitive-GET list once).
     patched_authenticator.create_key(label="alice")
-    # We don't need a successful chat; just assert auth does not 401-reject.
-    # The endpoint will fail downstream (no model), but not with 401.
-    response = TestClient(web_app.app).post(
+    response = TestClient(web_app.app).get("/api/metrics/history")
+    assert response.status_code == 401
+
+
+def test_middleware_chat_stream_is_gated(patched_authenticator):
+    # /api/chat/stream is the most expensive endpoint (LLM + GPU + corpus
+    # answers) and the browser fetch carries X-API-Token fine, so it is gated
+    # like every other POST when auth is configured.
+    full_key, _record = patched_authenticator.create_key(label="alice")
+    client = TestClient(web_app.app)
+    anonymous = client.post(
         "/api/chat/stream",
         json={"question": "hi"},
         headers={"Content-Type": "application/json"},
+    )
+    assert anonymous.status_code == 401
+    # A valid credential still gets past auth (the endpoint then fails
+    # downstream with no model -- but not with 401).
+    response = client.post(
+        "/api/chat/stream",
+        json={"question": "hi"},
+        headers={"Content-Type": "application/json", "X-API-Token": full_key},
     )
     assert response.status_code != 401
 

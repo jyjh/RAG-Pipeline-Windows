@@ -24,13 +24,23 @@ from typing import Any, Iterator
 
 from src.atomic_io import write_json_atomic
 from src.caches import BoundedLRU
+from src.file_lock import acquire_registry_lock
 
 LEDGER_FILENAME = ".job_ledger.json"
 LEDGER_VERSION = 1
 
 # Job kinds that are NOT tracked by the PDF registry and therefore need the
 # ledger for crash recovery. Upload jobs are recovered via the registry.
-LEDGER_TRACKED_KINDS = {"reindex", "reindex_source", "rebuild", "backup", "restore", "rebuild_vector_index", "compact"}
+LEDGER_TRACKED_KINDS = {
+    "reindex",
+    "reindex_source",
+    "rebuild",
+    "backup",
+    "restore",
+    "rebuild_vector_index",
+    "compact",
+    "transfer_sources",
+}
 
 _LOCK = threading.RLock()
 # Bounded LRU: the ledger is tiny (a handful of paths per server instance) so
@@ -86,10 +96,29 @@ class JobLedger:
     A job is recorded when enqueued and removed when it reaches a terminal
     status. On startup, ``pending_entries`` returns whatever remains, so the
     queue can re-enqueue jobs that were interrupted by a crash.
+
+    Writes take the in-process lock plus a best-effort cross-process lock on
+    the ledger directory (same pattern as the PDF registry / KeyStore): during
+    the update-restart flow two server processes can overlap, and a
+    read-modify-write interleave would drop entries.
     """
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
+
+    @contextlib.contextmanager
+    def _lock_for(self) -> Iterator[None]:
+        with _LOCK:
+            with contextlib.ExitStack() as stack:
+                try:
+                    stack.enter_context(
+                        acquire_registry_lock(self.path.parent, timeout=30.0)
+                    )
+                except (TimeoutError, OSError):
+                    # Fall back to the in-process lock alone rather than
+                    # failing the mutation.
+                    pass
+                yield
 
     def _load(self) -> dict[str, Any]:
         with _LOCK:
@@ -103,7 +132,7 @@ class JobLedger:
         """
         if kind not in LEDGER_TRACKED_KINDS:
             return
-        with _LOCK:
+        with self._lock_for():
             payload = self._load()
             jobs = payload.setdefault("jobs", {})
             entry: dict[str, Any] = {"kind": kind, "recorded_at": utcnow()}
@@ -114,7 +143,7 @@ class JobLedger:
     def remove(self, job_id: str) -> None:
         """Remove a job entry (called when the job reaches a terminal state)."""
         job_id = str(job_id)
-        with _LOCK:
+        with self._lock_for():
             payload = self._load()
             jobs = payload.get("jobs", {})
             if job_id not in jobs:

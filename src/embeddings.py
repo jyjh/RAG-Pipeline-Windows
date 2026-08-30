@@ -572,12 +572,14 @@ class EmbeddingEngine:
             )
             batch_embeddings = response.get("embeddings")
         except Exception as exc:
-            raise RuntimeError(
-                f"Ollama embedding failed for model '{self.model_name}' "
-                f"on batch {batch_number}/{total_batches}. "
-                f"Run `{_ollama_pull_command(self.model_name)}` and ensure Ollama is running. "
-                f"Original error: {exc}"
-            ) from exc
+            # An Ollama older than /api/embed (mid-2024) answers HTTP 404, so
+            # the batch endpoint failing is not fatal: fall through to the
+            # one-by-one /api/embeddings loop instead of failing the batch.
+            _status(
+                f"Batch /api/embed failed for Ollama model {self.model_name} "
+                f"({exc}); falling back to one-by-one /api/embeddings.",
+            )
+            batch_embeddings = None
 
         if batch_embeddings is None:
             batch_embeddings = []
@@ -594,7 +596,11 @@ class EmbeddingEngine:
                 )
                 embedding = response.get("embedding")
                 if embedding is None:
-                    raise RuntimeError("Ollama embedding response did not contain an embedding.")
+                    raise RuntimeError(
+                        f"Ollama embedding failed for model '{self.model_name}' "
+                        f"on batch {batch_number}/{total_batches}. "
+                        f"Run `{_ollama_pull_command(self.model_name)}` and ensure Ollama is running."
+                    )
                 batch_embeddings.append(embedding)
 
         if len(batch_embeddings) != len(batch):

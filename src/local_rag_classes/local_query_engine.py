@@ -197,6 +197,11 @@ class LocalQueryEngine:
         # per-store ANN results by score. ``category_labels`` names each dir
         # in results (record["category"]).
         dirs = [str(d) for d in (working_dirs or []) if str(d or "").strip()]
+        if len(dirs) == 1:
+            # A single-element working_dirs must win over the default working_dir
+            # -- otherwise a caller selecting exactly one category would silently
+            # query the General index instead.
+            working_dir = dirs[0]
         if len(dirs) > 1:
             from src.vector_store import MultiVectorStore
 
@@ -233,7 +238,17 @@ class LocalQueryEngine:
         for label, store in self._iter_stores():
             try:
                 _model, dim = store.metadata()
-            except Exception:
+            except Exception as exc:
+                # An unreadable index (corrupt/locked) cannot be dim-checked, so
+                # a mismatch would surface later as an opaque store error; log
+                # the skip so the root cause is traceable. getattr because
+                # instances built via __new__ (tests wiring fakes) have no
+                # progress_enabled.
+                where = f" (category '{label}')" if label else ""
+                _status(
+                    f"Could not read index metadata for dim check{where}: {exc}",
+                    enabled=getattr(self, "progress_enabled", False),
+                )
                 continue
             if dim and int(dim) != self.embedding_dim:
                 where = f" (category '{label}')" if label else ""
@@ -275,7 +290,7 @@ class LocalQueryEngine:
         """
         return bool(self.planner_enabled and self.record_count)
 
-    def _tool_messages(self, question: str) -> list[dict[str, Any]]:
+    def _tool_messages(self, question: str, history: list[dict[str, str]] | None = None) -> list[dict[str, Any]]:
         web_instruction = (
             "Use web_search only when local context is insufficient or the user asks for current/external facts, "
             "and only while the prompt remains under the input-context budget."
@@ -298,13 +313,16 @@ class LocalQueryEngine:
             system_prompt = system_prompt.replace("{web_instruction}", web_instruction)
         else:
             system_prompt = f"{system_prompt}\n\n{web_instruction}"
-        return [
+        conversation: list[dict[str, str]] = [
             {
                 "role": "system",
                 "content": system_prompt,
-            },
-            {"role": "user", "content": question},
+            }
         ]
+        for turn in _sanitize_history(history):
+            conversation.append({"role": turn["role"], "content": turn["content"]})
+        conversation.append({"role": "user", "content": question})
+        return conversation
 
     def _tool_definitions(self, *, include_web_search: bool | None = None) -> list[dict[str, Any]]:
         tools = [
@@ -419,6 +437,7 @@ class LocalQueryEngine:
         *,
         exclude_ids: set[str] | None = None,
         token_budget: int | None = None,
+        min_score_override: float | None = None,
     ) -> list[dict[str, Any]]:
         if not self.record_count:
             return []
@@ -438,7 +457,16 @@ class LocalQueryEngine:
             return []
 
         best_score = max(float(candidate.get("score") or 0.0) for candidate in candidates)
-        score_cutoff = max(self.retrieval_min_score, best_score * self.retrieval_relative_cutoff)
+        # Per-call floor override instead of mutating self.retrieval_min_score:
+        # concurrent searches on one engine instance would otherwise restore a
+        # foreign floor in a save/set/finally-restore interleave.
+        floor = self.retrieval_min_score
+        if min_score_override is not None:
+            try:
+                floor = max(0.0, float(min_score_override))
+            except (TypeError, ValueError):
+                floor = self.retrieval_min_score
+        score_cutoff = max(floor, best_score * self.retrieval_relative_cutoff)
         query_terms = _claim_keywords(question)
         token_budget = self._context_token_budget() if token_budget is None else max(0, int(token_budget))
         if token_budget <= 0:
@@ -510,6 +538,7 @@ class LocalQueryEngine:
             ranked["lexical_score"] = round(lexical_score, 4)
             ranked["hybrid_score"] = round(hybrid_score, 4)
             ranked["source_group"] = str(reliability.get("key") or SOURCE_GROUP_UNGROUPED)
+            ranked["review_status"] = str(reliability.get("review_status") or "unreviewed")
             ranked["reliability_modifier"] = round(reliability_modifier, 4)
             ranked["score"] = round(final_score, 4)
             return ranked
@@ -541,6 +570,11 @@ class LocalQueryEngine:
             item["lexical_score"] = round(float(record.get("lexical_score") or 0.0), 4)
             item["hybrid_score"] = round(float(record.get("hybrid_score") or vector_score), 4)
             item["source_group"] = str(record.get("source_group") or SOURCE_GROUP_UNGROUPED)
+            item["review_status"] = str(
+                record.get("review_status")
+                or self._reliability_details(record).get("review_status")
+                or "unreviewed"
+            )
             item["reliability_modifier"] = round(
                 float(record.get("reliability_modifier") or source_group_weight(SOURCE_GROUP_UNGROUPED)),
                 4,
@@ -595,6 +629,7 @@ class LocalQueryEngine:
         token_budget: int | None = None,
         matches: list[dict[str, Any]] | None = None,
         planner_queries: list[str] | None = None,
+        min_score_override: float | None = None,
     ) -> dict[str, Any]:
         token_budget = self._context_token_budget() if token_budget is None else max(0, int(token_budget))
         result = {
@@ -616,7 +651,12 @@ class LocalQueryEngine:
 
         result_budget = token_budget - base_tokens
         if matches is None:
-            matches = self._retrieve(query, exclude_ids=exclude_ids, token_budget=result_budget)
+            matches = self._retrieve(
+                query,
+                exclude_ids=exclude_ids,
+                token_budget=result_budget,
+                min_score_override=min_score_override,
+            )
         context_blocks = []
         used_tokens = 0
         truncated = False
@@ -683,21 +723,16 @@ class LocalQueryEngine:
         relevance_floor: float | None = None,
         token_budget: int | None = None,
     ) -> dict[str, Any]:
-        previous_min_score = self.retrieval_min_score
-        if relevance_floor is not None:
-            try:
-                self.retrieval_min_score = max(0.0, float(relevance_floor))
-            except (TypeError, ValueError):
-                self.retrieval_min_score = previous_min_score
-        try:
-            return self._local_tool_result(
-                query=query,
-                exclude_ids=set(),
-                citations=CitationRegistry(asset_store=self.asset_store),
-                token_budget=token_budget,
-            )
-        finally:
-            self.retrieval_min_score = previous_min_score
+        # Pass the floor through as a per-call override instead of mutating
+        # self.retrieval_min_score around the call: that save/set/restore is
+        # not reentrant, so concurrent searches could restore a foreign floor.
+        return self._local_tool_result(
+            query=query,
+            exclude_ids=set(),
+            citations=CitationRegistry(asset_store=self.asset_store),
+            token_budget=token_budget,
+            min_score_override=relevance_floor,
+        )
 
     def _web_tool_result(
         self,
@@ -898,6 +933,7 @@ class LocalQueryEngine:
         question: str,
         citations: CitationRegistry,
         messages: list[dict[str, Any]],
+        history: list[dict[str, str]] | None = None,
     ) -> tuple[dict[str, Any], str] | None:
         """Pre-fetch local context before the main model is invoked.
 
@@ -913,6 +949,7 @@ class LocalQueryEngine:
         token_budget = self._tool_result_token_budget(messages)
         planner_queries = generate_search_queries(
             question,
+            history=history,
             model=self.planner_model,
             max_queries=self.planner_max_queries,
             timeout=DEFAULT_PLANNER_TIMEOUT,
@@ -965,9 +1002,9 @@ class LocalQueryEngine:
             text = str(result["error"])
         return result, text
 
-    def _run_tool_rounds(self, question: str):
+    def _run_tool_rounds(self, question: str, history: list[dict[str, str]] | None = None):
         citations = CitationRegistry(asset_store=self.asset_store)
-        messages = self._tool_messages(question)
+        messages = self._tool_messages(question, history=history)
         local_search_used = False
         tool_calls_used = 0
 
@@ -981,6 +1018,7 @@ class LocalQueryEngine:
                 question=question,
                 citations=citations,
                 messages=messages,
+                history=history,
             )
             if eager is not None:
                 result, text = eager
@@ -1005,7 +1043,10 @@ class LocalQueryEngine:
                 messages=messages,
                 options=self._ollama_options(),
                 stream=False,
-                timeout=None,
+                # A finite timeout is what turns a hung (not crashed) backend
+                # into a recoverable error; with None the request can block
+                # forever and bypass the health-check/failover machinery.
+                timeout=self.llm_timeout,
                 health_check_interval=self.ollama_health_check_interval,
                 max_lost_health_checks=self.ollama_max_lost_health_checks,
                 tools=tools,
@@ -1049,7 +1090,17 @@ class LocalQueryEngine:
                         "type": "notice",
                         "text": "Tool-call limit reached; answering from the context already retrieved.",
                     }
-                    break
+                    # Every tool_call in the appended assistant message must be
+                    # answered by a matching role:"tool" message before the next
+                    # model call; strict OpenAI-compatible backends otherwise
+                    # reject the whole request (HTTP 400).
+                    function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                    self._append_tool_result(
+                        messages,
+                        tool_name=str(function.get("name") or "unknown"),
+                        result={"error": "skipped: tool-call limit reached"},
+                    )
+                    continue
                 function = call.get("function") if isinstance(call.get("function"), dict) else {}
                 tool_name = str(function.get("name") or "unknown")
                 yield {"type": "tool_call", "tool": tool_name, "text": f"Running {tool_name}..."}
@@ -1097,14 +1148,15 @@ class LocalQueryEngine:
             if event["type"] == "answer":
                 yield event["text"]
 
-    def ask_stream_events(self, question: str):
+    def ask_stream_events(self, question: str, history: list[dict[str, str]] | None = None):
+        history = _sanitize_history(history)
         if self.planner_enabled and self.record_count:
             yield {"type": "notice", "text": "Searching local context..."}
         else:
             yield {"type": "notice", "text": "Planning retrieval tool calls..."}
         try:
             tool_state: dict[str, Any] | None = None
-            for event in self._run_tool_rounds(question):
+            for event in self._run_tool_rounds(question, history=history):
                 if event.get("type") == "_tool_state":
                     tool_state = event
                     continue
@@ -1126,7 +1178,10 @@ class LocalQueryEngine:
                 messages=messages,
                 options=self._ollama_options(),
                 stream=True,
-                timeout=None,
+                # Socket-level stall detector so a hung backend eventually
+                # raises into the recovery path (per-read timeout, so long
+                # generations are unaffected as long as tokens keep flowing).
+                timeout=self.llm_timeout,
                 health_check_interval=self.ollama_health_check_interval,
                 max_lost_health_checks=self.ollama_max_lost_health_checks,
             )
@@ -1136,6 +1191,11 @@ class LocalQueryEngine:
             in_thinking = False
             done_reason = ""
             answer_text = ""
+            # A <think>/</think> tag can be tokenized across chunk boundaries;
+            # hold back any trailing partial-tag text so it is recognized on
+            # the next chunk instead of leaking literally into the answer.
+            carry = ""
+            carry_type = "answer"
             for chunk in stream:
                 done_reason = _ollama_done_reason(chunk) or done_reason
                 thinking = _ollama_response_thinking(chunk)
@@ -1147,17 +1207,37 @@ class LocalQueryEngine:
                 content = _ollama_response_content(chunk)
                 if content:
                     events, in_thinking = _split_think_tag_events(
-                        content,
+                        carry + content,
                         in_thinking=in_thinking,
                     )
-                    for event in events:
-                        emitted = True
-                        if event["type"] == "thinking":
-                            thinking_emitted = True
-                        if event["type"] == "answer":
-                            answer_emitted = True
-                            answer_text += event["text"]
-                        yield event
+                    carry = ""
+                    if events:
+                        partial = _partial_think_tag_suffix(events[-1]["text"])
+                        if partial:
+                            carry = partial
+                            carry_type = events[-1]["type"]
+                            trimmed = events[-1]["text"][: -len(partial)]
+                            events = (
+                                [*events[:-1], {**events[-1], "text": trimmed}]
+                                if trimmed
+                                else events[:-1]
+                            )
+                        for event in events:
+                            emitted = True
+                            if event["type"] == "thinking":
+                                thinking_emitted = True
+                            if event["type"] == "answer":
+                                answer_emitted = True
+                                answer_text += event["text"]
+                            yield event
+            if carry:
+                emitted = True
+                if carry_type == "thinking":
+                    thinking_emitted = True
+                else:
+                    answer_emitted = True
+                    answer_text += carry
+                yield {"type": carry_type, "text": carry}
         except Exception as exc:
             raise RuntimeError(
                 f"Local Ollama streaming query failed for model '{self.model}'. "
@@ -1202,3 +1282,19 @@ class LocalQueryEngine:
 LocalQueryEngine.__module__ = _source_module.__name__
 finalize_split_class(_source_module, LocalQueryEngine)
 
+
+
+# Prior-turn bounds: enough context for follow-ups without ballooning the
+# prompt; the endpoint already caps turns, this guards direct engine callers.
+_HISTORY_MAX_TURNS = 12
+_HISTORY_MAX_CHARS = 4000
+
+
+def _sanitize_history(history: list[dict[str, str]] | None) -> list[dict[str, str]]:
+    turns: list[dict[str, str]] = []
+    for turn in list(history or [])[-_HISTORY_MAX_TURNS:]:
+        role = str((turn or {}).get("role") or "")
+        content = str((turn or {}).get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            turns.append({"role": role, "content": content[:_HISTORY_MAX_CHARS]})
+    return turns

@@ -79,6 +79,11 @@ class PathsConfig:
     processed_dir: str = "processed_docs"
     db_dir: str = "db"
     asset_dir: str = DEFAULT_ASSET_DIR
+    # Extra directories the web UI may serve source PDFs from. Bulk-ingested
+    # corpora usually live outside data_dir (e.g. a second drive), and the
+    # download/preview path containment rejects anything outside the known
+    # roots -- list such roots here, one absolute path per entry.
+    corpus_roots: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -405,8 +410,17 @@ class HpcConfig:
 
 
 @dataclass
+class BackupsConfig:
+    # 0 disables the automatic backup scheduler; otherwise the web app
+    # enqueues an index backup when the newest backup is older than this
+    # many hours (checked hourly while the server runs).
+    auto_backup_hours: int = 0
+
+
+@dataclass
 class PipelineConfig:
     paths: PathsConfig = field(default_factory=PathsConfig)
+    backups: BackupsConfig = field(default_factory=BackupsConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
     ingestion: IngestionConfig = field(default_factory=IngestionConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
@@ -461,7 +475,15 @@ def _merge_dataclass(target: Any, values: dict[str, Any], *, path: str = "") -> 
 
 # Parsed-config cache keyed on (resolved path, mtime, size). ``load_config``
 # returns a deep copy so callers can mutate without polluting the cache.
+# Only the newest signature per path is retained: keeping every version would
+# leak one full PipelineConfig per config-file edit for the process lifetime.
 _CONFIG_CACHE: dict[tuple[str, int, int], PipelineConfig] = {}
+
+
+def _prune_config_cache(current: tuple[str, int, int]) -> None:
+    path = current[0]
+    for signature in [key for key in _CONFIG_CACHE if key[0] == path and key != current]:
+        _CONFIG_CACHE.pop(signature, None)
 
 
 def default_config_path() -> Path:
@@ -505,5 +527,6 @@ def load_config(path: str | os.PathLike[str] | None = None) -> PipelineConfig:
             _merge_dataclass(cfg, _load_mapping(chosen))
         cfg.ensure_dirs()
         _CONFIG_CACHE[signature] = cfg
+        _prune_config_cache(signature)
         cached = cfg
     return copy.deepcopy(cached)

@@ -28,6 +28,8 @@ _RE_NUMBERED_HEADING = re.compile(
 )
 _RE_FRONT_MATTER_NUMBER = re.compile(r"^(?:\[begin lecture [^\]]+\]\s*)?\(?\d+\)?$")
 _RE_FRONT_MATTER_NUMBERED = re.compile(r"^\d+(?:\.\d+)*\s+[A-Za-z][^\n.]{2,}$")
+# Leading top-level number of a numbered-heading/TOC line ("12.3 Title" -> 12).
+_RE_NUMBERED_LEADING = re.compile(r"^(\d+)")
 _RE_SPLIT_PARAGRAPH = re.compile(r"\n\s*\n")
 _RE_TAG_WORD = re.compile(r"[A-Za-z][A-Za-z0-9-]{2,}")
 _RE_TITLE_WHITESPACE = re.compile(r"\s+")
@@ -115,7 +117,9 @@ def build_section_records(
     source_root = source_root or Path.cwd()
     from src.pdf_registry import source_entry_for_markdown
 
-    markdown_content = markdown_path.read_text(encoding="utf-8")
+    # errors="replace": a manually dropped .md in a non-UTF-8 encoding must
+    # not crash incremental indexing at unguarded call sites.
+    markdown_content = markdown_path.read_text(encoding="utf-8", errors="replace")
     source_entry = source_entry_for_markdown(markdown_path)
     mapped_pdf_value = str(source_entry.get("source_pdf_path", ""))
     mapped_pdf_path = Path(mapped_pdf_value) if mapped_pdf_value else None
@@ -287,6 +291,43 @@ def records_for_section(
 
     if section.children:
         chunk_counter = chunk_counter_start
+        # The parent's own prose (the intro between its heading and its first
+        # child heading) was previously dropped: parents emitted only a
+        # summary, and every child's content starts AT the child heading, so
+        # chapter/section overviews were not retrievable at all.
+        intro_chunks = split_text(
+            own_text_for_section(section, pages),
+            max_chars=max_chars,
+            overlap_chars=overlap_chars,
+        )
+        for offset, chunk in enumerate(intro_chunks):
+            chunk_index = chunk_counter
+            chunk_counter += 1
+            prefixed = (
+                f"Section: {section_path}\n"
+                f"Pages: {format_page_range(section.page_start, section.page_end)}\n\n"
+                f"{chunk}"
+            ).strip()
+            records.append(
+                SectionChunk(
+                    doc_id=doc_id,
+                    node_id=stable_id(doc_id, "chunk", section.node_id, "intro", str(offset)),
+                    parent_id=active_summary_parent,
+                    node_type="chunk",
+                    title=section.title,
+                    section_path=section_path,
+                    page_start=section.page_start,
+                    page_end=section.page_end,
+                    content=prefixed,
+                    summary=summary,
+                    tags=tags,
+                    chunk_index=chunk_index,
+                    source_path=source_path,
+                    source_hash=source_hash,
+                    source_pdf_name=source_pdf_name,
+                    source_pdf_path=source_pdf_path,
+                )
+            )
         for child_index, child in enumerate(section.children):
             child_records = records_for_section(
                 child,
@@ -387,28 +428,40 @@ def write_pages_sidecar(markdown_path: Path, page_texts: Iterable[str]) -> None:
     """
     import json
 
+    from src.atomic_io import _replace_with_retry as replace_with_retry
+
     sidecar = pages_sidecar_path(markdown_path)
     tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
     # Stream the page array so a very large PDF does not create a second full
     # normalized-page list just to serialize the sidecar. The reader accepts
     # the same JSON shape, including the exact page_count field.
-    with tmp.open("w", encoding="utf-8") as handle:
-        handle.write('{"version":%d,"page_count":' % _PAGES_SIDECAR_VERSION)
-        count_position = handle.tell()
-        handle.write("0".ljust(20))
-        handle.write(',"pages":[')
-        count = 0
-        for text in page_texts:
-            if count:
-                handle.write(",")
-            json.dump(normalize_page_text(text), handle, ensure_ascii=False)
-            count += 1
-        handle.write("]}")
-        end_position = handle.tell()
-        handle.seek(count_position)
-        handle.write(str(count).ljust(20))
-        handle.seek(end_position)
-    tmp.replace(sidecar)
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write('{"version":%d,"page_count":' % _PAGES_SIDECAR_VERSION)
+            count_position = handle.tell()
+            handle.write("0".ljust(20))
+            handle.write(',"pages":[')
+            count = 0
+            for text in page_texts:
+                if count:
+                    handle.write(",")
+                json.dump(normalize_page_text(text), handle, ensure_ascii=False)
+                count += 1
+            handle.write("]}")
+            end_position = handle.tell()
+            handle.seek(count_position)
+            handle.write(str(count).ljust(20))
+            handle.seek(end_position)
+        # Same Windows hardening as atomic_io's other writers: an
+        # antivirus/search-indexer lock on the destination raises
+        # PermissionError on replace, so retry instead of flaking the ingest.
+        replace_with_retry(tmp, sidecar)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def read_pages_sidecar(markdown_path: Path) -> list[str] | None:
@@ -451,10 +504,17 @@ def sections_from_pdf(
         # already loaded normalized page text from the sidecar written at ingest time.
         pages = [PageText(index + 1, text) for index, text in enumerate(cached_pages)]
     else:
-        pages = [
-            PageText(index + 1, normalize_page_text(page.extract_text() or ""))
-            for index, page in enumerate(reader.pages)
-        ]
+        # Per-page isolation, matching the ingestion-side extractor: one
+        # corrupt page must degrade to empty text for that page, not abort
+        # the whole file's sectioning (the incremental indexer calls this
+        # outside any per-file guard).
+        def _page_texts():
+            for index, page in enumerate(reader.pages):
+                try:
+                    yield PageText(index + 1, normalize_page_text(page.extract_text() or ""))
+                except Exception:  # noqa: BLE001 - per-page isolation
+                    yield PageText(index + 1, "")
+        pages = list(_page_texts())
     outline = getattr(reader, "outline", None) or []
     sections = outline_sections(reader, outline, page_count=len(pages))
     if not sections:
@@ -669,16 +729,53 @@ def markdown_headings(content: str) -> list[tuple[int, int, str]]:
 
 
 def strip_front_matter(content: str) -> str:
+    """Drop a leading table-of-contents block from extracted text.
+
+    A TOC is a tight run of numbered-entry lines near the top (bare
+    page-number/lecture-marker lines between entries are TOC-ish too). Two
+    signals end the TOC and keep the rest of the document intact:
+
+    * body prose separating two numbered lines means they are real section
+      headings, not a TOC -- nothing is stripped at all;
+    * the leading number RESTARTING (``...3 Engine`` then ``1 Introduction``)
+      marks where the document body begins.
+
+    The old two-marker heuristic returned content starting at the SECOND
+    numbered heading, silently discarding the preamble, the first heading,
+    and its entire body for any document without a genuine TOC.
+    """
     lines = content.replace("\r\n", "\n").splitlines()
-    content_markers = []
+    toc_end: int | None = None  # exclusive end of the contiguous TOC block
+    last_number = 0
+    numbered_seen = 0
+    prose_since_heading = False
     for index, line in enumerate(lines):
         stripped = line.strip()
-        if _RE_FRONT_MATTER_NUMBER.match(stripped.lower()):
+        if not stripped:
             continue
         if _RE_FRONT_MATTER_NUMBERED.match(stripped):
-            content_markers.append(index)
-            if len(content_markers) >= 2:
-                return "\n".join(lines[index:]).strip()
+            leading = int(_RE_NUMBERED_LEADING.match(stripped).group(1))
+            if numbered_seen >= 1:
+                if prose_since_heading:
+                    # Prose separated two numbered headings: real content,
+                    # not a TOC. Keep the document intact.
+                    return content.strip()
+                if leading < last_number:
+                    # Top-level numbering went backwards (e.g. ...3 -> 1):
+                    # the document body begins here.
+                    return "\n".join(lines[index:]).strip()
+            numbered_seen += 1
+            last_number = leading
+            toc_end = index + 1
+            prose_since_heading = False
+            continue
+        if numbered_seen and _RE_FRONT_MATTER_NUMBER.match(stripped.lower()):
+            # Bare page-number / lecture-marker line inside the run.
+            continue
+        if numbered_seen:
+            prose_since_heading = True
+    if numbered_seen >= 2 and toc_end is not None:
+        return "\n".join(lines[toc_end:]).strip()
     return content.strip()
 
 
@@ -694,6 +791,29 @@ def content_for_section(section: SectionNode, pages: list[PageText]) -> str:
         page_text = "\n\n".join(selected)
     page_text = trim_to_heading(page_text, section.title, next_title=section.next_title)
     return page_text.strip()
+
+
+def own_text_for_section(section: SectionNode, pages: list[PageText]) -> str:
+    """A parent section's OWN prose: the text between its heading and its
+    first child's heading ("" when it has no separate intro).
+
+    A leaf's text is the whole content_for_section; a parent's page range
+    spans all of its children, so its own intro must be cut at the first
+    child heading -- otherwise chunking it would duplicate the chapter.
+    """
+    if not section.children:
+        return content_for_section(section, pages)
+    text = content_for_section(section, pages)
+    if not text:
+        return ""
+    lines = text.splitlines()
+    start = find_heading_line(lines, section.title)
+    if start is not None:
+        lines = lines[start + 1 :]
+    end = find_heading_line(lines, section.children[0].title)
+    if end is not None:
+        lines = lines[:end]
+    return "\n".join(lines).strip()
 
 
 def trim_to_heading(text: str, title: str, *, next_title: str = "") -> str:

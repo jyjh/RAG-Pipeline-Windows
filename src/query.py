@@ -85,12 +85,15 @@ class QueryEngine:
         logger.info("Streaming local Ollama index query: %s", question)
         return self.local_engine.ask_stream(question)
 
-    def ask_stream_events(self, question: str):
+    def ask_stream_events(self, question: str, history: list[dict[str, str]] | None = None):
         """
         Streams local answer events with separate thinking and answer chunks.
+
+        ``history`` carries sanitized prior turns (oldest first) so follow-up
+        questions resolve conversation context.
         """
         logger.info("Streaming local Ollama index query events: %s", question)
-        return self.local_engine.ask_stream_events(question)
+        return self.local_engine.ask_stream_events(question, history=history)
 
 
 if __name__ == "__main__":

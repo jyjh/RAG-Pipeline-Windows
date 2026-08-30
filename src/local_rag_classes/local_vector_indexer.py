@@ -22,6 +22,15 @@ from src.progress_protocol import emit_progress
 # idempotent (delete-then-add per source), so re-running without --resume is
 # safe but wasteful. See index_markdown(resume=...).
 CHECKPOINT_FILENAME = ".index_build_checkpoint.json"
+
+
+def _signature_for_path(path: Path) -> tuple[int, int] | None:
+    """Best-effort ``(mtime_ns, size)`` fingerprint of a file (None if unreadable)."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
 CHECKPOINT_INTERVAL_FILES = 250
 CHECKPOINT_INTERVAL_SECONDS = 900.0  # 15 minutes
 
@@ -312,20 +321,31 @@ class LocalVectorIndexer:
         total_embedded: int,
         total_reused: int,
         manifest: IndexManifest,
+        markdown_dir: str | Path | None = None,
     ) -> None:
         """Atomically persist resume state.
 
-        Captures the set of completed markdown filenames plus a snapshot of the
-        running manifest so a resumed run can (a) skip re-sectioning/embedding
-        completed files and (b) reconstruct the manifest without re-reading the
-        already-written LanceDB rows. Atomic via temp+replace so a crash during
-        the write never leaves a half-written checkpoint.
+        Captures the set of completed markdown filenames (plus their
+        ``(mtime_ns, size)`` signatures when ``markdown_dir`` is given) plus a
+        snapshot of the running manifest so a resumed run can (a) skip
+        re-sectioning/embedding completed files, (b) detect files whose
+        content changed since the checkpoint, and (c) reconstruct the manifest
+        without re-reading the already-written LanceDB rows. Atomic via
+        temp+replace so a crash during the write never leaves a half-written
+        checkpoint.
         """
         from src.atomic_io import write_json_atomic
 
         manifest_snapshot = dict(manifest.payload)
+        file_signatures: dict[str, list[int]] = {}
+        if markdown_dir is not None:
+            for name in sorted(set(completed_files)):
+                signature = _signature_for_path(Path(markdown_dir) / name)
+                if signature is not None:
+                    file_signatures[name] = list(signature)
         payload = {
             "completed_files": sorted(set(completed_files)),
+            "file_signatures": file_signatures,
             "processed_files": int(processed_files),
             "failed_files": int(failed_files),
             "written_records": int(written_records),
@@ -438,7 +458,16 @@ class LocalVectorIndexer:
             # Only resume if the checkpoint's completed set is a subset of the
             # current inputs (no missing files) AND non-empty. A superset or a
             # mismatch means the corpus changed -- start fresh.
-            if cp_file_set and cp_file_set.issubset(current_names):
+            signatures_ok = True
+            cp_signatures = checkpoint.get("file_signatures")
+            if isinstance(cp_signatures, dict) and cp_signatures:
+                for name, signature in cp_signatures.items():
+                    current = _signature_for_path(Path(markdown_dir) / str(name))
+                    expected = tuple(signature) if isinstance(signature, (list, tuple)) else None
+                    if current is None or expected is None or tuple(current) != tuple(expected):
+                        signatures_ok = False
+                        break
+            if cp_file_set and cp_file_set.issubset(current_names) and signatures_ok:
                 completed_file_names = cp_file_set
                 # Rebuild the manifest from the checkpoint so the final publish
                 # has correct document entries + embedded/reused totals for the
@@ -579,12 +608,53 @@ class LocalVectorIndexer:
 
                     # Wait for the previous write to finish before queueing this
                     # one (bounds memory to ~2 files and preserves write order).
-                    # The previous file's write is now durable -- record it as
-                    # completed for the checkpoint.
-                    _await_pending_write()
-                    if pending_write_file is not None:
-                        completed_file_names.add(pending_write_file)
+                    # A write failure is attributed to the file that was in
+                    # flight (pending_write_file), not to the current file whose
+                    # records are already embedded -- the current file is still
+                    # written below.
+                    if pending_write is not None:
+                        try:
+                            pending_write.result()
+                        except Exception as exc:
+                            failed_files += 1
+                            failed_name = pending_write_file or "<unknown>"
+                            index_errors.append(
+                                {"file": failed_name, "error": f"background write failed: {exc}"}
+                            )
+                            _status(
+                                f"Local index: background write failed for {failed_name}: {exc}.",
+                                enabled=self.progress_enabled,
+                            )
+                        else:
+                            if pending_write_file is not None:
+                                completed_file_names.add(pending_write_file)
+                        pending_write = None
                         pending_write_file = None
+
+                    # Checkpoint BEFORE queueing the next write: no writer is in
+                    # flight at this point, so the manifest snapshot cannot race
+                    # the writer thread's merge_records (json.dumps walking a
+                    # dict the writer mutates raises RuntimeError, and the
+                    # swallowed failure meant checkpoints silently never
+                    # landed). The snapshot now matches exactly the
+                    # completed_files recorded above.
+                    now = time.monotonic()
+                    checkpoint_due = (
+                        files_done_this_run % CHECKPOINT_INTERVAL_FILES == 0
+                        or (now - last_checkpoint_write) >= CHECKPOINT_INTERVAL_SECONDS
+                    )
+                    if checkpoint_due:
+                        self._write_checkpoint(
+                            completed_files=sorted(completed_file_names),
+                            processed_files=processed_files,
+                            failed_files=failed_files,
+                            written_records=written_records,
+                            total_embedded=total_embedded,
+                            total_reused=total_reused,
+                            manifest=manifest,
+                            markdown_dir=markdown_dir,
+                        )
+                        last_checkpoint_write = now
 
                     # Snapshot what the background writer needs, then queue it.
                     # manifest merging happens in the writer to keep the main
@@ -609,24 +679,6 @@ class LocalVectorIndexer:
                         enabled=self.progress_enabled,
                     )
                     _report_indexing_progress()
-                    # Periodic checkpoint so a crash loses at most ~one checkpoint
-                    # interval of work. Written only after the in-flight write for
-                    # the previous file is confirmed durable above.
-                    now = time.monotonic()
-                    if (
-                        files_done_this_run % CHECKPOINT_INTERVAL_FILES == 0
-                        or (now - last_checkpoint_write) >= CHECKPOINT_INTERVAL_SECONDS
-                    ):
-                        self._write_checkpoint(
-                            completed_files=sorted(completed_file_names),
-                            processed_files=processed_files,
-                            failed_files=failed_files,
-                            written_records=written_records,
-                            total_embedded=total_embedded,
-                            total_reused=total_reused,
-                            manifest=manifest,
-                        )
-                        last_checkpoint_write = now
                     # Drop this file's records before reading the next one.
                     del file_records
                 except Exception as exc:
@@ -639,9 +691,27 @@ class LocalVectorIndexer:
                     _report_indexing_progress()
         finally:
             # Flush the last in-flight write before continuing to ANN build.
-            _await_pending_write()
-            if pending_write_file is not None:
-                completed_file_names.add(pending_write_file)
+            try:
+                _await_pending_write()
+                if pending_write_file is not None:
+                    completed_file_names.add(pending_write_file)
+                    pending_write_file = None
+            except Exception as exc:
+                # Attribute the failure to the file whose write was in flight
+                # and keep going: aborting here would leave the staged dir with
+                # LanceDB rows but no manifest, which hard-fails every later
+                # incremental index. The failed file stays out of
+                # completed_file_names, so a resumed build redoes it.
+                failed_files += 1
+                index_errors.append(
+                    {"file": pending_write_file or "<unknown>", "error": f"background write failed: {exc}"}
+                )
+                _status(
+                    f"Local index: background write failed for "
+                    f"{pending_write_file or '<unknown>'}: {exc}.",
+                    enabled=self.progress_enabled,
+                )
+                pending_write = None
                 pending_write_file = None
             write_executor.shutdown(wait=True)
 

@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Local FSAE RAG</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ctext x='4' y='19' font-size='19' fill='%23176b87'%3E%E2%97%88%3C/text%3E%3C/svg%3E" />
     <script>
       // Resolve the theme before first paint so a dark-mode reload never
       // flashes the light palette.
@@ -22,6 +23,7 @@
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
+    <a class="skip-link" href="#mainContent">Skip to content</a>
     <div class="app-shell">
       <aside id="appSidebar" class="app-sidebar" aria-label="Navigation">
         <div class="sidebar-brand">
@@ -89,7 +91,7 @@
           <button id="jobsStripViewButton" type="button">View jobs</button>
         </div>
 
-        <main>
+        <main id="mainContent">
       <section id="upload" class="panel">
         <div id="uploadDropZone" class="upload-drop-zone">
           <div class="toolbar">
@@ -133,12 +135,12 @@
         <table id="jobsTable" class="data-table">
           <thead>
             <tr>
-              <th>Job</th>
-              <th>Status</th>
-              <th>Phase</th>
-              <th>Files</th>
-              <th>Error</th>
-              <th>Action</th>
+              <th scope="col">Job</th>
+              <th scope="col">Status</th>
+              <th scope="col">Phase</th>
+              <th scope="col">Files</th>
+              <th scope="col">Error</th>
+              <th scope="col">Action</th>
             </tr>
           </thead>
           <tbody id="jobsBody"></tbody>
@@ -209,6 +211,8 @@
             </select>
           </label>
           <button id="pdfBulkMoveButton" type="button" title="Move the selected documents into the chosen category (reuses existing vectors, no re-embedding)">Move</button>
+          <button id="pdfBulkRerunButton" type="button">Re-run selected</button>
+          <button id="pdfBulkDeleteButton" class="danger" type="button">Delete selected</button>
           <button id="pdfBulkClearButton" type="button">Clear</button>
         </div>
         <div class="toolbar table-pager">
@@ -230,19 +234,24 @@
         <table id="pdfsTable" class="data-table pdf-table">
           <thead>
             <tr>
-              <th class="pdf-select-col"><input id="pdfSelectAllCheckbox" type="checkbox" title="Select all untagged PDFs on this page" /></th>
-              <th>PDF</th>
-              <th>Status</th>
-              <th>Quality</th>
-              <th>Download</th>
+              <th scope="col" class="pdf-select-col"><input id="pdfSelectAllCheckbox" type="checkbox" title="Select all untagged PDFs on this page" /></th>
+              <th scope="col"><button type="button" class="th-sort" data-sort-key="filename" title="Sort by file name">PDF <span class="sort-indicator" aria-hidden="true"></span></button></th>
+              <th scope="col"><button type="button" class="th-sort" data-sort-key="trust" title="Sort by trust review status">Status <span class="sort-indicator" aria-hidden="true"></span></button></th>
+              <th scope="col"><button type="button" class="th-sort" data-sort-key="group" title="Sort by source group">Quality <span class="sort-indicator" aria-hidden="true"></span></button></th>
+              <th scope="col">Download</th>
             </tr>
           </thead>
-          <tbody id="pdfsBody"></tbody>
+          <tbody id="pdfsBody" aria-label="PDF library"></tbody>
         </table>
       </section>
 
       <section id="index" class="panel">
-        <div class="toolbar">
+        <div class="toolbar review-view-switch">
+          <span class="view-switch-label">View:</span>
+          <button id="reviewViewChunks" type="button" class="active">Chunks</button>
+          <button id="reviewViewDocuments" type="button">Documents</button>
+        </div>
+        <div class="toolbar" id="reviewSearchToolbar">
           <input id="searchInput" type="search" placeholder="Search indexed content" />
           <button id="searchButton" type="button">Search</button>
           <label class="inline-select-label">
@@ -264,7 +273,7 @@
           <span id="pageLabel"></span>
           <button id="nextPageButton" type="button">Next</button>
         </div>
-        <details class="advanced-settings">
+        <details class="advanced-settings" id="reviewVectorToolbar">
           <summary>Advanced retrieval search</summary>
           <div class="toolbar vector-search-toolbar">
             <input id="vectorSearchInput" type="search" placeholder="Vector search query" />
@@ -279,12 +288,27 @@
         <table id="indexTable" class="data-table index-table">
           <thead>
             <tr>
-              <th>Structure</th>
-              <th>Content</th>
-              <th>Actions</th>
+              <th scope="col">Structure</th>
+              <th scope="col">Content</th>
+              <th scope="col">Actions</th>
             </tr>
           </thead>
           <tbody id="indexBody"></tbody>
+        </table>
+        <div class="toolbar table-pager" id="docsPager" hidden>
+          <strong>Documents</strong>
+          <span id="docsPageLabel"></span>
+        </div>
+        <table id="docsTable" class="data-table docs-table" hidden>
+          <thead>
+            <tr>
+              <th scope="col"></th>
+              <th scope="col">Document</th>
+              <th scope="col">Status</th>
+              <th scope="col">Group</th>
+            </tr>
+          </thead>
+          <tbody id="docsBody"></tbody>
         </table>
       </section>
 
@@ -296,6 +320,7 @@
               <button id="collapseChatSidebarButton" type="button">Hide</button>
             </div>
             <button id="newChatButton" type="button">New chat</button>
+            <input id="chatSearchInput" type="search" placeholder="Search chats" aria-label="Search chats" />
             <div id="savedChatsList" class="saved-chats-list"></div>
           </aside>
           <div class="chat-main">
@@ -346,8 +371,11 @@
                   </label>
                 </div>
               </details>
-              <textarea id="questionInput" rows="3" placeholder="Ask a question"></textarea>
-              <button id="sendButton" type="submit">Send</button>
+              <div class="composer-pill">
+                <textarea id="questionInput" rows="1" placeholder="Ask a question about the library"></textarea>
+                <button id="sendButton" type="submit">Send</button>
+              </div>
+              <p class="composer-hint">Answers cite local sources — verify critical figures. <kbd>Enter</kbd> sends, <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a line.</p>
             </form>
           </div>
         </div>
@@ -394,14 +422,14 @@
             <table id="adminKeysTable" class="data-table admin-keys-table">
               <thead>
                 <tr>
-                  <th>Prefix</th>
-                  <th>Label</th>
-                  <th>Role</th>
-                  <th>Status</th>
-                  <th>Expires</th>
-                  <th>Usage</th>
-                  <th>Last used</th>
-                  <th>Actions</th>
+                  <th scope="col">Prefix</th>
+                  <th scope="col">Label</th>
+                  <th scope="col">Role</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Expires</th>
+                  <th scope="col">Usage</th>
+                  <th scope="col">Last used</th>
+                  <th scope="col">Actions</th>
                 </tr>
               </thead>
               <tbody id="adminKeysBody"></tbody>
@@ -425,16 +453,25 @@
               <thead>
                 <tr>
                   <th>Key</th>
-                  <th>Label</th>
+                  <th scope="col">Label</th>
                   <th>Documents</th>
                   <th>Records</th>
                   <th>Embedding</th>
-                  <th>Actions</th>
+                  <th scope="col">Actions</th>
                 </tr>
               </thead>
               <tbody id="adminCategoriesBody"></tbody>
             </table>
           </div>
+        </div>
+
+        <div class="admin-section">
+          <div class="admin-section-header">
+            <h3>Updates</h3>
+            <span id="updatePanelRefreshedAt" class="status"></span>
+            <button id="updatePanelRefreshButton" type="button">Check now</button>
+          </div>
+          <div id="updatePanelBody" class="update-panel-body"><p class="hint">Checking for updates…</p></div>
         </div>
 
         <div class="admin-section">
@@ -447,6 +484,8 @@
             <button id="toggleRestorePanelButton" type="button" title="Show saved index backups">Restore…</button>
             <button id="reingestButton" class="danger" type="button" title="Re-run PDF extraction (ingestion) and indexing for every registered PDF">Re-ingest all</button>
             <button id="rebuildIndexButton" class="danger" type="button" title="Drop the current index and rebuild it from processed Markdown">Re-build index</button>
+            <button id="compactIndexButton" type="button" title="Merge LanceDB fragments and reclaim space from reindex cycles">Compact index</button>
+            <button id="rebuildVectorIndexButton" type="button" title="Re-train the ANN index without re-embedding (after many incremental reindexes)">Rebuild vector index</button>
           </div>
           <div id="restoreIndexPanel" class="restore-panel" hidden>
             <div class="restore-panel-header">
@@ -536,11 +575,14 @@
         <div class="pdf-preview-header">
           <strong id="pdfPreviewTitle">PDF preview</strong>
           <div class="pdf-preview-header-actions">
+            <button id="pdfPreviewModePdf" type="button">PDF</button>
+            <button id="pdfPreviewModeText" type="button">Extracted text</button>
             <a id="pdfPreviewDownloadLink" href="#" download>Download</a>
             <button id="pdfPreviewCloseButton" type="button">Close</button>
           </div>
         </div>
         <iframe id="pdfPreviewFrame" title="PDF preview" hidden></iframe>
+        <div id="pdfPreviewText" class="rendered pdf-preview-text" hidden></div>
         <p id="pdfPreviewFallback" class="status" hidden>Preview unavailable — use the download link above.</p>
       </div>
     </div>
@@ -686,6 +728,6 @@
       </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script type="module" src="/static/app.js"></script>
   </body>
 </html>

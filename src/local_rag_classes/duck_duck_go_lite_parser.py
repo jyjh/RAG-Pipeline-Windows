@@ -16,6 +16,9 @@ class DuckDuckGoLiteParser(HTMLParser):
         self.results: list[dict[str, str]] = []
         self._link: dict[str, Any] | None = None
         self._snippet: list[str] | None = None
+        # The block-level tag that opened the snippet; inline tags inside the
+        # snippet (e.g. <b>) must not close it, or the text after them is lost.
+        self._snippet_tag: str = ""
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr = {key.lower(): value or "" for key, value in attrs}
@@ -30,6 +33,7 @@ class DuckDuckGoLiteParser(HTMLParser):
             return
         if "result-snippet" in classes or "result__snippet" in classes:
             self._snippet = []
+            self._snippet_tag = tag
 
     def handle_data(self, data: str) -> None:
         if self._link is not None:
@@ -45,11 +49,12 @@ class DuckDuckGoLiteParser(HTMLParser):
                 self.results.append({"title": title, "url": url, "snippet": ""})
             self._link = None
             return
-        if self._snippet is not None:
+        if self._snippet is not None and tag == self._snippet_tag:
             snippet = " ".join("".join(self._snippet).split())
             if snippet and self.results and not self.results[-1].get("snippet"):
                 self.results[-1]["snippet"] = snippet
             self._snippet = None
+            self._snippet_tag = ""
 
 DuckDuckGoLiteParser.__module__ = _source_module.__name__
 finalize_split_class(_source_module, DuckDuckGoLiteParser)

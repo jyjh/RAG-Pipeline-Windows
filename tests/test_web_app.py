@@ -3399,23 +3399,33 @@ def test_pdf_download_reports_missing_hash_and_missing_file(monkeypatch, workspa
 
 
 def test_pdf_download_rejects_paths_outside_data_dir(monkeypatch, workspace_tmp):
+    """Paths outside every configured corpus root are refused with 403.
+
+    The allow-list covers data_dir, the repo root, and db/processed roots, so
+    the "outside" file must live in the system temp dir to prove containment.
+    """
+    import tempfile
+
     processed_dir = workspace_tmp / "processed"
     processed_dir.mkdir()
-    outside_pdf = workspace_tmp / "outside.pdf"
+    outside_pdf = Path(tempfile.gettempdir()) / f"rag_outside_{uuid.uuid4().hex}.pdf"
     outside_pdf.write_bytes(b"%PDF-1.4 outside")
-    write_source_entry(
-        processed_dir=processed_dir,
-        markdown_path=processed_dir / "doc.md",
-        source_hash="hash-unsafe",
-        source_pdf_name="outside.pdf",
-        source_pdf_path=outside_pdf,
-    )
-    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
-    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    try:
+        write_source_entry(
+            processed_dir=processed_dir,
+            markdown_path=processed_dir / "doc.md",
+            source_hash="hash-unsafe",
+            source_pdf_name="outside.pdf",
+            source_pdf_path=outside_pdf,
+        )
+        monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+        monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
 
-    client = TestClient(web_app.app)
+        client = TestClient(web_app.app)
 
-    assert client.get("/api/pdfs/hash-unsafe/download").status_code == 403
+        assert client.get("/api/pdfs/hash-unsafe/download").status_code == 403
+    finally:
+        outside_pdf.unlink(missing_ok=True)
 
 
 def test_image_asset_endpoint_serves_manifest_known_files(monkeypatch, workspace_tmp):
@@ -3457,8 +3467,19 @@ def test_image_asset_endpoint_serves_manifest_known_files(monkeypatch, workspace
     assert unsafe.status_code == 404
 
 
+def _frontend_script() -> str:
+    """Full client source: the module entry plus every web/js module.
+
+    The front-end split into ES modules (web/app.js imports web/js/*.js), so
+    source-string assertions need the whole tree, not just the entry file.
+    """
+    entry = Path("web/app.js").read_text(encoding="utf-8")
+    modules = sorted(Path("web/js").glob("*.js"))
+    return entry + chr(10).join(m.read_text(encoding="utf-8") for m in modules)
+
+
 def test_sources_panel_frontend_includes_image_asset_preview():
-    script = Path("web/app.js").read_text(encoding="utf-8")
+    script = _frontend_script()
     styles = Path("web/styles.css").read_text(encoding="utf-8")
 
     assert "source.assets" in script
@@ -3473,7 +3494,7 @@ def test_sources_panel_frontend_includes_image_asset_preview():
 
 
 def test_frontend_upload_uses_xhr_progress_and_keeps_duplicate_prompt():
-    script = Path("web/app.js").read_text(encoding="utf-8")
+    script = _frontend_script()
 
     assert "function uploadFormData(path, body, options = {})" in script
     assert "new XMLHttpRequest()" in script
@@ -3490,7 +3511,7 @@ def test_frontend_upload_uses_xhr_progress_and_keeps_duplicate_prompt():
 
 
 def test_frontend_jobs_polling_uses_active_count():
-    script = Path("web/app.js").read_text(encoding="utf-8")
+    script = _frontend_script()
 
     assert "JOBS_ACTIVE_POLL_INTERVAL_MS" in script
     assert "state.jobsActive = Number(data.active_count || 0) > 0" in script
@@ -3505,8 +3526,11 @@ def test_frontend_jobs_polling_uses_active_count():
 
 
 def test_frontend_uses_etag_cache_lazy_panels_and_keyed_row_patching():
-    script = Path("web/app.js").read_text(encoding="utf-8")
-    startup = script[script.index("loadReviewerName();") :]
+    script = _frontend_script()
+    # "startup" means the entry file's init tail only -- module code must not
+    # leak into the eager-startup slice now that sources are concatenated.
+    entry = Path("web/app.js").read_text(encoding="utf-8")
+    startup = entry[entry.index("loadReviewerName();") :]
 
     assert "const getJsonCache = new Map();" in script
     assert 'headers.set("If-None-Match", cached.etag)' in script
@@ -3526,7 +3550,7 @@ def test_frontend_uses_etag_cache_lazy_panels_and_keyed_row_patching():
 
 
 def test_frontend_reduces_chat_render_churn():
-    script = Path("web/app.js").read_text(encoding="utf-8")
+    script = _frontend_script()
 
     assert "function scheduleChatScroll(force = false)" in script
     assert "window.requestAnimationFrame" in script
@@ -3547,10 +3571,10 @@ def test_root_injects_static_asset_cache_busting():
 
 def test_frontend_pdf_rows_show_interrupted_warning():
     markup = Path("web/index.html").read_text(encoding="utf-8")
-    script = Path("web/app.js").read_text(encoding="utf-8")
+    script = _frontend_script()
     styles = Path("web/styles.css").read_text(encoding="utf-8")
 
-    assert "<th>Action</th>" in markup
+    assert '<th scope="col">Action</th>' in markup
     assert "renderPdfInterruptedBadge" in script
     assert "job_interrupted" in script
     assert "pdf-warning-badge" in script
@@ -3560,7 +3584,7 @@ def test_frontend_pdf_rows_show_interrupted_warning():
 
 def test_frontend_includes_new_user_guide_and_walkthrough():
     markup = Path("web/index.html").read_text(encoding="utf-8")
-    script = Path("web/app.js").read_text(encoding="utf-8")
+    script = _frontend_script()
     styles = Path("web/styles.css").read_text(encoding="utf-8")
     refresh_pdfs = script[
         script.index("async function refreshPdfs(options = {})") : script.index("async function handlePdfAction")
@@ -3617,7 +3641,7 @@ def test_frontend_includes_new_user_guide_and_walkthrough():
 
 def test_frontend_pdf_trust_actions_record_reviewer_name():
     markup = Path("web/index.html").read_text(encoding="utf-8")
-    script = Path("web/app.js").read_text(encoding="utf-8")
+    script = _frontend_script()
     styles = Path("web/styles.css").read_text(encoding="utf-8")
 
     assert 'id="reviewerNameInput"' in markup
@@ -3674,7 +3698,7 @@ def test_frontend_pdf_trust_actions_record_reviewer_name():
 
 
 def test_frontend_delete_control_lives_in_documents_panel():
-    script = Path("web/app.js").read_text(encoding="utf-8")
+    script = _frontend_script()
 
     pdf_actions_block = re.search(
         r"function renderPdfActions\(item\) \{(?P<body>.*?)\n\}",
@@ -3704,7 +3728,7 @@ def test_chat_stream_endpoint_streams_and_tracks_query_count(monkeypatch):
         def __init__(self, **kwargs):
             events.append(("engine", kwargs))
 
-        def ask_stream_events(self, question):
+        def ask_stream_events(self, question, history=None):
             assert question == "alpha?"
             yield {"type": "thinking", "text": "checking "}
             yield {
@@ -4478,6 +4502,172 @@ def test_chunk_upload_accepts_hex_id_and_appends():
     part.parent.rmdir()
 
 
+def test_chunk_upload_enforces_per_file_size_cap(monkeypatch):
+    """The append is hard-capped against the REAL .part size, not the
+    client-declared total_size: a crafted client cannot stream past
+    max_upload_bytes one small chunk at a time."""
+    monkeypatch.setattr(
+        web_app, "UPLOADS_CONFIG", {**web_app.UPLOADS_CONFIG, "max_upload_bytes": 6}
+    )
+    client = TestClient(web_app.app)
+    upload_id = "c" * 32
+    ok = _chunk_post(client, upload_id=upload_id, body=b"1234", total_size="4")
+    assert ok.status_code == 200
+    over = _chunk_post(client, upload_id=upload_id, body=b"5678", offset="4", total_size="4")
+    assert over.status_code == 413
+    part = web_app.STAGING_DIR / upload_id / f"{upload_id}.part"
+    assert part.read_bytes() == b"1234"  # partial append rolled back
+    part.unlink(missing_ok=True)
+    part.parent.rmdir()
+
+
+def test_chunked_complete_rejects_oversized_part(monkeypatch):
+    """complete() re-checks the real .part size before copying: a .part that
+    is over the cap on disk (e.g. staged before the limit was tightened) is
+    refused instead of being queued."""
+    monkeypatch.setattr(
+        web_app, "UPLOADS_CONFIG", {**web_app.UPLOADS_CONFIG, "max_upload_bytes": 4}
+    )
+    client = TestClient(web_app.app)
+    upload_id = "d" * 32
+    part_dir = web_app.STAGING_DIR / upload_id
+    part_dir.mkdir(parents=True, exist_ok=True)
+    (part_dir / f"{upload_id}.part").write_bytes(b"12345678")
+    done = client.post(
+        "/api/uploads/complete",
+        json={"upload_id": upload_id, "filename": "doc.pdf"},
+    )
+    assert done.status_code == 413
+    part = part_dir / f"{upload_id}.part"
+    part.unlink(missing_ok=True)
+    part.parent.rmdir()
+
+
+def test_chunked_complete_requires_force_token(monkeypatch, workspace_tmp):
+    """Forcing a duplicate through /api/uploads/complete demands the same
+    signed, TTL-bound force token the multipart path issues with the 409."""
+    captured = {}
+
+    class FakeQueue:
+        def enqueue_upload(self, **kwargs):
+            captured.update(kwargs)
+            return web_app.QueueJob(
+                id=kwargs["job_id"],
+                kind="upload",
+                filenames=kwargs["filenames"],
+                uploads=kwargs["uploads"],
+                force_duplicate_hashes=kwargs["force_duplicate_hashes"],
+                staging_dir=str(kwargs["staging_dir"]),
+            )
+
+    monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", workspace_tmp / "processed")
+    monkeypatch.setattr(web_app, "DB_DIR", workspace_tmp / "db")
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+    monkeypatch.setattr(web_app, "_schedule_upload_auto_tag", lambda uploads: None)
+
+    content = b"%PDF-1.4 duplicate"
+    source_hash = hashlib.sha256(content).hexdigest()
+    client = TestClient(web_app.app)
+    first = client.post(
+        "/api/uploads",
+        data={"source_groups": "official"},
+        files=[("files", ("notes.pdf", content, "application/pdf"))],
+    )
+    assert first.status_code == 200
+
+    def stage_part(upload_id: str) -> None:
+        part_dir = web_app.STAGING_DIR / upload_id
+        part_dir.mkdir(parents=True, exist_ok=True)
+        (part_dir / f"{upload_id}.part").write_bytes(content)
+
+    # A bare force_duplicates boolean must NOT queue the duplicate.
+    upload_id = "e" * 32
+    stage_part(upload_id)
+    bare = client.post(
+        "/api/uploads/complete",
+        json={"upload_id": upload_id, "filename": "copy.pdf", "force_duplicates": "true"},
+    )
+    assert bare.status_code == 409
+    token = bare.json()["detail"]["force_token"]
+    assert token  # the 409 still issues a token the client can retry with
+
+    # The retry carries the token (the real client re-uploads chunks to a
+    # fresh upload_id after the 409 consumed the first .part).
+    retry_id = "f" * 32
+    stage_part(retry_id)
+    forced = client.post(
+        "/api/uploads/complete",
+        json={
+            "upload_id": retry_id,
+            "filename": "copy.pdf",
+            "force_duplicates": "true",
+            "force_token": token,
+        },
+    )
+    assert forced.status_code == 200, forced.text
+    assert captured["force_duplicate_hashes"] == [source_hash]
+
+
+def test_chunked_complete_applies_source_group(monkeypatch, workspace_tmp):
+    """A source group chosen on the chunked path must land in the trust
+    registry (the only source the Library listing reads), not just in the
+    registry options."""
+    captured = {}
+
+    class FakeQueue:
+        def enqueue_upload(self, **kwargs):
+            captured.update(kwargs)
+            return web_app.QueueJob(
+                id=kwargs["job_id"],
+                kind="upload",
+                filenames=kwargs["filenames"],
+                uploads=kwargs["uploads"],
+                staging_dir=str(kwargs["staging_dir"]),
+            )
+
+    monkeypatch.setattr(web_app, "STAGING_DIR", workspace_tmp / "staging")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+    monkeypatch.setattr(web_app, "job_queue", FakeQueue())
+    monkeypatch.setattr(web_app, "_schedule_upload_auto_tag", lambda uploads: None)
+
+    content = b"%PDF-1.4 grouped"
+    source_hash = hashlib.sha256(content).hexdigest()
+    client = TestClient(web_app.app)
+    upload_id = "1" * 32
+    part_dir = web_app.STAGING_DIR / upload_id
+    part_dir.mkdir(parents=True)
+    (part_dir / f"{upload_id}.part").write_bytes(content)
+    response = client.post(
+        "/api/uploads/complete",
+        json={"upload_id": upload_id, "filename": "grouped.pdf", "source_groups": "official"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured["uploads"][0]["source_group"] == "official"
+    trust = json.loads((workspace_tmp / "trust.json").read_text())
+    assert trust["documents"][source_hash]["source_group"] == "official"
+
+
+def test_page_slice_all_page_sizes_honor_max_page_size():
+    """limit<=0 (the UI's All mode) resolves to each endpoint's MAX_PAGE_SIZE
+    before hitting _page_slice; the slice must keep that ceiling instead of
+    clamping everything to its generic 100-row default."""
+    rows = [{"id": str(i)} for i in range(300)]
+
+    assert web_app._page_slice(rows, offset=0, limit=500, cap=500)["limit"] == 500
+    assert web_app._page_slice(rows, offset=0, limit=2000, cap=2000)["limit"] == 2000
+    assert web_app._page_slice(rows, offset=0, limit=500)["limit"] == 100  # default cap
+    # End-to-end through the jobs listing envelope (empty queue is fine: the
+    # resolved limit is what regressed).
+    assert web_app.list_job_rows(offset=0, limit=web_app.JOBS_MAX_PAGE_SIZE)["limit"] == (
+        web_app.JOBS_MAX_PAGE_SIZE
+    )
+
+
 def test_health_redacts_master_token(monkeypatch, safe_tmp_path):
     """/api/health is an open GET; it must never echo the master token."""
     monkeypatch.setattr(
@@ -4611,3 +4801,362 @@ def test_tracked_job_ledger_lifecycle(workspace_tmp):
     finally:
         with queue._condition:
             queue._jobs.pop("ledger-cancel-test", None)
+
+
+def test_pdf_documents_endpoint_sorts_by_column(monkeypatch, workspace_tmp):
+    """sort=filename/-filename/-updated reorders rows; default keeps ungrouped first."""
+    registry_path = workspace_tmp / "registry.json"
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    trust_path = workspace_tmp / "trust.json"
+    web_app.PdfRegistry(registry_path).register_queued(
+        job_id="job",
+        files=[
+            {"filename": "Beta.pdf", "hash": "hash-b", "staging_path": ""},
+            {"filename": "alpha.pdf", "hash": "hash-a", "staging_path": ""},
+        ],
+    )
+    web_app._write_trust_registry(
+        {"documents": {"hash-a": {"source_group": "official"}}},
+        trust_path,
+    )
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", registry_path)
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", trust_path)
+    monkeypatch.setattr(web_app, "DB_DIR", workspace_tmp / "db")
+
+    client = TestClient(web_app.app)
+    default_order = client.get("/api/pdfs").json()
+    # Default: ungrouped (Beta) first.
+    assert [pdf["hash"] for pdf in default_order["pdfs"]] == ["hash-b", "hash-a"]
+
+    by_name = client.get("/api/pdfs", params={"sort": "filename"}).json()
+    assert [pdf["hash"] for pdf in by_name["pdfs"]] == ["hash-a", "hash-b"]
+
+    by_name_desc = client.get("/api/pdfs", params={"sort": "-filename"}).json()
+    assert [pdf["hash"] for pdf in by_name_desc["pdfs"]] == ["hash-b", "hash-a"]
+
+    # Ascending group order is the useful direction: official < ungrouped.
+    by_group = client.get("/api/pdfs", params={"sort": "group"}).json()
+    assert [pdf["hash"] for pdf in by_group["pdfs"]] == ["hash-a", "hash-b"]
+
+
+# ---------------------------------------------------------------------------
+# Corpus-root allow-list, Markdown preview, disk/history/security surfaces.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_pdf_path_accepts_configured_corpus_roots(monkeypatch, workspace_tmp):
+    """A source PDF outside data_dir is servable when its root is configured."""
+    from src import config as config_module
+
+    import tempfile
+
+    # Roots under the repo are always allowed (ROOT_DIR), so the probe files
+    # must live in the system temp dir to prove containment actually blocks.
+    corpus_root = Path(tempfile.gettempdir()) / f"rag_eval_corpus_{uuid.uuid4().hex}"
+    source_pdf = corpus_root / "batch" / "report.pdf"
+    source_pdf.parent.mkdir(parents=True)
+    source_pdf.write_bytes(b"%PDF-1.4 test")
+
+    outside_root = Path(tempfile.gettempdir()) / f"rag_eval_outside_{uuid.uuid4().hex}"
+    outside = outside_root / "secret.pdf"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"%PDF-1.4 secret")
+
+    monkeypatch.setattr(web_app, "DATA_DIR", workspace_tmp / "data")
+    monkeypatch.setattr(
+        config_module,
+        "_CONFIG_CACHE",
+        {},
+    )
+    real_load = config_module.load_config
+
+    class FakePaths:
+        corpus_roots = [str(corpus_root)]
+
+    class FakeCfg:
+        paths = FakePaths()
+
+    monkeypatch.setattr(web_app, "_default_config_path", lambda: Path("config.toml"))
+    monkeypatch.setattr(config_module, "load_config", lambda path=None: FakeCfg())
+    # _resolve_pdf_path imports load_config from src.config at call time.
+    monkeypatch.setattr(
+        web_app,
+        "_allowed_corpus_roots",
+        lambda: [web_app.DATA_DIR.resolve(), web_app.ROOT_DIR.resolve(), corpus_root.resolve()],
+    )
+
+    assert web_app._resolve_pdf_path(str(source_pdf)).resolve() == source_pdf.resolve()
+    with pytest.raises(PermissionError):
+        web_app._resolve_pdf_path(str(outside))
+
+
+def test_pdf_markdown_endpoint_serves_processed_text(monkeypatch, safe_tmp_path):
+    """GET /api/pdfs/{hash}/markdown returns the processed Markdown content."""
+    md_file = Path(safe_tmp_path) / "doc.md"
+    md_file.write_text("# Processed title\n\nBody text.", encoding="utf-8")
+
+    monkeypatch.setattr(
+        web_app,
+        "_pdf_row_for_hash",
+        lambda source_hash: {
+            "hash": "hash-md",
+            "filename": "doc.pdf",
+            "processed_markdown_path": str(md_file),
+        },
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_resolve_markdown_path",
+        lambda raw_path, **kwargs: md_file,
+    )
+
+    client = TestClient(web_app.app)
+    response = client.get("/api/pdfs/hash-md/markdown")
+    assert response.status_code == 200
+    assert response.json()["markdown"].startswith("# Processed title")
+
+    monkeypatch.setattr(
+        web_app,
+        "_pdf_row_for_hash",
+        lambda source_hash: None,
+    )
+    missing = client.get("/api/pdfs/unknown-hash/markdown")
+    assert missing.status_code == 404
+
+
+def test_metrics_includes_disk_and_history(monkeypatch, workspace_tmp):
+    """/api/metrics carries disk volumes; history samples accumulate."""
+    from collections import deque
+
+    class StubStore:
+        def exists(self):
+            return True
+
+        def count(self):
+            return 7
+
+        def _on_disk_bytes(self):
+            return 1024
+
+        def table_version_hint_path(self):
+            return Path("/tmp/nonexistent_hint")
+
+    monkeypatch.setattr(web_app, "_index_store", lambda *a, **k: StubStore())
+
+    class StubQueue:
+        def summary(self):
+            return {"queued_count": 0, "active_job_count": 0, "active_query_count": 0}
+
+        def state_version(self):
+            return 1
+
+    monkeypatch.setattr(web_app, "job_queue", StubQueue())
+    monkeypatch.setattr(web_app, "_load_index_manifest", lambda *a, **k: {})
+    monkeypatch.setattr(web_app, "_ollama_status_snapshot", lambda: {"reachable": False})
+
+    web_app._METRICS_HISTORY.clear()
+    web_app._sample_metrics_once()
+    web_app._sample_metrics_once()
+
+    assert len(web_app._METRICS_HISTORY) == 2
+    sample = web_app._METRICS_HISTORY[0]
+    assert set(sample) >= {"at", "records", "queued", "active"}
+
+    client = TestClient(web_app.app)
+    response = client.get("/api/metrics")
+    assert response.status_code == 200
+    body = response.json()
+    assert isinstance(body.get("disk"), list)
+    for volume in body["disk"]:
+        assert {"label", "free_bytes", "total_bytes"} <= set(volume)
+
+    history = client.get("/api/metrics/history")
+    assert history.status_code == 200
+    assert len(history.json()["samples"]) == 2
+
+
+def test_health_reports_security_and_startup_notices(monkeypatch):
+    """/api/health exposes auth/bind posture and any startup repair notices."""
+    monkeypatch.setattr(web_app, "_API_TOKEN", "")
+    monkeypatch.setattr(web_app, "api_authenticator", None)
+    monkeypatch.setattr(web_app, "_STARTUP_NOTICES", ["Interrupted index swap recovered from x"])
+
+    class StubStore:
+        def exists(self):
+            return False
+
+        def count(self):
+            return 0
+
+        def table_version_hint_path(self):
+            return Path("/tmp/nonexistent_hint")
+
+    monkeypatch.setattr(web_app, "_index_store", lambda *a, **k: StubStore())
+
+    class StubQueue:
+        def summary(self):
+            return {"queued_count": 0, "active_job_count": 0, "active_query_count": 0}
+
+    monkeypatch.setattr(web_app, "job_queue", StubQueue())
+    monkeypatch.setattr(web_app, "_llm_status_snapshot", lambda: {})
+    monkeypatch.setitem(web_app.SERVER_CONFIG, "bind_all", False)
+    monkeypatch.setitem(web_app.SERVER_CONFIG, "host", "127.0.0.1")
+
+    response = TestClient(web_app.app).get("/api/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["security"] == {"auth_enabled": False, "bind_all": False}
+    assert body["startup_notices"] == ["Interrupted index swap recovered from x"]
+
+
+# ---------------------------------------------------------------------------
+# Conversation history, review-status weighting, document records endpoint.
+# ---------------------------------------------------------------------------
+
+
+def test_chat_request_accepts_and_bounds_history():
+    """ChatTurn validation + endpoint sanitization (roles, size, cap)."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        web_app.ChatTurn(role="system", content="nope")
+    with pytest.raises(ValidationError):
+        web_app.ChatTurn(role="user", content="")
+
+    turns = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"turn {index}"}
+        for index in range(30)
+    ]
+    payload = web_app.ChatRequest(question="q", history=turns)
+    sanitized = web_app._sanitize_chat_history(payload.history)
+    assert len(sanitized) == web_app.MAX_CHAT_HISTORY_TURNS
+    assert sanitized[-1]["content"] == "turn 29"
+
+
+def test_chat_stream_passes_history_to_engine(monkeypatch):
+    """chat_stream forwards sanitized history into ask_stream_events."""
+    captured: dict = {}
+
+    class StubEngine:
+        def __init__(self, **kwargs):
+            captured["init_kwargs"] = kwargs
+
+        def ask_stream_events(self, question, history=None):
+            captured["question"] = question
+            captured["history"] = history
+            yield {"type": "answer", "text": "ok"}
+
+    class StubQueue:
+        def begin_query(self):
+            pass
+
+        def finish_query(self):
+            pass
+
+    monkeypatch.setattr(web_app, "job_queue", StubQueue())
+    import src.query as query_module
+
+    real_query_engine = query_module.QueryEngine
+    monkeypatch.setattr(query_module, "QueryEngine", StubEngine)
+    # chat_stream imports QueryEngine from src.query inside generate(); patch
+    # the attribute on the module the function reads.
+    monkeypatch.setattr("src.query.QueryEngine", StubEngine)
+    monkeypatch.setattr(web_app, "_resolve_chat_categories", lambda keys: [{"db_dir": "x", "label": "general"}])
+
+    from fastapi.testclient import TestClient
+
+    # Plain client (no context manager): entering the lifespan would trip the
+    # single-instance data lock while the developer's server is running.
+    client = TestClient(web_app.app)
+    with client.stream(
+        "POST",
+        "/api/chat/stream",
+        json={
+            "question": "what about the rear wing?",
+            "history": [
+                {"role": "user", "content": "How does downforce work?"},
+                {"role": "assistant", "content": "Downforce presses the car into the road."},
+            ],
+        },
+    ) as response:
+        assert response.status_code == 200
+        body = "".join(response.iter_text())
+    assert "Downforce presses" in str(captured.get("history"))
+    assert captured["question"] == "what about the rear wing?"
+
+
+def test_review_status_affects_group_map_weight(safe_tmp_path):
+    """load_source_group_map folds review status into the effective weight."""
+    from src.reliability import load_source_group_map
+
+    trust_path = Path(safe_tmp_path) / ".document_trust.json"
+    trust_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "documents": {
+                    "hash-approved": {"source_group": "official", "review_status": "approved"},
+                    "hash-stale": {"source_group": "official", "review_status": "stale"},
+                    "hash-unreviewed": {"source_group": "official"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    groups = load_source_group_map(trust_path)
+    approved = groups["hash-approved"]
+    stale = groups["hash-stale"]
+    unreviewed = groups["hash-unreviewed"]
+
+    assert approved["review_status"] == "approved"
+    assert approved["weight"] == pytest.approx(1.0)
+    assert stale["review_status"] == "stale"
+    # official(1.0) * stale(0.6)
+    assert stale["weight"] == pytest.approx(0.6)
+    assert unreviewed["weight"] == pytest.approx(0.95)
+    # The ranking invariant: stale official now ranks below approved official.
+    assert stale["weight"] < unreviewed["weight"] < approved["weight"]
+
+
+def test_document_records_endpoint_returns_sorted_rows(monkeypatch, lancedb_tmp):
+    """/api/index/document_records scopes to one hash, sorted, paginated."""
+    db_dir = lancedb_tmp / "db"
+    records = []
+    for index in range(5):
+        records.append(
+            {
+                "id": f"doc:{index}",
+                "doc_id": "doc",
+                "parent_id": "",
+                "node_type": "chunk",
+                "file_path": "doc.pdf",
+                "chunk_index": index,
+                "content": f"chunk number {index}",
+                "title": "Doc",
+                "section_path": "Doc",
+                "page_start": 1,
+                "page_end": 1,
+                "summary": "summary",
+                "tags": [],
+                "source_hash": "hash-doc",
+                "vector": [1.0, 0.0, 0.0],
+            }
+        )
+    # Also a record from a different document that must NOT appear.
+    records.append({**records[0], "id": "other:0", "doc_id": "other", "source_hash": "hash-other", "content": "other doc"})
+    LanceDBVectorStore(db_dir).write_records(records, embedding_model="fake-embed", embedding_dim=3)
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+
+    client = TestClient(web_app.app)
+    response = client.get(
+        "/api/index/document_records",
+        params={"source_hash": "hash-doc", "offset": 1, "limit": 2},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 5
+    assert len(payload["rows"]) == 2
+    assert payload["rows"][0]["content"] == "chunk number 1"
+    assert all(row["source_hash"] == "hash-doc" for row in payload["rows"])

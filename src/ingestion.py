@@ -38,9 +38,15 @@ from src.atomic_io import write_json_atomic, write_text_atomic
 from src.coerce import as_bool, as_optional_int
 from src.console import status as _progress_status
 from src.console import iter_with_progress as _iter_with_progress
-from src.job_logging import RunTimer, log_event, write_run_summary
+from src.job_logging import RunTimer, log_event
 
 INGEST_RESULT_FILENAME = ".ingest_result.json"
+
+# Hard limit per PDF in the parallel pool, enforced by the completion wait in
+# _run_parallel_ingestion. The previous future.result(timeout=1800) sat AFTER
+# as_completed, which only yields already-settled futures -- so the timeout
+# never fired and one hung OCR/Docling worker wedged the whole job forever.
+PER_FILE_TIMEOUT_SECONDS = 1800.0
 
 _CLASS_MODULE_PROXY_FUNCTIONS = (
     "_usable_vision_description",
@@ -178,10 +184,12 @@ VISION_IMAGE_MAX_EDGE = 1568
 
 
 def _png_bytes_for_vision(image, fallback_bytes: bytes | None = None) -> bytes:
-    """Encode a PIL image to PNG, downscaling to ``VISION_IMAGE_MAX_EDGE`` on the
-    long edge. Returns ``fallback_bytes`` unchanged when ``image`` is not a real
-    PIL image (e.g. a test double), so callers can always pass the original
-    encoded bytes as a safe fallback. The caller owns ``image``."""
+    """Encode a PIL image to JPEG, downscaling to ``VISION_IMAGE_MAX_EDGE`` on the
+    long edge. (Named for the historical PNG encode; the vision payload is JPEG
+    now — ``soclaas_vision`` labels it ``image/jpeg``.) Returns ``fallback_bytes``
+    unchanged when ``image`` is not a real PIL image (e.g. a test double), so
+    callers can always pass the original encoded bytes as a safe fallback. The
+    caller owns ``image``."""
     from PIL import Image
 
     if not hasattr(image, "size") or not callable(getattr(image, "resize", None)):
@@ -529,6 +537,13 @@ def _ingest_one_pdf(
             return {"file": file_name, "status": "skipped", "hash": source_hash}
 
         processor = _get_or_build_processor(options, progress_enabled=progress_enabled)
+        # Removed BEFORE the parse, deliberately: asset ids are deterministic
+        # (source/page/image-sha), so a changed PDF re-registers fresh ids and
+        # the pre-clean drops exactly the previous generation. Removing after
+        # the parse would also delete the entries the parse just re-added.
+        # Trade-off: if the parse FAILS, the existing markdown's asset markers
+        # point at removed files until a successful re-ingest repopulates them
+        # (a store-level snapshot/restore would be needed to avoid this).
         ImageAssetStore(options.get("asset_dir", DEFAULT_ASSET_DIR)).remove_source_assets(source_hash)
         processor.set_source_context(source_hash=source_hash, source_pdf_name=file_name)
         md_content = processor.process_pdf(str(input_path))
@@ -623,7 +638,10 @@ def _run_serial_ingestion(
                 f"Failed to ingest {result['file']}: {result.get('error')}. Continuing.",
                 enabled=progress_enabled,
             )
-            logger.exception("Ingestion failed for %s", result["file"])
+            # logger.exception would append a bogus "NoneType: None" traceback
+            # here: there is no active exception in this path (the real detail
+            # is the error string the worker returned).
+            logger.error("Ingestion failed for %s: %s", result["file"], result.get("error", ""))
             log_event("file_ingest_failed", file=result["file"], error=result.get("error", ""))
         done_in_batch += 1
         _emit(done_in_batch)
@@ -659,35 +677,63 @@ def _run_parallel_ingestion(
     total = total_files if total_files is not None else len(pending)
     ingest_timer = RunTimer()
     try:
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(
-                    _ingest_one_pdf,
-                    str(input_path),
-                    output_dir,
-                    options,
-                    progress_enabled=progress_enabled,
-                ): input_path
-                for input_path in pending
-            }
-            completed = 0
-            total_futures = len(futures)
-            # Drain in COMPLETION order (as_completed), not submission order:
-            # blocking on the first-submitted future meant one hung PDF delayed
-            # surfacing (and per-file failure isolation of) every already-
-            # finished document behind it. as_completed yields each future the
-            # moment it settles, so progress and results stay live.
-            for future in _iter_with_progress(
-                as_completed(futures),
-                enabled=progress_enabled,
-                total=total_futures,
-                desc="Ingest documents",
-                unit="doc",
-            ):
+        executor = ProcessPoolExecutor(max_workers=workers)
+        futures = {
+            executor.submit(
+                _ingest_one_pdf,
+                str(input_path),
+                output_dir,
+                options,
+                progress_enabled=progress_enabled,
+            ): input_path
+            for input_path in pending
+        }
+        completed = 0
+        total_futures = len(futures)
+        # Drain in completion order: blocking on the first-submitted future
+        # meant one slow PDF delayed surfacing every already-finished document
+        # behind it. wait(FIRST_COMPLETED) yields each future the moment it
+        # settles AND enforces the per-file deadline across the batch.
+        from concurrent.futures import FIRST_COMPLETED, wait as cf_wait
+
+        outstanding = set(futures)
+        while outstanding:
+            done, outstanding = cf_wait(
+                outstanding,
+                timeout=PER_FILE_TIMEOUT_SECONDS,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                # No worker made progress within the per-file limit: mark the
+                # still-running files failed instead of blocking forever.
+                # Terminate the wedged worker PROCESSES too: cancel_futures
+                # only drops queued work, so without this the wedged OCR/
+                # Docling worker keeps holding models/GPU for the life of the
+                # process and can re-wedge the job at interpreter exit (the
+                # pool's atexit join waits on its workers).
+                for proc in list(getattr(executor, "_processes", {}).values()):
+                    try:
+                        proc.terminate()
+                    except Exception:  # noqa: BLE001 - best-effort cleanup
+                        pass
+                for stale in outstanding:
+                    file_name = futures[stale].name
+                    message = (
+                        f"Exceeded the {PER_FILE_TIMEOUT_SECONDS:.0f}s per-file "
+                        "ingestion limit (worker appears hung)."
+                    )
+                    failed.append({"file": file_name, "hash": "", "error": message})
+                    _progress_status(
+                        f"Failed to ingest {file_name}: {message}",
+                        enabled=progress_enabled,
+                    )
+                    log_event("file_ingest_failed", file=file_name, error=message)
+                break
+            for future in done:
                 completed += 1
                 input_path = futures[future]
                 try:
-                    result = future.result(timeout=1800)  # 30 min hard limit per PDF
+                    result = future.result()
                 except Exception as exc:  # noqa: BLE001 - worker-level isolation
                     file_name = input_path.name
                     failed.append({"file": file_name, "hash": "", "error": str(exc)})
@@ -722,6 +768,10 @@ def _run_parallel_ingestion(
                     unit="files",
                     rate_per_min=completed / elapsed_min,
                 )
+        # Do NOT wait on shutdown: on the timeout path a wedged worker process
+        # would block the context-manager exit forever. Queued-but-unstarted
+        # futures are cancelled; the job completes with partial results.
+        executor.shutdown(wait=False, cancel_futures=True)
     except Exception as exc:
         # If the pool itself cannot start (e.g. pickling failure on Windows),
         # fall back to serial so ingestion still completes.
@@ -911,14 +961,9 @@ def run_ingestion(
 
     elapsed = timer.elapsed()
     result_path = Path(output_dir) / INGEST_RESULT_FILENAME
-    write_run_summary(
-        result_path,
-        phase="ingest",
-        files_processed=len(processed) + len(skipped),
-        files_failed=len(failed),
-        elapsed_s=elapsed,
-        errors=failed or None,
-    )
+    # NOTE: write_run_summary here would be dead — the very next write
+    # replaces the file, and the job-queue reader (_summarize_ingest_result)
+    # only understands the processed/skipped/failed shape below.
     # Persist the structured per-run result so the job queue can surface a
     # processed/failed/skipped breakdown in the job log without coupling the
     # subprocess to the server-side registry.

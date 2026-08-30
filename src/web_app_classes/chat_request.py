@@ -12,8 +12,18 @@ bind_module_namespace(
 )
 
 
+class ChatTurn(BaseModel):
+    # One prior conversation turn. The endpoint sanitizes the list (roles,
+    # length, per-turn size) before the engine sees it.
+    role: str = Field(pattern="^(user|assistant)$")
+    content: str = Field(min_length=1, max_length=4000)
+
+
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1)
+    # Recent conversation turns (oldest first) so follow-up questions resolve
+    # context. Bounded: the endpoint keeps at most the last 12 turns.
+    history: list[ChatTurn] = Field(default_factory=list)
     # Category selection ("split databases"): keys of the categories to search.
     # Empty list = all categories. "general" is the default index; unknown keys
     # are rejected by the endpoint before engine construction.
@@ -24,8 +34,11 @@ class ChatRequest(BaseModel):
     embedding_timeout: float | None = Field(DEFAULT_EMBEDDING_TIMEOUT, gt=0)
     temperature: float | None = Field(DEFAULT_TEMPERATURE, ge=0, le=5)
     max_k: int | None = Field(DEFAULT_MAX_K, ge=1, le=500)
-    context_window: int | None = Field(CHAT_CONFIG["context_window"], ge=512)
-    llm_num_predict: int | None = Field(CHAT_CONFIG["llm_num_predict"], ge=1)
+    # Upper bounds: num_ctx is allocated up-front as KV cache by a local
+    # backend, so an unbounded client value can OOM the shared model for every
+    # other user.
+    context_window: int | None = Field(CHAT_CONFIG["context_window"], ge=512, le=1_048_576)
+    llm_num_predict: int | None = Field(CHAT_CONFIG["llm_num_predict"], ge=1, le=131_072)
     llm_timeout: float | None = Field(CHAT_CONFIG["llm_timeout"], gt=0)
     web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED
     retrieval_candidate_k: int | None = Field(DEFAULT_RETRIEVAL_CANDIDATE_K, ge=1)

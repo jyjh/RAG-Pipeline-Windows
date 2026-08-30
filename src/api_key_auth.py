@@ -106,12 +106,21 @@ def hash_key(full_key: str) -> str:
     return hashlib.sha256(full_key.encode("utf-8")).hexdigest()
 
 
-def make_prefix(full_key: str) -> str:
-    """Return a display-only prefix ``<head>…<last4>`` for listings/logs."""
-    secret = full_key
+def make_prefix(full_key: str, *, prefix: str = DEFAULT_KEY_PREFIX) -> str:
+    """Return a display-only prefix ``<key-prefix-head>…<last4>``.
+
+    Only the caller-known head (e.g. ``rag_``) and the last four secret
+    characters are shown. The middle of the secret is NEVER stored, listed,
+    or logged -- the store must not contain anything a reader could turn
+    back into the full key.
+    """
+    secret = str(full_key or "")
     if len(secret) < 8:
         return secret
-    return f"{secret[: len(secret) - 4]}…{secret[-4:]}"
+    head = str(prefix or "")
+    if not head or not secret.startswith(head):
+        head = secret[:4]
+    return f"{head}…{secret[-4:]}"
 
 
 def _parse_expires(raw: str | None) -> str | None:
@@ -192,26 +201,47 @@ class KeyStore:
         self.path = Path(path)
         self._lock = threading.Lock()
         self._cache: tuple[tuple[int, int], dict[str, Any]] | None = None
+        # True when the store FILE exists but could not be read/parsed. Auth
+        # must fail CLOSED in that state: treating an unreadable store as
+        # empty would silently disable authentication for every request.
+        self._unreadable = False
 
     # -- locking -----------------------------------------------------------
     @contextlib.contextmanager
     def _lock_for(self) -> Iterator[None]:
-        """Hold the in-process lock and a best-effort cross-process lock."""
+        """Hold the in-process lock and a best-effort cross-process lock.
+
+        Only the cross-process ACQUIRE may fail soft (falling back to the
+        in-process lock alone). A failure raised by the wrapped body -- e.g.
+        a disk-full OSError from ``_save_raw`` -- must propagate unchanged;
+        swallowing it here would yield twice from this generator and surface
+        as a contextlib RuntimeError instead of the real error.
+        """
         with self._lock:
-            try:
-                with acquire_registry_lock(self.path.parent, timeout=30.0):
-                    yield
-            except (TimeoutError, OSError):
-                # Fall back to the in-process lock alone rather than failing the
-                # mutation (matches pdf_registry._registry_lock_for behavior).
+            with contextlib.ExitStack() as stack:
+                try:
+                    stack.enter_context(
+                        acquire_registry_lock(self.path.parent, timeout=30.0)
+                    )
+                except (TimeoutError, OSError):
+                    # Fall back to the in-process lock alone rather than
+                    # failing the mutation (matches
+                    # pdf_registry._registry_lock_for behavior).
+                    pass
                 yield
 
     # -- low-level io ------------------------------------------------------
     def _load_raw(self) -> dict[str, Any]:
         try:
             stat = self.path.stat()
+        except FileNotFoundError:
+            # A missing store is a legitimate fresh deployment: empty and open.
+            self._cache = None
+            self._unreadable = False
+            return self._empty()
         except OSError:
             self._cache = None
+            self._unreadable = True
             return self._empty()
         signature = (stat.st_mtime_ns, stat.st_size)
         if self._cache is not None and self._cache[0] == signature:
@@ -220,12 +250,17 @@ class KeyStore:
             payload = json_loads_dict(self.path)
         except (OSError, ValueError):
             # A torn write should be impossible (writes are atomic), so a parse
-            # error here is real corruption -- surface an empty store rather
-            # than crashing the server. The next write will overwrite it.
+            # error here means the file is temporarily unreadable (e.g. an
+            # antivirus lock on Windows) or truly corrupt. Fail CLOSED: report
+            # an empty payload but keep ``_unreadable`` set so ``has_any_key``
+            # still reports keys exist and gating stays on, instead of silently
+            # disabling authentication. The next successful write clears it.
             self._cache = None
+            self._unreadable = True
             return self._empty()
         normalized = self._normalize(payload)
         self._cache = (signature, normalized)
+        self._unreadable = False
         return normalized
 
     @staticmethod
@@ -270,7 +305,15 @@ class KeyStore:
             return self._load_raw()
 
     def has_any_key(self) -> bool:
-        """True if the store contains at least one key record (any status)."""
+        """True if the store contains at least one key record (any status).
+
+        Also True when the store file exists but cannot currently be read
+        (locked, corrupt): callers gate authentication on this, so an unreadable
+        store must look "keys exist" (fail closed) rather than "no keys"
+        (which would disable auth entirely).
+        """
+        if self._unreadable:
+            return True
         return bool(self.load().get("keys"))
 
     def get_by_hash(self, key_hash: str) -> dict[str, Any] | None:
@@ -344,6 +387,27 @@ class KeyStore:
             self._save_raw(payload)
             return True
 
+    def rotate_stored(self, key_hash: str, build_stored) -> str | None:
+        """Replace ``key_hash`` in one locked write, deriving the new record
+        inside the lock via ``build_stored(record) -> (new_hash, stored)``.
+
+        Reading the existing record inside the same lock as the write means a
+        concurrent ``update``/``set_role`` cannot be silently reverted by a
+        stale read (the rotate always sees the latest record).
+        Returns the new hash, or ``None`` if ``key_hash`` was not found.
+        """
+        with self._lock_for():
+            payload = self._load_raw()
+            keys = payload["keys"]
+            record = keys.get(key_hash)
+            if record is None:
+                return None
+            new_hash, stored = build_stored(record)
+            del keys[key_hash]
+            keys[new_hash] = stored
+            self._save_raw(payload)
+            return new_hash
+
     def merge_usage(self, deltas: dict[str, dict[str, Any]]) -> None:
         """Apply accumulated usage deltas (``requests``/``last_used_*``)."""
         if not deltas:
@@ -365,6 +429,40 @@ class KeyStore:
                 changed = True
             if changed:
                 self._save_raw(payload)
+
+    def repair_leaked_prefixes(self) -> int:
+        """Rewrite legacy prefixes that embedded the whole secret.
+
+        An earlier ``make_prefix`` stored ``<secret[:-4]>…<secret[-4:]>``,
+        which contained the full key (the ellipsis hid nothing). Removing the
+        ellipsis from such a value reproduces the key, and the record's
+        sha256 id lets us VERIFY that reconstruction before rewriting -- a
+        candidate that does not hash to the record's id is left untouched.
+        Returns the number of records repaired.
+        """
+        repaired = 0
+        with self._lock_for():
+            payload = self._load_raw()
+            keys = payload.get("keys", {})
+            for key_hash, record in keys.items():
+                if not isinstance(record, dict):
+                    continue
+                display = str(record.get("prefix") or "")
+                if "…" not in display:
+                    continue
+                candidate = display.replace("…", "")
+                # A genuine display prefix only ever held the ``rag_`` head;
+                # anything longer than head+4 chars may have been the
+                # leaked-secret form and is worth checking.
+                if len(candidate) <= len(DEFAULT_KEY_PREFIX) + 4:
+                    continue
+                if hash_key(candidate) != key_hash:
+                    continue
+                record["prefix"] = make_prefix(candidate)
+                repaired += 1
+            if repaired:
+                self._save_raw(payload)
+        return repaired
 
 
 def json_loads_dict(path: Path) -> dict[str, Any]:
@@ -456,13 +554,31 @@ class UsageTracker:
             self.flush()
 
     def flush(self) -> None:
-        """Persist and clear all pending deltas. Safe to call from any thread."""
+        """Persist and clear all pending deltas. Safe to call from any thread.
+
+        If the store write fails (disk full, transient lock timeout), the
+        deltas are merged back into ``_pending`` so the usage they represent is
+        retried on the next flush instead of being silently lost.
+        """
         with self._lock:
             if not self._pending:
                 return
             deltas = self._pending
             self._pending = {}
-        self._store.merge_usage(deltas)
+        try:
+            self._store.merge_usage(deltas)
+        except OSError:
+            with self._lock:
+                for identity, entry in deltas.items():
+                    pending = self._pending.setdefault(
+                        identity,
+                        {"requests": 0, "last_used_at": None, "last_used_ip": None},
+                    )
+                    pending["requests"] += int(entry.get("requests", 0))
+                    if entry.get("last_used_at"):
+                        pending["last_used_at"] = entry["last_used_at"]
+                    if entry.get("last_used_ip"):
+                        pending["last_used_ip"] = entry["last_used_ip"]
 
 
 # ---------------------------------------------------------------------------
@@ -523,8 +639,14 @@ class ApiKeyAuthenticator:
 
         supplied_str = (supplied or "").strip()
 
-        # Master bypass.
-        if master_active and supplied_str and hmac.compare_digest(supplied_str, master_token):
+        # Master bypass. compare_digest on str inputs requires ASCII-only text
+        # and raises TypeError otherwise (a non-ASCII credential must yield a
+        # clean rejection, not a 500), so compare encoded bytes instead.
+        if (
+            master_active
+            and supplied_str
+            and hmac.compare_digest(supplied_str.encode("utf-8"), master_token.encode("utf-8"))
+        ):
             result = AuthResult(
                 key_id=MASTER_KEY_ID,
                 role=ROLE_ADMIN,
@@ -596,7 +718,7 @@ class ApiKeyAuthenticator:
         key_hash = hash_key(full_key)
         stored = {
             "label": str(label or "").strip(),
-            "prefix": make_prefix(full_key),
+            "prefix": make_prefix(full_key, prefix=prefix),
             "status": STATUS_ACTIVE,
             "role": role,
             "created_at": _utcnow_iso(),
@@ -613,29 +735,35 @@ class ApiKeyAuthenticator:
 
         Preserves label/role/expiry/rate-limit; resets usage and bumps
         ``created_at`` + ``prefix``. The old secret stops working in the SAME
-        single locked write (``KeyStore.replace_key``), so a crash mid-rotate
-        cannot leave the old (possibly compromised) secret active (fail-open) as
-        a separate create-then-delete would. Returns ``(full_key_plaintext,
-        record)`` or ``None`` if ``key_hash`` is not found.
+        single locked write (``KeyStore.rotate_stored``), and the record the
+        new secret is derived from is read inside that same lock, so a
+        concurrent ``update``/``set_role`` cannot be silently reverted and a
+        crash mid-rotate cannot leave the old (possibly compromised) secret
+        active. Returns ``(full_key_plaintext, record)`` or ``None`` if
+        ``key_hash`` is not found.
         """
-        record = self.store.get_by_hash(key_hash)
-        if record is None:
+        generated: list[tuple[str, dict[str, Any]]] = []
+
+        def _build(record: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+            full_key = generate_full_key(prefix=prefix)
+            new_hash = hash_key(full_key)
+            stored = {
+                "label": str(record.get("label", "")),
+                "prefix": make_prefix(full_key, prefix=prefix),
+                "status": STATUS_ACTIVE,
+                "role": record.get("role", ROLE_USER),
+                "created_at": _utcnow_iso(),
+                "expires_at": record.get("expires_at"),
+                "rate_limit_per_minute": _coerce_optional_int(record.get("rate_limit_per_minute")),
+                "usage": {"requests": 0, "last_used_at": None, "last_used_ip": None},
+            }
+            generated.append((full_key, new_hash, stored))
+            return new_hash, stored
+
+        if self.store.rotate_stored(key_hash, _build) is None or not generated:
+            # Not found (or lost a race with a concurrent delete); surface it.
             return None
-        full_key = generate_full_key(prefix=prefix)
-        new_hash = hash_key(full_key)
-        stored = {
-            "label": str(record.get("label", "")),
-            "prefix": make_prefix(full_key),
-            "status": STATUS_ACTIVE,
-            "role": record.get("role", ROLE_USER),
-            "created_at": _utcnow_iso(),
-            "expires_at": record.get("expires_at"),
-            "rate_limit_per_minute": _coerce_optional_int(record.get("rate_limit_per_minute")),
-            "usage": {"requests": 0, "last_used_at": None, "last_used_ip": None},
-        }
-        if not self.store.replace_key(key_hash, new_hash, stored):
-            # Lost a race with a concurrent delete; surface to the caller.
-            return None
+        full_key, new_hash, stored = generated[0]
         new_record = {"key_id": new_hash, **stored}
         return full_key, new_record
 
@@ -712,6 +840,13 @@ def create_default_authenticator(
 ) -> ApiKeyAuthenticator:
     """Build an :class:`ApiKeyAuthenticator` rooted at ``data_dir/.api_keys.json``."""
     store = KeyStore(Path(data_dir) / STORE_FILENAME)
+    try:
+        # One-time repair of legacy records whose display prefix embedded the
+        # whole secret (see repair_leaked_prefixes). Best-effort: a read-only
+        # or corrupt store must not block startup.
+        store.repair_leaked_prefixes()
+    except Exception:
+        pass
     return ApiKeyAuthenticator(
         store,
         default_rate_limit=default_rate_limit,

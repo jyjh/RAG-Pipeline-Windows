@@ -47,6 +47,7 @@ class CitationRegistry:
             "hybrid_score": round(float(record.get("hybrid_score") or 0.0), 4),
             "reliability_modifier": round(float(record.get("reliability_modifier") or 0.0), 4),
             "source_group": str(record.get("source_group") or SOURCE_GROUP_UNGROUPED),
+            "review_status": str(record.get("review_status") or "unreviewed"),
             "snippet": _short_snippet(str(record.get("content") or "")),
             "open_url": _pdf_source_url(source_hash, mode="view", page=page_start),
             "download_url": _pdf_source_url(source_hash, mode="download"),
