@@ -17,10 +17,16 @@ class HybridPdfParser:
         manual_parser: ManualTextPdfParser,
         docling_parser: DoclingPdfParser,
         scanned_page_parser: ScannedPageImageParser | None = None,
+        scanned_ocr_parser: PdfParser | None = None,
     ):
         self.manual_parser = manual_parser
         self.docling_parser = docling_parser
         self.scanned_page_parser = scanned_page_parser
+        # Optional primary engine for scanned/low-text PDFs (e.g.
+        # UnlimitedOcrPdfParser). When set it runs BEFORE Docling; Docling and
+        # the page-image fallback remain the failure path. None = historical
+        # Docling-first behavior.
+        self.scanned_ocr_parser = scanned_ocr_parser
 
     def parse(self, file_path: str) -> str:
         # Cheap usability probe: extract a spread of pages (first/middle/last +
@@ -36,25 +42,13 @@ class HybridPdfParser:
         else:
             sample = self.manual_parser.extract_page_texts(file_path)
         if not self.manual_parser.is_text_usable(sample):
+            engine = type(self.scanned_ocr_parser).__name__ if self.scanned_ocr_parser else "Docling"
             logger.info(
-                "Sampled text probe indicates a scanned/low-quality PDF; using Docling parsing: %s",
+                "Sampled text probe indicates a scanned/low-quality PDF; using %s parsing: %s",
+                engine,
                 file_path,
             )
-            try:
-                content = self.docling_parser.parse(file_path)
-            except Exception as exc:
-                logger.warning(
-                    "Docling parsing failed for scanned PDF; using page-image fallback: %s", exc
-                )
-                return self._parse_scanned_pages(file_path)
-            if content.strip():
-                return content
-            logger.warning(
-                "Docling parsing returned empty content for scanned PDF; "
-                "using page-image fallback: %s",
-                file_path,
-            )
-            return self._parse_scanned_pages(file_path)
+            return self._parse_scanned(file_path)
 
         # Born-digital: the sample was usable, so extract the full text. This is
         # the fast path and is unchanged from before -- we just deferred it past
@@ -64,21 +58,14 @@ class HybridPdfParser:
         # whole is borderline (e.g. only the sampled pages had text). If the
         # full extraction is not usable after all, fall through to Docling.
         if not self.manual_parser.is_text_usable(page_texts):
+            engine = type(self.scanned_ocr_parser).__name__ if self.scanned_ocr_parser else "Docling"
             logger.info(
                 "Full text extraction was not usable despite a passing sample; "
-                "using Docling parsing: %s",
+                "using %s parsing: %s",
+                engine,
                 file_path,
             )
-            try:
-                content = self.docling_parser.parse(file_path)
-            except Exception as exc:
-                logger.warning(
-                    "Docling parsing failed for scanned PDF; using page-image fallback: %s", exc
-                )
-                return self._parse_scanned_pages(file_path)
-            if content.strip():
-                return content
-            return self._parse_scanned_pages(file_path)
+            return self._parse_scanned(file_path)
 
         if hasattr(self.manual_parser, "asset_enrichment_page_hints"):
             asset_hints = self.manual_parser.asset_enrichment_page_hints(file_path, page_texts)
@@ -94,6 +81,42 @@ class HybridPdfParser:
             enriched_asset_pages=enriched_asset_pages,
             page_texts=page_texts,
         )
+
+    def _parse_scanned(self, file_path: str) -> str:
+        """OCR a scanned PDF: configured engine first, then Docling, then page images."""
+        if self.scanned_ocr_parser is not None:
+            try:
+                content = self.scanned_ocr_parser.parse(file_path)
+            except Exception as exc:
+                logger.warning(
+                    "Scanned OCR engine (%s) failed for PDF; falling back to Docling: %s",
+                    type(self.scanned_ocr_parser).__name__,
+                    exc,
+                )
+            else:
+                if content.strip():
+                    return content
+                logger.warning(
+                    "Scanned OCR engine (%s) returned empty content for PDF; "
+                    "falling back to Docling: %s",
+                    type(self.scanned_ocr_parser).__name__,
+                    file_path,
+                )
+        try:
+            content = self.docling_parser.parse(file_path)
+        except Exception as exc:
+            logger.warning(
+                "Docling parsing failed for scanned PDF; using page-image fallback: %s", exc
+            )
+            return self._parse_scanned_pages(file_path)
+        if content.strip():
+            return content
+        logger.warning(
+            "Docling parsing returned empty content for scanned PDF; "
+            "using page-image fallback: %s",
+            file_path,
+        )
+        return self._parse_scanned_pages(file_path)
 
     def _parse_scanned_pages(self, file_path: str) -> str:
         if self.scanned_page_parser is None:

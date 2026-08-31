@@ -1,0 +1,25 @@
+-52-
+
+this distance has three components:
+
+Zc = vertical deflection of the center-of-gravity;
+
+Zs__ = vertical deflection of a given spindle; and
+
+H = vertical distance between the C.G. and the plane containing all four spindles at design position.
+
+Note: H__ = H at design position; this is a convention
+
+Figure 3-3: Center of gravity to spindle vertical distance
+
+The first two of these parameters, Zc and Zs__, are calculated in the model. The H value is found by subtracting the static-loaded-radius of the tires from the vertical position of the C.G. relative to ground at design position. Consequently, the "C.G. to spindle distance" is defined for each spindle in Figure 3-3.
+
+HFR = H - Zc + ZSFR    (3-16)
+
+HFL = H - Zc + ZSFL    (3-17)
+
+HBR = H - Zc + ZSBR    (3-18)
+
+HBL = H - Zc + ZSBL    (3-19)
+
+The subscripts used throughout this document will be explained as needed except for those used to express a specific corner

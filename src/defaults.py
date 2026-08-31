@@ -87,3 +87,24 @@ DEFAULT_TESSERACT_PSM = None
 
 SUPPORTED_OCR_BACKENDS = ("auto", "rapidocr", "tesseract_cli", "tesseract", "easyocr")
 SUPPORTED_RAPIDOCR_BACKENDS = ("onnxruntime", "openvino", "paddle", "torch")
+
+# Scanned-PDF OCR engine. "docling" = the Docling pipeline's OCR plugin
+# (see SUPPORTED_OCR_BACKENDS); "unlimited_ocr" = Baidu's Unlimited-OCR VLM
+# served by the local Ollama host (render pages -> one vision request each).
+DEFAULT_SCANNED_OCR_ENGINE = "docling"
+SUPPORTED_SCANNED_OCR_ENGINES = ("docling", "unlimited_ocr", "vision_ocr")
+DEFAULT_UNLIMITED_OCR_MODEL = "frob/unlimited-ocr"
+# The Ollama/llama.cpp build of Unlimited-OCR resizes every page to ~1024px
+# regardless of render dpi, and lacks the vendor's ngram anti-repetition
+# guard: at 300 dpi dense text becomes illegible and the model hallucinates
+# (eval/ocr/RESULTS.md). 110 dpi kept text legible after the downscale and is
+# the highest-fidelity measured setting for the Ollama route.
+DEFAULT_UNLIMITED_OCR_DPI = 110
+DEFAULT_UNLIMITED_OCR_NUM_CTX = 16384
+# vision_ocr engine: a general vision-language model (local Ollama) used as
+# the scanned-PDF OCR engine. Unlike the Unlimited-OCR port, qwen2.5-vl tiles
+# natively so full 300 dpi renders work. Most accurate local OCR measured
+# (eval/ocr/RESULTS.md) at ~3-4 min/page on a 4 GB GPU.
+DEFAULT_VISION_OCR_MODEL = "qwen2.5vl:3b"
+DEFAULT_VISION_OCR_DPI = 300
+DEFAULT_VISION_OCR_NUM_CTX = 8192

@@ -24,13 +24,21 @@ from src.defaults import (
     DEFAULT_OCR_LANGS,
     DEFAULT_PDF_PARSER_MODE,
     DEFAULT_RAPIDOCR_BACKEND,
+    DEFAULT_SCANNED_OCR_ENGINE,
     DEFAULT_TESSERACT_CMD,
     DEFAULT_TESSERACT_DATA_PATH,
     DEFAULT_TESSERACT_PSM,
+    DEFAULT_UNLIMITED_OCR_DPI,
+    DEFAULT_UNLIMITED_OCR_MODEL,
+    DEFAULT_UNLIMITED_OCR_NUM_CTX,
+    DEFAULT_VISION_OCR_DPI,
+    DEFAULT_VISION_OCR_MODEL,
+    DEFAULT_VISION_OCR_NUM_CTX,
     DEFAULT_VISION_ENABLED,
     DEFAULT_VISION_MODEL,
     SUPPORTED_OCR_BACKENDS,
     SUPPORTED_RAPIDOCR_BACKENDS,
+    SUPPORTED_SCANNED_OCR_ENGINES,
 )
 
 from src._class_module_support import import_split_class
@@ -391,6 +399,14 @@ ScannedPageImageParser = import_split_class("src.ingestion_classes.scanned_page_
 ScannedPageImageParser.__module__ = __name__
 
 
+UnlimitedOcrPdfParser = import_split_class("src.ingestion_classes.unlimited_ocr_pdf_parser", "UnlimitedOcrPdfParser")
+UnlimitedOcrPdfParser.__module__ = __name__
+
+
+VisionOcrPdfParser = import_split_class("src.ingestion_classes.unlimited_ocr_pdf_parser", "VisionOcrPdfParser")
+VisionOcrPdfParser.__module__ = __name__
+
+
 HybridPdfParser = import_split_class("src.ingestion_classes.hybrid_pdf_parser", "HybridPdfParser")
 HybridPdfParser.__module__ = __name__
 
@@ -468,6 +484,11 @@ _PROCESSOR_OPTION_FIELDS = (
     "tesseract_cmd",
     "tesseract_data_path",
     "tesseract_psm",
+    "scanned_ocr_engine",
+    "unlimited_ocr_model",
+    "unlimited_ocr_dpi",
+    "vision_ocr_model",
+    "vision_ocr_dpi",
 )
 
 
@@ -815,6 +836,11 @@ def run_ingestion(
     tesseract_cmd: str = DEFAULT_TESSERACT_CMD,
     tesseract_data_path: str | None = DEFAULT_TESSERACT_DATA_PATH,
     tesseract_psm: int | str | None = DEFAULT_TESSERACT_PSM,
+    scanned_ocr_engine: str = DEFAULT_SCANNED_OCR_ENGINE,
+    unlimited_ocr_model: str = DEFAULT_UNLIMITED_OCR_MODEL,
+    unlimited_ocr_dpi: int = DEFAULT_UNLIMITED_OCR_DPI,
+    vision_ocr_model: str = DEFAULT_VISION_OCR_MODEL,
+    vision_ocr_dpi: int = DEFAULT_VISION_OCR_DPI,
     progress_enabled: bool = True,
     ingestion_workers: int | None = None,
     max_pages_whole_doc: int = 50,
@@ -871,6 +897,11 @@ def run_ingestion(
         "tesseract_cmd": tesseract_cmd,
         "tesseract_data_path": tesseract_data_path,
         "tesseract_psm": tesseract_psm,
+        "scanned_ocr_engine": scanned_ocr_engine,
+        "unlimited_ocr_model": unlimited_ocr_model,
+        "unlimited_ocr_dpi": unlimited_ocr_dpi,
+        "vision_ocr_model": vision_ocr_model,
+        "vision_ocr_dpi": vision_ocr_dpi,
         "max_pages_whole_doc": max_pages_whole_doc,
         "input_root": str(Path(input_dir)),
         "duplicate_stems": {stem for stem, count in stem_counts.items() if count > 1},

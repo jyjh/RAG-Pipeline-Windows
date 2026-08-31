@@ -44,6 +44,11 @@ from src.defaults import (
     DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
     DEFAULT_OCR_FORCE_FULL_PAGE,
     DEFAULT_OCR_LANGS,
+    DEFAULT_SCANNED_OCR_ENGINE,
+    DEFAULT_UNLIMITED_OCR_DPI,
+    DEFAULT_UNLIMITED_OCR_MODEL,
+    DEFAULT_VISION_OCR_DPI,
+    DEFAULT_VISION_OCR_MODEL,
     DEFAULT_OLLAMA_KEEP_ALIVE,
     DEFAULT_PDF_PARSER_MODE,
     DEFAULT_PLANNER_MAX_QUERIES,
@@ -157,6 +162,17 @@ class IngestionConfig:
     tesseract_cmd: str = DEFAULT_TESSERACT_CMD
     tesseract_data_path: str = DEFAULT_TESSERACT_DATA_PATH
     tesseract_psm: int | None = DEFAULT_TESSERACT_PSM
+    # Which engine OCRs scanned/low-text PDFs: "docling" runs the Docling
+    # pipeline's OCR plugin (ocr_backend above); "unlimited_ocr" renders each
+    # page and asks Baidu's Unlimited-OCR VLM on the local Ollama host;
+    # "vision_ocr" does the same with a general vision model
+    # (vision_ocr_model, default qwen2.5vl:3b) and a verbatim-transcription
+    # prompt -- the most accurate local option per eval/ocr/RESULTS.md.
+    scanned_ocr_engine: str = DEFAULT_SCANNED_OCR_ENGINE
+    unlimited_ocr_model: str = DEFAULT_UNLIMITED_OCR_MODEL
+    unlimited_ocr_dpi: int = DEFAULT_UNLIMITED_OCR_DPI
+    vision_ocr_model: str = DEFAULT_VISION_OCR_MODEL
+    vision_ocr_dpi: int = DEFAULT_VISION_OCR_DPI
     ingestion_workers: int = 1
     max_pages_whole_doc: int = 50
     # Estimated on-disk expansion when PDFs become Markdown + .pages.json

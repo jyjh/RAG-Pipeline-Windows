@@ -297,6 +297,12 @@ function activeChat() {
 
 
 function createChat({ activate = true, persist = true } = {}) {
+  // "New chat" on an untouched chat would otherwise stack indistinguishable
+  // empty "New chat" entries; reuse the empty one instead.
+  const current = activeChat();
+  if (current && !current.messages.length && !current.customTitle) {
+    return current;
+  }
   const chat = {
     id: newId(),
     title: "New chat",
@@ -1031,6 +1037,11 @@ function linkAnswerCitations(parts) {
   );
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
+      // Saved answers come back with citation anchors already in the stored
+      // HTML; re-linking their text would nest <a> inside <a>.
+      if (node.parentElement && node.parentElement.closest("a")) {
+        return NodeFilter.FILTER_REJECT;
+      }
       if (!node.nodeValue || !/\[[SW]\d+\]/.test(node.nodeValue)) {
         return NodeFilter.FILTER_REJECT;
       }

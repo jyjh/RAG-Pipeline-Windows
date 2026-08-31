@@ -301,6 +301,36 @@ function trackJobTransitions(jobs) {
 }
 
 
+// A drained queue can fail dozens of recovered jobs within seconds; one
+// full-width error toast per job buried the whole UI. Failures arriving in
+// quick succession are batched into a single summary toast instead.
+const FAILED_TOAST_COALESCE_MS = 1500;
+const FAILED_TOAST_ERROR_CHARS = 90;
+let failedToastTimer = null;
+const pendingFailedToasts = [];
+
+
+function flushFailedToasts() {
+  failedToastTimer = null;
+  const batch = pendingFailedToasts.splice(0, pendingFailedToasts.length);
+  if (!batch.length) {
+    return;
+  }
+  if (batch.length === 1) {
+    const { label, detail } = batch[0];
+    showToast(`${label} failed${detail ? `: ${detail}` : ""}.`, {
+      kind: "error",
+      onClick: () => activateTab("upload"),
+    });
+    return;
+  }
+  showToast(`${batch.length} jobs failed — open Documents for the errors.`, {
+    kind: "error",
+    onClick: () => activateTab("upload"),
+  });
+}
+
+
 function notifyJobOutcome(jobId, status, job) {
   const shortId = jobId.slice(0, 8);
   const names = Array.isArray(job.filenames) ? job.filenames.filter(Boolean) : [];
@@ -308,11 +338,11 @@ function notifyJobOutcome(jobId, status, job) {
   if (status === "done") {
     showToast(`${label} finished.`, { kind: "success", onClick: () => activateTab("upload") });
   } else if (status === "failed") {
-    const firstErrorLine = String(job.error || "").split("\n")[0].slice(0, 160);
-    showToast(`${label} failed${firstErrorLine ? `: ${firstErrorLine}` : ""}.`, {
-      kind: "error",
-      onClick: () => activateTab("upload"),
-    });
+    const firstErrorLine = String(job.error || "").split("\n")[0].trim().slice(0, FAILED_TOAST_ERROR_CHARS);
+    pendingFailedToasts.push({ label, detail: firstErrorLine });
+    if (!failedToastTimer) {
+      failedToastTimer = setTimeout(flushFailedToasts, FAILED_TOAST_COALESCE_MS);
+    }
   } else if (status === "cancelled") {
     showToast(`${label} was cancelled.`, { kind: "info" });
   }

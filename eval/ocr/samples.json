@@ -1,0 +1,38 @@
+[
+ {
+  "id": "apollo_p5",
+  "pdf": "F:/rag-fsae/.ingest_batches/run_20260826_163219/scan_batch_0003/[NASA美国太空总署资料（长期更新）].[NASA].Apollo.Operations.Handbook.-.03.Guidance.and.Navigation.System.pdf",
+  "page": 4,
+  "gt": "eval/ocr/ground_truth/apollo_p5.txt"
+ },
+ {
+  "id": "apollo_p21",
+  "pdf": "F:/rag-fsae/.ingest_batches/run_20260826_163219/scan_batch_0003/[NASA美国太空总署资料（长期更新）].[NASA].Apollo.Operations.Handbook.-.03.Guidance.and.Navigation.System.pdf",
+  "page": 20,
+  "gt": "eval/ocr/ground_truth/apollo_p21.txt"
+ },
+ {
+  "id": "ship_p3",
+  "pdf": "F:/rag-fsae/.ingest_batches/run_20260826_163219/scan_batch_0005/Finite element comparative study of ship structural detail.pdf",
+  "page": 2,
+  "gt": "eval/ocr/ground_truth/ship_p3.txt"
+ },
+ {
+  "id": "thesis_p9",
+  "pdf": "F:/rag-fsae/.ingest_batches/run_20260826_163219/scan_batch_0006/PatsMITMastersThesisD-Chap3-EquationDerivation.pdf",
+  "page": 8,
+  "gt": "eval/ocr/ground_truth/thesis_p9.txt"
+ },
+ {
+  "id": "lec11_p8",
+  "pdf": "F:/rag-fsae/.ingest_batches/run_20260826_163219/scan_batch_0005/ME 4106C.Lec11.YYC.pdf",
+  "page": 7,
+  "gt": "eval/ocr/ground_truth/lec11_p8.txt"
+ },
+ {
+  "id": "lec7_p5",
+  "pdf": "F:/rag-fsae/.ingest_batches/run_20260826_163219/scan_batch_0003/ME5702.Lec07.pdf",
+  "page": 4,
+  "gt": "eval/ocr/ground_truth/lec7_p5.txt"
+ }
+]

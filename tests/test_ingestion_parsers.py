@@ -1,3 +1,4 @@
+import base64
 import hashlib
 from types import SimpleNamespace
 
@@ -925,3 +926,304 @@ def test_docling_parser_threshold_zero_never_forces():
     parser.parse("huge.pdf")
 
     assert routing == ["whole_doc"], f"expected whole-doc routing, got: {routing}"
+
+
+# --- Unlimited-OCR scanned-PDF engine ----------------------------------------
+
+from src.ingestion import DocumentProcessor, UnlimitedOcrPdfParser
+from src.ingestion_classes.unlimited_ocr_pdf_parser import (
+    UNLIMITED_OCR_PROMPT,
+    strip_detection_markers,
+)
+
+
+def test_unlimited_ocr_strips_detection_markers():
+    ollama_style = (
+        "title [130, 92, 816, 138]APOLLO OPERATIONS HANDBOOK\n"
+        "text [131, 157, 198, 176]Note:\n"
+        "text [221, 180, 804, 223]a) The steer angle required..."
+    )
+    assert strip_detection_markers(ollama_style) == (
+        "APOLLO OPERATIONS HANDBOOK\nNote:\na) The steer angle required..."
+    )
+
+    raw_style = "<|det|>text [1, 2, 3, 4]<|/det|>steady-state handling"
+    assert strip_detection_markers(raw_style) == "steady-state handling"
+
+
+def test_unlimited_ocr_parser_emits_per_page_markdown(monkeypatch):
+    parser = UnlimitedOcrPdfParser(progress_enabled=False)
+    pages = iter([(1, b"page-one-png"), (2, b"page-two-png"), (3, b"page-three-png")])
+    monkeypatch.setattr(parser, "_iter_page_pngs", lambda file_path: pages)
+    seen: list[bytes] = []
+
+    def fake_ocr(png_bytes, file_path):
+        seen.append(png_bytes)
+        return f"transcribed page {len(seen)}"
+
+    monkeypatch.setattr(parser, "_ocr_page_png", fake_ocr)
+
+    output = parser.parse("scanned.pdf")
+
+    assert seen == [b"page-one-png", b"page-two-png", b"page-three-png"]
+    assert "## Page 1\n\ntranscribed page 1" in output
+    assert "## Page 3\n\ntranscribed page 3" in output
+
+
+def test_unlimited_ocr_parser_skips_blank_pages_and_requires_content(monkeypatch):
+    parser = UnlimitedOcrPdfParser(progress_enabled=False)
+    pages = iter([(1, b"blank"), (2, b"real")])
+    monkeypatch.setattr(parser, "_iter_page_pngs", lambda file_path: pages)
+    monkeypatch.setattr(parser, "_ocr_page_png", lambda png, fp: "" if png == b"blank" else "text here")
+
+    output = parser.parse("scanned.pdf")
+
+    assert output == "## Page 2\n\ntext here"
+
+    empty = UnlimitedOcrPdfParser(progress_enabled=False)
+    monkeypatch.setattr(empty, "_iter_page_pngs", lambda file_path: iter([(1, b"x")]))
+    monkeypatch.setattr(empty, "_ocr_page_png", lambda png, fp: "")
+    with pytest.raises(RuntimeError, match="produced no text"):
+        empty.parse("scanned.pdf")
+
+
+def test_unlimited_ocr_parser_raises_for_ollama_after_retries(monkeypatch):
+    parser = UnlimitedOcrPdfParser(progress_enabled=False, retries=2)
+
+    def boom(*args, **kwargs):
+        raise ConnectionError("ollama down")
+
+    monkeypatch.setattr("ollama.generate", boom)
+    with pytest.raises(RuntimeError, match="failed after 2 attempt"):
+        parser._ocr_page_png(b"png", "scanned.pdf")
+
+
+def test_unlimited_ocr_parser_sends_vendor_prompt_and_context(monkeypatch):
+    parser = UnlimitedOcrPdfParser(progress_enabled=False, num_ctx=9999, model="custom-ocr")
+    captured: dict = {}
+
+    def fake_generate(*, model, prompt, images, options):
+        captured.update(model=model, prompt=prompt, images=images, options=options)
+
+        class Response:
+            response = "text [1, 2, 3, 4]hello"
+
+        return Response()
+
+    monkeypatch.setattr("ollama.generate", fake_generate)
+
+    assert parser._ocr_page_png(b"png-bytes", "f.pdf") == "hello"
+    assert captured["model"] == "custom-ocr"
+    assert captured["prompt"] == UNLIMITED_OCR_PROMPT
+    assert captured["options"] == {"num_ctx": 9999}
+    assert captured["images"] == [base64.b64encode(b"png-bytes").decode()]
+
+
+def test_document_processor_builds_unlimited_ocr_engine_when_configured():
+    processor = DocumentProcessor(
+        vision_enabled=False,
+        progress_enabled=False,
+        scanned_ocr_engine="unlimited_ocr",
+        unlimited_ocr_model="custom/unlimited-ocr",
+        unlimited_ocr_dpi=200,
+    )
+
+    assert isinstance(processor.scanned_ocr_parser, UnlimitedOcrPdfParser)
+    assert processor.scanned_ocr_parser.model == "custom/unlimited-ocr"
+    assert processor.scanned_ocr_parser.dpi == 200
+
+    docling_processor = DocumentProcessor(vision_enabled=False, progress_enabled=False)
+    assert docling_processor.scanned_ocr_parser is None
+
+
+def test_document_processor_rejects_unknown_scanned_engine():
+    with pytest.raises(ValueError, match="scanned OCR engine"):
+        DocumentProcessor(vision_enabled=False, progress_enabled=False, scanned_ocr_engine="ocrmypdf")
+
+
+def test_hybrid_parser_prefers_scanned_ocr_engine_for_low_text_pdfs():
+    class Manual:
+        def extract_sampled_page_texts(self, file_path):
+            return [""]
+
+        def extract_page_texts(self, file_path):
+            return [""]
+
+        def is_text_usable(self, page_texts):
+            return False
+
+    class Docling:
+        def __init__(self):
+            self.called = False
+
+        def parse(self, file_path):
+            self.called = True
+            return "docling"
+
+    class ScannedEngine:
+        def parse(self, file_path):
+            return "unlimited ocr text"
+
+    docling = Docling()
+    parser = HybridPdfParser(
+        manual_parser=Manual(),
+        docling_parser=docling,
+        scanned_ocr_parser=ScannedEngine(),
+    )
+
+    assert parser.parse("scan.pdf") == "unlimited ocr text"
+    assert not docling.called
+
+
+def test_hybrid_parser_falls_back_to_docling_when_scanned_engine_fails():
+    class Manual:
+        def extract_sampled_page_texts(self, file_path):
+            return [""]
+
+        def extract_page_texts(self, file_path):
+            return [""]
+
+        def is_text_usable(self, page_texts):
+            return False
+
+    class Docling:
+        def parse(self, file_path):
+            return "docling text"
+
+    class ScannedEngine:
+        def parse(self, file_path):
+            raise RuntimeError("ollama unreachable")
+
+    parser = HybridPdfParser(
+        manual_parser=Manual(),
+        docling_parser=Docling(),
+        scanned_page_parser=None,
+        scanned_ocr_parser=ScannedEngine(),
+    )
+
+    assert parser.parse("scan.pdf") == "docling text"
+
+
+def test_hybrid_parser_falls_back_when_scanned_engine_is_empty():
+    class Manual:
+        def extract_sampled_page_texts(self, file_path):
+            return [""]
+
+        def extract_page_texts(self, file_path):
+            return [""]
+
+        def is_text_usable(self, page_texts):
+            return False
+
+    class Docling:
+        def parse(self, file_path):
+            return "docling text"
+
+    class ScannedEngine:
+        def parse(self, file_path):
+            return "   "
+
+    parser = HybridPdfParser(
+        manual_parser=Manual(),
+        docling_parser=Docling(),
+        scanned_ocr_parser=ScannedEngine(),
+    )
+
+    assert parser.parse("scan.pdf") == "docling text"
+
+
+def test_run_ingestion_threads_scanned_engine_options(monkeypatch, safe_tmp_path):
+    captured: dict = {}
+
+    def fake_ingest_one(input_path_str, output_dir, options, *, progress_enabled):
+        captured.update(options)
+        return {"file": input_path_str, "status": "processed", "hash": "h"}
+
+    monkeypatch.setattr("src.ingestion._ingest_one_pdf", fake_ingest_one)
+    pdf_path = safe_tmp_path / "scan.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+    run_ingestion(
+        str(safe_tmp_path),
+        str(safe_tmp_path / "out"),
+        scanned_ocr_engine="unlimited_ocr",
+        unlimited_ocr_model="custom/unlimited-ocr",
+        unlimited_ocr_dpi=250,
+        progress_enabled=False,
+    )
+
+    assert captured["scanned_ocr_engine"] == "unlimited_ocr"
+    assert captured["unlimited_ocr_model"] == "custom/unlimited-ocr"
+    assert captured["unlimited_ocr_dpi"] == 250
+
+
+# --- vision_ocr engine (local qwen2.5-vl) ------------------------------------
+
+from src.ingestion import VisionOcrPdfParser
+from src.ingestion_classes.unlimited_ocr_pdf_parser import VISION_OCR_PROMPT
+
+
+def test_vision_ocr_parser_defaults_match_measured_config():
+    parser = VisionOcrPdfParser(progress_enabled=False)
+
+    assert parser.model == "qwen2.5vl:3b"
+    assert parser.dpi == 300
+    assert parser.num_ctx == 8192
+    assert parser.prompt == VISION_OCR_PROMPT
+    assert parser.strip_markers is False
+
+
+def test_vision_ocr_parser_does_not_strip_content_that_resembles_bboxes(monkeypatch):
+    """qwen output has no detection markers; a prose line like 'volts [1, 2, 3, 4]'
+    must survive untouched."""
+    parser = VisionOcrPdfParser(progress_enabled=False)
+
+    def fake_generate(*, model, prompt, images, options):
+        class Response:
+            response = "voltages measured [1, 2, 3, 4] across the run"
+
+        return Response()
+
+    monkeypatch.setattr("ollama.generate", fake_generate)
+
+    assert parser._ocr_page_png(b"png", "f.pdf") == "voltages measured [1, 2, 3, 4] across the run"
+
+
+def test_document_processor_builds_vision_ocr_engine_when_configured():
+    processor = DocumentProcessor(
+        vision_enabled=False,
+        progress_enabled=False,
+        scanned_ocr_engine="vision_ocr",
+        vision_ocr_model="qwen2.5vl:7b",
+        vision_ocr_dpi=200,
+    )
+
+    assert isinstance(processor.scanned_ocr_parser, VisionOcrPdfParser)
+    assert processor.scanned_ocr_parser.model == "qwen2.5vl:7b"
+    assert processor.scanned_ocr_parser.dpi == 200
+    assert processor.scanned_ocr_parser.prompt == VISION_OCR_PROMPT
+
+
+def test_run_ingestion_threads_vision_ocr_options(monkeypatch, safe_tmp_path):
+    captured: dict = {}
+
+    def fake_ingest_one(input_path_str, output_dir, options, *, progress_enabled):
+        captured.update(options)
+        return {"file": input_path_str, "status": "processed", "hash": "h"}
+
+    monkeypatch.setattr("src.ingestion._ingest_one_pdf", fake_ingest_one)
+    pdf_path = safe_tmp_path / "scan.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+    run_ingestion(
+        str(safe_tmp_path),
+        str(safe_tmp_path / "out"),
+        scanned_ocr_engine="vision_ocr",
+        vision_ocr_model="qwen2.5vl:7b",
+        vision_ocr_dpi=250,
+        progress_enabled=False,
+    )
+
+    assert captured["scanned_ocr_engine"] == "vision_ocr"
+    assert captured["vision_ocr_model"] == "qwen2.5vl:7b"
+    assert captured["vision_ocr_dpi"] == 250

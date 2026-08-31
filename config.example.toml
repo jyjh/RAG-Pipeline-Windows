@@ -34,6 +34,25 @@ rapidocr_backend = "onnxruntime"
 tesseract_cmd = "tesseract"
 tesseract_data_path = ""
 tesseract_psm = 3
+# Engine for scanned/low-text PDFs:
+#   "docling"       - the Docling pipeline's OCR plugin above (default; keep
+#                     this on CPU-only hosts such as the HPC ingest cluster).
+#   "vision_ocr"    - a general vision model on the LOCAL Ollama host
+#                     (vision_ocr_model, default qwen2.5vl:3b): each page is
+#                     rendered at vision_ocr_dpi and transcribed verbatim.
+#                     Most accurate local engine measured on real corpus scans
+#                     (~10x lower CER than RapidOCR, see eval/ocr/RESULTS.md),
+#                     at ~3-4 min/page on a 4 GB GPU -- budget ingest time
+#                     accordingly. Docling stays as the failure fallback.
+#   "unlimited_ocr" - Baidu's Unlimited-OCR VLM (unlimited_ocr_model). Not
+#                     recommended via Ollama: pages are resized to ~1024px and
+#                     the anti-repetition guard is missing, so dense pages
+#                     hallucinate (eval/ocr/RESULTS.md).
+scanned_ocr_engine = "docling"
+unlimited_ocr_model = "frob/unlimited-ocr"
+unlimited_ocr_dpi = 110
+vision_ocr_model = "qwen2.5vl:3b"
+vision_ocr_dpi = 300
 vision_enabled = true
 code_enrichment = false
 formula_enrichment = true

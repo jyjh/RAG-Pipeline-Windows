@@ -1,0 +1,23 @@
+## TRANSIENT RESPONSE CHARACTERISTICS
+
+See Fig. 5.17.
+
+## Rocard Model of Vehicle with Rigid Frame
+
+Fig. 5.17 Simplified vehicle model for analysis of transient motions.
+
+<!-- image -->
+
+## Define:
+
+X, Y = axes of fixed frame of reference
+
+x = longitudinal axis of vehicle
+
+y = perpendicular axis of vehicle
+
+G = center of mass of vehicle
+
+Vx = x-component of velocity of G parallel to x-axis
+
+Vy = y-component of velocity of G perpendicular to x-axis

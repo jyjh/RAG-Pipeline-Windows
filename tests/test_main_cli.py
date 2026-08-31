@@ -25,6 +25,11 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         tesseract_cmd,
         tesseract_data_path,
         tesseract_psm,
+        scanned_ocr_engine,
+        unlimited_ocr_model,
+        unlimited_ocr_dpi,
+        vision_ocr_model,
+        vision_ocr_dpi,
         progress_enabled,
         ingestion_workers=1,
     ):
@@ -47,6 +52,11 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         calls["tesseract_cmd"] = tesseract_cmd
         calls["tesseract_data_path"] = tesseract_data_path
         calls["tesseract_psm"] = tesseract_psm
+        calls["scanned_ocr_engine"] = scanned_ocr_engine
+        calls["unlimited_ocr_model"] = unlimited_ocr_model
+        calls["unlimited_ocr_dpi"] = unlimited_ocr_dpi
+        calls["vision_ocr_model"] = vision_ocr_model
+        calls["vision_ocr_dpi"] = vision_ocr_dpi
         calls["progress_enabled"] = progress_enabled
 
     monkeypatch.setattr(main, "run_ingestion", fake_run_ingestion)
@@ -118,6 +128,11 @@ def test_main_ingest_dispatches_to_current_ingestion(monkeypatch):
         "tesseract_cmd": "C:/Tools/tesseract.exe",
         "tesseract_data_path": "C:/Tools/tessdata",
         "tesseract_psm": 6,
+        "scanned_ocr_engine": "docling",
+        "unlimited_ocr_model": "frob/unlimited-ocr",
+        "unlimited_ocr_dpi": 110,
+        "vision_ocr_model": "qwen2.5vl:3b",
+        "vision_ocr_dpi": 300,
         "progress_enabled": False,
     }
 

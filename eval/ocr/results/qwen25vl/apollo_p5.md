@@ -1,0 +1,14 @@
+SM2A-03-BLOCK II-(1)
+APOLLO OPERATIONS HANDBOOK
+
+SYSTEMS DATA
+
+for display on the two DSKYs. The DSKYS enable the flight crew to enter data or instructions into the CMC, request display of data from CMC memory, and offer an interrupt control of CMC operation. The CMC timing section provides timing signals of various frequencies for internal use and to other onboard systems which require accurate or synchronized timing. Data within the CMC is transmitted to MSFN through a "downlink" telemetry function. Telemetered data is transmitted as a function of a CMC program or by request from MSFN.
+
+Data within the CMC may be updated through "uplink" telemetry from the MSFN. The CMC performs guidance functions by executing internal programs using predetermined trajectory parameters, attitude angles from the inertial CDUs, velocity changes from the PIPAs, and commands from the DSKYS (crew) to generate control commands. The navigation function is performed by using stored star-landmark or star-horizon data, optics angles from the optics CDUs, and velocity changes from the PIPAs in the execution of navigation programs.
+
+The optics provide accurate star and landmark angular measurements. Sightings are accomplished by the navigator using the SXT and SCT. The optics are positioned by drive motors commanded by the optics hand controller or by the CMC. The shaft axes are parallel. Trunnion axes may be operated in parallel or offset, as required. The SCT is a unity power instrument providing an approximate 60-degree field of view. It is used to make landmark sightings and to acquire and center stars or landmarks prior to SXT use. The SXT provides 28-power magnification with a 1.8-degree field of view. The SXT has two lines of sight, enabling it to measure the included angle between two objects. This requires two lines of sight which enable the two viewed objects to be superimposed. For a star-landmark or star-horizon sighting, the landmark line of sight is centered along the SXT shaft axis. The star image is moved toward the landmark or horizon by rotating the shaft and trunnion axes until the two viewed objects are superimposed. The shaft and trunnion angles are repeated by the optic CDUs. When the navigator is satisfied with image positions, he issues a marked command to the CMC. The CMC reads the optics CDU angles, IMU CDU angles, and time and computes the position of the spacecraft. The CMC bases the computation on stored star and navigator-supplied landmark data which may also be used by the CMC to request specific stars for navigational sightings. Two or more sightings, on two or more different stars, must be taken to perform a complete position determination.
+
+GUIDANCE AND NAVIGATION SYSTEM
+
+Mission Basic Date 15 April 1969 Change Date 16 July 1969 Page 2.2-5

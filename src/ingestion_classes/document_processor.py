@@ -31,10 +31,19 @@ class DocumentProcessor:
         tesseract_cmd: str = DEFAULT_TESSERACT_CMD,
         tesseract_data_path: str | None = DEFAULT_TESSERACT_DATA_PATH,
         tesseract_psm: int | str | None = DEFAULT_TESSERACT_PSM,
+        scanned_ocr_engine: str = DEFAULT_SCANNED_OCR_ENGINE,
+        unlimited_ocr_model: str = DEFAULT_UNLIMITED_OCR_MODEL,
+        unlimited_ocr_dpi: int = DEFAULT_UNLIMITED_OCR_DPI,
+        vision_ocr_model: str = DEFAULT_VISION_OCR_MODEL,
+        vision_ocr_dpi: int = DEFAULT_VISION_OCR_DPI,
         progress_enabled: bool = True,
         max_pages_whole_doc: int = 50,
     ):
         self.vision_model = vision_model
+        scanned_ocr_engine = str(scanned_ocr_engine or DEFAULT_SCANNED_OCR_ENGINE).lower()
+        if scanned_ocr_engine not in SUPPORTED_SCANNED_OCR_ENGINES:
+            choices = ", ".join(SUPPORTED_SCANNED_OCR_ENGINES)
+            raise ValueError(f"Unsupported scanned OCR engine '{scanned_ocr_engine}'. Use one of: {choices}")
         vision_enabled = _normalize_bool(vision_enabled, DEFAULT_VISION_ENABLED)
         code_enrichment = _normalize_bool(code_enrichment, DEFAULT_CODE_ENRICHMENT)
         formula_enrichment = _normalize_bool(formula_enrichment, DEFAULT_FORMULA_ENRICHMENT)
@@ -113,6 +122,22 @@ class DocumentProcessor:
             vision_enabled=vision_enabled,
             progress_enabled=progress_enabled,
         )
+        # Primary scanned-PDF engine. None = Docling stays the first stop for
+        # scanned PDFs (historical behavior); a vision OCR engine takes over
+        # the scanned route otherwise, with Docling demoted to its fallback.
+        self.scanned_ocr_parser = None
+        if scanned_ocr_engine == "unlimited_ocr":
+            self.scanned_ocr_parser = UnlimitedOcrPdfParser(
+                model=unlimited_ocr_model,
+                dpi=unlimited_ocr_dpi,
+                progress_enabled=progress_enabled,
+            )
+        elif scanned_ocr_engine == "vision_ocr":
+            self.scanned_ocr_parser = VisionOcrPdfParser(
+                model=vision_ocr_model,
+                dpi=vision_ocr_dpi,
+                progress_enabled=progress_enabled,
+            )
         self.parser = self._select_parser(parser_mode)
 
     def set_source_context(self, *, source_hash: str = "", source_pdf_name: str = "") -> None:
@@ -126,6 +151,7 @@ class DocumentProcessor:
                 manual_parser=self.manual_parser,
                 docling_parser=self.docling_parser,
                 scanned_page_parser=self.scanned_page_parser,
+                scanned_ocr_parser=self.scanned_ocr_parser,
             )
         if mode == "manual":
             return self.manual_parser

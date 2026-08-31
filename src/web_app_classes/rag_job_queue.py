@@ -1155,6 +1155,11 @@ class RagJobQueue:
             "tesseract_cmd": options.get("tesseract_cmd", INGESTION_CONFIG["tesseract_cmd"]),
             "tesseract_data_path": options.get("tesseract_data_path", INGESTION_CONFIG["tesseract_data_path"]),
             "tesseract_psm": options.get("tesseract_psm", INGESTION_CONFIG["tesseract_psm"]),
+            "scanned_ocr_engine": options.get("scanned_ocr_engine", INGESTION_CONFIG["scanned_ocr_engine"]),
+            "unlimited_ocr_model": options.get("unlimited_ocr_model", INGESTION_CONFIG["unlimited_ocr_model"]),
+            "unlimited_ocr_dpi": options.get("unlimited_ocr_dpi", INGESTION_CONFIG["unlimited_ocr_dpi"]),
+            "vision_ocr_model": options.get("vision_ocr_model", INGESTION_CONFIG["vision_ocr_model"]),
+            "vision_ocr_dpi": options.get("vision_ocr_dpi", INGESTION_CONFIG["vision_ocr_dpi"]),
             "ingestion_workers": options.get(
                 "ingestion_workers", INGESTION_CONFIG.get("ingestion_workers", 1)
             ),
