@@ -91,60 +91,110 @@
           <button id="jobsStripViewButton" type="button">View jobs</button>
         </div>
 
+        <div id="shutdownBanner" class="shutdown-banner" hidden role="alert">
+          <span class="shutdown-banner-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 3v9M18.4 6.6a9 9 0 1 1-12.8 0" /></svg>
+          </span>
+          <div class="shutdown-banner-text">
+            <strong>Server is shutting down</strong>
+            <span id="shutdownBannerText">Active jobs are being finalized so they do not restart on the next boot.</span>
+          </div>
+        </div>
+
         <main id="mainContent">
       <section id="upload" class="panel">
-        <div id="uploadDropZone" class="upload-drop-zone">
-          <div class="toolbar">
-            <input id="fileInput" type="file" accept="application/pdf,.pdf,.zip,application/zip,application/x-zip-compressed" multiple />
-            <label class="inline-select-label">
-              Category
+        <p class="page-intro">Add PDFs to the knowledge base, say where they belong, and watch processing run in the background.</p>
+
+        <!-- Step 1: stage files. -->
+        <div id="uploadDropZone" class="upload-card upload-drop-zone">
+          <input id="fileInput" type="file" accept="application/pdf,.pdf,.zip,application/zip,application/x-zip-compressed" multiple class="visually-hidden-input" tabindex="-1" aria-hidden="true" />
+          <button id="dropzoneButton" type="button" class="dropzone-body">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 14.9A7 7 0 1 1 15.7 8h1.8a4.5 4.5 0 0 1 2.4 8.3M12 12v9m0-9l-3.5 3.5M12 12l3.5 3.5" /></svg>
+            <span class="dropzone-title">Drop PDFs or a .zip of PDFs here</span>
+            <span class="dropzone-sub">or click to browse your files</span>
+          </button>
+          <div id="selectedFilesLabel" class="selected-files-label" role="status"></div>
+        </div>
+
+        <!-- Step 2: appears once files are staged — pick destination, then upload. -->
+        <div id="uploadStagingPanel" class="upload-card upload-staging" hidden>
+          <header class="upload-staging-head">
+            <div>
+              <h3>Choose where these files go</h3>
+              <p class="hint">Both settings shape storage and search ranking, and both can be changed later.</p>
+            </div>
+            <span id="uploadStagingCount" class="upload-staging-count" role="status"></span>
+          </header>
+          <div class="upload-staging-grid">
+            <div class="upload-option-block">
+              <label class="upload-option-label" for="uploadCategorySelect">Index category</label>
               <select id="uploadCategorySelect" aria-label="Target category for the upload">
                 <option value="general" selected>General</option>
               </select>
-            </label>
-            <button id="uploadButton" type="button">Upload + index</button>
-            <button id="reindexButton" type="button">Reindex</button>
+              <p class="hint">Categories are separate searchable indexes — the whole batch is indexed into one. Move files between categories later from the Library tab.</p>
+            </div>
+            <div class="upload-option-block">
+              <span class="upload-option-label" id="uploadGroupsLabel">Source group per file</span>
+              <p class="hint">Tags how reliable each source is, which weights retrieval: Official ×1.00 · Student Research ×0.90 · Unofficial ×0.80.</p>
+            </div>
           </div>
-          <div id="selectedFilesLabel" class="selected-files-label">Drop PDFs or a .zip of PDFs</div>
-          <div id="uploadGroupsPanel" class="upload-groups-panel" hidden></div>
+          <div id="uploadGroupsPanel" class="upload-groups-panel" aria-labelledby="uploadGroupsLabel" hidden></div>
+          <footer class="upload-staging-actions">
+            <button id="uploadButton" type="button">Upload &amp; index</button>
+            <button id="cancelUploadButton" type="button" class="quiet">Cancel</button>
+            <p class="hint">Files upload one at a time; extraction and indexing run as jobs in the list below.</p>
+          </footer>
         </div>
-        <div id="uploadStatus" class="status"></div>
+
+        <div id="uploadStatus" class="status" role="status"></div>
         <div id="duplicatePrompt" class="duplicate-prompt" hidden>
           <div id="duplicatePromptText"></div>
           <button id="forceUploadButton" class="danger" type="button" disabled>Force upload</button>
         </div>
-        <div class="toolbar">
-          <strong>Jobs</strong>
-          <input id="jobSearchInput" type="search" placeholder="Search jobs" />
-          <button id="jobSearchButton" type="button">Search</button>
-          <button id="enableJobNotificationsButton" type="button" hidden title="Show a desktop notification when a background job finishes or fails">Notify on completion</button>
-          <label class="inline-select-label">
-            Rows
-            <select id="jobsPageSizeSelect">
-              <option value="10" selected>10</option>
-              <option value="20">20</option>
-              <option value="50">50</option>
-              <option value="100">100</option>
-              <option value="all">All</option>
-            </select>
-          </label>
-          <button id="prevJobsPageButton" type="button">Prev</button>
-          <span id="jobsPageLabel"></span>
-          <button id="nextJobsPageButton" type="button">Next</button>
+
+        <!-- Background jobs: every upload, reindex, and maintenance action. -->
+        <div class="upload-card jobs-card">
+          <header class="jobs-card-head">
+            <div>
+              <h3>Background jobs</h3>
+              <p class="hint">Uploads, reindexing, and maintenance run here — long jobs keep going while you use other tabs.</p>
+            </div>
+            <button id="reindexButton" type="button" title="Re-run indexing over every registered PDF">Reindex</button>
+          </header>
+          <div class="toolbar jobs-toolbar">
+            <input id="jobSearchInput" type="search" placeholder="Search jobs" aria-label="Search jobs" />
+            <button id="jobSearchButton" type="button">Search</button>
+            <button id="enableJobNotificationsButton" type="button" hidden title="Show a desktop notification when a background job finishes or fails">Notify on completion</button>
+            <label class="inline-select-label">
+              Rows
+              <select id="jobsPageSizeSelect">
+                <option value="10" selected>10</option>
+                <option value="20">20</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+                <option value="all">All</option>
+              </select>
+            </label>
+            <div class="jobs-pager">
+              <button id="prevJobsPageButton" type="button">Prev</button>
+              <span id="jobsPageLabel"></span>
+              <button id="nextJobsPageButton" type="button">Next</button>
+            </div>
+          </div>
+          <table id="jobsTable" class="data-table">
+            <thead>
+              <tr>
+                <th scope="col">Job</th>
+                <th scope="col">Status</th>
+                <th scope="col">Phase</th>
+                <th scope="col">Files</th>
+                <th scope="col">Error</th>
+                <th scope="col">Action</th>
+              </tr>
+            </thead>
+            <tbody id="jobsBody"></tbody>
+          </table>
         </div>
-        <table id="jobsTable" class="data-table">
-          <thead>
-            <tr>
-              <th scope="col">Job</th>
-              <th scope="col">Status</th>
-              <th scope="col">Phase</th>
-              <th scope="col">Files</th>
-              <th scope="col">Error</th>
-              <th scope="col">Action</th>
-            </tr>
-          </thead>
-          <tbody id="jobsBody"></tbody>
-        </table>
       </section>
 
       <section id="library" class="panel">
@@ -168,6 +218,22 @@
               <option value="unreviewed">Unreviewed</option>
               <option value="approved">Approved</option>
               <option value="stale">Stale</option>
+            </select>
+          </label>
+          <label class="inline-select-label">
+            Status
+            <select id="pdfStatusFilterSelect">
+              <option value="all" selected>All statuses</option>
+              <option value="queued">Queued</option>
+              <option value="saving_uploads">Saving uploads</option>
+              <option value="ingesting">Ingesting</option>
+              <option value="ingested">Ingested</option>
+              <option value="indexed">Indexed</option>
+              <option value="not_indexed">Not indexed</option>
+              <option value="failed">Failed</option>
+              <option value="interrupted">Interrupted</option>
+              <option value="superseded">Superseded</option>
+              <option value="none">No status</option>
             </select>
           </label>
           <label class="inline-select-label">
@@ -238,6 +304,7 @@
               <th scope="col"><button type="button" class="th-sort" data-sort-key="filename" title="Sort by file name">PDF <span class="sort-indicator" aria-hidden="true"></span></button></th>
               <th scope="col"><button type="button" class="th-sort" data-sort-key="trust" title="Sort by trust review status">Status <span class="sort-indicator" aria-hidden="true"></span></button></th>
               <th scope="col"><button type="button" class="th-sort" data-sort-key="group" title="Sort by source group">Quality <span class="sort-indicator" aria-hidden="true"></span></button></th>
+              <th scope="col"><button type="button" class="th-sort" data-sort-key="category" title="Sort by category">Category <span class="sort-indicator" aria-hidden="true"></span></button></th>
               <th scope="col">Download</th>
             </tr>
           </thead>
@@ -395,16 +462,15 @@
             <h3>API keys</h3>
             <span id="adminKeysStatus" class="status"></span>
           </div>
-          <p class="hint" id="adminKeysHint">Keys authenticate mutations and admin endpoints. The plaintext secret is shown once at creation. Requires an admin-role key or the master token.</p>
+          <p class="hint" id="adminKeysHint">Keys authenticate remote clients; each key inherits the category access and powers of its permission set. The plaintext secret is shown once at creation. Requires an admin key, the master token, or local access.</p>
           <details class="advanced-settings admin-key-create">
             <summary>Issue new key</summary>
             <div class="toolbar admin-key-create-toolbar">
               <input id="adminKeyLabelInput" type="text" placeholder="Label (e.g. laptop-alice)" maxlength="120" aria-label="Key label" />
               <label class="inline-select-label">
-                Role
-                <select id="adminKeyRoleSelect">
+                Permission set
+                <select id="adminKeyPermSetSelect">
                   <option value="user" selected>user</option>
-                  <option value="admin">admin</option>
                 </select>
               </label>
               <label class="inline-select-label">
@@ -424,7 +490,7 @@
                 <tr>
                   <th scope="col">Prefix</th>
                   <th scope="col">Label</th>
-                  <th scope="col">Role</th>
+                  <th scope="col">Permission set</th>
                   <th scope="col">Status</th>
                   <th scope="col">Expires</th>
                   <th scope="col">Usage</th>
@@ -439,10 +505,54 @@
 
         <div class="admin-section">
           <div class="admin-section-header">
+            <h3>Permission sets</h3>
+            <span id="adminPermSetsStatus" class="status"></span>
+          </div>
+          <p class="hint" id="adminPermSetsHint">Permission sets decide which categories a key can see and query, plus upload/edit (write) and admin powers. Every key is assigned exactly one set; changes apply to its keys on their next request. Leave every category unchecked for “all categories”.</p>
+          <details class="advanced-settings admin-key-create" id="adminPermSetEditor">
+            <summary id="adminPermSetEditorSummary">Create permission set</summary>
+            <div class="permset-editor-form">
+              <div class="toolbar admin-key-create-toolbar">
+                <input id="adminPermSetNameInput" type="text" placeholder="Name (e.g. team-a-read-only)" maxlength="64" aria-label="Permission set name" />
+                <input id="adminPermSetLabelInput" type="text" placeholder="Display label (optional)" maxlength="120" aria-label="Permission set label" />
+                <label class="inline-check">
+                  <input id="adminPermSetWriteCheck" type="checkbox" checked />
+                  Can upload &amp; edit
+                </label>
+                <label class="inline-check">
+                  <input id="adminPermSetAdminCheck" type="checkbox" />
+                  Admin
+                </label>
+                <button id="adminPermSetSaveButton" type="button">Create set</button>
+                <button id="adminPermSetCancelButton" type="button" hidden>Cancel edit</button>
+              </div>
+              <div id="adminPermSetCatsBox" class="permset-cats" aria-label="Category access"></div>
+            </div>
+          </details>
+          <div class="admin-keys-table-wrap">
+            <table id="adminPermSetsTable" class="data-table admin-permsets-table">
+              <thead>
+                <tr>
+                  <th scope="col">Name</th>
+                  <th scope="col">Label</th>
+                  <th scope="col">Categories</th>
+                  <th scope="col">Write</th>
+                  <th scope="col">Admin</th>
+                  <th scope="col">Keys</th>
+                  <th scope="col">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="adminPermSetsBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="admin-section">
+          <div class="admin-section-header">
             <h3>Categories</h3>
             <span id="adminCategoriesStatus" class="status"></span>
           </div>
-          <p class="hint">Categories split the corpus into independent indexes — for example general textbooks vs. team design documents. Queries on the Ask tab can target one, several, or all of them, and moving a document between categories reuses its existing vectors (no re-embedding). Backups, rebuild, and compaction currently operate on the General index.</p>
+          <p class="hint">Categories split the corpus into independent indexes. Retrieval weights boost or downrank a category when searching multiple categories; General is fixed at 1×. Moving documents reuses existing vectors (no re-embedding).</p>
           <div class="toolbar">
             <input id="adminCategoryKeyInput" type="text" placeholder="New category name (e.g. Team design docs)" maxlength="120" aria-label="New category name" />
             <button id="adminCategoryCreateButton" type="button">Create category</button>
@@ -457,6 +567,7 @@
                   <th>Documents</th>
                   <th>Records</th>
                   <th>Embedding</th>
+                  <th>Retrieval weight</th>
                   <th scope="col">Actions</th>
                 </tr>
               </thead>
@@ -486,6 +597,7 @@
             <button id="rebuildIndexButton" class="danger" type="button" title="Drop the current index and rebuild it from processed Markdown">Re-build index</button>
             <button id="compactIndexButton" type="button" title="Merge LanceDB fragments and reclaim space from reindex cycles">Compact index</button>
             <button id="rebuildVectorIndexButton" type="button" title="Re-train the ANN index without re-embedding (after many incremental reindexes)">Rebuild vector index</button>
+            <button id="shutdownServerButton" class="danger" type="button" hidden title="Stop the server after a countdown. Local machine only — running jobs are finalized, not resumed after restart.">Shut down server</button>
           </div>
           <div id="restoreIndexPanel" class="restore-panel" hidden>
             <div class="restore-panel-header">
@@ -516,7 +628,7 @@
             <ol class="guide-steps">
               <li>
                 <strong>Add PDFs</strong>
-                <span>On the Documents tab, upload team reports, textbooks, notes, papers, or standards and choose a reliability group for each PDF. You can also drop a <code>.zip</code> of PDFs — subfolders are flattened automatically.</span>
+                <span>On the Documents tab, upload team reports, textbooks, notes, papers, or standards and choose a reliability group for each PDF. Staged files also pick an index category — the searchable index the batch lands in. You can also drop a <code>.zip</code> of PDFs — subfolders are flattened automatically.</span>
               </li>
               <li>
                 <strong>Wait for jobs</strong>
@@ -558,7 +670,8 @@
             <ul class="guide-list">
               <li>Long ingestion and indexing jobs run in the background; chat can still use the last published index.</li>
               <li>Index edits are disabled while indexing is active to avoid writing into a changing database.</li>
-              <li>Administrators manage API keys and index maintenance (backup, restore, rebuild) from the Admin tab.</li>
+              <li>Access is authenticated: this machine is fully trusted, and remote clients need an API key. Permission sets (Admin tab) decide which categories a key can see, plus write/admin powers.</li>
+              <li>Administrators manage API keys, permission sets, and index maintenance (backup, restore, rebuild) from the Admin tab.</li>
               <li>Saved chats live in this browser only and are useful for recurring investigation threads.</li>
             </ul>
           </section>

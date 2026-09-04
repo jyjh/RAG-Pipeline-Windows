@@ -29,6 +29,7 @@ class LocalQueryEngine:
         *,
         working_dirs: list[str] | None = None,
         category_labels: list[str] | None = None,
+        category_weights: dict[str, float] | None = None,
         asset_dir: str | Path | None = None,
         trust_path: str | Path | None = None,
         model: str = DEFAULT_LLM_MODEL,
@@ -65,6 +66,10 @@ class LocalQueryEngine:
         from src.asset_store import ImageAssetStore
 
         self.working_dir = working_dir
+        self.category_weights = {
+            str(key): float(value) for key, value in (category_weights or {}).items()
+        }
+        self.default_category_key = str((category_labels or ["general"])[0] or "general")
         self.asset_dir = Path(asset_dir) if asset_dir is not None else Path(working_dir) / "assets"
         env_trust_path = os.environ.get("LOCAL_RAG_TRUST_PATH")
         inferred_trust_path = Path(working_dir).resolve().parent / "data" / ".document_trust.json"
@@ -212,6 +217,7 @@ class LocalQueryEngine:
                 [default_store(d, prefer_lancedb=True) for d in dirs],
                 labels=labels,
                 keys=dirs,
+                weights=[self.category_weights.get(label, 1.0) for label in labels],
             )
             self.working_dirs = dirs
         else:
@@ -518,6 +524,7 @@ class LocalQueryEngine:
             return (1.0 - self.retrieval_lexical_weight) * vector_score + self.retrieval_lexical_weight * rrf
 
         def rank_record(record: dict[str, Any], *, inherited_score: float | None = None) -> dict[str, Any]:
+            nonlocal max_rrf
             vector_score = float(record.get("score") or inherited_score or 0.0)
             lexical_score = _lexical_relevance(query_terms, record, keyword_cache=keyword_cache)
             record_id = str(record.get("id") or "")
@@ -528,11 +535,19 @@ class LocalQueryEngine:
                 child_bm25 = _bm25_scores(query_terms, [record])
                 if child_bm25.get(record_id, 0.0) > 0.0:
                     rrf_scores[record_id] = 1.0 / (self.retrieval_rrf_k + 1)
+                    # Keep the normalizer in sync, else this child's normalized
+                    # RRF exceeds 1 and its hybrid score is inflated.
+                    max_rrf = max(max_rrf, rrf_scores[record_id])
                     bm25_ranked.insert(0, record_id)
             hybrid_score = _fused_score(record_id, vector_score)
             reliability = self._reliability_details(record)
             reliability_modifier = float(reliability.get("weight") or source_group_weight(SOURCE_GROUP_UNGROUPED))
             final_score = hybrid_score * reliability_modifier
+            category_weight = float(
+                record.get("category_weight")
+                or self.category_weights.get(str(record.get("category") or self.default_category_key), 1.0)
+            )
+            final_score *= category_weight
             ranked = dict(record)
             ranked["vector_score"] = round(vector_score, 4)
             ranked["lexical_score"] = round(lexical_score, 4)
@@ -540,6 +555,7 @@ class LocalQueryEngine:
             ranked["source_group"] = str(reliability.get("key") or SOURCE_GROUP_UNGROUPED)
             ranked["review_status"] = str(reliability.get("review_status") or "unreviewed")
             ranked["reliability_modifier"] = round(reliability_modifier, 4)
+            ranked["category_weight"] = round(category_weight, 4)
             ranked["score"] = round(final_score, 4)
             return ranked
 
@@ -577,6 +593,12 @@ class LocalQueryEngine:
             )
             item["reliability_modifier"] = round(
                 float(record.get("reliability_modifier") or source_group_weight(SOURCE_GROUP_UNGROUPED)),
+                4,
+            )
+            item["category_weight"] = round(
+                float(record.get("category_weight") or self.category_weights.get(
+                    str(record.get("category") or self.default_category_key), 1.0
+                )),
                 4,
             )
             item["estimated_tokens"] = tokens

@@ -142,7 +142,7 @@ def _load_ingestion_config(config_path: Path | None = None) -> dict[str, Any]:
         "vision_ocr_model": str(ingestion.vision_ocr_model or DEFAULT_VISION_OCR_MODEL),
         "vision_ocr_dpi": _as_positive_int(ingestion.vision_ocr_dpi, DEFAULT_VISION_OCR_DPI),
         "ingestion_workers": _as_positive_int(ingestion.ingestion_workers, 1),
-        "max_pages_whole_doc": max(0, int(ingestion.max_pages_whole_doc or 0)),
+        "max_pages_whole_doc": max(0, _as_optional_int(ingestion.max_pages_whole_doc, 0) or 0),
     }
 
 

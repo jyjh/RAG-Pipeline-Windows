@@ -3,12 +3,12 @@
 
 import { ANSWER_PRESETS, clearApiKey, closeSourceGroupPrompt, els, loadApiKey, parseSourceGroupInput, reloadAfterCacheClear, selectAllUntaggedPdfs, setApiKey, state, stopGeneration, CHAT_UI_STORAGE_KEY } from "./js/core.js";
 import { applyUpdate, handleJobAction, handleVisibilityChange, refreshHealth, refreshJobs, refreshUpdateStatus, scheduleHealthPolling, scheduleJobsPolling, scheduleUpdatePolling, updateComposerSettingsSummary } from "./js/status.js";
-import { clearUploadDrag, enqueueReindex, fileToGroupSelect, handleUploadDrag, handleUploadDrop, renderUploadGroupSelectors, setSelectedUploadFiles, updateSelectedFilesLabel, uploadFiles } from "./js/upload.js";
+import { clearStagedUploadFiles, clearUploadDrag, enqueueReindex, fileToGroupSelect, handleUploadDrag, handleUploadDrop, renderUploadGroupSelectors, setSelectedUploadFiles, updateSelectedFilesLabel, uploadFiles } from "./js/upload.js";
 import { applyBulkTagGroup, clearPdfSelection, closePdfPreview, handlePdfAction, loadReviewerName, refreshPdfs, runAutoTagSweep, saveReviewerName, syncPdfSelectAllState, togglePdfSelection, updatePdfBulkBar, handleLibrarySortClick, bulkDeleteSelected, bulkRerunSelected, setPdfPreviewMode } from "./js/library.js";
-import { bulkMoveSelectedToCategory, createCategoryFromAdmin, deleteCategoryFromAdmin, refreshCategories } from "./js/categories.js";
-import { endInlineEdit, handleIndexAction, loadIndex, runIndexVectorSearch, handleDocumentListClick, refreshDocumentList, setReviewViewMode } from "./js/review.js";
+import { bulkMoveSelectedToCategory, createCategoryFromAdmin, deleteCategoryFromAdmin, refreshCategories, updateCategoryWeight } from "./js/categories.js";
+import { endInlineEdit, handleIndexAction, loadIndex, runIndexVectorSearch, handleDocumentListClick, refreshDocumentList, setReviewViewMode, reviewViewMode } from "./js/review.js";
 import { applyAnswerPreset, assistantMessageParts, cancelInlineMessageEdit, createChat, focusSourceForCitation, hideCitationPopover, loadChatState, persistChatState, renderActiveChat, renderSavedChats, restoreAnswerPreset, sendQuestion, setChatSidebarCollapsed, showCitationPopover } from "./js/chat.js";
-import { createAdminApiKey, enqueueBackup, enqueueRebuild, enqueueReingest, handleAdminKeyAction, handleBackupAction, loadIndexBackups, refreshAdminPanel, toggleRestorePanel, refreshUpdatePanel, enqueueCompact, enqueueRebuildVectorIndex } from "./js/admin.js";
+import { createAdminApiKey, enqueueBackup, enqueueRebuild, enqueueReingest, handleAdminKeyAction, handleAdminPermSetAction, handleBackupAction, loadIndexBackups, refreshAdminPanel, resetPermSetEditor, saveAdminPermSet, toggleRestorePanel, refreshUpdatePanel, enqueueCompact, enqueueRebuildVectorIndex, shutdownServer } from "./js/admin.js";
 import { acceptWelcomeTutorialPrompt, activateTab, applyTheme, closeCachePrompt, closeSettingsDialog, closeWalkthrough, closeWelcomeTutorialPrompt, handleGlobalShortcut, loadAppSidebarCollapsed, loadThemePreference, markComposerSettingsCustom, maybeStartFirstVisitWalkthrough, nextWalkthroughStep, openSettingsDialog, previousWalkthroughStep, resolveTheme, setAppSidebarCollapsed, setThemePreference, startWalkthrough, welcomeTutorialPromptOpen, handleSidebarKeydown } from "./js/shell.js";
 
 document.querySelectorAll("[data-tab-target]").forEach((button) => {
@@ -123,6 +123,13 @@ els.fileInput.addEventListener("change", () => {
   setSelectedUploadFiles(els.fileInput.files);
 });
 
+// The visually-hidden file input is driven by the big dropzone button.
+if (els.dropzoneButton) {
+  els.dropzoneButton.addEventListener("click", () => els.fileInput.click());
+}
+
+els.uploadCategorySelect.addEventListener("change", updateSelectedFilesLabel);
+
 els.uploadDropZone.addEventListener("dragenter", handleUploadDrag);
 
 els.uploadDropZone.addEventListener("dragover", handleUploadDrag);
@@ -132,6 +139,10 @@ els.uploadDropZone.addEventListener("dragleave", clearUploadDrag);
 els.uploadDropZone.addEventListener("drop", handleUploadDrop);
 
 els.uploadButton.addEventListener("click", () => uploadFiles());
+
+if (els.cancelUploadButton) {
+  els.cancelUploadButton.addEventListener("click", clearStagedUploadFiles);
+}
 
 els.forceUploadButton.addEventListener("click", () => {
   if (!state.pendingForceUploadToken) {
@@ -220,6 +231,14 @@ if (els.pdfTrustFilterSelect) {
   });
 }
 
+if (els.pdfStatusFilterSelect) {
+  els.pdfStatusFilterSelect.addEventListener("change", () => {
+    state.pdfStatusFilter = els.pdfStatusFilterSelect.value || "all";
+    state.pdfOffset = 0;
+    refreshPdfs({ force: true });
+  });
+}
+
 if (els.pdfCategoryFilterSelect) {
   els.pdfCategoryFilterSelect.addEventListener("change", () => {
     state.pdfCategoryFilter = els.pdfCategoryFilterSelect.value || "all";
@@ -255,6 +274,10 @@ if (els.adminCategoriesBody) {
     if (button.dataset.categoryAction === "delete") {
       deleteCategoryFromAdmin(button.dataset.categoryKey || "");
     }
+  });
+  els.adminCategoriesBody.addEventListener("change", (event) => {
+    const input = event.target.closest("[data-category-weight-key]");
+    if (input) updateCategoryWeight(input.dataset.categoryWeightKey || "", input.value);
   });
 }
 
@@ -364,6 +387,11 @@ els.chatMessages.addEventListener("click", (event) => {
   }
   event.preventDefault();
   const target = decodeURIComponent(link.dataset.reviewSearch || "");
+  // The search toolbar only exists in chunks mode; Documents mode would
+  // swallow the jump silently.
+  if (reviewViewMode() !== "chunks") {
+    setReviewViewMode("chunks");
+  }
   activateTab("index");
   els.searchInput.value = target;
   els.searchButton.click();
@@ -496,6 +524,18 @@ if (els.adminKeyCreateButton) {
 if (els.adminKeysBody) {
   els.adminKeysBody.addEventListener("click", handleAdminKeyAction);
   els.adminKeysBody.addEventListener("change", handleAdminKeyAction);
+}
+
+if (els.adminPermSetSaveButton) {
+  els.adminPermSetSaveButton.addEventListener("click", saveAdminPermSet);
+}
+
+if (els.adminPermSetCancelButton) {
+  els.adminPermSetCancelButton.addEventListener("click", resetPermSetEditor);
+}
+
+if (els.adminPermSetsBody) {
+  els.adminPermSetsBody.addEventListener("click", handleAdminPermSetAction);
 }
 
 els.jobSearchButton.addEventListener("click", () => {
@@ -660,8 +700,15 @@ els.chatMessages.addEventListener("click", (event) => {
 
 
 // Phones start with the chat sidebar collapsed to keep the conversation
-// usable; an explicit expand (persisted) still wins.
-if (window.innerWidth <= 760 && !localStorage.getItem(CHAT_UI_STORAGE_KEY)) {
+// usable; an explicit expand (persisted) still wins. Storage can be blocked
+// (e.g. "block all cookies"); this runs during bootstrap, so never throw.
+let hasStoredChatUi = false;
+try {
+  hasStoredChatUi = Boolean(localStorage.getItem(CHAT_UI_STORAGE_KEY));
+} catch (_) {
+  // Storage unavailable: fall through with the default (collapsed) state.
+}
+if (window.innerWidth <= 760 && !hasStoredChatUi) {
   state.chatSidebarCollapsed = true;
 }
 loadReviewerName();
@@ -724,6 +771,15 @@ if (els.compactIndexButton) {
 }
 if (els.rebuildVectorIndexButton) {
   els.rebuildVectorIndexButton.addEventListener("click", enqueueRebuildVectorIndex);
+}
+// "Shut down server" is a local-operator control: the endpoint enforces the
+// loopback restriction server-side, so the button is only REVEALED when the
+// browser itself is on the machine (a LAN admin never sees it at all).
+if (els.shutdownServerButton) {
+  const host = String(window.location.hostname || "").toLowerCase();
+  const isLocalBrowser = host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+  els.shutdownServerButton.hidden = !isLocalBrowser;
+  els.shutdownServerButton.addEventListener("click", shutdownServer);
 }
 if (els.pdfBulkRerunButton) {
   els.pdfBulkRerunButton.addEventListener("click", bulkRerunSelected);

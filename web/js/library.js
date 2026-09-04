@@ -1,6 +1,7 @@
 // Library tab: PDF trust/review table, facets, preview modal, auto-tag.
 
-import { REVIEWER_NAME_COOKIE, SOURCE_GROUP_LABELS, chooseSourceGroup, confirmAction, els, escapeHtml, inlineNotePrompt, formatBrowserTimestamp, getCookie, markIndexDirty, patchTableRows, promptText, requestJson, setCookie, setStatus, showToast, sourceGroupTitle, sourceGroupWeight, sourceTypeTitle, stableJsonHash, state, toastError, updatePageControls, visibleUntaggedRowCheckboxes, renderMarkdown } from "./core.js";
+import { REVIEWER_NAME_COOKIE, SOURCE_GROUP_LABELS, chooseSourceGroup, confirmAction, els, escapeHtml, inlineNotePrompt, formatBrowserTimestamp, getCookie, markIndexDirty, mediaUrlWithToken, patchTableRows, promptText, requestJson, setCookie, setStatus, showToast, sourceGroupTitle, sourceGroupWeight, sourceTypeTitle, stableJsonHash, state, toastError, updatePageControls, visibleUntaggedRowCheckboxes, renderMarkdown } from "./core.js";
+import { _populateCategorySelect, categoryBadgeHtml } from "./categories.js";
 import { refreshJobs } from "./status.js";
 import { extractPdfsFromZip, isZipFile } from "./upload.js";
 import { WALKTHROUGH_FAKE_PDF_HASH, highlightWalkthroughTarget, walkthroughSteps } from "./shell.js";
@@ -60,6 +61,7 @@ function qualityTitle(value) {
 
 function qualityWarnings(warnings) {
   const labels = {
+    low_chunk_density: "few chunks for its size",
     low_extracted_text: "low text",
     missing_index_manifest: "index details missing",
     missing_markdown: "missing Markdown",
@@ -69,6 +71,7 @@ function qualityWarnings(warnings) {
     marked_stale: "marked stale",
     rejected_source: "rejected",
     review_expired: "review expired",
+    single_chunk: "single chunk",
     unreviewed_source: "unreviewed",
   };
   return (Array.isArray(warnings) ? warnings : []).map((warning) => labels[warning] || warning);
@@ -178,10 +181,14 @@ async function applyBulkTagGroup() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ source_hashes: hashes, source_group: sourceGroup }),
     });
+    let patchedAny = false;
     for (const item of result.updated || []) {
       if (item.pdf) {
-        patchPdfRow(item.pdf);
+        patchedAny = patchPdfRow(item.pdf, { skipSelectionSync: true }) || patchedAny;
       }
+    }
+    if (patchedAny) {
+      syncPdfSelectionAfterRender();
     }
     clearPdfSelection();
     const label = SOURCE_GROUP_LABELS[sourceGroup] || sourceGroup;
@@ -199,6 +206,37 @@ async function applyBulkTagGroup() {
     setStatus(els.libraryStatus, error.message, true);
   }
   await refreshPdfs({ force: true });
+}
+
+
+// One classification batch takes tens of seconds on a local model, so a
+// 200-PDF sweep can run for the better part of an hour. Poll the run status
+// far longer than any other UI request before giving up on the report (the
+// background run itself is unaffected; this only bounds the button/status).
+const AUTO_TAG_POLL_INTERVAL_MS = 3000;
+const AUTO_TAG_POLL_MAX_MS = 2 * 60 * 60 * 1000;
+
+
+async function pollAutoTagRun(queuedCount) {
+  const deadline = Date.now() + AUTO_TAG_POLL_MAX_MS;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, AUTO_TAG_POLL_INTERVAL_MS));
+    let status;
+    try {
+      status = await requestJson("/api/pdfs/trust/auto-tag");
+    } catch {
+      continue; // transient poll failure; the server-side run is unaffected
+    }
+    if (!status || status.running !== true) {
+      return status || null;
+    }
+    const tagged = Number(status.tagged) || 0;
+    setStatus(
+      els.libraryStatus,
+      `Auto-tagging ${queuedCount} PDF${queuedCount === 1 ? "" : "s"}... ${tagged} tagged so far.`
+    );
+  }
+  return null;
 }
 
 
@@ -221,15 +259,42 @@ async function runAutoTagSweep() {
       setStatus(els.libraryStatus, result.message || "No ungrouped PDFs to tag.");
       return;
     }
-    const autoTagMessage = `Auto-tagging ${queued.length} PDF${queued.length === 1 ? "" : "s"} with ${result.model || "the LLM"}. Rows update as decisions land.`;
+    // total_ungrouped > queued.length means this run hit the per-run cap
+    // ([auto_tag].max_items_per_run): say "200 of 327" so the round number
+    // reads as a limit, not the whole backlog.
+    const totalUngrouped = Number(result.total_ungrouped) || queued.length;
+    const scope = totalUngrouped > queued.length
+      ? `${queued.length} of ${totalUngrouped} ungrouped PDFs`
+      : `${queued.length} PDF${queued.length === 1 ? "" : "s"}`;
+    const autoTagMessage = `Auto-tagging ${scope} with ${result.model || "the LLM"}. Rows update as decisions land.`;
     setStatus(els.libraryStatus, autoTagMessage);
     showToast(autoTagMessage, { kind: "info" });
-    // Decisions are written to the trust registry as the model answers;
-    // poll a few times so rows flip to their auto tag without a manual reload.
-    for (const delay of [4000, 12000, 30000]) {
-      setTimeout(() => {
-        refreshPdfs({ force: true });
-      }, delay);
+    // The sweep is one background LLM run that can outlive many refreshes;
+    // track it to completion so the outcome (or its failures) is visible.
+    const finalStatus = await pollAutoTagRun(queued.length);
+    await refreshPdfs({ force: true });
+    if (!finalStatus) {
+      showToast("Auto-tag is still running in the background; refresh later to see the rest.", { kind: "info", timeoutMs: 10000 });
+      setStatus(els.libraryStatus, "Auto-tag run still in progress; refresh later for the rest.");
+      return;
+    }
+    const tagged = Number(finalStatus.tagged) || 0;
+    const failedBatches = Number(finalStatus.failed_batches) || 0;
+    const errorText = String(finalStatus.last_error || "").trim();
+    if (errorText) {
+      setStatus(
+        els.libraryStatus,
+        `Auto-tag finished with failures (${tagged} tagged, ${failedBatches} batch${failedBatches === 1 ? "" : "es"} failed): ${errorText}`,
+        true
+      );
+      showToast(`Auto-tag finished with failures: ${tagged} tagged, ${failedBatches} batches failed.`, { kind: "error" });
+    } else if (!tagged) {
+      setStatus(els.libraryStatus, "Auto-tag finished: no PDFs were tagged (replies were unparseable or below the confidence floor).");
+      showToast("Auto-tag finished: nothing was tagged.", { kind: "info" });
+    } else {
+      const doneMessage = `Auto-tag finished: ${tagged} of ${queued.length} PDF${queued.length === 1 ? "" : "s"} tagged.`;
+      setStatus(els.libraryStatus, doneMessage);
+      showToast(doneMessage, { kind: "info" });
     }
   } catch (error) {
     setStatus(els.libraryStatus, error.message, true);
@@ -327,7 +392,7 @@ function createPdfRow(item, options = {}) {
     row.classList.add("walkthrough-fake-pdf-row");
   }
   const download = item.download_url
-    ? `<a class="download-link" href="${escapeHtml(item.download_url)}">Download</a>`
+    ? `<a class="download-link" href="${escapeHtml(mediaUrlWithToken(item.download_url))}">Download</a>`
     : escapeHtml(item.path_error || "");
   const selectCell = isUntagged && sourceHash && sourceHash !== WALKTHROUGH_FAKE_PDF_HASH
     ? `<td class="pdf-select-col"><input type="checkbox" class="pdf-row-select" data-pdf-select="${escapeHtml(sourceHash)}" title="Select this untagged PDF"${state.selectedPdfHashes.has(sourceHash) ? " checked" : ""} /></td>`
@@ -347,6 +412,7 @@ function createPdfRow(item, options = {}) {
     </td>
     <td>${escapeHtml(item.status || "")}</td>
     <td>${renderQualityCell(item)}</td>
+    <td class="pdf-category-cell">${categoryBadgeHtml(item.category || "general")}</td>
     <td>${download}</td>
   `;
   return row;
@@ -373,7 +439,12 @@ function patchPdfRow(item, options = {}) {
   row.dataset.patchKey = key;
   row.dataset.renderKey = pdfRowRenderKey(item, options);
   existing.replaceWith(row);
-  syncPdfSelectionAfterRender();
+  // Callers patching many rows at once pass skipSelectionSync and run
+  // syncPdfSelectionAfterRender() once afterwards; the per-row sync
+  // re-queries every checkbox in the table (O(rows) per patch).
+  if (!options.skipSelectionSync) {
+    syncPdfSelectionAfterRender();
+  }
   return true;
 }
 
@@ -394,6 +465,7 @@ async function refreshPdfs(options = {}) {
       search: state.pdfSearch,
       source_group: state.pdfGroupFilter || "all",
       trust_status: state.pdfTrustFilter || "all",
+      status: state.pdfStatusFilter || "all",
       category: state.pdfCategoryFilter || "all",
       sort: state.pdfSort || "",
     });
@@ -437,6 +509,20 @@ async function refreshPdfs(options = {}) {
 
 
 async function handlePdfAction(event) {
+  // Category badge in the row: a one-click facet filter for that category.
+  const filterBadge = event.target.closest("[data-category-filter]");
+  if (filterBadge) {
+    const key = filterBadge.dataset.categoryFilter || "general";
+    state.pdfCategoryFilter = state.pdfCategoryFilter === key ? "all" : key;
+    state.pdfOffset = 0;
+    _populateCategorySelect(els.pdfCategoryFilterSelect, {
+      value: state.pdfCategoryFilter,
+      includeAll: true,
+      allLabel: "All categories",
+    });
+    refreshPdfs({ force: true });
+    return;
+  }
   const button = event.target.closest("[data-pdf-action]");
   if (!button) {
     return;
@@ -601,9 +687,15 @@ export function setPdfPreviewMode(mode) {
   els.pdfPreviewModePdf.classList.toggle("active", showPdf);
   els.pdfPreviewModeText.classList.toggle("active", !showPdf);
   if (!showPdf && pdfPreviewActive.sourceHash && !els.pdfPreviewText.dataset.loaded) {
+    // Capture the hash: a slow fetch must never render document A's text
+    // under document B's title after the preview target changed.
+    const requestedHash = pdfPreviewActive.sourceHash;
     els.pdfPreviewText.textContent = "Loading extracted text…";
-    requestJson(`/api/pdfs/${encodeURIComponent(pdfPreviewActive.sourceHash)}/markdown`)
+    requestJson(`/api/pdfs/${encodeURIComponent(requestedHash)}/markdown`)
       .then(async (payload) => {
+        if (pdfPreviewActive.sourceHash !== requestedHash || !els.pdfPreviewOverlay || els.pdfPreviewOverlay.hidden) {
+          return;
+        }
         if (payload && typeof payload.markdown === "string") {
           els.pdfPreviewText.innerHTML = await renderMarkdown(payload.markdown);
         } else {
@@ -612,6 +704,9 @@ export function setPdfPreviewMode(mode) {
         els.pdfPreviewText.dataset.loaded = "1";
       })
       .catch((error) => {
+        if (pdfPreviewActive.sourceHash !== requestedHash || !els.pdfPreviewOverlay || els.pdfPreviewOverlay.hidden) {
+          return;
+        }
         els.pdfPreviewText.textContent = error.message;
       });
   }
@@ -623,8 +718,8 @@ function openPdfPreview(sourceHash, filename, { preferText = false } = {}) {
   }
   pdfPreviewActive = { sourceHash, mode: preferText ? "text" : "pdf" };
   els.pdfPreviewTitle.textContent = `Preview — ${filename}`;
-  els.pdfPreviewDownloadLink.href = `/api/pdfs/${encodeURIComponent(sourceHash)}/download`;
-  els.pdfPreviewFrame.src = preferText ? "about:blank" : `/api/pdfs/${encodeURIComponent(sourceHash)}/view`;
+  els.pdfPreviewDownloadLink.href = mediaUrlWithToken(`/api/pdfs/${encodeURIComponent(sourceHash)}/download`);
+  els.pdfPreviewFrame.src = preferText ? "about:blank" : mediaUrlWithToken(`/api/pdfs/${encodeURIComponent(sourceHash)}/view`);
   delete els.pdfPreviewText.dataset.loaded;
   els.pdfPreviewText.innerHTML = "";
   setPdfPreviewMode(preferText ? "text" : "pdf");
@@ -702,10 +797,10 @@ function renderPdfRows(items) {
   if (!rows.length) {
     const emptyRow = document.createElement("tr");
     emptyRow.className = "library-empty-state";
-    const detail = state.pdfSearch || state.pdfGroupFilter !== "all" || state.pdfTrustFilter !== "all"
+    const detail = state.pdfSearch || state.pdfGroupFilter !== "all" || state.pdfTrustFilter !== "all" || state.pdfStatusFilter !== "all" || state.pdfCategoryFilter !== "all"
       ? "No PDFs match the current search or filters."
       : "No PDFs yet — upload some on the Documents tab.";
-    emptyRow.innerHTML = `<td colspan="5" class="library-empty-cell">${escapeHtml(detail)}</td>`;
+    emptyRow.innerHTML = `<td colspan="6" class="library-empty-cell">${escapeHtml(detail)}</td>`;
     els.pdfsBody.replaceChildren(emptyRow);
     return;
   }

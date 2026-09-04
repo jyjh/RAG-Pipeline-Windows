@@ -10,12 +10,20 @@ of that module into the FastAPI middleware + admin endpoint in
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 import src.api_key_auth as aka
 import src.web_app as web_app
+
+# This module tests credential handling itself, so every test here runs in the
+# strict remote posture (see the ``_local_operator`` fixture in conftest.py):
+# TestClient requests are NOT treated as loopback. The localhost auto-auth
+# bypass stays enabled -- the tests that exercise it use an explicit
+# 127.0.0.1 client address.
+pytestmark = pytest.mark.remote_client
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +279,181 @@ def test_create_rejects_invalid_role(authenticator):
 
 
 # ===========================================================================
+# Permission sets
+# ===========================================================================
+
+
+def test_builtin_sets_provisioned_on_fresh_store(authenticator):
+    sets = {s["name"]: s for s in authenticator.list_permission_sets()}
+    assert sets[aka.PERMSET_ADMIN]["admin"] is True
+    assert sets[aka.PERMSET_ADMIN]["builtin"] is True
+    assert sets[aka.PERMSET_ADMIN]["categories"] == [aka.PERMSET_WILDCARD]
+    assert sets[aka.PERMSET_USER]["admin"] is False
+    assert sets[aka.PERMSET_USER]["builtin"] is True
+
+
+def test_create_key_defaults_map_roles_to_builtin_sets(authenticator):
+    _, user_record = _make_key(authenticator, label="u")
+    assert user_record["permission_set"] == aka.PERMSET_USER
+    _, admin_record = _make_key(authenticator, label="a", role=aka.ROLE_ADMIN)
+    assert admin_record["permission_set"] == aka.PERMSET_ADMIN
+
+
+def test_create_key_with_permission_set_overrides_role(authenticator):
+    authenticator.create_permission_set(
+        name="team-a", label="Team A", categories=["general", "team-a"]
+    )
+    _, record = _make_key(authenticator, label="k", role=aka.ROLE_ADMIN, permission_set="team-a")
+    assert record["permission_set"] == "team-a"
+    # The legacy role mirrors the set's admin flag (not the role argument).
+    assert record["role"] == aka.ROLE_USER
+
+
+def test_create_key_rejects_unknown_permission_set(authenticator):
+    with pytest.raises(ValueError):
+        _make_key(authenticator, label="k", permission_set="nope")
+
+
+def test_key_authenticates_through_its_set(authenticator):
+    authenticator.create_permission_set(
+        name="ops", categories=["*"], admin=True, can_write=True
+    )
+    full_key, _ = _make_key(authenticator, label="k", permission_set="ops")
+    result, rejection = authenticator.authenticate(full_key, master_token="")
+    assert rejection is None
+    assert result.role == aka.ROLE_ADMIN
+    assert result.permission_set == "ops"
+
+
+def test_permission_set_roundtrip_and_counts(authenticator):
+    created = authenticator.create_permission_set(name="viewers", categories=["general"], can_write=False)
+    assert created["name"] == "viewers"
+    got = authenticator.get_permission_set("viewers")
+    assert got["can_write"] is False
+    assert got["categories"] == ["general"]
+    _make_key(authenticator, label="k", permission_set="viewers")
+    assert authenticator.permission_set_key_counts().get("viewers") == 1
+
+
+def test_permission_set_rejects_bad_name_and_duplicate(authenticator):
+    with pytest.raises(ValueError):
+        authenticator.create_permission_set(name="Bad Name!")
+    authenticator.create_permission_set(name="dup")
+    with pytest.raises(ValueError):
+        authenticator.create_permission_set(name="dup")
+
+
+def test_permission_set_category_validation(authenticator):
+    with pytest.raises(ValueError):
+        authenticator.create_permission_set(name="bad-cats", categories=["Not A Slug"])
+    # Wildcard collapses whatever else was listed.
+    record = authenticator.create_permission_set(name="wild", categories=["*", "general"])
+    assert record["categories"] == [aka.PERMSET_WILDCARD]
+    # Comma-separated strings are accepted for CLI convenience.
+    record = authenticator.create_permission_set(name="csv", categories="general, team-a")
+    assert record["categories"] == ["general", "team-a"]
+
+
+def test_delete_builtin_set_refused(authenticator):
+    with pytest.raises(ValueError):
+        authenticator.delete_permission_set(aka.PERMSET_ADMIN)
+    with pytest.raises(ValueError):
+        authenticator.delete_permission_set(aka.PERMSET_USER)
+
+
+def test_delete_set_in_use_refused(authenticator):
+    authenticator.create_permission_set(name="used")
+    full_key, _ = _make_key(authenticator, label="k", permission_set="used")
+    with pytest.raises(ValueError):
+        authenticator.delete_permission_set("used")
+    # Still functional after the refused delete.
+    result, rejection = authenticator.authenticate(full_key, master_token="")
+    assert rejection is None
+
+
+def test_delete_unused_set_succeeds(authenticator):
+    authenticator.create_permission_set(name="unused")
+    assert authenticator.delete_permission_set("unused") is True
+    assert authenticator.get_permission_set("unused") is None
+
+
+def test_update_set_revalidates_and_syncs_key_roles(authenticator):
+    authenticator.create_permission_set(name="promote")
+    full_key, _ = _make_key(authenticator, label="k", permission_set="promote")
+    updated = authenticator.update_permission_set("promote", {"admin": True, "categories": ["team-x"]})
+    assert updated["admin"] is True
+    assert updated["categories"] == ["team-x"]
+    # The member key's legacy role follows the set.
+    fresh = authenticator.store.get_by_hash(aka.hash_key(full_key))
+    assert fresh["role"] == aka.ROLE_ADMIN
+    # The builtin admin set cannot be demoted.
+    demoted = authenticator.update_permission_set(aka.PERMSET_ADMIN, {"admin": False})
+    assert demoted["admin"] is True
+
+
+def test_legacy_role_store_migrates_to_permission_sets(authenticator, safe_tmp_path):
+    import json
+
+    full_key = aka.generate_full_key()
+    key_hash = aka.hash_key(full_key)
+    legacy_payload = {
+        "version": 1,
+        "keys": {
+            key_hash: {
+                "label": "legacy",
+                "prefix": aka.make_prefix(full_key),
+                "status": aka.STATUS_ACTIVE,
+                "role": aka.ROLE_ADMIN,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "expires_at": None,
+                "rate_limit_per_minute": None,
+                "usage": {"requests": 0, "last_used_at": None, "last_used_ip": None},
+            }
+        },
+    }
+    store_path = safe_tmp_path / aka.STORE_FILENAME
+    store_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
+    result, rejection = authenticator.authenticate(full_key, master_token="")
+    assert rejection is None
+    assert result.permission_set == aka.PERMSET_ADMIN
+    assert result.role == aka.ROLE_ADMIN
+    record = authenticator.store.get_by_hash(key_hash)
+    assert record["permission_set"] == aka.PERMSET_ADMIN
+
+
+def test_store_with_unknown_set_reference_fails_toward_builtin(authenticator, safe_tmp_path):
+    import json
+
+    full_key = aka.generate_full_key()
+    key_hash = aka.hash_key(full_key)
+    payload = {
+        "version": 2,
+        "permission_sets": {
+            aka.PERMSET_ADMIN: {"name": aka.PERMSET_ADMIN, "admin": True, "builtin": True},
+            aka.PERMSET_USER: {"name": aka.PERMSET_USER, "admin": False, "builtin": True},
+        },
+        "keys": {
+            key_hash: {
+                "label": "orphan",
+                "prefix": aka.make_prefix(full_key),
+                "status": aka.STATUS_ACTIVE,
+                "role": aka.ROLE_USER,
+                "permission_set": "vanished",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "expires_at": None,
+                "rate_limit_per_minute": None,
+                "usage": {"requests": 0, "last_used_at": None, "last_used_ip": None},
+            }
+        },
+    }
+    store_path = safe_tmp_path / aka.STORE_FILENAME
+    store_path.write_text(json.dumps(payload), encoding="utf-8")
+    record = authenticator.store.get_by_hash(key_hash)
+    # Reassigned to the builtin user set rather than a permanent 401.
+    assert record["permission_set"] == aka.PERMSET_USER
+
+
+# ===========================================================================
 # Expiry
 # ===========================================================================
 
@@ -361,11 +544,14 @@ def test_master_token_constant_time_wrong_rejected(authenticator):
     assert rejection.status_code == 401
 
 
-def test_no_op_when_no_master_and_no_keys(authenticator):
-    # Fresh deploy: empty store + no master -> everything passes.
+def test_rejects_when_no_master_and_no_keys(authenticator):
+    # Auth has no open mode: empty store + no master -> any credential fails
+    # closed with a clean 401 (loopback auto-auth is handled by the middleware,
+    # not here).
     result, rejection = authenticator.authenticate("anything", master_token="")
     assert result is None
-    assert rejection is None
+    assert rejection is not None
+    assert rejection.status_code == 401
 
 
 def test_master_engages_gating_even_with_empty_store(safe_tmp_path):
@@ -559,11 +745,12 @@ def _stub_queue(monkeypatch):
     monkeypatch.setattr(web_app, "job_queue", StubQueue())
 
 
-def test_middleware_noop_when_empty(patched_authenticator):
-    # No keys, no master token -> fresh-deploy open behavior.
+def test_middleware_gates_even_when_store_empty(patched_authenticator):
+    # Auth is always the basis: even with no keys and no master token, a
+    # remote (non-loopback) client without a credential gets 401. The
+    # TestClient's host ("testclient") is not loopback, so no auto-auth.
     response = TestClient(web_app.app).post("/api/reindex")
-    # Auth passes (not 401). Downstream status depends on the handler.
-    assert response.status_code != 401
+    assert response.status_code == 401
 
 
 def test_middleware_requires_key_when_store_nonempty(patched_authenticator):
@@ -644,12 +831,12 @@ def test_sensitive_gets_accept_valid_key(patched_authenticator):
     assert r_metrics.status_code != 401
 
 
-def test_sensitive_gets_open_when_no_auth_configured(patched_authenticator):
-    # Fresh-deploy no-op: empty store + no master token -> sensitive GETs pass
-    # through (zero-config single-user UX preserved).
+def test_sensitive_gets_gated_when_no_auth_configured(patched_authenticator):
+    # No open mode: even with an empty store and no master token, sensitive
+    # GETs require a credential from remote clients.
     # (patched_authenticator fixture starts with an empty store.)
     r_metrics = TestClient(web_app.app).get("/api/metrics")
-    assert r_metrics.status_code != 401
+    assert r_metrics.status_code == 401
 
 
 def test_metrics_history_gated_when_auth_configured(patched_authenticator):
@@ -728,12 +915,191 @@ def test_middleware_rate_limit_429(monkeypatch, safe_tmp_path):
 
 
 # ===========================================================================
+# Localhost auto-auth + permission-set category scoping (end-to-end)
+# ===========================================================================
+
+
+@pytest.fixture
+def scoped_world(patched_authenticator, monkeypatch, safe_tmp_path):
+    """Two categories, one two-doc corpus, and a set factory.
+
+    The TestClient host ("testclient") is NOT loopback, so requests act as
+    remote clients; the localhost case is exercised with an explicit
+    127.0.0.1 client address.
+    """
+    entries = [
+        {"key": "general", "label": "General", "db_dir": str(safe_tmp_path / "db"), "exists": True},
+        {"key": "team-a", "label": "Team A", "db_dir": str(safe_tmp_path / "db" / "team-a"), "exists": True},
+    ]
+    memberships = {"hash-a": "general", "hash-b": "team-a"}
+
+    class StubCategoryStore:
+        def list_categories(self, *, anchor_db_dir=None):
+            return [dict(entry) for entry in entries]
+
+        def memberships_for(self, hashes):
+            return {h: memberships.get(h, "general") for h in hashes}
+
+        def state_version(self):
+            return "stub-1"
+
+    monkeypatch.setattr(web_app, "_category_store", lambda *a, **k: StubCategoryStore())
+
+    def make_set(name, *, categories, can_write=True, admin=False):
+        return patched_authenticator.create_permission_set(
+            name=name, categories=categories, can_write=can_write, admin=admin,
+        )
+
+    return {"make_set": make_set, "auth": patched_authenticator}
+
+
+def test_localhost_requests_are_auto_authenticated(scoped_world):
+    # No credential at all, but the socket peer is 127.0.0.1: the middleware
+    # stashes the full-admin localhost identity and the request passes.
+    local_client = TestClient(web_app.app, client=("127.0.0.1", 51000))
+    assert local_client.post("/api/reindex").status_code != 401
+    # The TestClient's default host ("testclient") is remote: a bare request,
+    # even with a spoofed X-Forwarded-For (only trusted from loopback peers),
+    # is rejected.
+    remote_client = TestClient(web_app.app)
+    assert remote_client.post("/api/reindex").status_code == 401
+
+
+def test_category_listing_filtered_by_permission_set(patched_authenticator, monkeypatch, scoped_world):
+    monkeypatch.setattr(
+        web_app,
+        "_category_listing",
+        lambda: {"categories": [
+            {"key": "general", "label": "General"},
+            {"key": "team-a", "label": "Team A"},
+        ], "total_sources": 2},
+    )
+    scoped_world["make_set"]("team-a-only", categories=["team-a"])
+    scoped_key, _ = patched_authenticator.create_key(label="a", permission_set="team-a-only")
+    open_key, _ = patched_authenticator.create_key(label="b")
+    client = TestClient(web_app.app)
+    scoped = client.get("/api/categories", headers={"X-API-Token": scoped_key}).json()
+    assert [entry["key"] for entry in scoped["categories"]] == ["team-a"]
+    open_view = client.get("/api/categories", headers={"X-API-Token": open_key}).json()
+    assert [entry["key"] for entry in open_view["categories"]] == ["general", "team-a"]
+
+
+def test_pdfs_endpoint_passes_scope_into_listing(patched_authenticator, monkeypatch, scoped_world):
+    captured = {}
+
+    def fake_list_pdf_documents(**kwargs):
+        captured["allowed"] = kwargs.get("allowed_categories")
+        return {"pdfs": [], "total": 0, "offset": 0, "limit": 10, "facets": {}, "categories": []}
+
+    monkeypatch.setattr(web_app, "list_pdf_documents", fake_list_pdf_documents)
+    scoped_world["make_set"]("general-only", categories=["general"])
+    full_key, _ = patched_authenticator.create_key(label="c", permission_set="general-only")
+    response = TestClient(web_app.app).get("/api/pdfs", headers={"X-API-Token": full_key})
+    assert response.status_code == 200
+    assert captured["allowed"] == {"general"}
+
+
+def test_pdfs_endpoint_403_for_out_of_scope_category_param(patched_authenticator, scoped_world):
+    scoped_world["make_set"]("general-only", categories=["general"])
+    full_key, _ = patched_authenticator.create_key(label="d", permission_set="general-only")
+    response = TestClient(web_app.app).get(
+        "/api/pdfs", params={"category": "team-a"}, headers={"X-API-Token": full_key}
+    )
+    assert response.status_code == 403
+
+
+def test_index_endpoint_403_for_out_of_scope_category(patched_authenticator, monkeypatch, scoped_world, safe_tmp_path):
+    # Stub the dir resolution so the scope check is what rejects (the real one
+    # would 400 on the unknown key first).
+    monkeypatch.setattr(web_app, "_resolve_category_db_dir", lambda key, **kwargs: Path(safe_tmp_path))
+    scoped_world["make_set"]("general-only", categories=["general"])
+    full_key, _ = patched_authenticator.create_key(label="e", permission_set="general-only")
+    response = TestClient(web_app.app).get(
+        "/api/index", params={"category": "team-a"}, headers={"X-API-Token": full_key}
+    )
+    assert response.status_code == 403
+
+
+def test_chat_stream_403_for_out_of_scope_category(patched_authenticator, scoped_world):
+    scoped_world["make_set"]("general-only", categories=["general"])
+    full_key, _ = patched_authenticator.create_key(label="f", permission_set="general-only")
+    response = TestClient(web_app.app).post(
+        "/api/chat/stream",
+        json={"question": "hi", "categories": ["team-a"]},
+        headers={"X-API-Token": full_key, "Content-Type": "application/json"},
+    )
+    assert response.status_code == 403
+
+
+def test_upload_403_for_out_of_scope_category(patched_authenticator, scoped_world):
+    scoped_world["make_set"]("team-a-only", categories=["team-a"])
+    full_key, _ = patched_authenticator.create_key(label="g", permission_set="team-a-only")
+    response = TestClient(web_app.app).post(
+        "/api/uploads",
+        files={"files": ("doc.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        data={"category": "general"},
+        headers={"X-API-Token": full_key},
+    )
+    assert response.status_code == 403
+
+
+def test_read_only_set_cannot_upload(patched_authenticator, scoped_world):
+    scoped_world["make_set"]("viewers", categories=["*"], can_write=False)
+    full_key, _ = patched_authenticator.create_key(label="h", permission_set="viewers")
+    response = TestClient(web_app.app).post(
+        "/api/uploads",
+        files={"files": ("doc.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        headers={"X-API-Token": full_key},
+    )
+    assert response.status_code == 403
+    assert "read-only" in response.json()["detail"].lower()
+
+
+def test_permission_set_admin_api_lifecycle(patched_authenticator, monkeypatch, scoped_world):
+    auth = scoped_world["auth"]
+    monkeypatch.setattr(web_app, "_API_TOKEN", "master-token")
+    headers = {"X-API-Token": "master-token"}
+    client = TestClient(web_app.app)
+
+    created = client.post(
+        "/api/admin/permission-sets",
+        headers=headers,
+        json={"name": "reviewers", "label": "Reviewers", "categories": ["general"], "can_write": False},
+    )
+    assert created.status_code == 200, created.text
+    record = created.json()["permission_set"]
+    assert record["name"] == "reviewers"
+    assert record["categories"] == ["general"]
+
+    listed = client.get("/api/admin/permission-sets", headers=headers).json()
+    names = [s["name"] for s in listed["permission_sets"]]
+    assert {"admin", "user", "reviewers"}.issubset(set(names))
+
+    # Assign a key to the set via the dedicated endpoint.
+    full_key, key_record = auth.create_key(label="k")
+    assign = client.post(
+        f"/api/admin/api-keys/{key_record['prefix']}/permission-set",
+        headers=headers,
+        json={"permission_set": "reviewers"},
+    )
+    assert assign.status_code == 200, assign.text
+    assert assign.json()["record"]["permission_set"] == "reviewers"
+
+    # A set still referenced by a key cannot be deleted; builtins never delete.
+    refused = client.delete("/api/admin/permission-sets/reviewers", headers=headers)
+    assert refused.status_code == 409
+    assert client.delete("/api/admin/permission-sets/admin", headers=headers).status_code == 409
+
+
+# ===========================================================================
 # Admin endpoint GET /api/admin/api-keys
 # ===========================================================================
 
 
-def test_admin_endpoint_open_when_no_auth_configured(monkeypatch):
-    # Zero-config state (no master, empty store) -> openly readable.
+def test_admin_endpoint_gated_even_when_no_auth_configured(monkeypatch):
+    # No open mode: a remote (non-loopback) client without a credential gets
+    # 401 even when the store is empty and no master token is set. The local
+    # operator reaches the same endpoint via the localhost auto-auth bypass.
     monkeypatch.setattr(web_app, "_API_TOKEN", "")
     store = aka.KeyStore(web_app.DATA_DIR / aka.STORE_FILENAME)
     # Use the real module authenticator but ensure its store is empty for the
@@ -745,10 +1111,7 @@ def test_admin_endpoint_open_when_no_auth_configured(monkeypatch):
     auth = aka.ApiKeyAuthenticator(aka.KeyStore(tmp), default_rate_limit=60, persist_interval=999)
     monkeypatch.setattr(web_app, "api_authenticator", auth)
     response = TestClient(web_app.app).get("/api/admin/api-keys")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["keys"] == []
-    assert body["master_configured"] is False
+    assert response.status_code == 401
 
 
 def test_admin_endpoint_requires_master_or_admin_key(patched_authenticator):

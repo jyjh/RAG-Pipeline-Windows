@@ -1,16 +1,61 @@
-"""Regression tests for chat, toast, and saved-chat usability fixes.
+"""Regression tests for chat, toast, category UI, and saved-chat fixes.
 
 Read-only against the server: state changes happen only in the throwaway
-browser context (seeded localStorage / in-page module calls). Run via
-`python -m pytest tests/browser -q`.
+browser context (seeded localStorage, in-page module calls, and network
+stubs scoped to the test's own context). Run via `python -m pytest tests/browser -q`.
 """
 from __future__ import annotations
+
+import re
 
 import pytest
 
 from helpers import activate_tab  # noqa: E402  (tests/browser is a sys.path root)
 
 pytestmark = pytest.mark.browser
+
+CATEGORY_ENTRIES = [
+    {"key": "general", "label": "General", "source_count": 2, "record_count": 10},
+    {"key": "design-docs", "label": "Design Docs", "source_count": 1, "record_count": 4},
+]
+
+
+def _pdf_row(hash_: str, filename: str, category: str) -> dict:
+    return {
+        "hash": hash_,
+        "filename": filename,
+        "status": "indexed",
+        "category": category,
+        "download_url": f"/api/pdfs/{hash_}/download",
+        "trust": {"source_group": "official", "review_status": "unreviewed"},
+        "quality": {
+            "label": "ready",
+            "chunk_count": 3,
+            "markdown_char_count": 100,
+            "enrichment_markers": 0,
+            "warnings": [],
+        },
+    }
+
+
+def _stub_categories(page, entries) -> None:
+    page.route(
+        re.compile(r"/api/categories/?$"),
+        lambda route: route.fulfill(
+            content_type="application/json",
+            json={"categories": entries, "total_sources": sum(e.get("source_count", 0) for e in entries)},
+        ),
+    )
+
+
+def _stub_pdfs(page, rows) -> None:
+    def fulfill(route):
+        route.fulfill(
+            content_type="application/json",
+            json={"pdfs": rows, "total": len(rows), "offset": 0, "limit": 10},
+        )
+
+    page.route(re.compile(r"/api/pdfs\?"), fulfill)
 
 
 def _seed_chat_with_saved_answer(page) -> None:
@@ -131,3 +176,112 @@ def test_new_chat_reuses_empty_active_chat(page):
     new_chat.click()
     page.wait_for_timeout(300)
     assert list_rows.count() == 2
+
+
+def test_library_category_column_badges_sort_and_click_filter(page):
+    _stub_categories(page, CATEGORY_ENTRIES)
+    _stub_pdfs(
+        page,
+        [
+            _pdf_row("a" * 64, "Design Brief.pdf", "design-docs"),
+            _pdf_row("b" * 64, "Textbook.pdf", "general"),
+        ],
+    )
+    # Reload so the boot-time /api/categories fetch runs against the stub and
+    # races the first Library render, exactly like a cold start.
+    page.reload()
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_timeout(400)
+    activate_tab(page, "library")
+    page.wait_for_selector("#pdfsBody .category-badge")
+
+    # Sortable Category column exists.
+    assert page.locator("#pdfsTable .th-sort[data-sort-key='category']").count() == 1
+
+    # Badges may initially show the raw key until /api/categories lands; the
+    # relabel pass must resolve them to their labels.
+    page.wait_for_function(
+        "() => document.querySelector('#pdfsBody .category-badge-custom')?.textContent === 'Design Docs'"
+    )
+    badges = page.locator("#pdfsBody .category-badge")
+    assert badges.count() == 2
+    custom = page.locator("#pdfsBody .category-badge-custom")
+    assert custom.count() == 1
+    assert custom.first.inner_text() == "Design Docs"
+    general = page.locator("#pdfsBody .category-badge-general")
+    assert general.count() == 1
+    assert general.first.inner_text() == "General"
+
+    # Clicking a badge facets the table to that category and syncs the select.
+    custom.first.click()
+    page.wait_for_timeout(400)
+    assert page.locator("#pdfCategoryFilterSelect").input_value() == "design-docs"
+
+
+def test_ask_category_chips_offer_general_and_summary_scope(page):
+    _stub_categories(page, CATEGORY_ENTRIES)
+    activate_tab(page, "chat")
+    # Boot may render the single-category hint first; wait for the stubbed
+    # category set to land.
+    page.wait_for_function(
+        "() => document.querySelectorAll('#chatCategoryChips .category-chip').length === 3"
+    )
+
+    labels = [
+        page.locator("#chatCategoryChips .category-chip").nth(i).inner_text()
+        for i in range(page.locator("#chatCategoryChips .category-chip").count())
+    ]
+    assert labels == ["All categories", "General", "Design Docs"]
+
+    # Selecting a subset narrows the search and is reflected in the summary.
+    page.locator("#chatCategoryChips .category-chip").filter(has_text="Design Docs").click()
+    page.wait_for_timeout(200)
+    assert page.locator(
+        "#chatCategoryChips .category-chip"
+    ).filter(has_text="✓ Design Docs").count() == 1
+    assert page.locator("#composerSettingsSummary").inner_text().endswith("1/2 categories")
+
+    # Back to everything: no scope suffix. (The All chip shortens to "All"
+    # while a subset is active, so target it by its stable title.)
+    page.locator(
+        "#chatCategoryChips .category-chip[title='Search every category (default)']"
+    ).click()
+    page.wait_for_timeout(200)
+    assert not page.locator("#composerSettingsSummary").inner_text().endswith("categories")
+
+
+def test_ask_chips_show_scope_when_only_general_exists(page):
+    # Single-category deployments hide nothing: the composer states its scope.
+    _stub_categories(page, [CATEGORY_ENTRIES[0]])
+    activate_tab(page, "chat")
+    hint = page.locator("#chatCategoryChips .category-chip-static")
+    hint.wait_for(state="visible")
+    assert "General" in hint.inner_text()
+
+
+def test_upload_cancel_button_clears_staged_files(page):
+    """The staging card's Cancel discards a picked-but-not-sent selection
+    without a page refresh (previously refreshing the tab was the only way
+    out of a mistaken pick)."""
+    activate_tab(page, "upload")
+    staging = page.locator("#uploadStagingPanel")
+    assert staging.is_hidden()
+
+    page.set_input_files(
+        "#fileInput",
+        [
+            {"name": "mistake.pdf", "mimeType": "application/pdf", "buffer": b"%PDF-1.4\n"},
+            {"name": "keep.pdf", "mimeType": "application/pdf", "buffer": b"%PDF-1.4\n"},
+        ],
+    )
+    staging.wait_for(state="visible")
+    assert "2 staged" in page.locator("#selectedFilesLabel").inner_text()
+
+    page.locator("#cancelUploadButton").click()
+
+    staging.wait_for(state="hidden")
+    assert page.locator("#selectedFilesLabel").inner_text().strip() == ""
+    assert page.locator("#uploadGroupsPanel").is_hidden()
+    assert page.eval_on_selector("#fileInput", "el => el.files.length") == 0
+    # The batch target resets so the next upload starts fresh.
+    assert page.locator("#uploadCategorySelect").input_value() == "general"

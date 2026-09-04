@@ -79,6 +79,23 @@ def _inert_llm_auto_tag(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _identity_serving_model_resolution(monkeypatch):
+    """Keep auto-tag model-name resolution hermetic in endpoint tests.
+
+    web_app resolves the configured auto-tag model onto the model that would
+    actually serve it (``llm_api.resolve_local_model``) for status messages
+    and provenance stamps. Left live, endpoint tests would report
+    machine-dependent names on a developer box with a running Ollama, and pay
+    a /api/tags network timeout on every cold cache when it is down. Tests
+    for the resolution itself re-install the real helper (saved at import
+    time in their module) and stub ``llm_api`` instead.
+    """
+    import src.web_app as web_app
+
+    monkeypatch.setattr(web_app, "_resolve_serving_model", lambda model: model)
+
+
+@pytest.fixture(autouse=True)
 def _isolated_local_model_cache():
     """Start every test with a cold /api/tags cache.
 
@@ -96,3 +113,29 @@ def _isolated_local_model_cache():
     llm_api.reset_local_model_cache()
     yield
     llm_api.reset_local_model_cache()
+
+
+@pytest.fixture(autouse=True)
+def _local_operator(request, monkeypatch):
+    """Run server tests as the trusted local operator by default.
+
+    The server is always in an authentication posture: loopback clients are
+    auto-authenticated as full admin, and every other client needs a
+    credential. TestClient requests arrive with the non-loopback host
+    "testclient", so by default this fixture treats them as loopback (exactly
+    what uvicorn on 127.0.0.1 does for the real UI) and every handler test
+    passes auth the way the local app does. Tests marked ``remote_client``
+    (individual tests, or whole modules via ``pytestmark``) opt out and see
+    the strict network posture: gated requests without a credential get 401.
+    """
+    import src.web_app as web_app
+
+    monkeypatch.setattr(web_app, "_LOCALHOST_AUTO_AUTH", True)
+    if request.node.get_closest_marker("remote_client"):
+        return
+    real_loopback = web_app._is_loopback_host
+    monkeypatch.setattr(
+        web_app,
+        "_is_loopback_host",
+        lambda host: True if str(host or "") == "testclient" else real_loopback(host),
+    )

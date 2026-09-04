@@ -46,7 +46,12 @@ from src.reliability import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gemma4:26b"
-DEFAULT_BATCH_SIZE = 20
+# Small batches keep the JSON array inside a local model's reliability (and
+# generation budget): a 4-classification reply is ~200 tokens, while a
+# 20-document batch elicits multi-thousand-token replies that overrun the
+# request timeout on a 4 GB GPU and often come back malformed (see
+# classify_documents: output budget scales with batch size).
+DEFAULT_BATCH_SIZE = 5
 DEFAULT_MIN_CONFIDENCE = 0.6
 DEFAULT_EXCERPT_CHARS = 1200
 DEFAULT_TIMEOUT_SECONDS = 120.0
@@ -182,6 +187,15 @@ def parse_classification_response(
     return decisions
 
 
+def _batch_doc_count(messages: list[dict[str, Any]]) -> int:
+    """Number of documents in a classification user message (0 if unreadable)."""
+    try:
+        docs = json.loads(str(messages[-1].get("content") or "").split("\n\n", 1)[1])
+    except (IndexError, KeyError, TypeError, ValueError):
+        return 0
+    return len(docs) if isinstance(docs, list) else 0
+
+
 def _default_chat_fn(*, model: str, messages: list[dict[str, Any]], timeout: float | None):
     """Send one non-streaming chat request through the app's LLM transport.
 
@@ -196,11 +210,26 @@ def _default_chat_fn(*, model: str, messages: list[dict[str, Any]], timeout: flo
     response = _llm_chat(
         model=model,
         messages=messages,
-        options={"temperature": 0.0, "num_predict": 2048},
+        # Size the reply budget to this exact batch: a valid 5-document array
+        # is ~300 tokens, so a batch-proportional cap stops derailed
+        # generations well before the request timeout without truncating
+        # well-formed replies.
+        options={"temperature": 0.0, "num_predict": max_output_tokens(_batch_doc_count(messages))},
         stream=False,
         timeout=timeout,
     )
     return _ollama_response_content(response)
+
+
+def max_output_tokens(batch_size: int) -> int:
+    """Generation budget for one batch reply.
+
+    Each decision object is ~40-60 tokens; ~200 per document is generous, the
+    floor keeps room for a one-document batch, and the cap stops a confused
+    model from generating to its context limit and blowing the request
+    timeout (the batch would be dropped anyway as unparseable).
+    """
+    return min(2048, max(256, 200 * max(1, int(batch_size))))
 
 
 def classify_documents(
@@ -211,18 +240,21 @@ def classify_documents(
     batch_size: int = DEFAULT_BATCH_SIZE,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
     timeout: float | None = DEFAULT_TIMEOUT_SECONDS,
+    on_batch_failure: Callable[[int, Exception], None] | None = None,
 ) -> dict[str, AutoTagDecision]:
     """Classify documents in batches; return ``{source_hash: AutoTagDecision}``.
 
     ``chat_fn`` (keyword-only: ``model``, ``messages``, ``timeout``) defaults
     to the app LLM transport; tests substitute a stub. Per-batch failures
     are logged and skipped so one bad batch cannot lose the rest of a large
-    run.
+    run; ``on_batch_failure(batch_index, exc)`` lets callers surface the
+    damage (e.g. in the web app's run status) without changing this return
+    contract.
     """
     chat = chat_fn or _default_chat_fn
     size = max(1, int(batch_size))
     decisions: dict[str, AutoTagDecision] = {}
-    for start in range(0, len(items), size):
+    for index, start in enumerate(range(0, len(items), size)):
         batch = items[start : start + size]
         try:
             reply = chat(
@@ -240,6 +272,11 @@ def classify_documents(
             logger.warning(
                 "auto-tag batch failed (%d documents, model %s): %s", len(batch), model, exc
             )
+            if on_batch_failure is not None:
+                try:
+                    on_batch_failure(index, exc)
+                except Exception:
+                    logger.debug("auto-tag on_batch_failure callback raised", exc_info=True)
             continue
         decisions.update(batch_decisions)
     return decisions

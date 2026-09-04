@@ -33,6 +33,7 @@ What this does NOT do (intentionally, see docs/HPC_DELEGATION.md "next steps"):
 from __future__ import annotations
 
 import logging
+import os
 import posixpath
 import re
 import shlex
@@ -206,6 +207,12 @@ class HpcBackend:
                 argv,
                 capture_output=capture,
                 text=True,
+                # Locale decoding (cp1252 on Windows) crashes on remote UTF-8
+                # and re-encodes to different byte lengths, which corrupts the
+                # byte offsets _relay_new_progress tracks. surrogateescape
+                # round-trips the remote bytes exactly.
+                encoding="utf-8",
+                errors="surrogateescape",
                 timeout=timeout,
                 check=False,
             )
@@ -216,7 +223,7 @@ class HpcBackend:
         if check and result.returncode != 0:
             raise HpcError(
                 f"ssh {host} failed (exit {result.returncode}): "
-                f"{remote_command}\nstderr: {result.stderr.strip()}"
+                f"{remote_command}\nstderr: {(result.stderr or '').strip()}"
             )
         return result
 
@@ -244,10 +251,14 @@ class HpcBackend:
             # accepts ``host:/dir/.`` and recursively copies the directory
             # contents, which preserves the same source semantics used here.
             # scp spawns ssh itself, so BatchMode/ConnectTimeout apply via the
-            # OpenSSH options (scp forwards them). No native idle-timeout flag.
+            # OpenSSH options (scp forwards them). No native idle-timeout flag,
+            # so cap the whole transfer at the process level -- a dropped
+            # connection without RST would otherwise wedge the job worker.
             scp_source = source[:-1] + "/." if source.endswith("/") else source
             argv = ["scp", *_SSH_BASE_OPTS, "-r", scp_source, dest]
             tool = "scp"
+            if timeout is None:
+                timeout = _SSH_DEFAULT_TIMEOUT * 30
         else:
             raise HpcError(
                 "Neither rsync nor scp was found. Install OpenSSH (Windows "
@@ -264,7 +275,7 @@ class HpcBackend:
         if check and result.returncode != 0:
             raise HpcError(
                 f"{tool} {source} -> {dest} failed (exit {result.returncode}): "
-                f"{result.stderr.strip()}"
+                f"{(result.stderr or '').strip()}"
             )
         return result
 
@@ -495,9 +506,11 @@ class HpcBackend:
         return generate_pbs_script(skip_index=skip_index, **kwargs)
 
     def _remote_pbs_path(self, cluster: HpcClusterConfig, kind: str = "ingest") -> str:
+        # pid disambiguates overlapping processes (server worker + CLI script);
+        # threading.get_ident() is only unique within one process.
         return posixpath.join(
             cluster.remote_repo_dir,
-            f".hpc_{kind}_{int(time.time())}_{threading.get_ident()}.pbs",
+            f".hpc_{kind}_{int(time.time())}_{os.getpid()}_{threading.get_ident()}.pbs",
         )
 
     def _write_remote_pbs_script(self, pbs_script: str, cluster: HpcClusterConfig,
@@ -633,7 +646,10 @@ class HpcBackend:
         )
         if result.returncode != 0 or not result.stdout:
             return already_relayed
-        new_bytes = len(result.stdout.encode("utf-8"))
+        # Mirror _run_ssh's surrogateescape decoding so this count matches the
+        # exact remote byte length; a drifted offset would make the next
+        # `tail -c +N` start mid-line.
+        new_bytes = len(result.stdout.encode("utf-8", "surrogateescape"))
         for line in result.stdout.splitlines():
             text = line.rstrip()
             if not text:

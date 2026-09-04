@@ -9,8 +9,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 import src.web_app as web_app
+from src import llm_api
 from src.auto_tag import AutoTagDecision
 from conftest import _rmtree_with_retry
+
+# The conftest autouse fixture stubs _resolve_serving_model to identity for
+# suite hermeticity; the resolution tests below restore this real helper and
+# stub llm_api instead.
+_REAL_RESOLVE_SERVING_MODEL = web_app._resolve_serving_model
 
 
 @pytest.fixture
@@ -211,9 +217,9 @@ class TestAutoTagEndpoints:
             web_app,
             "_auto_tag_settings",
             lambda: {
-                "enabled": False, "model": "gemma4:26b", "batch_size": 20,
-                "min_confidence": 0.6, "excerpt_chars": 1200, "timeout": 120.0,
-                "max_items_per_run": 200,
+                "enabled": False, "model": "gemma4:26b", "configured_model": "gemma4:26b",
+                "batch_size": 20, "min_confidence": 0.6, "excerpt_chars": 1200,
+                "timeout": 120.0, "max_items_per_run": 200,
             },
         )
         response = TestClient(web_app.app).post("/api/pdfs/trust/auto-tag", json={})
@@ -296,9 +302,9 @@ class TestUploadAutoTagScheduling:
             web_app,
             "_auto_tag_settings",
             lambda: {
-                "enabled": False, "model": "gemma4:26b", "batch_size": 20,
-                "min_confidence": 0.6, "excerpt_chars": 0, "timeout": 120.0,
-                "max_items_per_run": 200,
+                "enabled": False, "model": "gemma4:26b", "configured_model": "gemma4:26b",
+                "batch_size": 20, "min_confidence": 0.6, "excerpt_chars": 0,
+                "timeout": 120.0, "max_items_per_run": 200,
             },
         )
         calls = _stub_classifier(monkeypatch, {})
@@ -307,3 +313,86 @@ class TestUploadAutoTagScheduling:
         )
         assert calls == []
         assert not web_app.DOCUMENT_TRUST_PATH.exists()
+
+
+class TestServingModelResolution:
+    """Status messages and provenance must name the model that actually runs.
+
+    On the local Ollama backend the transport substitutes cloud tags
+    (gemma4:26b -> the [models].local_llm_model pin) at call time; reporting
+    the raw configured tag made the button message look frozen regardless of
+    the model serving the requests.
+    """
+
+    def _use_real_resolution(self, monkeypatch):
+        monkeypatch.setattr(web_app, "_resolve_serving_model", _REAL_RESOLVE_SERVING_MODEL)
+
+    def test_post_reports_and_stamps_the_serving_model(self, trust_env, monkeypatch):
+        self._use_real_resolution(monkeypatch)
+        monkeypatch.setattr(llm_api, "active_backend", lambda: llm_api.OLLAMA)
+        monkeypatch.setattr(
+            llm_api,
+            "resolve_local_model",
+            lambda model, **_: "qwen3:4b-instruct" if model == "gemma4:26b" else model,
+        )
+        _register_pdfs(trust_env, ["hash-a"])
+        _stub_classifier(monkeypatch, {"hash-a": AutoTagDecision("official", 0.9, "datasheet")})
+
+        response = TestClient(web_app.app).post("/api/pdfs/trust/auto-tag", json={})
+
+        assert response.status_code == 200
+        assert response.json()["model"] == "qwen3:4b-instruct"
+        assert response.json()["configured_model"] == "gemma4:26b"
+        # The run (inlined by the fixture) stamps provenance with the SERVING
+        # model, so reviewers auditing the row see what classified the file.
+        persisted = json.loads(web_app.DOCUMENT_TRUST_PATH.read_text(encoding="utf-8"))
+        assert persisted["documents"]["hash-a"]["auto_tag_model"] == "qwen3:4b-instruct"
+
+    def test_status_endpoint_exposes_both_model_names(self, trust_env, monkeypatch):
+        self._use_real_resolution(monkeypatch)
+        monkeypatch.setattr(llm_api, "active_backend", lambda: llm_api.OLLAMA)
+        monkeypatch.setattr(llm_api, "resolve_local_model", lambda model, **_: f"local::{model}")
+
+        status = TestClient(web_app.app).get("/api/pdfs/trust/auto-tag").json()
+
+        assert status["model"].startswith("local::gemma4")
+        assert status["configured_model"] == "gemma4:26b"
+
+    def test_resolution_is_a_noop_on_the_cloud_backend(self, monkeypatch):
+        self._use_real_resolution(monkeypatch)
+        monkeypatch.setattr(llm_api, "active_backend", lambda: llm_api.SOCLAAS)
+
+        def _explode(model, **_):
+            raise AssertionError("resolve_local_model must not run on soclaas")
+
+        monkeypatch.setattr(llm_api, "resolve_local_model", _explode)
+        assert web_app._resolve_serving_model("gemma4:26b") == "gemma4:26b"
+
+    def test_resolution_failure_falls_back_to_configured_model(self, monkeypatch):
+        self._use_real_resolution(monkeypatch)
+        monkeypatch.setattr(llm_api, "active_backend", lambda: llm_api.OLLAMA)
+
+        def _boom(model, **_):
+            raise OSError("ollama is down")
+
+        monkeypatch.setattr(llm_api, "resolve_local_model", _boom)
+        assert web_app._resolve_serving_model("gemma4:26b") == "gemma4:26b"
+
+    def test_post_reports_total_ungrouped_alongside_the_run_cap(self, trust_env, monkeypatch):
+        _register_pdfs(trust_env, ["hash-a", "hash-b", "hash-c"])
+        _stub_classifier(monkeypatch, {})
+        monkeypatch.setattr(
+            web_app,
+            "_auto_tag_settings",
+            lambda: {
+                "enabled": True, "model": "gemma4:26b", "configured_model": "gemma4:26b",
+                "batch_size": 5, "min_confidence": 0.6, "excerpt_chars": 0,
+                "timeout": 120.0, "max_items_per_run": 2,
+            },
+        )
+
+        response = TestClient(web_app.app).post("/api/pdfs/trust/auto-tag", json={})
+
+        assert response.status_code == 200
+        assert len(response.json()["queued"]) == 2  # capped per run
+        assert response.json()["total_ungrouped"] == 3

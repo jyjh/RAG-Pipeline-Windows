@@ -18,7 +18,7 @@ Retrieval-augmented generation pipeline for NUS FSAE knowledge transfer. The pro
 - `src/local_rag.py`: performs two-tier retrieval over the local LanceDB index and asks the SoCLAaS LLM to answer from retrieved context.
 - `src/query.py`: thin query wrapper around the local RAG path.
 - `src/web_app.py`: local FastAPI browser UI for uploads, queued indexing, index edits, and chat.
-- `src/auto_tag.py`: LLM source-group auto-tagger plugin (gemma4) for the document-trust registry.
+- `src/auto_tag.py`: LLM source-group auto-tagger plugin for the document-trust registry.
 - `src/llm_api.py`: OpenAI-compatible client for the hosted SoCLAaS API (chat, vision, embeddings) and the `soclaas`/`ollama` backend selector.
 - `src/embeddings.py`: calls the embeddings transport selected by `[embeddings].backend` (default: local Ollama `all-minilm`).
 
@@ -36,7 +36,7 @@ Implemented behavior:
 - Section-aware chunking from PDF outlines/bookmarks, table-of-contents parsing, or heading fallback.
 - LanceDB-backed vector storage in `db/lancedb`.
 - Categories ("split databases"): user-created partitions of the corpus, each an independent LanceDB index under `db/categories/<key>`. Create them in Admin (or `POST /api/categories`), upload straight into one (upload form's Category selector), move documents between them from the Library (select rows → Move to — vectors are reused, so a move never re-embeds), and toggle which ones a chat searches with the Ask tab's category chips (default: all). Membership is per source and lives in `data/.categories.json.sqlite3`; the default index `db/` is the implicit "General" category, so existing deployments need no migration. Deleting a category requires moving its documents out first. Backups, rebuild, compaction, and HPC delegation currently operate on the General index only; a full rebuild automatically drops categorized sources from General so they are not duplicated.
-- LLM auto-tagging: PDFs uploaded without a source group are classified into Official / Student Research / Unofficial by `gemma4:26b` (filename + first-page excerpt, batched, confidence-floored) and written to the trust registry like manual tags, but flagged `auto_tagged` with model/confidence/reason for review; a manual tag always overrides. Configure under `[auto_tag]`; trigger a sweep with the web UI's "Auto-tag ungrouped" button or `POST /api/pdfs/trust/auto-tag`.
+- LLM auto-tagging: PDFs uploaded without a source group are classified into Official / Student Research / Unofficial by the `[auto_tag].model` (default: the chat model; cloud tags are substituted with the installed local model on the Ollama backend, and that serving model is what status messages and provenance report) using the filename plus a first-page excerpt, batched and confidence-floored, then written to the trust registry like manual tags but flagged `auto_tagged` with model/confidence/reason for review; a manual tag always overrides. Configure under `[auto_tag]`; trigger a sweep with the web UI's "Auto-tag ungrouped" button or `POST /api/pdfs/trust/auto-tag`.
 
 The `processed_docs/` Markdown files are corpus data generated from sample PDFs, not project documentation.
 
@@ -291,6 +291,41 @@ Use `bind_all = true` to listen on all IPv4 interfaces (`0.0.0.0`) instead of on
 with `uvicorn` directly, pass the same bind explicitly, for example `uvicorn src.web_app:app --host 0.0.0.0 --port 8000`.
 By default, `/api/health` and `/api/jobs` are polled once per minute:
 
+### Access control & permission sets
+
+The server is always in an authentication posture. Requests from the local
+machine (`127.0.0.1`/`::1`) are auto-authenticated as a **full-admin localhost
+identity** — that is also the bootstrap path for minting the first keys. Every
+other client must present the master `[server] api_token` or a per-user API
+key sent as `X-API-Token: <secret>` (or `?token=<secret>` for GET-only
+consumers such as download links and media).
+
+Each key is assigned a **permission set** that defines:
+
+- **Category access** — an allowlist of document categories (`["*"]` = all,
+  including categories created later). Listings, queries, uploads, index
+  browsing, and job visibility are all scoped to it: a restricted key never
+  even sees documents in other categories.
+- **Write** — whether the key may upload, edit, delete, or re-index (read-only
+  sets can only search and browse).
+- **Admin** — access to key/permission-set management, category management,
+  and index maintenance.
+
+Two built-in sets are always present (`admin`, `user`); create more from the
+Admin tab ("Permission sets") or the CLI:
+
+```powershell
+python scripts/manage_api_keys.py create-set team-a-read-only `
+    --label "Team A (read only)" --categories general,team-a --read-only
+python scripts/manage_api_keys.py create --label "alice laptop" `
+    --permission-set team-a-read-only
+python scripts/manage_api_keys.py list-sets
+```
+
+Set edits apply to every member key on its next request; a set still
+referenced by a key cannot be deleted. Set `localhost_auto_auth = false` under
+`[api_keys]` to require credentials even from the local machine.
+
 ```toml
 [server]
 host = "127.0.0.1"
@@ -308,7 +343,7 @@ Open `http://127.0.0.1:8000`. The UI is a dependency-free ES-module app served f
 - **Library** — the PDF trust/review table: server-side search plus group/trust/category facet filters, sortable columns, bulk tag/move/re-run/delete (destructive bulk uses typed confirmation), quality and trust badges with a legend, per-row actions (approve, flag stale with an inline note, re-run, re-index, delete), and an in-app preview that shows the original PDF or the extracted Markdown text.
 - **Review** — index browsing with a Chunks view (search, pagination, vector-search diagnostics, in-place record editing with Markdown preview) and a Documents view (one row per source document, expandable to that document's records).
 - **Ask** — multi-turn chat: the last exchanges are sent with each question and the retrieval planner resolves follow-up references against them; answer modes (Precise/Balanced/Deep) map to sampler presets; answers stream with Markdown/LaTeX rendering, a Sources panel (group badges, scores, page links, extracted-image lightbox, stale-source warnings, per-answer settings/duration meta), copy/regenerate/edit-and-resend actions, and a saved-chat sidebar with search, pin, rename-in-place, and Markdown export. Chats persist in the browser's localStorage.
-- **Admin** — ops dashboard (index/queue/LLM/embedding/disk/category cards with 24 h trend sparklines), security-posture and startup-repair banners, API key management (issue, role, disable, delete; plaintext shown once), update manager (branch, current vs. target commit, blocking reasons), and guarded maintenance (backup/restore, compact, rebuild vector index, full re-ingest/rebuild with typed confirmation).
+- **Admin** — ops dashboard (index/queue/LLM/embedding/disk/category cards with 24 h trend sparklines), security-posture and startup-repair banners, permission-set management (category allowlists plus write/admin flags per set) and API key management (issue with a permission set, reassign, disable, delete; plaintext shown once), update manager (branch, current vs. target commit, blocking reasons), and guarded maintenance (backup/restore, compact, rebuild vector index, full re-ingest/rebuild with typed confirmation).
 - **Guide** — new-user walkthrough (replayable from Settings).
 
 Keyboard shortcuts (`?` shows the cheat sheet): `g`+`d/l/r/a/m/g` switches views, `/` focuses the current view's search, `n` starts a new chat, `Esc` closes dialogs. Light/dark themes follow the system with a manual toggle; the layout is usable down to phone widths. Uploaded and indexed PDFs are tracked by SHA-256 hash; duplicates are rejected unless a forced re-upload is confirmed. Downloads and previews are path-contained: sources must live under the configured roots (`[paths] corpus_roots` covers bulk corpora on other volumes). The UI respects `[server]` host/port/poll intervals/update target as before, and only one web instance may run per data directory unless `RAG_ALLOW_MULTIPLE_WEB_INSTANCES=1` is set.

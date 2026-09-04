@@ -71,7 +71,13 @@ def _load_json(path: Path) -> dict[str, Any]:
     cached = _JSON_CACHE.get(cache_key)
     if cached is not None and cached[0] == signature:
         return cached[1]
-    payload = path.read_text(encoding="utf-8")
+    try:
+        payload = path.read_text(encoding="utf-8")
+    except OSError:
+        # The ledger can be replaced/removed between stat() and read() during
+        # the update-restart flow; treat it like a missing file.
+        _JSON_CACHE.pop(cache_key, None)
+        return {"version": LEDGER_VERSION, "jobs": {}}
     import json
 
     value = json.loads(payload) if payload else {"version": LEDGER_VERSION, "jobs": {}}

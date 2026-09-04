@@ -60,7 +60,9 @@ DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 # per classification request, confidence floor below which a PDF stays
 # ungrouped, excerpt budget per PDF, and per-request LLM timeout.
 DEFAULT_AUTO_TAG_MODEL = ""
-DEFAULT_AUTO_TAG_BATCH_SIZE = 20
+# Small batches keep the JSON reply inside a local model's reliability and
+# generation budget (see src/auto_tag.py DEFAULT_BATCH_SIZE rationale).
+DEFAULT_AUTO_TAG_BATCH_SIZE = 5
 DEFAULT_AUTO_TAG_MIN_CONFIDENCE = 0.6
 DEFAULT_AUTO_TAG_EXCERPT_CHARS = 1200
 DEFAULT_AUTO_TAG_TIMEOUT_SECONDS = 120.0

@@ -249,12 +249,44 @@ main {
   min-width: 52px;
 }
 
-.upload-drop-zone {
-  border: 1px dashed var(--line);
-  border-radius: 8px;
+/* Documents page: numbered step cards keep upload, categorization, and job
+   tracking visually separate instead of one flat toolbar pile. */
+.upload-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
   background: var(--surface);
-  padding: 12px;
-  margin-bottom: 10px;
+  padding: 16px;
+  margin-bottom: 14px;
+}
+
+.page-intro {
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.hint {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.visually-hidden-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.upload-drop-zone {
+  border: 1.5px dashed var(--line);
+  padding: 8px 8px 10px;
+  transition: border-color 0.15s ease, background 0.15s ease;
 }
 
 .upload-drop-zone.drag-over {
@@ -262,13 +294,183 @@ main {
   background: var(--info-bg);
 }
 
-.upload-drop-zone .toolbar {
-  margin-bottom: 8px;
+.dropzone-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  min-height: 128px;
+  padding: 22px 16px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.dropzone-body:hover:not(:disabled),
+.dropzone-body:focus-visible {
+  border: 0;
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.dropzone-body svg {
+  width: 30px;
+  height: 30px;
+  margin-bottom: 4px;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.dropzone-title {
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.dropzone-sub {
+  font-size: 13px;
+  color: var(--muted);
 }
 
 .selected-files-label {
   color: var(--muted);
   font-size: 13px;
+  text-align: center;
+  padding: 4px 6px 2px;
+}
+
+.selected-files-label:empty {
+  display: none;
+}
+
+/* Staging card: where staged files get their destination before uploading. */
+.upload-staging {
+  border-left: 3px solid var(--accent);
+}
+
+.upload-staging[hidden] {
+  display: none;
+}
+
+.upload-staging-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.upload-staging-head h3 {
+  margin: 0;
+}
+
+.upload-staging-head .hint {
+  margin: 3px 0 0;
+}
+
+.upload-staging-count {
+  color: var(--accent-strong);
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.upload-staging-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(240px, 1.3fr);
+  gap: 8px 20px;
+  margin-bottom: 14px;
+}
+
+.upload-option-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--meta-strong);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.upload-option-block select {
+  width: 100%;
+  max-width: 320px;
+}
+
+.upload-staging-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.upload-staging-actions #uploadButton {
+  min-height: 40px;
+  padding: 8px 20px;
+  font-weight: 650;
+}
+
+/* Cancel discards the staged selection: a quiet text action so the primary
+   "Upload & index" stays the obvious choice. Red on hover signals discard. */
+.upload-staging-actions #cancelUploadButton {
+  min-height: 40px;
+  border-color: transparent;
+  background: none;
+  color: var(--meta-strong);
+}
+
+.upload-staging-actions #cancelUploadButton:hover:not(:disabled) {
+  color: var(--danger);
+}
+
+.upload-staging-actions .hint {
+  margin: 0;
+}
+
+/* Jobs card: its own header so job tracking reads as a separate concern. */
+.jobs-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.jobs-card-head h3 {
+  margin: 0;
+}
+
+.jobs-card-head .hint {
+  margin: 3px 0 0;
+  max-width: 640px;
+}
+
+.jobs-toolbar {
+  margin-bottom: 10px;
+}
+
+.jobs-pager {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+@media (max-width: 720px) {
+  .upload-staging-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .jobs-pager {
+    margin-left: 0;
+  }
 }
 
 .upload-groups-panel {
@@ -387,6 +589,49 @@ select {
   color: var(--muted);
   font-size: 13px;
   font-weight: 650;
+}
+
+.inline-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.inline-check input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+/* Permission-set editor: category access checkbox grid. */
+.permset-editor-form {
+  padding: 0 12px 12px;
+}
+
+.permset-cats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.permset-cat-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.permset-cats-empty {
+  color: var(--muted);
+  font-size: 13px;
 }
 
 input[type="file"] {
@@ -1703,6 +1948,58 @@ input[type="file"] {
   display: none;
 }
 
+/* Shutdown warning: shown on every tab while a shutdown countdown runs (and,
+   in its .offline form, once the server has stopped). Colored like a danger
+   strip so it reads as an interruption, not regular status. */
+.shutdown-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 20px;
+  font-size: 13px;
+  color: var(--danger-strong);
+  background: var(--danger-soft);
+  border-bottom: 1px solid var(--danger-soft-line);
+}
+
+.shutdown-banner[hidden] {
+  display: none;
+}
+
+.shutdown-banner-icon {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  color: var(--danger);
+}
+
+.shutdown-banner-icon svg {
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.shutdown-banner-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.shutdown-banner.offline {
+  color: var(--warn-text);
+  background: var(--warn-bg);
+  border-bottom-color: var(--warn-line);
+}
+
+.shutdown-banner.offline .shutdown-banner-icon {
+  color: var(--warn);
+}
+
 .jobs-strip-text {
   flex: 1;
   min-width: 0;
@@ -2569,6 +2866,51 @@ html[data-theme="dark"] .theme-icon-moon {
   border-color: var(--accent);
   background: var(--accent-soft);
   color: var(--accent-strong);
+}
+
+/* Static scope indicator (single-category deployments): looks like a chip but
+   is not clickable, so it reads as state rather than a control. */
+.category-chip-static {
+  cursor: default;
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+/* Corpus category ("split database") badge. Custom categories get a stable
+   per-key hue so different partitions are distinguishable at a glance. */
+.category-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--badge-neutral-bg);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  white-space: nowrap;
+  vertical-align: 1px;
+}
+
+button.category-badge {
+  cursor: pointer;
+}
+
+button.category-badge:hover {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.category-badge-custom {
+  border-color: hsl(var(--cat-hue) 55% 45% / 0.55);
+  background: hsl(var(--cat-hue) 70% 50% / 0.13);
+  color: hsl(var(--cat-hue) 60% 32%);
+}
+
+html[data-theme="dark"] .category-badge-custom {
+  border-color: hsl(var(--cat-hue) 55% 60% / 0.5);
+  color: hsl(var(--cat-hue) 85% 78%);
 }
 
 

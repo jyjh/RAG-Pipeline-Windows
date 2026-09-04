@@ -24,7 +24,7 @@ const walkthroughSteps = [
     tab: "upload",
     target: "#uploadDropZone",
     title: "Add source PDFs",
-    text: "Drop PDFs here or use the file picker. Each PDF is queued as a background job that extracts Markdown, images, formulas, tables, and retrieval chunks.",
+    text: "Drop PDFs here or use the file picker. Staged files ask for an index category and a per-file source group before uploading, and every PDF is queued as a background job that extracts Markdown, images, formulas, tables, and retrieval chunks.",
   },
   {
     tab: "upload",

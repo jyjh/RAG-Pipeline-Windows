@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Union
+
 from pydantic import BaseModel, Field
 
 from src._class_module_support import bind_module_namespace, finalize_split_class
@@ -15,6 +17,8 @@ bind_module_namespace(
 class AdminApiKeyCreateRequest(BaseModel):
     label: str = ""
     role: str = "user"
+    # Permission set wins over the legacy two-value ``role`` when provided.
+    permission_set: str | None = None
     expires_at: str | None = None
     # Upper bound: timedelta/datetime arithmetic overflows at ~999999999 days
     # (and much earlier against datetime.max), which surfaced as an unhandled
@@ -29,6 +33,27 @@ class AdminApiKeyStatusRequest(BaseModel):
 
 class AdminApiKeyRoleRequest(BaseModel):
     role: str
+
+
+class AdminApiKeyPermissionSetRequest(BaseModel):
+    permission_set: str
+
+
+class PermissionSetCreateRequest(BaseModel):
+    name: str
+    label: str = ""
+    # ``["*"]`` (or "*") = every category, including ones created later; a list
+    # of slugs otherwise. Comma-separated strings are accepted from the CLI.
+    categories: Union[list[str], str, None] = None
+    can_write: bool = True
+    admin: bool = False
+
+
+class PermissionSetUpdateRequest(BaseModel):
+    label: str | None = None
+    categories: Union[list[str], str, None] = None
+    can_write: bool | None = None
+    admin: bool | None = None
 
 AdminApiKeyCreateRequest.__module__ = _source_module.__name__
 finalize_split_class(_source_module, AdminApiKeyCreateRequest)

@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from collections import deque
+from collections import Counter, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -38,14 +38,21 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from src.atomic_io import write_json_atomic
 from src.api_key_auth import (
     MASTER_KEY_ID,
+    PERMSET_ADMIN,
+    PERMSET_USER,
+    PERMSET_WILDCARD,
     RATE_WINDOW_SECONDS,
     ROLE_ADMIN,
     ROLE_USER,
     STATUS_ACTIVE,
     STATUS_DISABLED,
     ApiKeyAuthenticator,
+    AuthResult,
     RateLimitExceeded,
     create_default_authenticator,
+    local_auth_result,
+    normalize_permission_categories,
+    normalize_permission_set_name,
 )
 from src.caches import BoundedLRU
 from src.coerce import as_bool, as_optional_int, as_positive_float, as_positive_int, as_string_list
@@ -423,6 +430,7 @@ DEFAULT_SERVER_PORT = 8000
 # config.toml. The store is empty by default, so these are inert until an admin
 # creates a key (or [server] api_token is set).
 DEFAULT_API_KEYS_ENABLED = True
+DEFAULT_API_KEYS_LOCALHOST_AUTO_AUTH = True
 DEFAULT_API_KEYS_RATE_LIMIT = 60
 DEFAULT_API_KEYS_PERSIST_INTERVAL = 50
 DEFAULT_API_KEYS_PREFIX = "rag_"
@@ -670,13 +678,17 @@ def _load_server_config(config_path: Path | None = None) -> dict[str, Any]:
 def _load_api_keys_config(config_path: Path | None = None) -> dict[str, Any]:
     """Load the ``[api_keys]`` section (per-user keys, rate limiting, usage).
 
-    Empty/missing section yields the safe defaults: enabled, 60 req/min, flush
-    every 50 increments, ``rag_`` key prefix. The master ``[server] api_token``
-    is loaded separately and acts as an admin/owner bypass.
+    Empty/missing section yields the safe defaults: enabled, localhost
+    auto-auth on, 60 req/min, flush every 50 increments, ``rag_`` key prefix.
+    The master ``[server] api_token`` is loaded separately and acts as an
+    admin/owner bypass.
     """
     api_keys = _pipeline_config(config_path).api_keys
     return {
         "enabled": _bool_value(api_keys.enabled, DEFAULT_API_KEYS_ENABLED),
+        "localhost_auto_auth": _bool_value(
+            api_keys.localhost_auto_auth, DEFAULT_API_KEYS_LOCALHOST_AUTO_AUTH
+        ),
         "rate_limit_per_minute": _positive_int(
             api_keys.rate_limit_per_minute, DEFAULT_API_KEYS_RATE_LIMIT
         ),
@@ -869,14 +881,18 @@ def _resolve_category_db_dir(key: str, *, anchor_db_dir: Path | None = None) -> 
     return category_db_dir(anchor, normalized)
 
 
-def _resolve_chat_categories(keys: list[str] | None) -> list[dict[str, Any]]:
+def _resolve_chat_categories(keys: list[str] | None, request: Request | None = None) -> list[dict[str, Any]]:
     """Resolve a chat request's category selection into category entries.
 
-    Empty selection (or an explicit "all") searches every category. Selection
-    order is preserved and duplicates collapsed; unknown keys fail the request
-    rather than being silently dropped.
+    Empty selection (or an explicit "all") searches every category the
+    identity may see (permission-set scoped); selection order is preserved and
+    duplicates collapsed; unknown keys fail the request rather than being
+    silently dropped. A key outside the identity's permission set is a 403,
+    not a silent narrowing.
     """
     entries = _category_store().list_categories(anchor_db_dir=DB_DIR)
+    if request is not None:
+        entries = _filter_category_entries(request, entries)
     requested = [str(value or "").strip().lower() for value in (keys or []) if str(value or "").strip()]
     if not requested or "all" in requested:
         return entries
@@ -884,6 +900,8 @@ def _resolve_chat_categories(keys: list[str] | None) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
     for key in requested:
+        if request is not None:
+            _require_category_allowed(request, key)
         if key not in by_key:
             raise HTTPException(status_code=400, detail=f"Unknown category: {key}")
         if key not in seen:
@@ -1416,13 +1434,28 @@ def _publish_staged_index(staged_db_dir: str | Path, live_db_dir: str | Path) ->
             aside = aside_dir / live_component.name
             shutil.move(str(live_component), str(aside))
             preserved.append((aside, live_component))
-    try:
-        _swap_index_into(staged_db, live_db)
+    def _restore_preserved() -> bool:
+        ok = True
         for aside, live_component in preserved:
             if not live_component.exists():
-                shutil.move(str(aside), str(live_component))
+                try:
+                    shutil.move(str(aside), str(live_component))
+                except OSError:
+                    # The aside copy is the ONLY remaining copy of this
+                    # component; leave it on disk (repairable by
+                    # _repair_preserved_components) instead of deleting it.
+                    ok = False
+                    logger.exception("Failed to restore preserved index component %s", live_component)
+        return ok
+
+    try:
+        _swap_index_into(staged_db, live_db)
     finally:
-        _remove_path(aside_dir)
+        # Move overrides/hashes back whether the swap succeeded OR failed --
+        # they belong to the live dir either way. Only clean the aside dir
+        # when nothing was left behind.
+        if _restore_preserved():
+            _remove_path(aside_dir)
 
 
 def index_backup_root(db_dir: str | Path) -> Path:
@@ -1462,12 +1495,17 @@ def _backup_size_bytes(backup_dir: Path) -> int:
 
 
 def _invalidate_index_caches(db_dir: str | Path) -> None:
+    raw = str(db_dir)
     resolved = str(Path(db_dir).resolve())
     with _INDEX_CACHE_LOCK:
         _INDEX_RECORDS_SNAPSHOT_CACHE.pop(resolved, None)
-        store = _INDEX_STORE_CACHE.get(resolved)
-    if store is not None:
-        store._invalidate_table()
+        # _index_store keys entries by the *unresolved* str(db_dir), so drop
+        # both key forms: a relative/symlinked db_dir would otherwise miss
+        # the resolved-only lookup and leave a stale store cached.
+        for key in {raw, resolved}:
+            store = _INDEX_STORE_CACHE.pop(key, None)
+            if store is not None:
+                store._invalidate_table()
 
 
 
@@ -1693,6 +1731,17 @@ def _swap_index_into(
         rollover = live_db.parent / f".index_rollover_{uuid.uuid4().hex}"
         rollover.mkdir(parents=True, exist_ok=False)
         rollover_targets = [rollover / component.name for component in live_components]
+        def _restore_preserved_components() -> None:
+            for aside, live_component in preserved:
+                if not live_component.exists() and aside.exists():
+                    try:
+                        shutil.move(str(aside), str(live_component))
+                    except OSError:
+                        # Aside holds the ONLY copy; leave it on disk for
+                        # _repair_preserved_components rather than raise (and
+                        # never let the finally below delete it).
+                        logger.exception("Failed to restore preserved index component %s", live_component)
+
         try:
             for live_component, rollover_target in zip(live_components, rollover_targets):
                 if live_component.exists():
@@ -1708,22 +1757,25 @@ def _swap_index_into(
                             shutil.copy2(source_component, live_component)
                     else:
                         shutil.move(str(source_component), str(live_component))
-            for aside, live_component in preserved:
-                if not live_component.exists():
-                    shutil.move(str(aside), str(live_component))
+            _restore_preserved_components()
         except Exception:
             for live_component, rollover_target in zip(live_components, rollover_targets):
                 _remove_path(live_component)
                 if rollover_target.exists():
                     shutil.move(str(rollover_target), str(live_component))
-            for aside, live_component in preserved:
-                if not live_component.exists() and aside.exists():
-                    shutil.move(str(aside), str(live_component))
+            _restore_preserved_components()
             _remove_path(rollover)
             raise
         finally:
             _remove_path(rollover)
-            _remove_path(aside_dir)
+            # Only drop the aside dir when every preserved component made it
+            # back to the live dir; otherwise it holds the only surviving copy.
+            if all(live_component.exists() for _aside, live_component in preserved):
+                _remove_path(aside_dir)
+            else:
+                logger.warning(
+                    "Preserved index components remain in %s; leaving them for repair.", aside_dir
+                )
 
         _invalidate_index_caches(live_db)
 
@@ -1784,6 +1836,13 @@ def _index_mutation_blocker() -> str:
     if summary.get("indexing_job_ids"):
         return "Index edits are disabled while indexing is running. Try again after the job finishes."
     return ""
+
+
+def _ensure_index_mutation_allowed() -> None:
+    """Raise 409 when an indexing job blocks index mutations."""
+    blocker = _index_mutation_blocker()
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
 
 
 def _asset_url(asset_id: str) -> str:
@@ -2106,6 +2165,13 @@ def _spawn_restart_helper(*, old_pid: int, host: str, port: int) -> None:
 
 def _schedule_process_exit(delay_seconds: float = 0.5) -> None:
     def _exit_with_cleanup() -> None:
+        # Finalize active jobs BEFORE the hard exit (this path bypasses the
+        # lifespan's shutdown section): the post-update boot must not treat the
+        # restart as a crash and resurrect this run as "recovered" indexing.
+        try:
+            job_queue.shutdown_finalize()
+        except Exception:
+            pass
         # Terminate any in-flight pipeline subprocess before the hard exit so an
         # indexing job does not orphan and publish into a dead/restarting server.
         try:
@@ -2884,13 +2950,14 @@ def _pdf_download_url(source_hash: str) -> str:
     return f"/api/pdfs/{source_hash}/download" if source_hash else ""
 
 
-def _load_trust_registry(path: Path | None = None) -> dict[str, Any]:
+def _load_trust_registry(path: Path | None = None, *, copy: bool = True) -> dict[str, Any]:
     trust_path = path or DOCUMENT_TRUST_PATH
     payload = _cached_json_load(trust_path, default={"version": 1, "documents": {}})
-    # Detach from the shared cache object: callers mutate the payload in place
-    # before writing, and a failed write must not leave phantom state in memory
-    # (the cache would keep showing an update that never reached disk).
-    payload = json.loads(json.dumps(payload))
+    if copy:
+        # Detach from the shared cache object: callers mutate the payload in place
+        # before writing, and a failed write must not leave phantom state in memory
+        # (the cache would keep showing an update that never reached disk).
+        payload = json.loads(json.dumps(payload))
     payload.setdefault("version", 1)
     payload.setdefault("documents", {})
     if not isinstance(payload["documents"], dict):
@@ -3163,6 +3230,7 @@ _AUTO_TAG_STATE: dict[str, Any] = {
     "finished_at": "",
     "queued": 0,
     "tagged": 0,
+    "failed_batches": 0,
     "last_error": "",
 }
 # Count of scheduled-but-not-finished runs (ALL kinds), guarded by
@@ -3172,13 +3240,43 @@ _AUTO_TAG_STATE: dict[str, Any] = {
 _AUTO_TAG_ACTIVE_RUNS = 0
 
 
+def _resolve_serving_model(model: str) -> str:
+    """Map a configured (possibly cloud-named) tag onto the serving model.
+
+    On the local Ollama backend the chat transport substitutes cloud tags at
+    call time (``local_rag._llm_chat`` -> ``llm_api.resolve_local_model``), so
+    status messages and auto-tag provenance must name THAT model: reporting
+    ``gemma4:26b`` while ``qwen3:4b-instruct`` serves every request reads as a
+    frozen label that ignores the configured ``[models].local_*`` pins. SoCLAaS
+    serves the configured tags directly, so this is a no-op there. Ollama being
+    unreachable also returns the input unchanged (``resolve_local_model``'s own
+    contract); /api/tags lookups are TTL-cached in llm_api.
+    """
+    if not str(model or "").strip():
+        return model
+    try:
+        from src import llm_api
+
+        if llm_api.active_backend() != llm_api.OLLAMA:
+            return model
+        return llm_api.resolve_local_model(model)
+    except Exception:
+        logger.debug("Could not resolve the serving model for %r", model, exc_info=True)
+        return model
+
+
 def _auto_tag_settings() -> dict[str, Any]:
     """Effective [auto_tag] settings with the model fallback resolved."""
     cfg = _pipeline_config().auto_tag
     model = str(cfg.model or "").strip() or str(_pipeline_config().models.llm_model or "").strip()
+    configured_model = model or auto_tag.DEFAULT_MODEL
     return {
         "enabled": bool(cfg.enabled),
-        "model": model or auto_tag.DEFAULT_MODEL,
+        # "model" is what the run actually serves through; "configured_model"
+        # keeps the raw config knob for audits (they differ only when the
+        # local backend substitutes a cloud tag).
+        "model": _resolve_serving_model(configured_model),
+        "configured_model": configured_model,
         "batch_size": max(1, int(cfg.batch_size)),
         "min_confidence": min(max(0.0, float(cfg.min_confidence)), 1.0),
         "excerpt_chars": max(0, int(cfg.excerpt_chars)),
@@ -3203,6 +3301,16 @@ def _auto_tag_excerpt_source(item: dict[str, Any]) -> str:
 def _run_auto_tag(items: list[dict[str, Any]]) -> None:
     """Background auto-tag run; logs and records failures, never raises."""
     settings = _auto_tag_settings()
+    failed_batches = 0
+    last_failure = ""
+
+    def _record_batch_failure(_batch_index: int, exc: Exception) -> None:
+        # classify_documents already logged the detail; this only feeds the
+        # status endpoint so a fully-failed sweep is visible in the UI.
+        nonlocal failed_batches, last_failure
+        failed_batches += 1
+        last_failure = str(exc)
+
     try:
         inputs = []
         for item in items:
@@ -3223,6 +3331,7 @@ def _run_auto_tag(items: list[dict[str, Any]]) -> None:
             batch_size=settings["batch_size"],
             min_confidence=settings["min_confidence"],
             timeout=settings["timeout"],
+            on_batch_failure=_record_batch_failure,
         )
         # Only apply decisions for documents this run submitted; a confused
         # reply must never reach (and overwrite) hashes outside the run.
@@ -3244,7 +3353,8 @@ def _run_auto_tag(items: list[dict[str, Any]]) -> None:
                     "finished_at": _utcnow(),
                     "tagged": len(decisions),
                     "queued": len(items),
-                    "last_error": "",
+                    "failed_batches": failed_batches,
+                    "last_error": last_failure if failed_batches else "",
                 }
             )
     except Exception as exc:
@@ -3254,6 +3364,7 @@ def _run_auto_tag(items: list[dict[str, Any]]) -> None:
                 {
                     "running": _AUTO_TAG_ACTIVE_RUNS - 1 > 0,
                     "finished_at": _utcnow(),
+                    "failed_batches": failed_batches,
                     "last_error": str(exc),
                 }
             )
@@ -3282,6 +3393,7 @@ def _schedule_auto_tag(items: list[dict[str, Any]], *, exclusive: bool = False) 
                     "started_at": _utcnow(),
                     "queued": len(items),
                     "tagged": 0,
+                    "failed_batches": 0,
                     "last_error": "",
                 }
             )
@@ -3500,7 +3612,13 @@ _MARKDOWN_QUALITY_PERSIST_FLUSH_SECONDS = 10.0
 
 
 def _markdown_quality_persist_path(root_dir: Path) -> Path:
-    return root_dir / "data" / ".markdown_quality_cache.json"
+    # Honor the configured [paths] data_dir: every other workspace artifact
+    # lives under DATA_DIR, and root_dir/"data" is the wrong (possibly
+    # unwritable) tree when the data dir is redirected. A non-default
+    # root_dir (isolated test trees) keeps the root-derived path.
+    if Path(root_dir) == ROOT_DIR:
+        return DATA_DIR / ".markdown_quality_cache.json"
+    return Path(root_dir) / "data" / ".markdown_quality_cache.json"
 
 
 def _markdown_quality_persist_payload(cache_path: Path) -> dict[str, list[Any]]:
@@ -3594,6 +3712,26 @@ def _markdown_quality(processed_markdown_path: str, *, root_dir: Path = ROOT_DIR
     return result
 
 
+# Chunking sanity thresholds for the low-density check. A healthy chunk holds
+# at most the chunker's per-chunk ceiling (900 target tokens x 4 chars/token =
+# 3600 chars, see sectioning max_chunk_chars), so an index whose average
+# content chars per chunk is far above that was built from far fewer chunks
+# than the text volume warrants (a failed section split, a partial reindex,
+# or an index built under different chunking settings).
+LOW_CHUNK_DENSITY_CHARS_PER_CHUNK = 7200
+
+
+def _low_chunk_density(chunk_count: int, content_char_count: int) -> bool:
+    """True when a document's indexed text volume implies missing chunks.
+
+    Needs at least two chunks (a lone chunk is ``single_chunk``'s job) and an
+    average content length per chunk beyond twice the per-chunk ceiling.
+    """
+    if chunk_count < 2:
+        return False
+    return content_char_count / chunk_count > LOW_CHUNK_DENSITY_CHARS_PER_CHUNK
+
+
 def _document_quality(
     entry: dict[str, Any],
     *,
@@ -3615,8 +3753,14 @@ def _document_quality(
         warnings.append("job_interrupted")
     if not stats:
         warnings.append("missing_index_manifest")
-    elif int(stats.get("chunk_count") or 0) <= 0:
-        warnings.append("no_chunks")
+    else:
+        chunk_count = int(stats.get("chunk_count") or 0)
+        if chunk_count <= 0:
+            warnings.append("no_chunks")
+        elif chunk_count == 1:
+            warnings.append("single_chunk")
+        elif _low_chunk_density(chunk_count, int(stats.get("content_char_count") or 0)):
+            warnings.append("low_chunk_density")
     warnings.extend(_trust_warnings(trust))
 
     if not warnings:
@@ -3755,15 +3899,22 @@ def list_pdf_documents(
     source_group: str = "",
     trust_status: str = "",
     category: str = "",
+    status: str = "",
     sort: str = "",
     registry_path: Path | None = None,
     processed_dir: Path | None = None,
     root_dir: Path = ROOT_DIR,
     data_dir: Path = DATA_DIR,
     enrich: bool = True,
+    allowed_categories: set[str] | None = None,
 ) -> dict[str, Any]:
+    # ``allowed_categories`` (permission-set scope): ``None`` lists everything;
+    # a set restricts rows, totals, and facet counts to those category keys.
+    # Read-only listing: skip the defensive deep copy (rows are normalized into
+    # fresh dicts per entry anyway); the corpus-scale JSON round trip ran on
+    # every Library poll.
     manifest = _load_index_manifest(DB_DIR)
-    trust_payload = _load_trust_registry()
+    trust_payload = _load_trust_registry(copy=False)
     trust_documents = trust_payload.get("documents", {}) if isinstance(trust_payload.get("documents"), dict) else {}
 
     fields = _pdf_source_fields(registry_path=registry_path, processed_dir=processed_dir)
@@ -3800,6 +3951,23 @@ def list_pdf_documents(
         trust_by_hash[source_hash] = _normalize_trust_entry(source_hash, trust_documents.get(source_hash))
         rows.append(row)
 
+    # Filter before sorting: the common single-hash lookup would otherwise
+    # sort the entire corpus only to keep one row.
+    if allowed_categories is not None:
+        rows = [
+            item
+            for item in rows
+            if str(item.get("category") or GENERAL_CATEGORY_KEY) in allowed_categories
+        ]
+    query = search.strip().lower()
+    if query:
+        rows = [
+            item
+            for item in rows
+            if query in str(item.get("filename", "")).lower()
+            or query in str(item.get("hash", "")).lower()
+        ]
+
     def _trust_value(item: dict[str, Any], key: str) -> str:
         return str(trust_by_hash[str(item.get("hash") or "")].get(key) or "")
 
@@ -3823,6 +3991,16 @@ def list_pdf_documents(
             key=lambda item: _trust_value(item, "review_status") or "unreviewed",
             reverse=reverse,
         )
+    elif sort_key == "category":
+        # Library category column: group by category key, ties by filename so
+        # each category block reads in a stable order.
+        rows.sort(
+            key=lambda item: (
+                str(item.get("category") or GENERAL_CATEGORY_KEY),
+                str(item.get("filename") or "").lower(),
+            ),
+            reverse=reverse,
+        )
     else:
         rows.sort(
             key=lambda item: (
@@ -3831,14 +4009,6 @@ def list_pdf_documents(
                 str(item.get("hash") or ""),
             )
         )
-    query = search.strip().lower()
-    if query:
-        rows = [
-            item
-            for item in rows
-            if query in str(item.get("filename", "")).lower()
-            or query in str(item.get("hash", "")).lower()
-        ]
     # Trust facet filters resolve against the same normalized trust entries the
     # response rows carry, so the Library filters and the rendered badges can
     # never disagree. Untagged rows expose review_status "unreviewed".
@@ -3865,6 +4035,13 @@ def list_pdf_documents(
             for item in rows
             if str(item.get("category") or GENERAL_CATEGORY_KEY) == category_filter
         ]
+    # Pipeline-status facet: matches the raw registry status the Status column
+    # renders, including the listing-time "not_indexed" rewrite above. "none"
+    # selects rows with no registry status at all (source-map-only entries).
+    status_filter = (status or "").strip().lower()
+    if status_filter and status_filter != "all":
+        expected_status = "" if status_filter == "none" else status_filter
+        rows = [item for item in rows if str(item.get("status") or "") == expected_status]
     page = _page_slice(rows, offset=offset, limit=limit, cap=PDFS_MAX_PAGE_SIZE)
 
     # Enrich (path stats, trust, markdown quality) only the rows on the page so
@@ -3904,7 +4081,30 @@ def list_pdf_documents(
     }
 
 
-def list_job_rows(*, offset: int = 0, limit: int | None = 10, search: str = "") -> dict[str, Any]:
+def _job_scope_category(job: dict[str, Any]) -> str:
+    """The category key a job touches, for permission-set scoping (""=General).
+
+    Upload/index jobs carry ``options.category``; transfer jobs carry
+    ``options.target_category``. Unparseable values fall back to General so a
+    malformed job never widens a restricted identity's view.
+    """
+    options = job.get("options") if isinstance(job.get("options"), dict) else {}
+    raw = str(options.get("target_category") or options.get("category") or "").strip().lower()
+    if not raw:
+        return GENERAL_CATEGORY_KEY
+    try:
+        return normalize_category_key(raw)
+    except ValueError:
+        return GENERAL_CATEGORY_KEY
+
+
+def list_job_rows(
+    *,
+    offset: int = 0,
+    limit: int | None = 10,
+    search: str = "",
+    allowed_categories: set[str] | None = None,
+) -> dict[str, Any]:
     jobs = job_queue.list_jobs()
     active_count = sum(
         1
@@ -3922,6 +4122,8 @@ def list_job_rows(*, offset: int = 0, limit: int | None = 10, search: str = "") 
             or query in str(job.get("error", "")).lower()
             or query in ", ".join(str(name) for name in (job.get("filenames") or [])).lower()
         ]
+    if allowed_categories is not None:
+        jobs = [job for job in jobs if _job_scope_category(job) in allowed_categories]
     page = _page_slice(jobs, offset=offset, limit=limit, cap=JOBS_MAX_PAGE_SIZE)
     # log_tail (200 lines per job) is excluded from the list response: the 2s
     # active-job poll used to re-ship every visible job's whole tail. The UI
@@ -4368,17 +4570,19 @@ def enqueue_full_reingest(
     used_names: set[str] = set()
 
     try:
+        # One merged registry+source-map load for the whole loop: calling
+        # resolve_pdf_download_path per hash re-read both stores N times
+        # (O(n^2) for an N-document corpus).
+        fields = _pdf_source_fields(registry_path=registry_path, processed_dir=processed_dir)
         for source_hash in source_hashes:
-            try:
-                path, filename = resolve_pdf_download_path(
-                    source_hash,
-                    registry_path=registry_path,
-                    processed_dir=processed_dir,
-                    root_dir=root_dir,
-                    data_dir=data_dir,
-                )
-            except FileNotFoundError:
+            match = fields.get(source_hash)
+            if match is None:
                 continue
+            raw_path = str(match.get("upload_path") or match.get("source_pdf_path") or "")
+            path = _resolve_pdf_path(raw_path, root_dir=root_dir, data_dir=data_dir)
+            if not path.exists():
+                continue
+            filename = str(match.get("filename") or "") or path.name
             staged_name = _safe_filename(filename or path.name)
             base = staged_name
             counter = 1
@@ -4529,6 +4733,18 @@ AdminApiKeyRoleRequest = import_split_class("src.web_app_classes.admin_api_key_r
 AdminApiKeyRoleRequest.__module__ = __name__
 
 
+AdminApiKeyPermissionSetRequest = import_split_class("src.web_app_classes.admin_api_key_request", "AdminApiKeyPermissionSetRequest")
+AdminApiKeyPermissionSetRequest.__module__ = __name__
+
+
+PermissionSetCreateRequest = import_split_class("src.web_app_classes.admin_api_key_request", "PermissionSetCreateRequest")
+PermissionSetCreateRequest.__module__ = __name__
+
+
+PermissionSetUpdateRequest = import_split_class("src.web_app_classes.admin_api_key_request", "PermissionSetUpdateRequest")
+PermissionSetUpdateRequest.__module__ = __name__
+
+
 class BulkDocumentTrustRequest(BaseModel):
     source_hashes: list[str] = Field(default_factory=list)
     source_group: str
@@ -4602,6 +4818,98 @@ job_queue = RagJobQueue(
 
 def recover_pending_upload_jobs_on_startup() -> dict[str, Any]:
     return job_queue.recover_pending_uploads()
+
+
+# Server shutdown ("stop the machine" button).
+#
+# POST /api/server/shutdown is strictly loopback-only -- deliberately stricter
+# than the update endpoints (which also honor the configured bind host):
+# stopping the server is the one capability that must never be reachable over
+# the LAN, regardless of API-key role. The request only ARMS the shutdown; a
+# countdown thread then finalizes active jobs (terminal bookkeeping so startup
+# recovery cannot resurrect them) and asks uvicorn for a graceful stop via
+# SIGINT, whose lifespan shutdown re-runs the (idempotent) finalization.
+_SERVER_SHUTDOWN_MIN_DELAY_SECONDS = 5.0
+_SERVER_SHUTDOWN_MAX_DELAY_SECONDS = 300.0
+# Default countdown >= the default health-poll interval (60s), so every open
+# UI is guaranteed to see the shutdown banner before the server stops.
+_SERVER_SHUTDOWN_DEFAULT_DELAY_SECONDS = 60.0
+# Graceful shutdown can hang on a stuck in-flight response (e.g. a wedged chat
+# stream holding its connection). Job finalization has already run by the time
+# the exit is requested, so a hard exit at the deadline is safe.
+_SERVER_SHUTDOWN_WATCHDOG_SECONDS = 30.0
+
+_SERVER_SHUTDOWN_LOCK = threading.Lock()
+_SERVER_SHUTDOWN_STATE: dict[str, Any] = {"active": False}
+
+
+def _server_shutdown_public_state() -> dict[str, Any] | None:
+    with _SERVER_SHUTDOWN_LOCK:
+        return dict(_SERVER_SHUTDOWN_STATE) if _SERVER_SHUTDOWN_STATE.get("active") else None
+
+
+def _trigger_graceful_exit() -> None:
+    # uvicorn installs a SIGINT handler (signal.signal fallback on Windows);
+    # raising it from this worker thread runs that handler in the main thread
+    # at the next interpreter checkpoint (the serve loop wakes every ~100ms)
+    # and starts the normal graceful shutdown: stop accepting connections,
+    # drain in-flight requests, run the lifespan shutdown section, exit.
+    signal.raise_signal(signal.SIGINT)
+
+
+def _perform_server_shutdown(delay_seconds: float) -> None:
+    deadline = time.monotonic() + delay_seconds
+    # Sleep in slices against the live state so the countdown stays observable
+    # (and a future "abort shutdown" could flip it off before the point of no
+    # return, e.g. from tests).
+    while True:
+        with _SERVER_SHUTDOWN_LOCK:
+            if not _SERVER_SHUTDOWN_STATE.get("active"):
+                return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.25, remaining))
+    with _SERVER_SHUTDOWN_LOCK:
+        if not _SERVER_SHUTDOWN_STATE.get("active"):
+            return
+    logger.warning("Shutdown countdown elapsed: finalizing active jobs before exit.")
+    try:
+        finalized = job_queue.shutdown_finalize()
+        if finalized.get("finalized"):
+            logger.info(
+                "Shutdown finalized %d active job(s) (%d forced).",
+                finalized["finalized"], finalized["forced"],
+            )
+    except Exception:  # noqa: BLE001 - never leave the exit trigger un-armed
+        logger.exception("Shutdown job finalization failed; exiting anyway.")
+    watchdog = threading.Timer(_SERVER_SHUTDOWN_WATCHDOG_SECONDS, os._exit, args=(0,))
+    watchdog.daemon = True
+    watchdog.start()
+    _trigger_graceful_exit()
+
+
+def request_server_shutdown(delay_seconds: float) -> dict[str, Any]:
+    """Arm the shutdown countdown (idempotent; the first request wins)."""
+    now = datetime.now(timezone.utc)
+    shutdown_at = now + timedelta(seconds=delay_seconds)
+    with _SERVER_SHUTDOWN_LOCK:
+        if _SERVER_SHUTDOWN_STATE.get("active"):
+            return dict(_SERVER_SHUTDOWN_STATE)
+        state = {
+            "active": True,
+            "requested_at": now.isoformat(timespec="seconds"),
+            "shutdown_at": shutdown_at.isoformat(timespec="seconds"),
+            "delay_seconds": delay_seconds,
+        }
+        _SERVER_SHUTDOWN_STATE.update(state)
+    threading.Thread(
+        target=_perform_server_shutdown,
+        args=(delay_seconds,),
+        daemon=True,
+        name="server-shutdown",
+    ).start()
+    return dict(state)
 
 
 def _start_local_chat_model_warmup() -> None:
@@ -4830,6 +5138,24 @@ async def lifespan(app: FastAPI):
     yield
     _METRICS_SAMPLER_STOP.set()
     _BACKUP_SCHEDULER_STOP.set()
+    # Graceful-shutdown job finalization: a deliberate stop must not look like
+    # a crash. Without this, startup recovery re-enqueues every job that was
+    # still queued/running and re-runs indexing from scratch on the next boot.
+    # Hard kills (power loss, TerminateProcess) skip this section entirely, so
+    # genuine crash recovery still works.
+    try:
+        finalized = job_queue.shutdown_finalize()
+        if finalized.get("finalized"):
+            logger.info(
+                "Shutdown finalized %d active job(s) (%d forced).",
+                finalized["finalized"], finalized["forced"],
+            )
+    except Exception:  # noqa: BLE001 - finalization must never block shutdown
+        logger.exception("Job finalization during shutdown failed; continuing.")
+    try:
+        terminate_child_subprocesses(grace_seconds=5.0)
+    except Exception:  # noqa: BLE001 - best effort, mirrors the update path
+        pass
     # Persist any in-flight API-key usage counters so a restart does not lose
     # the tail of usage accounting (the tracker only flushes on a throttle).
     authenticator = globals().get("api_authenticator")
@@ -4871,7 +5197,7 @@ app.mount("/static", _RevalidatingStaticFiles(directory=WEB_DIR), name="static")
 #      against the hashed-key store (``data/.api_keys.json``) via the
 #      ``api_authenticator`` module global.
 #
-# Gating matches the prior behavior: only state-changing requests
+# Gating matches the established posture: only state-changing requests
 # (POST/PUT/DELETE/PATCH) to /api/* are gated; all GETs and the root/static
 # paths stay open so the UI loads and health/poll endpoints work. The only GET
 # that requires auth is the admin endpoint ``GET /api/admin/api-keys``, which is
@@ -4883,27 +5209,33 @@ app.mount("/static", _RevalidatingStaticFiles(directory=WEB_DIR), name="static")
 # reachable host burn model compute and read corpus-derived answers while
 # bypassing the per-key rate limiter.
 #
-# Fresh-deploy no-op: when ``[server] api_token`` is empty AND the key store has
-# no keys, ``api_authenticator.authenticate`` returns ``(None, None)`` and the
-# middleware passes everything through -- zero behavior change for the common
-# single-user / Tailscale-only deployment.
+# AUTH IS ALWAYS ON: there is no open mode. Requests from the local machine
+# (effective client IP loopback) are auto-authenticated as a full-admin
+# localhost identity before any credential check. Every other client must
+# present the master ``[server] api_token`` or a valid per-key API key, whose
+# permission set scopes category access (see _identity_allowed_categories).
+# ``GET /api/pdfs/{hash}/download|/view`` are gated too (media navigation
+# cannot send headers, so those links carry ``?token=``; see core.js). The
+# per-PDF asset routes (``/api/assets/``) stay open -- <img> tags cannot carry
+# credentials and the individual extracted images are low-value next to the
+# full corpus; a documented limitation, not an oversight.
 _API_TOKEN = str(SERVER_CONFIG.get("api_token") or "").strip()
+# Loopback clients are auto-authenticated as full admin unless this is switched
+# off in config. Read dynamically (like _API_TOKEN) so tests can flip it.
+_LOCALHOST_AUTO_AUTH = bool(API_KEYS_CONFIG.get("localhost_auto_auth", True))
 _MUTATING_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
 # POST routes treated as read-only (Markdown render). They read nothing
 # sensitive and never mutate server state, so they stay ungated even when auth
 # is configured.
 _NON_MUTATING_POST_PATHS = {"/api/render"}
-# GET routes that exfiltrate bulk data or server internals and so must be gated
-# when auth is configured. Most GETs (document lists, health, jobs, index rows)
-# stay open so the UI loads without a token; these stream the entire index or
+# GET routes that exfiltrate bulk data or server internals and so are gated.
+# Most GETs (health, update status) stay open; these stream the entire index or
 # expose filesystem paths/config and are full-corpus or server-recon surfaces.
-# Like mutating requests, the no-op path (no master token AND empty key store)
-# still passes them through, so a fresh single-user deployment is unchanged.
 _SENSITIVE_GET_PATHS = {"/api/index/stream", "/api/metrics", "/api/metrics/history"}
 
-# Prefix-gated GETs when auth is configured: these routes expose the corpus
-# (full chunk text, PDF registry, job history). They are fetch-based, so the
-# UI carries its credential in the X-API-Token header and keeps working.
+# Prefix-gated GETs: these routes expose the corpus (full chunk text, PDF
+# registry, job history). They are fetch-based, so the UI carries its
+# credential in the X-API-Token header and keeps working.
 _SENSITIVE_GET_PREFIXES = (
     "/api/pdfs",
     "/api/index",
@@ -4914,10 +5246,26 @@ _SENSITIVE_GET_PREFIXES = (
     "/api/categories",
     "/api/uploads/chunk_status",
 )
-# Media navigations (<a href> / <img src>) cannot carry headers, so the
-# download/view/asset routes stay reachable without a credential even when
-# auth is configured. Documented limitation, not an oversight.
+# Media navigations for full-document content (<a href> download/view) cannot
+# carry headers, so those links carry ``?token=`` instead (core.js appends it
+# for non-loopback use). Asset images (<img src> inside rendered answers) stay
+# open: documented limitation.
 _SENSITIVE_GET_EXEMPT_PREFIXES = ("/api/assets/",)
+
+# Endpoints that count toward per-key usage stats: real work only (queries and
+# uploads). Everything else that requires auth -- above all the /api/jobs and
+# /api/categories GETs that every open UI tab polls -- stays gated and
+# rate-limited, but polling no longer inflates the usage counter.
+_TRACKED_USAGE_PATHS = frozenset(
+    {
+        "/api/chat/stream",
+        "/api/index/vector-search",
+        "/api/uploads",
+        "/api/uploads/direct",
+        "/api/uploads/chunk",
+        "/api/uploads/complete",
+    }
+)
 
 
 def _is_sensitive_get(path: str) -> bool:
@@ -4925,10 +5273,6 @@ def _is_sensitive_get(path: str) -> bool:
         return True
     if path.startswith(_SENSITIVE_GET_EXEMPT_PREFIXES):
         return False
-    if path.startswith("/api/pdfs/"):
-        # Per-PDF media subpaths stay open (see exempt comment above); the
-        # collection route /api/pdfs itself is gated.
-        return not (path.endswith("/download") or path.endswith("/view"))
     return path.startswith(_SENSITIVE_GET_PREFIXES)
 
 api_authenticator: ApiKeyAuthenticator | None = (
@@ -5020,18 +5364,16 @@ async def _enforce_api_token(request: Request, call_next):
     # Gate state-changing methods plus sensitive GETs (full-corpus index
     # stream, metrics + history, and the fetch-based corpus/job listings -- see
     # _is_sensitive_get). Health, update status, the read-only POST
-    # (/api/render), and the media navigation routes (<a>/<img>: PDF
-    # download/view, assets) stay open so the UI loads without a credential;
-    # the admin GET /api/admin/api-keys is gated inside its own handler
-    # (role-restricted). Chat streaming is a POST, so it is gated like every
-    # other state-changing route.
-    # GETs are only gated WHEN auth is configured: with no master token and an
-    # empty key store the whole middleware is a pass-through (zero-config).
+    # (/api/render), and asset images stay open; PDF download/view are gated
+    # and carried by ?token= links. The admin GET /api/admin/api-keys is gated
+    # inside its own handler (role-restricted). Chat streaming is a POST, so it
+    # is gated like every other state-changing route.
     is_mutating = request.method in _MUTATING_METHODS and path not in _NON_MUTATING_POST_PATHS
     is_sensitive_get = request.method == "GET" and _is_sensitive_get(path)
     # CSRF guard: a cross-origin browser request must never reach a
-    # state-changing endpoint, regardless of auth state (the zero-config
-    # pass-through below would otherwise wave it through).
+    # state-changing endpoint, regardless of auth state. This also covers the
+    # localhost identity below: a CSRF POST arrives FROM the victim's browser
+    # on 127.0.0.1 and must not inherit its admin powers.
     if is_mutating and not _origin_allowed(request.headers.get("origin"), request):
         return JSONResponse(
             status_code=403,
@@ -5040,24 +5382,52 @@ async def _enforce_api_token(request: Request, call_next):
     if not (is_mutating or is_sensitive_get):
         return await call_next(request)
 
+    # Localhost auto-auth: the operator on the server machine is trusted with
+    # the full-admin identity (category management, key issuing). XFF is only
+    # honored from loopback peers, so a reverse-proxied external client
+    # resolves to its real address and does NOT get the local identity.
+    if globals().get("_LOCALHOST_AUTO_AUTH", True) and _is_loopback_host(_client_ip(request) or ""):
+        request.state.api_identity = local_auth_result(
+            default_rate_limit=int(API_KEYS_CONFIG["rate_limit_per_minute"])
+        )
+        return await call_next(request)
+
     # Read the master token dynamically (not via closure) so tests can patch it.
     master_token = (globals().get("_API_TOKEN") or "").strip()
     authenticator = globals().get("api_authenticator")
     if authenticator is None:
-        # Auth disabled (e.g. config [api_keys] enabled=false and no master).
-        # Still honor a bare master-token check for the legacy single-token case.
-        if master_token:
-            supplied = _resolve_api_credential(request)
-            # Byte comparison: str inputs to compare_digest must be ASCII-only,
-            # and a non-ASCII credential must yield a clean 401, not a 500.
-            if not hmac.compare_digest(supplied.encode("utf-8"), master_token.encode("utf-8")):
-                return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token."})
-        return await call_next(request)
+        # Per-key auth is disabled ([api_keys] enabled = false). Remote clients
+        # can only pass with the master token, when one is configured.
+        supplied = _resolve_api_credential(request)
+        if (
+            master_token
+            and supplied
+            and hmac.compare_digest(supplied.encode("utf-8"), master_token.encode("utf-8"))
+        ):
+            request.state.api_identity = AuthResult(
+                key_id=MASTER_KEY_ID,
+                role=ROLE_ADMIN,
+                label="master",
+                rate_limit_per_minute=int(API_KEYS_CONFIG["rate_limit_per_minute"]),
+                is_master=True,
+                permission_set=PERMSET_ADMIN,
+            )
+            return await call_next(request)
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "API key authentication is disabled on this server; "
+                               "access is limited to the local machine."},
+        )
 
     supplied = _resolve_api_credential(request)
     try:
         result, rejection = authenticator.authenticate(
-            supplied, master_token=master_token, client_ip=_client_ip(request)
+            supplied,
+            master_token=master_token,
+            client_ip=_client_ip(request),
+            # Rate limiting still applies to every gated request, but only the
+            # real-work endpoints above are metered into the usage counters.
+            track=path in _TRACKED_USAGE_PATHS,
         )
     except RateLimitExceeded as exc:
         return JSONResponse(
@@ -5065,14 +5435,14 @@ async def _enforce_api_token(request: Request, call_next):
             content={"detail": "Rate limit exceeded. Try again shortly."},
             headers={"Retry-After": str(exc.retry_after)},
         )
-    if rejection is not None:
-        # Auth is active but this credential is invalid/expired/disabled.
-        return JSONResponse(status_code=rejection.status_code, content={"detail": rejection.detail})
     if result is None:
-        # No-op path: neither master nor any key configured. Pass through.
-        return await call_next(request)
+        # Auth is active but the credential is invalid/expired/disabled.
+        # (authenticate no longer has an "auth disabled" pass-through mode.)
+        detail = rejection.detail if rejection is not None else "Invalid or missing API key."
+        status = rejection.status_code if rejection is not None else 401
+        return JSONResponse(status_code=status, content={"detail": detail})
     # Authenticated (master bypass or a valid API key). Stash the identity for
-    # downstream handlers that care (admin endpoint, future audit logging).
+    # the category-scoping and admin helpers downstream.
     request.state.api_identity = result
     return await call_next(request)
 
@@ -5150,35 +5520,143 @@ def root():
     return Response(content=text, media_type="text/html; charset=utf-8")
 
 
+def _request_identity(request: Request) -> AuthResult | None:
+    """The identity the auth middleware stashed for this request, if any.
+
+    Gated requests always carry one (localhost, master, or API key). Ungated
+    open endpoints (health, static) have none and are not scoped.
+    """
+    return getattr(request.state, "api_identity", None)
+
+
+def _identity_permission_set_record(request: Request) -> dict[str, Any] | None:
+    """The live permission-set record behind this request's identity.
+
+    Read per call (the store caches on file mtime) so an admin editing a set's
+    categories or flags takes effect on the next request without a restart.
+    Localhost/master identities resolve to the implicit full-power admin set.
+    """
+    identity = _request_identity(request)
+    if identity is None:
+        return None
+    if identity.is_local or identity.is_master:
+        return {
+            "name": PERMSET_ADMIN,
+            "label": "Administrator",
+            "categories": [PERMSET_WILDCARD],
+            "can_write": True,
+            "admin": True,
+        }
+    authenticator = globals().get("api_authenticator")
+    if authenticator is None:
+        return None
+    return authenticator.get_permission_set(identity.permission_set)
+
+
+def _identity_is_admin(request: Request) -> bool:
+    record = _identity_permission_set_record(request)
+    if record is None:
+        return False
+    return bool(record.get("admin"))
+
+
+def _identity_can_write(request: Request) -> bool:
+    """Upload/edit/delete inside the allowed categories (localhost/master always)."""
+    record = _identity_permission_set_record(request)
+    if record is None:
+        return False
+    return bool(record.get("can_write"))
+
+
+def _identity_allowed_categories(request: Request) -> set[str] | None:
+    """The category keys this identity may see and query.
+
+    ``None`` means unrestricted (localhost/master or a wildcard set). A set
+    otherwise returns its explicit allowlist; categories deleted after the set
+    was written simply never match the registry. Fail closed to an empty set
+    when the identity's set record cannot be resolved.
+    """
+    record = _identity_permission_set_record(request)
+    if record is None:
+        return set()
+    categories = record.get("categories") or [PERMSET_WILDCARD]
+    if PERMSET_WILDCARD in categories:
+        return None
+    return {str(key) for key in categories}
+
+
+def _require_admin_identity(request: Request) -> None:
+    if not _identity_is_admin(request):
+        raise HTTPException(status_code=403, detail="Admin role required.")
+
+
+def _require_write_identity(request: Request) -> None:
+    if not _identity_can_write(request):
+        raise HTTPException(
+            status_code=403,
+            detail="This API key's permission set is read-only.",
+        )
+
+
+def _require_category_allowed(request: Request, key: str) -> None:
+    """403 unless ``key`` ("" = General) is inside the identity's allowlist."""
+    allowed = _identity_allowed_categories(request)
+    if allowed is None:
+        return
+    text = str(key or "").strip().lower()
+    try:
+        normalized = normalize_category_key(text) if text else GENERAL_CATEGORY_KEY
+    except ValueError:
+        return  # malformed keys are rejected by the callers' own validation
+    if normalized not in allowed:
+        raise HTTPException(
+            status_code=403,
+            detail="This API key's permission set does not include that category.",
+        )
+
+
+def _filter_category_entries(request: Request, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Restrict a category listing (and everything derived from it) to the
+    identity's allowlist. Visibility, not just query scoping."""
+    allowed = _identity_allowed_categories(request)
+    if allowed is None:
+        return entries
+    return [entry for entry in entries if str(entry.get("key")) in allowed]
+
+
+def _identity_scope_signature(request: Request) -> str:
+    """Stable token for the identity's category scope, folded into ETag seeds
+    so two identities with different permissions never share a cached body."""
+    allowed = _identity_allowed_categories(request)
+    if allowed is None:
+        return "scope:all"
+    return "scope:" + ",".join(sorted(allowed))
+
+
 def _require_admin(request: Request, *, mutation: bool = False) -> JSONResponse | None:
     """Auth gate for admin endpoints. Returns an error response or ``None``.
 
-    This is the single GET that requires auth (the middleware only gates
-    mutating methods). Only the master token or an ``admin``-role API key may
-    list live key usage. When auth is fully disabled (no master token, empty
-    key store) the endpoint is openly readable -- there is nothing sensitive to
-    protect in that zero-config state.
-
-    Mutating admin endpoints (create/disable/delete keys) additionally require
-    a loopback client while auth is unconfigured: a LAN-open deployment would
-    otherwise let any host mint the first admin key and lock the operator out
-    of a system that is now gated by that attacker's key.
+    Admin powers: the localhost identity, the master token, or any key whose
+    permission set carries the admin flag. Mutating admin endpoints are
+    middleware-gated, so ``request.state.api_identity`` is already set for
+    them; the one ungated admin GET re-authenticates the credential itself.
     """
-    master_token = (globals().get("_API_TOKEN") or "").strip()
-    authenticator = globals().get("api_authenticator")
-    # Zero-config state: no master token and no key store -> nothing to gate.
-    if not master_token and (authenticator is None or not authenticator.store.has_any_key()):
-        if mutation and not _is_local_update_host(request.client.host if request.client else ""):
-            raise HTTPException(
-                status_code=403,
-                detail="Admin key management is restricted to the local machine until an API token or key is configured.",
-            )
+    # Local operator: trusted full admin (mirror of the middleware bypass) --
+    # this is also the bootstrap path that mints the first key.
+    if globals().get("_LOCALHOST_AUTO_AUTH", True) and _is_loopback_host(_client_ip(request) or ""):
         return None
+    identity = _request_identity(request)
+    if identity is not None:
+        if identity.is_master or identity.is_local or identity.role == ROLE_ADMIN:
+            return None
+        return JSONResponse(status_code=403, content={"detail": "Admin role required."})
     supplied = _resolve_api_credential(request)
+    authenticator = globals().get("api_authenticator")
     if authenticator is not None:
         try:
             result, rejection = authenticator.authenticate(
-                supplied, master_token=master_token, client_ip=_client_ip(request), track=False
+                supplied, master_token=(globals().get("_API_TOKEN") or "").strip(),
+                client_ip=_client_ip(request), track=False
             )
         except RateLimitExceeded as exc:
             return JSONResponse(
@@ -5188,12 +5666,12 @@ def _require_admin(request: Request, *, mutation: bool = False) -> JSONResponse 
             )
         if rejection is not None:
             return JSONResponse(status_code=rejection.status_code, content={"detail": rejection.detail})
-        if result is not None and result.role == "admin":
+        if result is not None and (result.is_master or result.role == ROLE_ADMIN):
             return None
         if result is not None:
             return JSONResponse(status_code=403, content={"detail": "Admin role required."})
-    elif master_token:
-        if hmac.compare_digest(supplied.encode("utf-8"), master_token.encode("utf-8")):
+    elif (globals().get("_API_TOKEN") or "").strip():
+        if hmac.compare_digest(supplied.encode("utf-8"), (globals().get("_API_TOKEN") or "").strip().encode("utf-8")):
             return None
         return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token."})
     return JSONResponse(status_code=401, content={"detail": "Admin authentication required."})
@@ -5220,28 +5698,21 @@ def admin_list_api_keys(request: Request):
         except Exception:
             pass
         for record in authenticator.store.list_keys():
-            # Drop the internal key_id hash from the public view.
-            keys.append(
-                {
-                    "prefix": record.get("prefix", ""),
-                    "label": record.get("label", ""),
-                    "role": record.get("role", "user"),
-                    "status": record.get("status", "active"),
-                    "created_at": record.get("created_at"),
-                    "expires_at": record.get("expires_at"),
-                    "rate_limit_per_minute": record.get("rate_limit_per_minute"),
-                    "usage": record.get("usage", {}),
-                }
-            )
+            keys.append(_admin_key_public_record(record))
     return {"keys": keys, "master_configured": bool((globals().get("_API_TOKEN") or "").strip())}
 
 
 def _admin_key_public_record(record: dict[str, Any]) -> dict[str, Any]:
     """Non-secret view of a key record for admin listings and mutation results."""
+    permission_set = str(
+        record.get("permission_set")
+        or (PERMSET_ADMIN if record.get("role") == ROLE_ADMIN else PERMSET_USER)
+    )
     return {
         "prefix": record.get("prefix", ""),
         "label": record.get("label", ""),
         "role": record.get("role", ROLE_USER),
+        "permission_set": permission_set,
         "status": record.get("status", STATUS_ACTIVE),
         "created_at": record.get("created_at"),
         "expires_at": record.get("expires_at"),
@@ -5279,7 +5750,8 @@ def admin_create_api_key(request: Request, payload: AdminApiKeyCreateRequest):
 
     The plaintext secret is returned here exactly once -- the store keeps only
     the hash, so a lost secret must be replaced via rotate/re-issue. Label,
-    role, expiry, and rate limit mirror ``scripts/manage_api_keys.py create``.
+    permission set (or legacy role), expiry, and rate limit mirror
+    ``scripts/manage_api_keys.py create``.
     """
     denied = _require_admin(request, mutation=True)
     if denied is not None:
@@ -5290,7 +5762,12 @@ def admin_create_api_key(request: Request, payload: AdminApiKeyCreateRequest):
             status_code=400,
             content={"detail": "API key auth is disabled in this deployment ([api_keys] enabled = false)."},
         )
-    if payload.role not in {ROLE_ADMIN, ROLE_USER}:
+    permission_set = str(payload.permission_set or "").strip()
+    if permission_set:
+        # The permission set carries the authorization semantics; the legacy
+        # role argument is ignored when a set is named explicitly.
+        payload.role = ROLE_USER
+    elif payload.role not in {ROLE_ADMIN, ROLE_USER}:
         return JSONResponse(
             status_code=400,
             content={"detail": f"Invalid role {payload.role!r}; expected 'user' or 'admin'."},
@@ -5308,10 +5785,16 @@ def admin_create_api_key(request: Request, payload: AdminApiKeyCreateRequest):
             role=payload.role,
             expires_at=expires_at,
             rate_limit_per_minute=payload.rate_limit_per_minute,
+            permission_set=permission_set or None,
         )
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
-    log_event("admin.api_key_created", prefix=record.get("prefix", ""), role=payload.role)
+    log_event(
+        "admin.api_key_created",
+        prefix=record.get("prefix", ""),
+        role=record.get("role", ROLE_USER),
+        permission_set=record.get("permission_set", PERMSET_USER),
+    )
     return {"key": full_key, "record": _admin_key_public_record(record)}
 
 
@@ -5350,6 +5833,136 @@ def admin_set_api_key_role(request: Request, prefix: str, payload: AdminApiKeyRo
     if updated is None:
         return JSONResponse(status_code=404, content={"detail": f"No API key with prefix {prefix!r}."})
     return {"record": _admin_key_public_record(updated)}
+
+
+@app.post("/api/admin/api-keys/{prefix}/permission-set")
+def admin_set_api_key_permission_set(request: Request, prefix: str, payload: AdminApiKeyPermissionSetRequest):
+    """Assign a key to a permission set (admin/master only).
+
+    The set defines the key's category allowlist plus its write/admin flags;
+    the legacy ``role`` field is kept in sync with the set's admin flag.
+    """
+    # Gate before payload validation (uniform 401 for unauthenticated callers).
+    denied, authenticator, record = _admin_key_context(request, prefix)
+    if denied is not None:
+        return denied
+    try:
+        updated = authenticator.set_permission_set(record["key_id"], payload.permission_set)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+    if updated is None:
+        return JSONResponse(status_code=404, content={"detail": f"No API key with prefix {prefix!r}."})
+    log_event(
+        "admin.api_key_permission_set",
+        prefix=record.get("prefix", ""),
+        permission_set=payload.permission_set,
+    )
+    return {"record": _admin_key_public_record(updated)}
+
+
+@app.get("/api/admin/permission-sets")
+def admin_list_permission_sets(request: Request):
+    """List permission sets with their key counts (admin/master only)."""
+    denied = _require_admin(request)
+    if denied is not None:
+        return denied
+    authenticator = globals().get("api_authenticator")
+    if authenticator is None:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "API key auth is disabled in this deployment ([api_keys] enabled = false)."},
+        )
+    counts = authenticator.permission_set_key_counts()
+    sets = [
+        {**record, "key_count": int(counts.get(str(record.get("name")), 0))}
+        for record in authenticator.list_permission_sets()
+    ]
+    return {"permission_sets": sets}
+
+
+@app.post("/api/admin/permission-sets")
+def admin_create_permission_set(request: Request, payload: PermissionSetCreateRequest):
+    """Create a permission set (admin/master only).
+
+    A set names a category allowlist (``["*"]`` = all categories) plus
+    ``can_write`` and ``admin`` flags. Keys assigned the set inherit exactly
+    that scope; edits apply to every member key on their next request.
+    """
+    denied = _require_admin(request, mutation=True)
+    if denied is not None:
+        return denied
+    authenticator = globals().get("api_authenticator")
+    if authenticator is None:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "API key auth is disabled in this deployment ([api_keys] enabled = false)."},
+        )
+    try:
+        record = authenticator.create_permission_set(
+            name=payload.name,
+            label=payload.label,
+            categories=payload.categories,
+            can_write=payload.can_write,
+            admin=payload.admin,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+    log_event("admin.permission_set_created", name=record.get("name", ""))
+    return {"permission_set": record}
+
+
+@app.post("/api/admin/permission-sets/{name}")
+def admin_update_permission_set(request: Request, name: str, payload: PermissionSetUpdateRequest):
+    """Update a permission set's label/categories/flags (admin/master only).
+
+    The builtin ``admin`` set keeps its powers (all categories, admin, write);
+    other sets -- including ``user`` -- are fully editable. Changes take effect
+    for member keys on their next request.
+    """
+    denied = _require_admin(request, mutation=True)
+    if denied is not None:
+        return denied
+    authenticator = globals().get("api_authenticator")
+    if authenticator is None:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "API key auth is disabled in this deployment ([api_keys] enabled = false)."},
+        )
+    mutate = {key: value for key, value in _model_dump(payload).items() if value is not None}
+    try:
+        record = authenticator.update_permission_set(name, mutate)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+    if record is None:
+        return JSONResponse(status_code=404, content={"detail": f"No permission set named {name!r}."})
+    log_event("admin.permission_set_updated", name=name)
+    return {"permission_set": record}
+
+
+@app.delete("/api/admin/permission-sets/{name}")
+def admin_delete_permission_set(request: Request, name: str):
+    """Delete a custom permission set (admin/master only).
+
+    Builtins and sets still assigned to at least one key are refused (409):
+    deleting an in-use set would orphan its keys' authorization.
+    """
+    denied = _require_admin(request, mutation=True)
+    if denied is not None:
+        return denied
+    authenticator = globals().get("api_authenticator")
+    if authenticator is None:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "API key auth is disabled in this deployment ([api_keys] enabled = false)."},
+        )
+    try:
+        deleted = authenticator.delete_permission_set(name)
+    except ValueError as exc:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+    if not deleted:
+        return JSONResponse(status_code=404, content={"detail": f"No permission set named {name!r}."})
+    log_event("admin.permission_set_deleted", name=name)
+    return {"deleted": True, "name": name}
 
 
 @app.delete("/api/admin/api-keys/{prefix}")
@@ -5402,6 +6015,9 @@ def health(request: Request):
         "ok": True,
         "security": {"auth_enabled": auth_enabled, "bind_all": bind_all},
         "startup_notices": list(_STARTUP_NOTICES),
+        # Set while a shutdown countdown is running: every open UI polls this
+        # endpoint, so it is the warning channel for "the server is stopping".
+        "shutting_down": _server_shutdown_public_state(),
         "paths": {
             "data_dir": str(DATA_DIR),
             "upload_dir": str(UPLOAD_DIR),
@@ -5801,6 +6417,33 @@ def update_apply(request: Request, background_tasks: BackgroundTasks):
     response = apply_available_update()
     background_tasks.add_task(_schedule_process_exit)
     return response
+
+
+@app.post("/api/server/shutdown")
+def server_shutdown(request: Request, delay_seconds: float = _SERVER_SHUTDOWN_DEFAULT_DELAY_SECONDS):
+    """Stop the server after a short countdown. Loopback-only, no exceptions.
+
+    Stricter than the update endpoints: only a raw loopback peer address may
+    call this, regardless of API-key role -- an admin key from the LAN gets
+    403 here. The peer address is read directly (never ``_client_ip()``), so a
+    local reverse proxy cannot launder a remote client into loopback. The
+    auth middleware's cross-origin check already blocks a malicious web page
+    from firing a no-cors POST at this endpoint from the operator's browser.
+    """
+    client_host = request.client.host if request.client else ""
+    if not _is_loopback_host(client_host):
+        raise HTTPException(
+            status_code=403,
+            detail="Server shutdown is restricted to the local machine (loopback clients only).",
+        )
+    try:
+        delay = float(delay_seconds)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="delay_seconds must be a number.")
+    delay = max(_SERVER_SHUTDOWN_MIN_DELAY_SECONDS, min(_SERVER_SHUTDOWN_MAX_DELAY_SECONDS, delay))
+    logger.warning("Server shutdown requested from %s; stopping in %.0fs.", client_host or "unknown", delay)
+    state = request_server_shutdown(delay)
+    return {"status": "shutting_down", **state}
 
 
 @app.post("/api/render")
@@ -6419,6 +7062,12 @@ async def _handle_upload_request(request: Request, *, require_source_groups: boo
 
     try:
         form = await request.form()
+        # Permission-set scope: uploading is a write, and the target category
+        # must be inside the caller's allowlist. Unlike _sanitize_upload_category
+        # (which leniently degrades stale/unknown keys), an out-of-scope
+        # category is an authorization failure and fails the request.
+        _require_write_identity(request)
+        _require_category_allowed(request, str(form.get("category") or ""))
         force_duplicates = str(form.get("force_duplicates") or "").lower() in {"1", "true", "yes", "on"}
         job_id = uuid.uuid4().hex
         staging_dir = STAGING_DIR / job_id
@@ -6529,10 +7178,12 @@ async def _handle_upload_request(request: Request, *, require_source_groups: boo
             require_groups=require_source_groups,
         )
 
+        # Counter instead of a per-item rescan: a max-size zip batch is
+        # ~10k entries and the nested scan made this O(n^2) on the request
+        # thread.
+        hash_counts = Counter(item["hash"] for item in uploads)
         batch_duplicate_hashes = {
-            item["hash"]
-            for item in uploads
-            if sum(1 for candidate in uploads if candidate["hash"] == item["hash"]) > 1
+            item_hash for item_hash, count in hash_counts.items() if count > 1
         }
         if batch_duplicate_hashes:
             raise HTTPException(
@@ -6860,7 +7511,9 @@ async def upload_chunk(request: Request):
                 )
     finally:
         _drop_upload_append_lock(upload_id, append_lock)
-    await chunk_field.close()
+        # Close on every path: the 409/413 raises above would otherwise leave
+        # the spooled upload file to GC.
+        await chunk_field.close()
 
     new_size = current_size + written
     with _CHUNK_UPLOADS_LOCK:
@@ -6900,6 +7553,9 @@ async def complete_chunked_upload(request: Request):
     409, same as the multipart path.
     """
     payload = await _optional_json(request)
+    # Permission-set scope: same write + category checks as the multipart path.
+    _require_write_identity(request)
+    _require_category_allowed(request, str(payload.get("category") or ""))
     upload_id = _require_upload_id(payload.get("upload_id"))
     filename = _safe_filename(str(payload.get("filename") or "upload.pdf"))
     part_path = _chunk_part_path(upload_id)
@@ -7063,6 +7719,8 @@ def _request_validation_error(exc: ValidationError) -> HTTPException:
 
 @app.post("/api/reindex")
 async def reindex(request: Request):
+    # Whole-corpus maintenance: spans every category, so admin-level.
+    _require_admin_identity(request)
     try:
         payload = ReindexRequest(**await _optional_json(request))
     except ValidationError as exc:
@@ -7072,10 +7730,9 @@ async def reindex(request: Request):
 
 
 @app.post("/api/reingest")
-def reingest():
-    blocker = _index_mutation_blocker()
-    if blocker:
-        raise HTTPException(status_code=409, detail=blocker)
+def reingest(request: Request):
+    _require_admin_identity(request)
+    _ensure_index_mutation_allowed()
     try:
         job = enqueue_full_reingest(
             registry_path=PDF_REGISTRY_PATH,
@@ -7093,25 +7750,28 @@ def reingest():
 
 @app.get("/api/index/backups")
 def index_backups(request: Request):
-    payload = {"backups": list_index_backups(DB_DIR), "keep": LANCEDB_BACKUP_KEEP}
+    # Check the client's ETag before building the payload: listing backups
+    # stats and opens every snapshot, which a 304 would throw away.
+    _require_admin_identity(request)
     seed = _file_signature(index_backup_root(DB_DIR))
-    return _conditional_json(request, payload, seed)
+    if not_modified := _not_modified_or_etag(request, seed):
+        return not_modified
+    payload = {"backups": list_index_backups(DB_DIR), "keep": LANCEDB_BACKUP_KEEP}
+    return _etagged_json(request, payload, seed)
 
 
 @app.post("/api/index/backup")
-def backup_index():
-    blocker = _index_mutation_blocker()
-    if blocker:
-        raise HTTPException(status_code=409, detail=blocker)
+def backup_index(request: Request):
+    _require_admin_identity(request)
+    _ensure_index_mutation_allowed()
     job = job_queue.enqueue_backup()
     return job.to_dict()
 
 
 @app.post("/api/index/rebuild")
 def rebuild_index(request: Request):
-    blocker = _index_mutation_blocker()
-    if blocker:
-        raise HTTPException(status_code=409, detail=blocker)
+    _require_admin_identity(request)
+    _ensure_index_mutation_allowed()
     job = job_queue.enqueue_rebuild()
     return job.to_dict()
 
@@ -7124,9 +7784,8 @@ def rebuild_vector_index(request: Request):
     partitions suboptimal. Cheaper than a full rebuild (no embedding) but still
     blocks queries briefly while the index is rebuilt under the index lock.
     """
-    blocker = _index_mutation_blocker()
-    if blocker:
-        raise HTTPException(status_code=409, detail=blocker)
+    _require_admin_identity(request)
+    _ensure_index_mutation_allowed()
     job = job_queue.enqueue_rebuild_vector_index()
     return job.to_dict()
 
@@ -7142,22 +7801,20 @@ def compact_index(request: Request):
     lock and reports bytes reclaimed. Safe to run periodically; the only cost is
     brief query blocking while the compaction runs.
     """
-    blocker = _index_mutation_blocker()
-    if blocker:
-        raise HTTPException(status_code=409, detail=blocker)
+    _require_admin_identity(request)
+    _ensure_index_mutation_allowed()
     job = job_queue.enqueue_compact()
     return job.to_dict()
 
 
 @app.post("/api/index/restore")
 async def restore_index(request: Request):
+    _require_admin_identity(request)
     try:
         payload = RestoreBackupRequest(**await _optional_json(request))
     except ValidationError as exc:
         raise _request_validation_error(exc) from exc
-    blocker = _index_mutation_blocker()
-    if blocker:
-        raise HTTPException(status_code=409, detail=blocker)
+    _ensure_index_mutation_allowed()
     try:
         job = job_queue.enqueue_restore(backup_name=payload.backup_name)
     except FileNotFoundError as exc:
@@ -7174,6 +7831,7 @@ def list_jobs(request: Request, offset: int = 0, limit: int = 10, search: str = 
     # can then 304 without paying the O(all-jobs) serialization. The version
     # bumps on every observable queue change (status/progress/log/pool), so no
     # stale payload can be served.
+    allowed_categories = _identity_allowed_categories(request)
     resolved_limit = JOBS_MAX_PAGE_SIZE if limit <= 0 else min(limit, JOBS_MAX_PAGE_SIZE)
     seed = _signature_from_parts(
         "jobs",
@@ -7181,24 +7839,33 @@ def list_jobs(request: Request, offset: int = 0, limit: int = 10, search: str = 
         offset,
         limit,
         search,
+        _identity_scope_signature(request),
     )
     if not_modified := _not_modified_or_etag(request, seed):
         return not_modified
-    payload = list_job_rows(offset=offset, limit=resolved_limit, search=search)
+    payload = list_job_rows(
+        offset=offset, limit=resolved_limit, search=search,
+        allowed_categories=allowed_categories,
+    )
     return _etagged_json(request, payload, seed)
 
 
 @app.get("/api/jobs/{job_id}")
-def get_job(job_id: str):
+def get_job(request: Request, job_id: str):
     job = job_queue.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
+    _require_category_allowed(request, _job_scope_category(job))
     return job
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-def cancel_job(job_id: str):
+def cancel_job(request: Request, job_id: str):
+    _require_write_identity(request)
     try:
+        job = job_queue.get_job(job_id)
+        if job is not None:
+            _require_category_allowed(request, _job_scope_category(job))
         return job_queue.cancel_job(job_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Job not found.") from exc
@@ -7259,15 +7926,21 @@ def list_categories(request: Request):
             "cats:" + _category_store().state_version(),
             "reg:" + registry_state_version(PDF_REGISTRY_PATH),
             _file_signature(DB_DIR / INDEX_MANIFEST_FILENAME),
+            # Two identities with different permission sets must never share a
+            # cached 304 body.
+            _identity_scope_signature(request),
         ),
     )
     if not_modified := _not_modified_or_etag(request, seed):
         return not_modified
-    return _etagged_json(request, _category_listing(), seed)
+    payload = _category_listing()
+    payload["categories"] = _filter_category_entries(request, payload["categories"])
+    return _etagged_json(request, payload, seed)
 
 
 @app.post("/api/categories")
 async def create_category(request: Request):
+    _require_admin_identity(request)
     payload = await _optional_json(request)
     try:
         # Free-form names are slugged ("Team A" -> "team-a"); the label keeps
@@ -7285,6 +7958,7 @@ async def create_category(request: Request):
 
 @app.post("/api/categories/{key}/label")
 async def rename_category(key: str, request: Request):
+    _require_admin_identity(request)
     payload = await _optional_json(request)
     try:
         entry = _category_store().rename_category(key, payload.get("label"))
@@ -7293,11 +7967,22 @@ async def rename_category(key: str, request: Request):
     return {"category": entry}
 
 
+@app.post("/api/categories/{key}/weight")
+async def update_category_weight(key: str, request: Request):
+    """Update the category's retrieval multiplier (admin only)."""
+    _require_admin_identity(request)
+    payload = await _optional_json(request)
+    try:
+        entry = _category_store().update_weight(key, payload.get("weight"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"category": entry}
+
+
 @app.delete("/api/categories/{key}")
-def delete_category(key: str):
-    blocker = _index_mutation_blocker()
-    if blocker:
-        raise HTTPException(status_code=409, detail=blocker)
+def delete_category(key: str, request: Request):
+    _require_admin_identity(request)
+    _ensure_index_mutation_allowed()
     try:
         _category_store().delete_category(key)
     except ValueError as exc:
@@ -7333,19 +8018,21 @@ def delete_category(key: str):
 
 
 @app.post("/api/pdfs/categories/bulk")
-def move_pdf_categories(payload: BulkCategoryMoveRequest):
+def move_pdf_categories(request: Request, payload: BulkCategoryMoveRequest):
     """Queue a transfer of documents into a category (reuses vectors, so a
     move costs no re-embedding). ``category`` "general" moves back to the
     default index."""
-    blocker = _index_mutation_blocker()
-    if blocker:
-        raise HTTPException(status_code=409, detail=blocker)
+    # Admins move anything; write-capable keys only within their own category
+    # scope (every source's current category AND the target must be allowed).
+    _require_write_identity(request)
+    _ensure_index_mutation_allowed()
     try:
         target_key = normalize_category_key(payload.category)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if target_key != GENERAL_CATEGORY_KEY and _category_store().get_category(target_key) is None:
         raise HTTPException(status_code=400, detail=f"Unknown category: {target_key}")
+    _require_category_allowed(request, target_key)
 
     hashes: list[str] = []
     seen: set[str] = set()
@@ -7354,6 +8041,11 @@ def move_pdf_categories(payload: BulkCategoryMoveRequest):
     # listings would be O(len(source_hashes) x corpus) on the merged
     # registry+source-map view (the UI's "select all" sends thousands).
     known_rows = _pdf_rows_by_hash()
+    allowed = _identity_allowed_categories(request)
+    if allowed is not None:
+        memberships = _category_store().memberships_for(list(known_rows.keys()))
+    else:
+        memberships = {}
     for raw_hash in payload.source_hashes:
         source_hash = str(raw_hash or "").strip()
         if not source_hash:
@@ -7365,6 +8057,13 @@ def move_pdf_categories(payload: BulkCategoryMoveRequest):
         if source_hash not in known_rows:
             failed.append({"source_hash": source_hash, "error": "Unknown source hash."})
             continue
+        if allowed is not None:
+            current = memberships.get(source_hash, GENERAL_CATEGORY_KEY)
+            if current not in allowed:
+                failed.append(
+                    {"source_hash": source_hash, "error": "Category not permitted for this API key."}
+                )
+                continue
         hashes.append(source_hash)
     if not hashes:
         raise HTTPException(status_code=400, detail="At least one known source hash is required.")
@@ -7384,8 +8083,14 @@ def pdf_documents(
     source_group: str = "",
     trust_status: str = "",
     category: str = "",
+    status: str = "",
     sort: str = "",
 ):
+    # An explicitly requested category outside the identity's permission set
+    # is a visibility violation -> 403, never an empty-but-200 listing.
+    allowed_categories = _identity_allowed_categories(request)
+    if allowed_categories is not None and category.strip().lower() not in ("", "all"):
+        _require_category_allowed(request, category)
     # The PDF list only changes when ingestion/indexing writes the registry,
     # source map, trust registry, or index manifest. Short-circuit unchanged
     # polls with a conditional 304 instead of rebuilding the whole list.
@@ -7401,6 +8106,7 @@ def pdf_documents(
                 DOCUMENT_TRUST_PATH,
                 DB_DIR / INDEX_MANIFEST_FILENAME,
             ),
+            _identity_scope_signature(request),
         ),
         search=search,
         offset=offset,
@@ -7409,6 +8115,7 @@ def pdf_documents(
         trust_status=trust_status,
         sort=sort,
         category=category,
+        status=status,
     )
     if not_modified := _not_modified_or_etag(request, seed):
         return not_modified
@@ -7421,20 +8128,42 @@ def pdf_documents(
         trust_status=trust_status,
         sort=sort,
         category=category,
+        status=status,
+        allowed_categories=allowed_categories,
     )
     return _etagged_json(request, payload, seed)
 
 
-def _pdf_rows_by_hash() -> dict[str, dict[str, Any]]:
+def _pdf_rows_by_hash(*, enrich: bool = False) -> dict[str, dict[str, Any]]:
     """All PDF rows keyed by source hash from ONE listing call.
 
     ``list_pdf_documents`` merges registry + source map + trust + manifest
     stats for the whole corpus, so callers that need rows for several hashes
     (bulk trust updates, auto-tagging) must build this map once instead of
     re-listing per hash.
+
+    Default is ``enrich=False`` plus the cheap in-memory trust attachment:
+    callers that only read registry/trust/category fields (existence checks,
+    auto-tag candidate selection) would otherwise pay a whole-corpus disk
+    walk for path stats and markdown quality. Callers that re-render the
+    rows in the UI (bulk trust update responses) pass ``enrich=True`` so
+    cells backed by response-only fields (download_url, quality, ...) keep
+    their values.
     """
-    rows = list_pdf_documents(search="", offset=0, limit=None)["pdfs"]
-    return {str(item.get("hash") or ""): item for item in rows if item.get("hash")}
+    rows = list_pdf_documents(search="", offset=0, limit=None, enrich=enrich)["pdfs"]
+    if enrich:
+        return {str(item.get("hash") or ""): item for item in rows if item.get("hash")}
+    documents = _load_trust_registry(copy=False).get("documents", {})
+    if not isinstance(documents, dict):
+        documents = {}
+    rows_by_hash: dict[str, dict[str, Any]] = {}
+    for item in rows:
+        source_hash = str(item.get("hash") or "")
+        if not source_hash:
+            continue
+        item["trust"] = _normalize_trust_entry(source_hash, documents.get(source_hash))
+        rows_by_hash[source_hash] = item
+    return rows_by_hash
 
 
 def _pdf_row_for_hash(source_hash: str) -> dict[str, Any] | None:
@@ -7489,24 +8218,41 @@ def _pdf_file_response(source_hash: str, *, inline: bool) -> FileResponse:
     )
 
 
+def _source_category_key(source_hash: str) -> str:
+    """The category a registered document belongs to (General when unassigned)."""
+    try:
+        memberships = _category_store().memberships_for([source_hash])
+    except Exception:
+        return GENERAL_CATEGORY_KEY
+    return memberships.get(source_hash) or GENERAL_CATEGORY_KEY
+
+
+def _require_source_category_allowed(request: Request, source_hash: str) -> None:
+    """403 unless the document's category is inside the identity's allowlist."""
+    _require_category_allowed(request, _source_category_key(source_hash))
+
+
 @app.get("/api/pdfs/{source_hash}/download")
-def download_pdf(source_hash: str):
+def download_pdf(request: Request, source_hash: str):
+    _require_source_category_allowed(request, source_hash)
     return _pdf_file_response(source_hash, inline=False)
 
 
 @app.get("/api/pdfs/{source_hash}/view")
-def view_pdf(source_hash: str):
+def view_pdf(request: Request, source_hash: str):
+    _require_source_category_allowed(request, source_hash)
     return _pdf_file_response(source_hash, inline=True)
 
 
 @app.get("/api/pdfs/{source_hash}/markdown")
-def pdf_markdown_text(source_hash: str):
+def pdf_markdown_text(request: Request, source_hash: str):
     """Serve the processed Markdown for a source, for in-app text preview.
 
     Review must not depend on the original PDF being reachable (bulk corpora
     often live on another volume); the extracted Markdown is always the
     canonical reviewed artifact.
     """
+    _require_source_category_allowed(request, source_hash)
     try:
         path, _filename = _markdown_path_for_hash(source_hash)
     except FileNotFoundError as exc:
@@ -7521,10 +8267,10 @@ def pdf_markdown_text(source_hash: str):
 
 
 @app.delete("/api/pdfs/{source_hash}")
-def delete_pdf(source_hash: str):
-    blocker = _index_mutation_blocker()
-    if blocker:
-        raise HTTPException(status_code=409, detail=blocker)
+def delete_pdf(request: Request, source_hash: str):
+    _require_write_identity(request)
+    _require_source_category_allowed(request, source_hash)
+    _ensure_index_mutation_allowed()
     try:
         return delete_pdf_document(
             source_hash,
@@ -7544,7 +8290,9 @@ def delete_pdf(source_hash: str):
 
 
 @app.post("/api/pdfs/{source_hash}/reprocess")
-def reprocess_pdf(source_hash: str):
+def reprocess_pdf(request: Request, source_hash: str):
+    _require_write_identity(request)
+    _require_source_category_allowed(request, source_hash)
     try:
         job = enqueue_source_reprocess(
             source_hash,
@@ -7562,7 +8310,9 @@ def reprocess_pdf(source_hash: str):
 
 
 @app.post("/api/pdfs/{source_hash}/reindex")
-def reindex_pdf(source_hash: str):
+def reindex_pdf(request: Request, source_hash: str):
+    _require_write_identity(request)
+    _require_source_category_allowed(request, source_hash)
     try:
         job = enqueue_source_reindex(
             source_hash,
@@ -7579,7 +8329,9 @@ def reindex_pdf(source_hash: str):
 
 
 @app.post("/api/pdfs/{source_hash}/trust")
-def update_pdf_trust(source_hash: str, payload: DocumentTrustRequest):
+def update_pdf_trust(request: Request, source_hash: str, payload: DocumentTrustRequest):
+    _require_write_identity(request)
+    _require_source_category_allowed(request, source_hash)
     try:
         entry = update_document_trust(
             source_hash,
@@ -7591,7 +8343,8 @@ def update_pdf_trust(source_hash: str, payload: DocumentTrustRequest):
 
 
 @app.post("/api/pdfs/trust/bulk")
-def update_pdf_trust_bulk(payload: BulkDocumentTrustRequest):
+def update_pdf_trust_bulk(request: Request, payload: BulkDocumentTrustRequest):
+    _require_write_identity(request)
     source_group = normalize_source_group(payload.source_group)
     if source_group not in TRUST_SOURCE_GROUPS or source_group == SOURCE_GROUP_UNGROUPED:
         choices = ", ".join(sorted(group for group in TRUST_SOURCE_GROUPS if group != SOURCE_GROUP_UNGROUPED))
@@ -7600,6 +8353,17 @@ def update_pdf_trust_bulk(payload: BulkDocumentTrustRequest):
     hashes = []
     seen = set()
     failed = []
+    allowed = _identity_allowed_categories(request)
+    requested_hashes = [
+        stripped
+        for stripped in (str(raw or "").strip() for raw in payload.source_hashes)
+        if stripped
+    ]
+    memberships: dict[str, str] = (
+        _category_store().memberships_for(sorted(set(requested_hashes)))
+        if allowed is not None and requested_hashes
+        else {}
+    )
     for raw_hash in payload.source_hashes:
         source_hash = str(raw_hash or "").strip()
         if not source_hash:
@@ -7608,6 +8372,11 @@ def update_pdf_trust_bulk(payload: BulkDocumentTrustRequest):
         if source_hash in seen:
             continue
         seen.add(source_hash)
+        if allowed is not None:
+            current = memberships.get(source_hash, GENERAL_CATEGORY_KEY)
+            if current not in allowed:
+                failed.append({"source_hash": source_hash, "error": "Category not permitted for this API key."})
+                continue
         hashes.append(source_hash)
     if not hashes and not failed:
         raise HTTPException(status_code=400, detail="At least one source hash is required.")
@@ -7625,7 +8394,9 @@ def update_pdf_trust_bulk(payload: BulkDocumentTrustRequest):
         entries = update_documents_trust({source_hash: updates for source_hash in hashes})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    rows_by_hash = _pdf_rows_by_hash()
+    # Enriched: the UI patches the visible rows in place from these payloads
+    # (download/quality cells are response-only fields).
+    rows_by_hash = _pdf_rows_by_hash(enrich=True)
     for source_hash in hashes:
         updated.append(
             {
@@ -7646,12 +8417,14 @@ def auto_tag_status():
         **state,
         "enabled": settings["enabled"],
         "model": settings["model"],
+        "configured_model": settings["configured_model"],
         "min_confidence": settings["min_confidence"],
     }
 
 
 @app.post("/api/pdfs/trust/auto-tag")
-def auto_tag_pdfs(payload: AutoTagRequest):
+def auto_tag_pdfs(request: Request, payload: AutoTagRequest):
+    _require_write_identity(request)
     settings = _auto_tag_settings()
     if not settings["enabled"]:
         raise HTTPException(
@@ -7659,6 +8432,7 @@ def auto_tag_pdfs(payload: AutoTagRequest):
             detail="Auto-tagging is disabled in config ([auto_tag].enabled = false).",
         )
 
+    allowed = _identity_allowed_categories(request)
     rows_by_hash = _pdf_rows_by_hash()
     requested = {
         str(raw_hash or "").strip()
@@ -7668,14 +8442,20 @@ def auto_tag_pdfs(payload: AutoTagRequest):
     # Ungrouped only: auto-tagging must never overwrite a human decision
     # (manual entries carry auto_tagged = false by definition after a
     # human set them, but ungrouped is the cheap, unambiguous filter).
+    # Restricted identities only ever tag inside their own categories.
     candidates = [
         row
         for row in rows_by_hash.values()
         if normalize_source_group((row.get("trust") or {}).get("source_group"))
         == SOURCE_GROUP_UNGROUPED
         and (not requested or str(row.get("hash")) in requested)
+        and (allowed is None or str(row.get("category") or GENERAL_CATEGORY_KEY) in allowed)
     ]
     limit = payload.limit if payload.limit and int(payload.limit) > 0 else settings["max_items_per_run"]
+    # Reported so the UI can say "tagging N of M" when this run is capped:
+    # a constant-looking "200 PDFs" on a larger backlog reads as a canned
+    # message rather than the per-run limit it is.
+    total_ungrouped = len(candidates)
     candidates = candidates[: int(limit)]
     if not candidates:
         return {"queued": [], "status": "idle", "tagged": 0, "message": "No ungrouped PDFs to tag."}
@@ -7695,7 +8475,23 @@ def auto_tag_pdfs(payload: AutoTagRequest):
         "queued": [item["hash"] for item in items],
         "status": "running",
         "model": settings["model"],
+        "configured_model": settings["configured_model"],
+        "total_ungrouped": total_ungrouped,
     }
+
+
+def _index_content_signature(db_dir: Path | None = None) -> str:
+    """Combined change signature of an index's table, manifest, and overrides.
+
+    Single source of truth for the ETag seed shared by the /api/index*
+    endpoints: rows only change when one of these three artifacts does.
+    """
+    resolved = Path(db_dir or DB_DIR)
+    return _file_signature(
+        _index_store(resolved).table_version_hint_path(),
+        resolved / INDEX_MANIFEST_FILENAME,
+        index_overrides_path(resolved),
+    )
 
 
 @app.get("/api/index")
@@ -7709,9 +8505,9 @@ def index_rows(
     # Index rows only change when the LanceDB table is rewritten; key the ETag on
     # the table version-hint file so unchanged polls short-circuit to a 304.
     category_db_dir_path = _resolve_category_db_dir(category)
-    version_hint = _index_store(category_db_dir_path).table_version_hint_path()
+    _require_category_allowed(request, category)
     seed = _scoped_signature(
-        _file_signature(version_hint, category_db_dir_path / INDEX_MANIFEST_FILENAME, index_overrides_path(category_db_dir_path)),
+        _index_content_signature(category_db_dir_path),
         offset=offset,
         limit=limit,
         search=search,
@@ -7734,12 +8530,9 @@ def index_summary_rows(
     category: str = "",
 ):
     category_dir = _resolve_category_db_dir(category)
+    _require_category_allowed(request, category)
     seed = _scoped_signature(
-        _file_signature(
-            _index_store(category_dir).table_version_hint_path(),
-            category_dir / INDEX_MANIFEST_FILENAME,
-            index_overrides_path(category_dir),
-        ),
+        _index_content_signature(category_dir),
         offset=offset,
         limit=limit,
         search=search,
@@ -7763,12 +8556,9 @@ def index_child_rows(
     category: str = "",
 ):
     category_dir = _resolve_category_db_dir(category)
+    _require_category_allowed(request, category)
     seed = _scoped_signature(
-        _file_signature(
-            _index_store(category_dir).table_version_hint_path(),
-            category_dir / INDEX_MANIFEST_FILENAME,
-            index_overrides_path(category_dir),
-        ),
+        _index_content_signature(category_dir),
         parent_id=parent_id,
         offset=offset,
         limit=limit,
@@ -7793,11 +8583,13 @@ def index_child_rows(
 
 @app.get("/api/index/stream")
 def index_rows_stream(
+    request: Request,
     batch_size: int = INDEX_STREAM_DEFAULT_BATCH_SIZE,
     search: str = "",
     category: str = "",
 ):
     category_dir = _resolve_category_db_dir(category)
+    _require_category_allowed(request, category)
     try:
         events = iter_index_row_events(batch_size=batch_size, search=search, db_dir=category_dir)
         first_event = next(events)
@@ -7827,10 +8619,10 @@ def index_rows_stream(
 
 
 @app.post("/api/index/update")
-def update_index(payload: IndexUpdateRequest):
-    blocker = _index_mutation_blocker()
-    if blocker:
-        raise HTTPException(status_code=409, detail=blocker)
+def update_index(request: Request, payload: IndexUpdateRequest):
+    _require_write_identity(request)
+    _ensure_index_mutation_allowed()
+    _require_category_allowed(request, payload.category)
     try:
         row = update_index_record(
             record_id=payload.record_id,
@@ -7850,10 +8642,10 @@ def update_index(payload: IndexUpdateRequest):
 
 
 @app.post("/api/index/delete")
-def delete_index(payload: IndexDeleteRequest):
-    blocker = _index_mutation_blocker()
-    if blocker:
-        raise HTTPException(status_code=409, detail=blocker)
+def delete_index(request: Request, payload: IndexDeleteRequest):
+    _require_write_identity(request)
+    _ensure_index_mutation_allowed()
+    _require_category_allowed(request, payload.category)
     try:
         return delete_index_records(
             record_ids=payload.record_ids,
@@ -7868,7 +8660,8 @@ def delete_index(payload: IndexDeleteRequest):
 
 
 @app.post("/api/index/vector-search")
-def vector_search_index(payload: IndexVectorSearchRequest):
+def vector_search_index(request: Request, payload: IndexVectorSearchRequest):
+    _require_category_allowed(request, payload.category)
     try:
         return vector_search_index_rows(
             query=payload.query,
@@ -7910,7 +8703,9 @@ def index_document_records(request: Request, source_hash: str, offset: int = 0, 
         raise HTTPException(status_code=400, detail="source_hash is required.")
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))
-    db_dir = _resolve_category_db_dir(request.query_params.get("category") or "")
+    category_param = request.query_params.get("category") or ""
+    db_dir = _resolve_category_db_dir(category_param)
+    _require_category_allowed(request, category_param)
     store = _index_store(db_dir=db_dir)
     if not store.exists():
         raise HTTPException(status_code=404, detail="Index does not exist.")
@@ -7928,17 +8723,24 @@ def index_document_records(request: Request, source_hash: str, offset: int = 0, 
 
 
 @app.post("/api/chat/stream")
-def chat_stream(payload: ChatRequest):
+def chat_stream(request: Request, payload: ChatRequest):
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
     history = _sanitize_chat_history(payload.history)
 
     # Resolve the category selection at request time so an unknown key is a
-    # clean 400 instead of a mid-stream error event.
-    selected_categories = _resolve_chat_categories(payload.categories)
+    # clean 400 instead of a mid-stream error event. The selection is scoped
+    # to the caller's permission set (explicit out-of-scope keys are a 403).
+    selected_categories = _resolve_chat_categories(payload.categories, request)
     category_dirs = [str(entry.get("db_dir") or "") for entry in selected_categories]
     category_labels = [str(entry.get("label") or entry.get("key") or "") for entry in selected_categories]
+    category_weights = {
+        str(value): float(entry.get("weight") or 1.0)
+        for entry in selected_categories
+        for value in (entry.get("key"), entry.get("label"))
+        if value
+    }
     category_dirs = [d for d in category_dirs if d] or [str(DB_DIR)]
     category_labels = (category_labels[: len(category_dirs)] or [GENERAL_CATEGORY_KEY] * len(category_dirs))
 
@@ -7964,7 +8766,8 @@ def chat_stream(payload: ChatRequest):
             engine = QueryEngine(
                 working_dir=str(category_dirs[0]),
                 working_dirs=category_dirs if len(category_dirs) > 1 else None,
-                category_labels=category_labels if len(category_dirs) > 1 else None,
+                category_labels=category_labels,
+                category_weights=category_weights,
                 asset_dir=str(ASSET_DIR),
                 trust_path=str(DOCUMENT_TRUST_PATH),
                 model=_safe_client_model(payload.llm_model, fallback=CHAT_CONFIG["llm_model"]),

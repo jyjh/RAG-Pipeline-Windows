@@ -112,7 +112,10 @@ def _import_legacy_if_needed(conn: sqlite3.Connection, json_path: Path) -> None:
     if int(count) > 0 or _meta_get(conn, "legacy_imported"):
         return
     if not json_path.exists():
-        _meta_set(conn, "legacy_imported", utcnow())
+        # Commit the marker: without `with conn:` the write is rolled back by
+        # _store's conn.close(), so every open on an empty store re-runs this.
+        with conn:
+            _meta_set(conn, "legacy_imported", utcnow())
         return
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     rows: list[tuple[str, str]] = []

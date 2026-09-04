@@ -2,7 +2,7 @@
 
 import { syncPdfSelectAllState, togglePdfSelection, updatePdfBulkBar } from "./library.js";
 import { renderOpsDashboard } from "./chat.js";
-import { adminApiHeaders, adminCard } from "./admin.js";
+import { adminCard } from "./admin.js";
 import { SITE_VERSION_COOKIE } from "./shell.js";
 
 const state = {
@@ -71,8 +71,12 @@ const state = {
   jobWatch: new Map(),
   adminDashboardLoaded: false,
   adminKeysAuthorized: null,
+  // Mirror of GET /api/admin/permission-sets for the keys + sets managers.
+  adminPermSets: [],
+  adminPermSetEditing: null,
   pdfGroupFilter: "all",
   pdfTrustFilter: "all",
+  pdfStatusFilter: "all",
   // Category ("split databases") state. categoriesCache mirrors /api/categories;
   // chatSelectedCategories === null means "search all categories", an array is
   // an explicit subset (possibly empty = none, e.g. web-only answers).
@@ -152,11 +156,15 @@ const els = {
   statusLine: document.getElementById("statusLine"),
   updateButton: document.getElementById("updateButton"),
   uploadDropZone: document.getElementById("uploadDropZone"),
+  dropzoneButton: document.getElementById("dropzoneButton"),
+  uploadStagingPanel: document.getElementById("uploadStagingPanel"),
+  uploadStagingCount: document.getElementById("uploadStagingCount"),
   fileInput: document.getElementById("fileInput"),
   selectedFilesLabel: document.getElementById("selectedFilesLabel"),
   uploadGroupsPanel: document.getElementById("uploadGroupsPanel"),
   uploadCategorySelect: document.getElementById("uploadCategorySelect"),
   uploadButton: document.getElementById("uploadButton"),
+  cancelUploadButton: document.getElementById("cancelUploadButton"),
   reindexButton: document.getElementById("reindexButton"),
   reingestButton: document.getElementById("reingestButton"),
   backupIndexButton: document.getElementById("backupIndexButton"),
@@ -175,6 +183,7 @@ const els = {
   pdfSearchButton: document.getElementById("pdfSearchButton"),
   pdfGroupFilterSelect: document.getElementById("pdfGroupFilterSelect"),
   pdfTrustFilterSelect: document.getElementById("pdfTrustFilterSelect"),
+  pdfStatusFilterSelect: document.getElementById("pdfStatusFilterSelect"),
   pdfCategoryFilterSelect: document.getElementById("pdfCategoryFilterSelect"),
   pdfAutoTagButton: document.getElementById("pdfAutoTagButton"),
   reviewerNameInput: document.getElementById("reviewerNameInput"),
@@ -215,6 +224,9 @@ const els = {
   jobsStrip: document.getElementById("jobsStrip"),
   jobsStripText: document.getElementById("jobsStripText"),
   jobsStripViewButton: document.getElementById("jobsStripViewButton"),
+  shutdownBanner: document.getElementById("shutdownBanner"),
+  shutdownBannerText: document.getElementById("shutdownBannerText"),
+  shutdownServerButton: document.getElementById("shutdownServerButton"),
   refreshAdminButton: document.getElementById("refreshAdminButton"),
   adminDashboard: document.getElementById("adminDashboard"),
   adminKeysStatus: document.getElementById("adminKeysStatus"),
@@ -222,9 +234,22 @@ const els = {
   adminKeysBody: document.getElementById("adminKeysBody"),
   adminKeyLabelInput: document.getElementById("adminKeyLabelInput"),
   adminKeyRoleSelect: document.getElementById("adminKeyRoleSelect"),
+  adminKeyPermSetSelect: document.getElementById("adminKeyPermSetSelect"),
   adminKeyExpiresInput: document.getElementById("adminKeyExpiresInput"),
   adminKeyRateInput: document.getElementById("adminKeyRateInput"),
   adminKeyCreateButton: document.getElementById("adminKeyCreateButton"),
+  adminPermSetsStatus: document.getElementById("adminPermSetsStatus"),
+  adminPermSetsHint: document.getElementById("adminPermSetsHint"),
+  adminPermSetsBody: document.getElementById("adminPermSetsBody"),
+  adminPermSetEditor: document.getElementById("adminPermSetEditor"),
+  adminPermSetEditorSummary: document.getElementById("adminPermSetEditorSummary"),
+  adminPermSetNameInput: document.getElementById("adminPermSetNameInput"),
+  adminPermSetLabelInput: document.getElementById("adminPermSetLabelInput"),
+  adminPermSetWriteCheck: document.getElementById("adminPermSetWriteCheck"),
+  adminPermSetAdminCheck: document.getElementById("adminPermSetAdminCheck"),
+  adminPermSetSaveButton: document.getElementById("adminPermSetSaveButton"),
+  adminPermSetCancelButton: document.getElementById("adminPermSetCancelButton"),
+  adminPermSetCatsBox: document.getElementById("adminPermSetCatsBox"),
   searchInput: document.getElementById("searchInput"),
   searchButton: document.getElementById("searchButton"),
   vectorSearchInput: document.getElementById("vectorSearchInput"),
@@ -655,6 +680,33 @@ function applyApiKeyHeaders(headers, { method }) {
     headers.set("X-API-Token", key);
   }
   return headers;
+}
+
+// Object-flavored twin of applyApiKeyHeaders for requestJson's `headers`
+// option. Single source of truth for the X-API-Token header.
+function apiKeyHeaderObject() {
+  const headers = {};
+  const key = getApiKey();
+  if (key) {
+    headers["X-API-Token"] = key;
+  }
+  return headers;
+}
+
+// Media navigations (<a href> download/view, iframe src) cannot carry headers,
+// and those routes are credential-gated for remote clients, so links carry the
+// key as ?token= instead. The token goes before any #fragment (view links use
+// "#page=N"). With no key stored (the normal local-operator case, where the
+// server auto-authenticates loopback) URLs stay clean.
+function mediaUrlWithToken(path) {
+  const key = getApiKey();
+  if (!key) {
+    return path;
+  }
+  const [beforeHash, hash = ""] = String(path).split("#", 2);
+  const separator = beforeHash.includes("?") ? "&" : "?";
+  const tokenPart = `${separator}token=${encodeURIComponent(key)}`;
+  return hash ? `${beforeHash}${tokenPart}#${hash}` : `${beforeHash}${tokenPart}`;
 }
 
 // Show the API-key prompt and resolve to the entered key (saved) or null
@@ -1363,7 +1415,7 @@ async function refreshOpsDashboard(options = {}) {
   }
   // /api/metrics is a sensitive GET: it is credential-gated when auth is
   // enabled, so attach the stored key (mutations get this automatically).
-  const adminHeaders = adminApiHeaders();
+  const adminHeaders = apiKeyHeaderObject();
   const results = await Promise.allSettled([
     requestJson("/api/health", { headers: adminHeaders }),
     requestJson("/api/metrics", { headers: adminHeaders }),
@@ -1498,6 +1550,11 @@ const SHORTCUT_SEQUENCE_TIMEOUT_MS = 1200;
 // animation-frame batches so the main thread never stalls on one giant
 // replaceChildren. Small pages keep the original single-swap path.
 export function appendRowsProgressively(tbody, fragment, totalRows, batchSize = 80) {
+  // Generation token: a re-render (poll tick, page change) swaps the tbody
+  // contents while earlier batches are still queued; stale callbacks must
+  // not append old rows into the fresh render.
+  const generation = (Number(tbody.dataset.renderGeneration) || 0) + 1;
+  tbody.dataset.renderGeneration = String(generation);
   if (totalRows <= batchSize) {
     tbody.replaceChildren(fragment);
     return;
@@ -1517,6 +1574,9 @@ export function appendRowsProgressively(tbody, fragment, totalRows, batchSize = 
   tbody.replaceChildren();
   let i = 0;
   const appendNext = () => {
+    if (Number(tbody.dataset.renderGeneration) !== generation || !tbody.isConnected) {
+      return;
+    }
     const batch = batches[i++];
     if (!batch) {
       return;
@@ -1556,6 +1616,7 @@ export {
   ZIP_IGNORED_NAMES,
   ZIP_IGNORED_PREFIXES,
   apiKeyPromptInFlight,
+  apiKeyHeaderObject,
   applyApiKeyHeaders,
   blockBoundariesBefore,
   chooseSourceGroup,
@@ -1570,6 +1631,7 @@ export {
   errorFromText,
   escapeHtml,
   firstErrorText,
+  mediaUrlWithToken,
   formatBrowserTimestamp,
   formatBytes,
   formatEta,

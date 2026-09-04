@@ -29,6 +29,9 @@ from src.vector_store import LanceDBVectorStore
 def _completed(args, *, stdout="", stderr="", returncode=0):
     return subprocess.CompletedProcess(["git", *args], returncode, stdout=stdout, stderr=stderr)
 
+# The auth posture for this suite (local operator vs ``remote_client`` opt-out)
+# is installed by the autouse ``_local_operator`` fixture in tests/conftest.py.
+
 
 def _set_update_config(monkeypatch, *, branch="main"):
     monkeypatch.setattr(
@@ -2894,6 +2897,16 @@ def test_pdf_documents_include_quality_payload(monkeypatch, workspace_tmp):
                 "page_start": 1,
                 "page_end": 1,
             },
+            {
+                "id": "chunk-2",
+                "node_type": "chunk",
+                "content": "beta context",
+                "source_hash": source_hash,
+                "source_pdf_name": "quality.pdf",
+                "source_pdf_path": str(web_app.DATA_DIR / "quality.pdf"),
+                "page_start": 2,
+                "page_end": 2,
+            },
         ],
         embedding_model="fake-embed",
         embedding_dim=3,
@@ -2910,12 +2923,119 @@ def test_pdf_documents_include_quality_payload(monkeypatch, workspace_tmp):
     assert response.status_code == 200
     quality = response.json()["pdfs"][0]["quality"]
     assert quality["label"] == "ready"
-    assert quality["chunk_count"] == 1
-    assert quality["record_count"] == 2
+    assert quality["warnings"] == []
+    assert quality["chunk_count"] == 2
+    assert quality["record_count"] == 3
     assert quality["markdown_exists"] is True
     assert response.json()["pdfs"][0]["trust"]["review_status"] == "approved"
     assert response.json()["pdfs"][0]["trust"]["source_group"] == "ungrouped"
     assert response.json()["pdfs"][0]["trust"]["reliability_weight"] == 0.1
+
+
+def test_pdf_documents_flag_single_chunk_document(monkeypatch, workspace_tmp):
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    markdown_path = processed_dir / "single-chunk.md"
+    markdown_path.write_text("# Single\n\n" + ("alpha context " * 80), encoding="utf-8")
+    source_hash = "hash-single-chunk"
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=markdown_path,
+        source_hash=source_hash,
+        source_pdf_name="single-chunk.pdf",
+        source_pdf_path=web_app.DATA_DIR / "single-chunk.pdf",
+    )
+    db_dir = workspace_tmp / "db"
+    local_rag.write_index_manifest(
+        db_dir,
+        [
+            {
+                "id": "chunk",
+                "node_type": "chunk",
+                "content": "alpha context",
+                "source_hash": source_hash,
+                "source_pdf_name": "single-chunk.pdf",
+                "source_pdf_path": str(web_app.DATA_DIR / "single-chunk.pdf"),
+                "page_start": 1,
+                "page_end": 1,
+            },
+        ],
+        embedding_model="fake-embed",
+        embedding_dim=3,
+    )
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+    web_app.update_document_trust(source_hash, {"review_status": "approved"})
+
+    client = TestClient(web_app.app)
+    response = client.get("/api/pdfs")
+
+    assert response.status_code == 200
+    quality = response.json()["pdfs"][0]["quality"]
+    assert "single_chunk" in quality["warnings"]
+    assert "no_chunks" not in quality["warnings"]
+    assert quality["label"] == "review"
+
+
+def test_pdf_documents_flag_low_chunk_density_document(monkeypatch, workspace_tmp):
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    markdown_path = processed_dir / "sparse-chunks.md"
+    markdown_path.write_text("# Sparse\n\n" + ("dense body text " * 900), encoding="utf-8")
+    source_hash = "hash-low-density"
+    write_source_entry(
+        processed_dir=processed_dir,
+        markdown_path=markdown_path,
+        source_hash=source_hash,
+        source_pdf_name="sparse-chunks.pdf",
+        source_pdf_path=web_app.DATA_DIR / "sparse-chunks.pdf",
+    )
+    db_dir = workspace_tmp / "db"
+    local_rag.write_index_manifest(
+        db_dir,
+        [
+            {
+                "id": "chunk",
+                "node_type": "chunk",
+                "content": "oversized body " * 600,
+                "source_hash": source_hash,
+                "source_pdf_name": "sparse-chunks.pdf",
+                "source_pdf_path": str(web_app.DATA_DIR / "sparse-chunks.pdf"),
+                "page_start": 1,
+                "page_end": 4,
+            },
+            {
+                "id": "chunk-2",
+                "node_type": "chunk",
+                "content": "oversized body " * 600,
+                "source_hash": source_hash,
+                "source_pdf_name": "sparse-chunks.pdf",
+                "source_pdf_path": str(web_app.DATA_DIR / "sparse-chunks.pdf"),
+                "page_start": 5,
+                "page_end": 8,
+            },
+        ],
+        embedding_model="fake-embed",
+        embedding_dim=3,
+    )
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", workspace_tmp / "registry.json")
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "DB_DIR", db_dir)
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", workspace_tmp / "trust.json")
+    web_app.update_document_trust(source_hash, {"review_status": "approved"})
+
+    client = TestClient(web_app.app)
+    response = client.get("/api/pdfs")
+
+    assert response.status_code == 200
+    quality = response.json()["pdfs"][0]["quality"]
+    assert quality["chunk_count"] == 2
+    assert quality["content_char_count"] == 2 * len("oversized body " * 600)
+    assert "low_chunk_density" in quality["warnings"]
+    assert "single_chunk" not in quality["warnings"]
+    assert quality["label"] == "review"
 
 
 def test_pdf_documents_warn_when_source_job_was_interrupted(monkeypatch, workspace_tmp):
@@ -3561,6 +3681,18 @@ def test_frontend_reduces_chat_render_churn():
     assert "toolResultsSignature" in script
 
 
+def test_frontend_chat_auth_uses_headers_instance():
+    script = _frontend_script()
+
+    assert 'const chatHeaders = new Headers({ "Content-Type": "application/json" });' in script
+
+
+def test_frontend_category_weight_accepts_hundredths():
+    script = _frontend_script()
+
+    assert 'min="0.01" max="100" step="0.01"' in script
+
+
 def test_root_injects_static_asset_cache_busting():
     response = TestClient(web_app.app).get("/")
 
@@ -4167,8 +4299,9 @@ def test_reingest_endpoint_blocks_during_indexing(monkeypatch):
     assert response.status_code == 409
 
 
+@pytest.mark.remote_client
 def test_api_token_middleware_blocks_mutation_without_token(monkeypatch):
-    """When api_token is set, mutating requests without it are rejected (401)."""
+    """With api_token set, a remote mutating request without it is rejected (401)."""
     monkeypatch.setattr(web_app, "_API_TOKEN", "secret-token-123")
 
     # A POST without the token -> 401.
@@ -4177,6 +4310,7 @@ def test_api_token_middleware_blocks_mutation_without_token(monkeypatch):
     assert "token" in response.json()["detail"].lower()
 
 
+@pytest.mark.remote_client
 def test_api_token_middleware_allows_mutation_with_correct_token(monkeypatch):
     """Mutating requests with the correct X-API-Token header succeed (past auth)."""
     monkeypatch.setattr(web_app, "_API_TOKEN", "secret-token-123")
@@ -4210,6 +4344,7 @@ def test_api_token_middleware_allows_mutation_with_correct_token(monkeypatch):
     assert response.status_code != 401, "correct token should pass auth"
 
 
+@pytest.mark.remote_client
 def test_api_token_middleware_allows_get_without_token(monkeypatch):
     """GET requests (health, listings) must work even when a token is set."""
     monkeypatch.setattr(web_app, "_API_TOKEN", "secret-token-123")
@@ -4218,8 +4353,9 @@ def test_api_token_middleware_allows_get_without_token(monkeypatch):
     assert response.status_code == 200
 
 
+@pytest.mark.remote_client
 def test_api_token_middleware_disabled_when_empty(monkeypatch):
-    """When api_token is empty (default), all requests pass through."""
+    """When api_token is empty (default), open GETs still work (health)."""
     monkeypatch.setattr(web_app, "_API_TOKEN", "")
 
     response = TestClient(web_app.app).get("/api/health")
@@ -4286,6 +4422,7 @@ def _install_admin_auth(monkeypatch, safe_tmp_path):
     return authenticator
 
 
+@pytest.mark.remote_client
 def test_admin_api_key_lifecycle(monkeypatch, safe_tmp_path):
     """Create -> list -> disable -> re-enable -> role change -> delete."""
     authenticator = _install_admin_auth(monkeypatch, safe_tmp_path)
@@ -4333,6 +4470,7 @@ def test_admin_api_key_lifecycle(monkeypatch, safe_tmp_path):
     assert authenticator.store.list_keys() == []
 
 
+@pytest.mark.remote_client
 def test_admin_api_key_endpoints_require_admin_role(monkeypatch, safe_tmp_path):
     """A user-role key can authenticate but gets 403 on admin endpoints."""
     authenticator = _install_admin_auth(monkeypatch, safe_tmp_path)
@@ -4354,6 +4492,42 @@ def test_admin_api_key_endpoints_require_admin_role(monkeypatch, safe_tmp_path):
     assert client.get("/api/admin/api-keys").status_code == 401
 
 
+@pytest.mark.remote_client
+def test_usage_meters_only_real_work(monkeypatch, safe_tmp_path):
+    """Usage counters record queries/uploads; polling GETs stay unmetered.
+
+    The middleware meters a request only when its path is real work: gated
+    reads like the jobs poll every open tab runs are authenticated and
+    rate-limited but not counted, while the real-work endpoints are counted
+    even when the handler rejects the (empty) body, since metering happens in
+    the middleware before routing.
+    """
+    authenticator = _install_admin_auth(monkeypatch, safe_tmp_path)
+    client = TestClient(web_app.app)
+
+    seen_tracks: list[bool] = []
+    real_authenticate = authenticator.authenticate
+
+    def _spy(supplied, **kwargs):
+        seen_tracks.append(kwargs.get("track"))
+        return real_authenticate(supplied, **kwargs)
+
+    monkeypatch.setattr(authenticator, "authenticate", _spy)
+
+    key, record = authenticator.create_key(label="metered user", role="user")
+    headers = {"X-API-Token": key}
+
+    assert client.get("/api/jobs", headers=headers).status_code == 200
+    assert client.post("/api/uploads", headers=headers).status_code >= 400
+    assert client.post("/api/chat/stream", headers=headers).status_code >= 400
+
+    assert seen_tracks == [False, True, True]
+    authenticator.usage.flush()
+    stored = authenticator.store.get_by_hash(record["key_id"])
+    assert stored["usage"]["requests"] == 2
+
+
+@pytest.mark.remote_client
 def test_admin_api_key_validation_errors(monkeypatch, safe_tmp_path):
     """Invalid role/expiry and unknown prefixes return 4xx, not 500."""
     _install_admin_auth(monkeypatch, safe_tmp_path)
@@ -4381,8 +4555,9 @@ def test_admin_api_key_validation_errors(monkeypatch, safe_tmp_path):
     assert missing_delete.status_code == 404
 
 
-def test_admin_api_key_endpoints_open_in_zero_config(monkeypatch, safe_tmp_path):
-    """No master token + empty store: auth is disabled, endpoints stay open (400 for create)."""
+@pytest.mark.remote_client
+def test_admin_api_key_endpoints_require_credential(monkeypatch, safe_tmp_path):
+    """No master token + empty store + remote client: uniform 401, no leak."""
     from src.api_key_auth import ApiKeyAuthenticator, KeyStore
 
     store = KeyStore(Path(safe_tmp_path) / ".api_keys.json")
@@ -4391,19 +4566,20 @@ def test_admin_api_key_endpoints_open_in_zero_config(monkeypatch, safe_tmp_path)
     monkeypatch.setattr(web_app, "_API_TOKEN", "")
 
     client = TestClient(web_app.app)
-    assert client.get("/api/admin/api-keys").status_code == 200
-    # Creating keys from a NON-loopback client is refused in the zero-config
-    # state: the first admin key must not be mintable by a LAN host (it would
-    # gate the whole deployment under the attacker's key). Loopback clients
-    # get a successful create or a clean 400, never a 500.
-    lan_response = client.post(
-        "/api/admin/api-keys", json={"label": "first", "role": "user"}
-    )
-    assert lan_response.status_code == 403
-    local_response = TestClient(web_app.app, client=("127.0.0.1", 51000)).post(
-        "/api/admin/api-keys", json={"label": "first", "role": "user"}
-    )
-    assert local_response.status_code in {200, 400}
+    assert client.get("/api/admin/api-keys").status_code == 401
+    # Creating keys from a remote client without a credential is rejected by
+    # the middleware itself; the first admin key can only come from the local
+    # machine (auto-auth) or an admin credential.
+    lan_response = client.post("/api/admin/api-keys", json={"label": "first", "role": "user"})
+    assert lan_response.status_code == 401
+    assert authenticator.store.list_keys() == []
+
+    # A loopback client (real client address this time, not the patched
+    # "testclient") passes the localhost auto-auth bypass and may mint keys.
+    monkeypatch.setattr(web_app, "_LOCALHOST_AUTO_AUTH", True)
+    local_client = TestClient(web_app.app, client=("127.0.0.1", 51000))
+    local_response = local_client.post("/api/admin/api-keys", json={"label": "first", "role": "user"})
+    assert local_response.status_code == 200
 
 
 def test_pdf_documents_endpoint_filters_by_group_and_trust(monkeypatch, workspace_tmp):
@@ -4452,6 +4628,59 @@ def test_pdf_documents_endpoint_filters_by_group_and_trust(monkeypatch, workspac
 
     everything = client.get("/api/pdfs", params={"source_group": "all"}).json()
     assert everything["total"] == 3
+
+
+def test_pdf_documents_endpoint_filters_by_pipeline_status(monkeypatch, workspace_tmp):
+    """status facet filters on the registry pipeline status the Status column shows."""
+    registry_path = workspace_tmp / "registry.json"
+    processed_dir = workspace_tmp / "processed"
+    processed_dir.mkdir()
+    trust_path = workspace_tmp / "trust.json"
+    web_app._write_trust_registry(
+        {"documents": {"hash-c": {"review_status": "approved", "source_group": "official"}}},
+        trust_path,
+    )
+    registry = web_app.PdfRegistry(registry_path)
+    files = [
+        {"filename": "queued.pdf", "hash": "hash-a", "staging_path": ""},
+        {"filename": "indexed.pdf", "hash": "hash-b", "staging_path": ""},
+        {"filename": "failed.pdf", "hash": "hash-c", "staging_path": ""},
+        {"filename": "interrupted.pdf", "hash": "hash-d", "staging_path": ""},
+    ]
+    registry.register_queued(job_id="job", files=files)
+    registry.mark_job_status(job_id="job", files=[files[1]], status="ingested")
+    registry.mark_job_status(job_id="job", files=[files[1]], status="indexed")
+    registry.mark_job_status(job_id="job", files=[files[2]], status="failed")
+    registry.mark_job_status(job_id="job", files=[files[3]], status="interrupted")
+    monkeypatch.setattr(web_app, "PDF_REGISTRY_PATH", registry_path)
+    monkeypatch.setattr(web_app, "PROCESSED_DIR", processed_dir)
+    monkeypatch.setattr(web_app, "DOCUMENT_TRUST_PATH", trust_path)
+    monkeypatch.setattr(web_app, "DB_DIR", workspace_tmp / "db")
+
+    client = TestClient(web_app.app)
+    queued = client.get("/api/pdfs", params={"status": "queued"}).json()
+    assert [pdf["hash"] for pdf in queued["pdfs"]] == ["hash-a"]
+
+    failed = client.get("/api/pdfs", params={"status": "failed"}).json()
+    assert [pdf["hash"] for pdf in failed["pdfs"]] == ["hash-c"]
+
+    interrupted = client.get("/api/pdfs", params={"status": "interrupted"}).json()
+    assert [pdf["hash"] for pdf in interrupted["pdfs"]] == ["hash-d"]
+
+    # No index manifest exists in this workspace, so the indexed row is
+    # reported (and must filter) as "not_indexed" — same as the Status column.
+    indexed = client.get("/api/pdfs", params={"status": "indexed"}).json()
+    assert indexed["pdfs"] == []
+    not_indexed = client.get("/api/pdfs", params={"status": "not_indexed"}).json()
+    assert [pdf["hash"] for pdf in not_indexed["pdfs"]] == ["hash-b"]
+
+    combined = client.get("/api/pdfs", params={"status": "failed", "trust_status": "approved"}).json()
+    assert [pdf["hash"] for pdf in combined["pdfs"]] == ["hash-c"]
+    combined_none = client.get("/api/pdfs", params={"status": "queued", "trust_status": "approved"}).json()
+    assert combined_none["pdfs"] == []
+
+    everything = client.get("/api/pdfs", params={"status": "all"}).json()
+    assert everything["total"] == 4
 
 
 # ---------------------------------------------------------------------------
@@ -4679,9 +4908,9 @@ def test_health_redacts_master_token(monkeypatch, safe_tmp_path):
     assert data["server"]["api_token_configured"] is True
 
 
-def test_admin_key_creation_requires_loopback_in_zero_config(monkeypatch, safe_tmp_path):
-    """No master token + empty store: only the local machine may mint the
-    first admin key (otherwise any LAN host takes over the auth system)."""
+@pytest.mark.remote_client
+def test_admin_key_creation_requires_local_machine(monkeypatch, safe_tmp_path):
+    """A remote host cannot mint keys; the local machine always can."""
     from src.api_key_auth import ApiKeyAuthenticator, KeyStore
 
     authenticator = ApiKeyAuthenticator(
@@ -4692,15 +4921,20 @@ def test_admin_key_creation_requires_loopback_in_zero_config(monkeypatch, safe_t
 
     lan_client = TestClient(web_app.app)  # default client host is not loopback
     denied = lan_client.post("/api/admin/api-keys", json={"label": "attacker", "role": "admin"})
-    assert denied.status_code == 403
+    assert denied.status_code == 401
     assert authenticator.store.list_keys() == []
 
     local_client = TestClient(web_app.app, client=("127.0.0.1", 51000))
     allowed = local_client.post("/api/admin/api-keys", json={"label": "owner", "role": "user"})
     assert allowed.status_code == 200
-    # The store is no longer zero-config: the listing now requires the admin
-    # credential (the freshly minted key is user-role -> 401 for a bare GET).
-    assert local_client.get("/api/admin/api-keys").status_code == 401
+    # The minted user-role key is NOT admin: from a remote client it can
+    # authenticate but gets 403 on the admin listing (localhost, by contrast,
+    # is always admin via auto-auth).
+    minted = allowed.json()["key"]
+    denied_list = TestClient(web_app.app).get(
+        "/api/admin/api-keys", headers={"X-API-Token": minted}
+    )
+    assert denied_list.status_code == 403
 
 
 def test_safe_client_model_rejects_oversized_override(monkeypatch):
@@ -4801,6 +5035,43 @@ def test_tracked_job_ledger_lifecycle(workspace_tmp):
     finally:
         with queue._condition:
             queue._jobs.pop("ledger-cancel-test", None)
+
+
+def test_equivalent_active_jobs_are_coalesced(workspace_tmp):
+    """Repeated equivalent maintenance requests must share one job."""
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=workspace_tmp / "db",
+        registry_path=workspace_tmp / "registry.json",
+    )
+    first = queue.enqueue_reindex(options={"embedding_model": "all-minilm"}, auto_start=False)
+    second = queue.enqueue_reindex(options={"embedding_model": "all-minilm"}, auto_start=False)
+
+    assert second is first
+    assert [job["id"] for job in queue.list_jobs()] == [first.id]
+    entries = json.loads(queue.ledger.path.read_text(encoding="utf-8"))["jobs"]
+    assert list(entries) == [first.id]
+
+
+def test_recovery_removes_duplicate_ledger_entries(workspace_tmp):
+    """A legacy ledger containing duplicates is compacted during recovery."""
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=workspace_tmp / "db",
+        registry_path=workspace_tmp / "registry.json",
+    )
+    options = {"embedding_model": "all-minilm"}
+    queue.ledger.record("reindex-a", kind="reindex", options=options)
+    queue.ledger.record("reindex-b", kind="reindex", options=options)
+
+    recovered = queue.recover_pending_uploads(auto_start=False)
+
+    assert recovered["recovered"] == 1
+    assert len(queue.list_jobs()) == 1
+    entries = json.loads(queue.ledger.path.read_text(encoding="utf-8"))["jobs"]
+    assert list(entries) == ["reindex-a"]
 
 
 def test_pdf_documents_endpoint_sorts_by_column(monkeypatch, workspace_tmp):
@@ -5063,7 +5334,7 @@ def test_chat_stream_passes_history_to_engine(monkeypatch):
     # chat_stream imports QueryEngine from src.query inside generate(); patch
     # the attribute on the module the function reads.
     monkeypatch.setattr("src.query.QueryEngine", StubEngine)
-    monkeypatch.setattr(web_app, "_resolve_chat_categories", lambda keys: [{"db_dir": "x", "label": "general"}])
+    monkeypatch.setattr(web_app, "_resolve_chat_categories", lambda keys, request=None: [{"db_dir": "x", "label": "general"}])
 
     from fastapi.testclient import TestClient
 
@@ -5160,3 +5431,237 @@ def test_document_records_endpoint_returns_sorted_rows(monkeypatch, lancedb_tmp)
     assert len(payload["rows"]) == 2
     assert payload["rows"][0]["content"] == "chunk number 1"
     assert all(row["source_hash"] == "hash-doc" for row in payload["rows"])
+
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown: job finalization + the localhost-only shutdown endpoint.
+# ---------------------------------------------------------------------------
+
+
+class _StubShutdownQueue:
+    """Stand-in for the app-level ``job_queue`` in shutdown endpoint tests.
+
+    The real queue points at the developer's live data/ directory; endpoint
+    tests must never touch it (a stray finalize would mutate the real ledger).
+    """
+
+    def __init__(self):
+        self.finalize_calls = 0
+
+    def summary(self):
+        return {"queued_count": 0, "active_job_count": 0, "active_query_count": 0}
+
+    def shutdown_finalize(self, **kwargs):
+        self.finalize_calls += 1
+        return {"finalized": 0, "forced": 0}
+
+
+@pytest.fixture()
+def shutdown_env(monkeypatch):
+    """Stub the exit trigger + app queue and hand the test a fresh state dict.
+
+    The countdown thread reads the module-global state, so restoring the
+    original (inactive) dict at teardown automatically de-arms any thread that
+    is still sleeping: its next active-check returns before it can finalize or
+    raise SIGINT.
+    """
+    stub = _StubShutdownQueue()
+    triggered = []
+    state = {"active": False}
+    monkeypatch.setattr(web_app, "job_queue", stub)
+    monkeypatch.setattr(web_app, "_trigger_graceful_exit", lambda: triggered.append(True))
+    monkeypatch.setattr(web_app, "_SERVER_SHUTDOWN_STATE", state)
+    return stub, triggered, state
+
+
+def test_shutdown_finalize_force_cancels_stuck_job(workspace_tmp):
+    """A job stuck inside a phase that never checks the cancel event is
+    force-finalized: it reaches a terminal state and the ledger entry is gone,
+    so startup recovery cannot resurrect it after the restart."""
+    release = threading.Event()
+
+    def fake_index(md_dir, db_dir, **kwargs):
+        release.wait(timeout=10)
+
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=workspace_tmp / "db",
+        registry_path=workspace_tmp / "registry.json",
+        run_indexing_func=fake_index,
+    )
+    job = queue.enqueue_reindex(job_id="stuck-reindex", auto_start=True)
+    _wait_for(lambda: queue.get_job(job.id)["status"] == "running")
+    try:
+        summary = queue.shutdown_finalize(grace_seconds=0.3)
+    finally:
+        release.set()
+        _wait_for(lambda: queue.get_job(job.id)["status"] in ("cancelled", "done", "failed"))
+
+    assert summary["finalized"] == 1
+    assert summary["forced"] == 1
+    assert queue.get_job(job.id)["status"] == "cancelled"
+    entries = json.loads(queue.ledger.path.read_text(encoding="utf-8"))["jobs"]
+    assert "stuck-reindex" not in entries
+    # Idempotent: a second pass (e.g. the endpoint thread, then the lifespan)
+    # finds nothing active.
+    assert queue.shutdown_finalize(grace_seconds=0.1) == {"finalized": 0, "forced": 0}
+
+
+def test_shutdown_finalize_lets_worker_do_its_own_bookkeeping(workspace_tmp):
+    """When the worker observes the cancel event within the grace window, it
+    runs the authoritative cancellation path itself and finalize forces
+    nothing."""
+    release = threading.Event()
+
+    def fake_index(md_dir, db_dir, **kwargs):
+        # Poll the cancel event like the real indexer does between phases,
+        # then return so the worker's own cancellation path runs.
+        for _ in range(200):
+            if job.cancel_requested:
+                break
+            time.sleep(0.01)
+        release.set()
+
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=workspace_tmp / "db",
+        registry_path=workspace_tmp / "registry.json",
+        run_indexing_func=fake_index,
+    )
+    job = queue.enqueue_reindex(job_id="polite-reindex", auto_start=True)
+    _wait_for(lambda: queue.get_job(job.id)["status"] == "running")
+    summary = queue.shutdown_finalize(grace_seconds=3.0)
+    release.wait(timeout=5)
+    _wait_for(lambda: queue.get_job(job.id)["status"] == "cancelled")
+
+    assert summary["finalized"] == 1
+    assert summary["forced"] == 0
+    entries = json.loads(queue.ledger.path.read_text(encoding="utf-8"))["jobs"]
+    assert "polite-reindex" not in entries
+
+
+def test_shutdown_finalize_marks_upload_sources_interrupted(workspace_tmp):
+    """Finalizing a stuck upload job writes the registry 'interrupted' status —
+    a non-recoverable status, so the next boot does not re-run the upload."""
+
+    def fake_ingest(input_dir, output_dir, **kwargs):
+        threading.Event().wait(timeout=10)
+
+    queue = web_app.RagJobQueue(
+        upload_root=workspace_tmp / "uploads",
+        processed_dir=workspace_tmp / "processed",
+        db_dir=workspace_tmp / "db",
+        registry_path=workspace_tmp / "registry.json",
+        run_ingestion_func=fake_ingest,
+    )
+    staging = workspace_tmp / "staging"
+    staging.mkdir()
+    staging.joinpath("doc.pdf").write_bytes(b"%PDF-1.4")
+    # The upload endpoints register files before enqueueing; mirror that so the
+    # job has registry entries to finalize.
+    queue.registry.register_queued(
+        job_id="upload-fix",
+        files=[{"filename": "doc.pdf", "hash": "hash-doc", "staging_path": str(staging / "doc.pdf")}],
+    )
+    job = queue.enqueue_upload(
+        staging_dir=staging,
+        filenames=["doc.pdf"],
+        job_id="upload-fix",
+        uploads=[{"filename": "doc.pdf", "hash": "hash-doc", "staging_path": str(staging / "doc.pdf")}],
+    )
+    _wait_for(lambda: queue.get_job(job.id)["status"] == "running")
+
+    summary = queue.shutdown_finalize(grace_seconds=0.3)
+
+    assert summary["finalized"] == 1
+    assert queue.get_job(job.id)["status"] == "cancelled"
+    registry = queue.registry.load()
+    statuses = {entry["status"] for entry in registry["pdfs"].values()}
+    assert statuses == {"interrupted"}
+    # 'interrupted' is not in RECOVERABLE_UPLOAD_STATUSES, so recovery at the
+    # next startup re-enqueues nothing from this job.
+    recovered = queue.recover_pending_uploads(auto_start=False)
+    assert recovered["recovered"] == 0
+
+
+@pytest.mark.remote_client
+def test_server_shutdown_rejects_remote_admin(monkeypatch, shutdown_env):
+    """Even a valid admin credential from off-machine gets 403: shutdown is a
+    loopback-only capability, not an admin-role one."""
+    stub, triggered, _state = shutdown_env
+    monkeypatch.setattr(web_app, "_API_TOKEN", "master-token-1")
+
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/server/shutdown",
+        headers={"X-API-Token": "master-token-1"},
+    )
+
+    assert response.status_code == 403
+    assert "local machine" in response.json()["detail"]
+    assert triggered == []
+    assert stub.finalize_calls == 0
+    assert web_app._server_shutdown_public_state() is None
+
+
+def test_server_shutdown_counts_down_then_finalizes(monkeypatch, shutdown_env):
+    """A loopback request arms the countdown, /api/health advertises it to the
+    other users, and the delayed thread finalizes jobs before triggering the
+    graceful exit."""
+    stub, triggered, _state = shutdown_env
+    monkeypatch.setattr(web_app, "_API_TOKEN", "")
+    monkeypatch.setattr(web_app, "api_authenticator", None)
+    monkeypatch.setattr(web_app, "_STARTUP_NOTICES", [])
+
+    class StubStore:
+        def exists(self):
+            return False
+
+        def count(self):
+            return 0
+
+        def table_version_hint_path(self):
+            return Path("/tmp/nonexistent_hint")
+
+    monkeypatch.setattr(web_app, "_index_store", lambda *a, **k: StubStore())
+    monkeypatch.setattr(web_app, "_llm_status_snapshot", lambda: {})
+
+    client = TestClient(web_app.app)
+    response = client.post("/api/server/shutdown", params={"delay_seconds": 5})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "shutting_down"
+    assert payload["active"] is True
+    assert payload["delay_seconds"] == 5.0
+
+    # Warning channel for the other open pages: the health payload flips to
+    # the shutdown state (its ETag seed changes with it).
+    health = client.get("/api/health")
+    assert health.status_code == 200
+    shutting_down = health.json()["shutting_down"]
+    assert shutting_down is not None and shutting_down["active"] is True
+
+    # The request only ARMS the shutdown: nothing finalizes or exits before
+    # the countdown elapses.
+    assert stub.finalize_calls == 0
+    assert triggered == []
+
+    # Countdown elapses: finalize runs, then the (stubbed) exit trigger fires.
+    _wait_for(lambda: triggered, timeout=8.0)
+    assert stub.finalize_calls == 1
+
+
+def test_server_shutdown_is_idempotent(monkeypatch, shutdown_env):
+    """A second request while the countdown runs returns the FIRST request's
+    state instead of scheduling a competing exit."""
+    _stub, triggered, _state = shutdown_env
+    client = TestClient(web_app.app)
+    first = client.post("/api/server/shutdown", params={"delay_seconds": 5}).json()
+    second = client.post("/api/server/shutdown", params={"delay_seconds": 5}).json()
+
+    assert first["shutdown_at"] == second["shutdown_at"]
+    assert first["requested_at"] == second["requested_at"]
+    # Only one countdown was armed; the fixture teardown de-arms it.
+    assert not triggered

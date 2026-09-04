@@ -1,3 +1,4 @@
+import io
 import json
 import shutil
 import tempfile
@@ -377,7 +378,54 @@ def test_ollama_chat_cancels_after_lost_health_check_cycles(monkeypatch):
         "http://127.0.0.1:11434/api/version",
         "http://127.0.0.1:11434/api/version",
     ]
-    assert [call["timeout"] for call in calls[1:]] == [0.1, 0.1]
+
+
+def test_ollama_chat_http_error_fails_fast_without_recovery(monkeypatch):
+    # An HTTP error response proves the server is up: no health-check cycles,
+    # no blind retry of an identical doomed request (which used to burn
+    # minutes per auto-tag batch before surfacing nothing but "recovered").
+    attempts = []
+
+    def fake_urlopen(request, timeout=None):
+        attempts.append(request.full_url)
+        raise urllib.error.HTTPError(
+            request.full_url,
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"error":"model requires more system memory"}'),
+        )
+
+    monkeypatch.setenv("OLLAMA_HOST", "127.0.0.1:11434")
+    monkeypatch.setattr(local_rag.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        local_rag,
+        "_wait_for_ollama_recovery",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("recovery must not run for HTTP errors")),
+    )
+
+    for stream in (False, True):
+        try:
+            result = local_rag._ollama_chat(
+                model="gemma4",
+                messages=[{"role": "user", "content": "hi"}],
+                options={"num_predict": 1},
+                stream=stream,
+                timeout=7.5,
+            )
+            if stream:
+                list(result)
+        except RuntimeError as exc:
+            assert "HTTP 400" in str(exc)
+            assert "model requires more system memory" in str(exc)
+        else:
+            raise AssertionError("Expected HTTP error failure")
+
+    # Exactly one attempt per call: the error was raised immediately.
+    assert attempts == [
+        "http://127.0.0.1:11434/api/chat",
+        "http://127.0.0.1:11434/api/chat",
+    ]
 
 
 def test_local_query_engine_uses_local_index_and_ollama(monkeypatch):

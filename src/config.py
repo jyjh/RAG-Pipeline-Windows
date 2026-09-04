@@ -16,6 +16,7 @@ import copy
 import json
 import logging
 import os
+import threading
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -262,19 +263,26 @@ class ServerConfig:
 class ApiKeysConfig:
     """Per-user API-key auth, rate limiting, and usage tracking.
 
-    This layers on top of the single shared ``[server] api_token`` (which stays
-    available as an admin/owner master bypass). When ``enabled`` is true and
-    at least one API key exists in the store (or a master token is set), mutating
-    ``/api/*`` requests require a valid credential. The store is empty by
-    default, so a fresh deployment stays fully open (zero-config).
+    The server always runs in an authentication posture: loopback clients
+    (127.0.0.1/::1) are auto-authenticated as a full-admin localhost identity,
+    and every other client must present the master ``[server] api_token`` or a
+    valid per-key credential from ``data/.api_keys.json``. When ``enabled`` is
+    false the per-key store is unavailable; remote clients are then rejected
+    outright (the master token, if configured, still works).
 
-    Rate limiting is a per-key (or per-master-token) sliding 60s window; the
-    global default applies unless a key carries its own override. Usage counters
-    are persisted to disk every ``usage_persist_interval`` increments and on
-    shutdown to avoid hitting the store on every request.
+    Each key is assigned a permission set (see ``src/api_key_auth.py``) that
+    restricts category access/visibility and carries ``admin``/``can_write``
+    flags. Rate limiting is a per-key (or per-master-token) sliding 60s window;
+    the global default applies unless a key carries its own override. Usage
+    counters are persisted to disk every ``usage_persist_interval`` increments
+    and on shutdown to avoid hitting the store on every request.
     """
 
     enabled: bool = True
+    # Auto-authenticate requests whose effective client IP is loopback as a
+    # full-admin localhost identity. Disable to force even local callers to
+    # present a credential.
+    localhost_auto_auth: bool = True
     rate_limit_per_minute: int = 60
     usage_persist_interval: int = 50
     key_prefix: str = "rag_"
@@ -482,8 +490,18 @@ def _merge_dataclass(target: Any, values: dict[str, Any], *, path: str = "") -> 
             logger.warning("Unknown config key [%s] ignored: %s", f"{path}.{key}".lstrip("."), key)
             continue
         current = getattr(target, key)
-        if is_dataclass(current) and isinstance(value, dict):
-            _merge_dataclass(current, value, path=f"{path}.{key}".lstrip("."))
+        if is_dataclass(current):
+            if isinstance(value, dict):
+                _merge_dataclass(current, value, path=f"{path}.{key}".lstrip("."))
+            else:
+                # A scalar bound to a section key (e.g. paths = "x") would
+                # replace the dataclass instance and crash attribute access
+                # far from the bad value; keep the section instead.
+                logger.warning(
+                    "Config value [%s] ignored: expected a table, got %r",
+                    f"{path}.{key}".lstrip("."),
+                    value,
+                )
         else:
             setattr(target, key, value)
     return target
@@ -494,6 +512,10 @@ def _merge_dataclass(target: Any, values: dict[str, Any], *, path: str = "") -> 
 # Only the newest signature per path is retained: keeping every version would
 # leak one full PipelineConfig per config-file edit for the process lifetime.
 _CONFIG_CACHE: dict[tuple[str, int, int], PipelineConfig] = {}
+# Guards _CONFIG_CACHE read/insert/prune: load_config runs per request in the
+# web server, and an unlocked prune-while-insert races into
+# "dictionary changed size during iteration".
+_CONFIG_CACHE_LOCK = threading.Lock()
 
 
 def _prune_config_cache(current: tuple[str, int, int]) -> None:
@@ -536,13 +558,14 @@ def load_config(path: str | os.PathLike[str] | None = None) -> PipelineConfig:
     else:
         chosen = None
         signature = ("<defaults>", 0, 0)
-    cached = _CONFIG_CACHE.get(signature)
-    if cached is None:
-        cfg = PipelineConfig()
-        if chosen is not None and chosen.exists():
-            _merge_dataclass(cfg, _load_mapping(chosen))
-        cfg.ensure_dirs()
-        _CONFIG_CACHE[signature] = cfg
-        _prune_config_cache(signature)
-        cached = cfg
+    with _CONFIG_CACHE_LOCK:
+        cached = _CONFIG_CACHE.get(signature)
+        if cached is None:
+            cfg = PipelineConfig()
+            if chosen is not None and chosen.exists():
+                _merge_dataclass(cfg, _load_mapping(chosen))
+            cfg.ensure_dirs()
+            _CONFIG_CACHE[signature] = cfg
+            _prune_config_cache(signature)
+            cached = cfg
     return copy.deepcopy(cached)

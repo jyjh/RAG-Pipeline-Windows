@@ -397,6 +397,28 @@ def _connection_lost_error(kind: str, exc: BaseException, *, max_lost_health_che
     )
 
 
+def _ollama_http_failure(kind: str, exc: "urllib.error.HTTPError") -> RuntimeError:
+    """Turn an HTTP error response into a RuntimeError carrying the body.
+
+    An HTTP response proves the server is up, so the connection-loss recovery
+    path (health-check cycles plus a blind retry of the identical request)
+    cannot help and only burns minutes on permanent failures (bad payload,
+    OOM rejection, model errors). Callers raise this immediately instead.
+    """
+    try:
+        body = exc.read().decode("utf-8", "replace").strip()
+    except Exception:
+        body = ""
+    try:
+        detail = str(json.loads(body).get("error") or "").strip()
+    except Exception:
+        detail = body
+    return RuntimeError(
+        f"Ollama {kind} got HTTP {exc.code} from {_ollama_host()}: "
+        f"{detail or getattr(exc, 'reason', '') or 'no detail'}"
+    )
+
+
 def _ollama_chat_once(
     payload: dict[str, Any],
     *,
@@ -409,6 +431,8 @@ def _ollama_chat_once(
         try:
             with urllib.request.urlopen(_ollama_chat_request(payload), timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise _ollama_http_failure("chat request", exc) from exc
         except (TimeoutError, socket.timeout, urllib.error.URLError, OSError) as exc:
             recovered = _wait_for_ollama_recovery(
                 health_check_interval=health_check_interval,
@@ -447,6 +471,10 @@ def _ollama_chat_stream(
                         emitted = True
                         yield event
                     return
+            except urllib.error.HTTPError as exc:
+                # An HTTP error response arrives before any event; the server
+                # is clearly up, so retrying cannot help. See _ollama_http_failure.
+                raise _ollama_http_failure("chat stream", exc) from exc
             except (TimeoutError, socket.timeout, urllib.error.URLError, OSError) as exc:
                 if emitted:
                     # A partially streamed answer must never restart from the
@@ -1354,10 +1382,18 @@ def _content_hash_sidecar_path(working_dir: str | Path, source_key: str) -> Path
 def _write_content_hash_sidecar(
     working_dir: str | Path, source_key: str, hashes: dict[str, str]
 ) -> None:
-    """Atomically write one source's content hashes to its sidecar file."""
+    """Atomically write one source's content hashes to its sidecar file.
+
+    Merges with the existing sidecar: a source whose records reach
+    ``merge_records`` across several calls (e.g. two same-hash Markdown files
+    in one ``index_markdown`` run) must accumulate hashes, not lose the
+    earlier batches to a wholesale overwrite.
+    """
     sidecar_dir = _content_hash_sidecar_dir(working_dir)
     sidecar_dir.mkdir(parents=True, exist_ok=True)
-    payload = {"source_key": source_key, "content_hashes": hashes}
+    merged = dict(load_content_hash_sidecar(working_dir, source_key))
+    merged.update(hashes)
+    payload = {"source_key": source_key, "content_hashes": merged}
     path = _content_hash_sidecar_path(working_dir, source_key)
     write_json_atomic(path, payload)
 

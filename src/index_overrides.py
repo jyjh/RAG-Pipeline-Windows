@@ -1,16 +1,42 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from src.atomic_io import write_json_atomic
+from src.file_lock import acquire_registry_lock
 
 
 INDEX_OVERRIDES_FILENAME = "index_overrides.json"
 INDEX_OVERRIDES_VERSION = 1
+
+# Overrides files are tiny and writes are rare (user edits), so one module-level
+# lock serializes every read-modify-write. A single lock (instead of per-path
+# locks) also avoids lock-ordering deadlocks: move_overrides_for_sources
+# mutates two db_dirs at once.
+_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def _mutation_lock(db_dir: str | Path) -> Iterator[None]:
+    """Hold the in-process lock plus a best-effort cross-process registry lock.
+
+    Only the cross-process acquire may fail soft (falling back to the
+    in-process lock alone), matching KeyStore._lock_for; a failure raised by
+    the wrapped body must propagate unchanged.
+    """
+    with _LOCK:
+        with contextlib.ExitStack() as stack:
+            try:
+                stack.enter_context(acquire_registry_lock(db_dir, timeout=30.0))
+            except (TimeoutError, OSError):
+                pass
+            yield
 
 
 def utcnow() -> str:
@@ -66,35 +92,37 @@ def persist_index_edit(db_dir: str | Path, record: dict[str, Any], content: str)
     record_id = str(record.get("id") or "")
     if not record_id:
         raise ValueError("record id is required.")
-    payload = load_index_overrides(db_dir)
-    payload["deletions"].pop(record_id, None)
-    payload["edits"][record_id] = {
-        "record_id": record_id,
-        "content": str(content),
-        "source_hash": str(record.get("source_hash") or ""),
-        "doc_id": str(record.get("doc_id") or ""),
-        "file_path": str(record.get("file_path") or ""),
-        "updated_at": utcnow(),
-    }
-    return write_index_overrides(db_dir, payload)
-
-
-def persist_index_deletions(db_dir: str | Path, records: list[dict[str, Any]]) -> dict[str, Any]:
-    payload = load_index_overrides(db_dir)
-    now = utcnow()
-    for record in records:
-        record_id = str(record.get("id") or "")
-        if not record_id:
-            continue
-        payload["edits"].pop(record_id, None)
-        payload["deletions"][record_id] = {
+    with _mutation_lock(db_dir):
+        payload = load_index_overrides(db_dir)
+        payload["deletions"].pop(record_id, None)
+        payload["edits"][record_id] = {
             "record_id": record_id,
+            "content": str(content),
             "source_hash": str(record.get("source_hash") or ""),
             "doc_id": str(record.get("doc_id") or ""),
             "file_path": str(record.get("file_path") or ""),
-            "updated_at": now,
+            "updated_at": utcnow(),
         }
-    return write_index_overrides(db_dir, payload)
+        return write_index_overrides(db_dir, payload)
+
+
+def persist_index_deletions(db_dir: str | Path, records: list[dict[str, Any]]) -> dict[str, Any]:
+    with _mutation_lock(db_dir):
+        payload = load_index_overrides(db_dir)
+        now = utcnow()
+        for record in records:
+            record_id = str(record.get("id") or "")
+            if not record_id:
+                continue
+            payload["edits"].pop(record_id, None)
+            payload["deletions"][record_id] = {
+                "record_id": record_id,
+                "source_hash": str(record.get("source_hash") or ""),
+                "doc_id": str(record.get("doc_id") or ""),
+                "file_path": str(record.get("file_path") or ""),
+                "updated_at": now,
+            }
+        return write_index_overrides(db_dir, payload)
 
 
 def apply_overrides_to_records(records: list[dict[str, Any]], payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -132,24 +160,51 @@ def apply_index_overrides(records: list[dict[str, Any]], db_dir: str | Path) -> 
 
 def clear_overrides_for_sources(db_dir: str | Path, source_hashes: set[str]) -> dict[str, Any]:
     hashes = {str(value) for value in source_hashes if value}
-    payload = load_index_overrides(db_dir)
-    if not hashes:
-        return payload
-    payload["edits"] = {
-        record_id: entry
-        for record_id, entry in payload.get("edits", {}).items()
-        if str(entry.get("source_hash") or "") not in hashes
-    }
-    payload["deletions"] = {
-        record_id: entry
-        for record_id, entry in payload.get("deletions", {}).items()
-        if str(entry.get("source_hash") or "") not in hashes
-    }
-    return write_index_overrides(db_dir, payload)
+    with _mutation_lock(db_dir):
+        payload = load_index_overrides(db_dir)
+        if not hashes:
+            return payload
+        payload["edits"] = {
+            record_id: entry
+            for record_id, entry in payload.get("edits", {}).items()
+            if str(entry.get("source_hash") or "") not in hashes
+        }
+        payload["deletions"] = {
+            record_id: entry
+            for record_id, entry in payload.get("deletions", {}).items()
+            if str(entry.get("source_hash") or "") not in hashes
+        }
+        return write_index_overrides(db_dir, payload)
+
+
+_EDITED_IDS_CACHE: dict[str, tuple[tuple[int, int], frozenset[str]]] = {}
+_EDITED_IDS_CACHE_LIMIT = 64
 
 
 def edited_record_ids(db_dir: str | Path) -> set[str]:
-    return set(str(record_id) for record_id in load_index_overrides(db_dir).get("edits", {}).keys())
+    """Record ids with manual edits, memoized on the file's (mtime_ns, size).
+
+    Called once per streaming batch / listing request; re-reading and
+    re-parsing the overrides file every time is pure waste since it only
+    changes through the (locked, atomic) writers in this module.
+    """
+    path = index_overrides_path(db_dir)
+    try:
+        stat = path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return set()
+    key = str(path)
+    cached = _EDITED_IDS_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        return set(cached[1])
+    ids = frozenset(
+        str(record_id) for record_id in load_index_overrides(db_dir).get("edits", {}).keys()
+    )
+    if len(_EDITED_IDS_CACHE) >= _EDITED_IDS_CACHE_LIMIT:
+        _EDITED_IDS_CACHE.clear()
+    _EDITED_IDS_CACHE[key] = (signature, ids)
+    return set(ids)
 
 
 def move_overrides_for_sources(
@@ -167,39 +222,42 @@ def move_overrides_for_sources(
     counts moved.
     """
     hashes = {str(value) for value in source_hashes if value}
-    payload = load_index_overrides(source_db_dir)
-    if not hashes:
-        return {"edits": 0, "deletions": 0}
-    moved_edits = {
-        record_id: entry
-        for record_id, entry in payload.get("edits", {}).items()
-        if str(entry.get("source_hash") or "") in hashes
-    }
-    moved_deletions = {
-        record_id: entry
-        for record_id, entry in payload.get("deletions", {}).items()
-        if str(entry.get("source_hash") or "") in hashes
-    }
-    if not moved_edits and not moved_deletions:
-        return {"edits": 0, "deletions": 0}
+    # One in-process lock spans both db_dirs; acquiring two cross-process
+    # locks here could deadlock against an opposite-direction move.
+    with _LOCK:
+        payload = load_index_overrides(source_db_dir)
+        if not hashes:
+            return {"edits": 0, "deletions": 0}
+        moved_edits = {
+            record_id: entry
+            for record_id, entry in payload.get("edits", {}).items()
+            if str(entry.get("source_hash") or "") in hashes
+        }
+        moved_deletions = {
+            record_id: entry
+            for record_id, entry in payload.get("deletions", {}).items()
+            if str(entry.get("source_hash") or "") in hashes
+        }
+        if not moved_edits and not moved_deletions:
+            return {"edits": 0, "deletions": 0}
 
-    target_payload = load_index_overrides(target_db_dir)
-    target_payload["edits"].update(moved_edits)
-    target_payload["deletions"].update(moved_deletions)
-    write_index_overrides(target_db_dir, target_payload)
+        target_payload = load_index_overrides(target_db_dir)
+        target_payload["edits"].update(moved_edits)
+        target_payload["deletions"].update(moved_deletions)
+        write_index_overrides(target_db_dir, target_payload)
 
-    payload["edits"] = {
-        record_id: entry
-        for record_id, entry in payload["edits"].items()
-        if record_id not in moved_edits
-    }
-    payload["deletions"] = {
-        record_id: entry
-        for record_id, entry in payload["deletions"].items()
-        if record_id not in moved_deletions
-    }
-    write_index_overrides(source_db_dir, payload)
-    return {"edits": len(moved_edits), "deletions": len(moved_deletions)}
+        payload["edits"] = {
+            record_id: entry
+            for record_id, entry in payload["edits"].items()
+            if record_id not in moved_edits
+        }
+        payload["deletions"] = {
+            record_id: entry
+            for record_id, entry in payload["deletions"].items()
+            if record_id not in moved_deletions
+        }
+        write_index_overrides(source_db_dir, payload)
+        return {"edits": len(moved_edits), "deletions": len(moved_deletions)}
 
 
 def copy_index_overrides(source_db_dir: str | Path, target_db_dir: str | Path) -> None:

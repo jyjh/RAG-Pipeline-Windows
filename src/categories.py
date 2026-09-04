@@ -34,6 +34,9 @@ from typing import Any, Iterator
 GENERAL_CATEGORY_KEY = "general"
 CATEGORIES_FILENAME = ".categories.json"
 CATEGORIES_DIRNAME = "categories"
+DEFAULT_CATEGORY_WEIGHT = 1.0
+MIN_CATEGORY_WEIGHT = 0.01
+MAX_CATEGORY_WEIGHT = 100.0
 
 # Category keys become directory names under <db>/categories/ and appear in
 # API paths, so they are restricted to a conservative slug alphabet. Labels
@@ -46,6 +49,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS categories (
     key TEXT PRIMARY KEY,
     label TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -133,7 +137,41 @@ class CategoryStore:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=10000")
         conn.executescript(_SCHEMA)
+        # Existing deployments predate category weights. SQLite's CREATE TABLE
+        # IF NOT EXISTS does not alter an existing table, so migrate in place.
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(categories)")}
+        if "weight" not in columns:
+            conn.execute("ALTER TABLE categories ADD COLUMN weight REAL NOT NULL DEFAULT 1.0")
+            # Seed the requested named defaults during the one-time migration;
+            # later admin changes are preserved.
+            for key, label in conn.execute("SELECT key, label FROM categories"):
+                default = self._default_weight(str(key), str(label))
+                if default != DEFAULT_CATEGORY_WEIGHT:
+                    conn.execute("UPDATE categories SET weight = ? WHERE key = ?", (default, key))
         return conn
+
+    @staticmethod
+    def _normalize_weight(value: Any) -> float:
+        try:
+            weight = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Category weight must be a number.") from exc
+        if not weight == weight or weight in (float("inf"), float("-inf")):
+            raise ValueError("Category weight must be finite.")
+        if not MIN_CATEGORY_WEIGHT <= weight <= MAX_CATEGORY_WEIGHT:
+            raise ValueError(
+                f"Category weight must be between {MIN_CATEGORY_WEIGHT:g} and {MAX_CATEGORY_WEIGHT:g}."
+            )
+        return round(weight, 6)
+
+    @staticmethod
+    def _default_weight(key: str, label: str) -> float:
+        text = f"{key} {label}".lower().replace("/", " ")
+        if "historical" in text and "document" in text:
+            return 0.1
+        if "2026" in text and "2027" in text and "design" in text and "document" in text:
+            return 1.5
+        return DEFAULT_CATEGORY_WEIGHT
 
     @contextlib.contextmanager
     def _store(self) -> Iterator[sqlite3.Connection]:
@@ -177,6 +215,7 @@ class CategoryStore:
             {
                 "key": GENERAL_CATEGORY_KEY,
                 "label": "General",
+                "weight": DEFAULT_CATEGORY_WEIGHT,
                 "created_at": "",
                 "updated_at": "",
                 "custom": False,
@@ -185,13 +224,14 @@ class CategoryStore:
         try:
             with self._store() as conn:
                 cursor = conn.execute(
-                    "SELECT key, label, created_at, updated_at FROM categories ORDER BY created_at, key"
+                    "SELECT key, label, weight, created_at, updated_at FROM categories ORDER BY created_at, key"
                 )
-                for key, label, created_at, updated_at in cursor:
+                for key, label, weight, created_at, updated_at in cursor:
                     rows.append(
                         {
                             "key": str(key),
                             "label": str(label),
+                            "weight": float(weight),
                             "created_at": str(created_at or ""),
                             "updated_at": str(updated_at or ""),
                             "custom": True,
@@ -213,6 +253,7 @@ class CategoryStore:
             entry = {
                 "key": GENERAL_CATEGORY_KEY,
                 "label": "General",
+                "weight": DEFAULT_CATEGORY_WEIGHT,
                 "created_at": "",
                 "updated_at": "",
                 "custom": False,
@@ -221,7 +262,7 @@ class CategoryStore:
             try:
                 with self._store() as conn:
                     row = conn.execute(
-                        "SELECT key, label, created_at, updated_at FROM categories WHERE key = ?",
+                        "SELECT key, label, weight, created_at, updated_at FROM categories WHERE key = ?",
                         (key,),
                     ).fetchone()
             except sqlite3.Error:
@@ -231,8 +272,9 @@ class CategoryStore:
             entry = {
                 "key": str(row[0]),
                 "label": str(row[1]),
-                "created_at": str(row[2] or ""),
-                "updated_at": str(row[3] or ""),
+                "weight": float(row[2]),
+                "created_at": str(row[3] or ""),
+                "updated_at": str(row[4] or ""),
                 "custom": True,
             }
         if anchor_db_dir is not None:
@@ -246,6 +288,7 @@ class CategoryStore:
         if key == GENERAL_CATEGORY_KEY:
             raise ValueError(f"'{GENERAL_CATEGORY_KEY}' is reserved for the default category.")
         label = normalize_category_label(label, fallback=key)
+        weight = self._default_weight(key, label)
         now = utcnow()
         with self._store() as conn:
             existing = conn.execute("SELECT key FROM categories WHERE key = ?", (key,)).fetchone()
@@ -253,11 +296,26 @@ class CategoryStore:
                 raise ValueError(f"Category '{key}' already exists.")
             with conn:
                 conn.execute(
-                    "INSERT INTO categories(key, label, created_at, updated_at) VALUES(?, ?, ?, ?)",
-                    (key, label, now, now),
+                    "INSERT INTO categories(key, label, weight, created_at, updated_at) VALUES(?, ?, ?, ?, ?)",
+                    (key, label, weight, now, now),
                 )
                 self._bump_version(conn)
-        return {"key": key, "label": label, "created_at": now, "updated_at": now, "custom": True}
+        return {"key": key, "label": label, "weight": weight, "created_at": now, "updated_at": now, "custom": True}
+
+    def update_weight(self, key: Any, weight: Any) -> dict[str, Any]:
+        key = normalize_category_key(key)
+        normalized = self._normalize_weight(weight)
+        if key == GENERAL_CATEGORY_KEY:
+            raise ValueError("The General category weight is fixed at 1.0.")
+        with self._store() as conn:
+            existing = conn.execute("SELECT key FROM categories WHERE key = ?", (key,)).fetchone()
+            if not existing:
+                raise ValueError(f"Unknown category: {key}")
+            now = utcnow()
+            with conn:
+                conn.execute("UPDATE categories SET weight = ?, updated_at = ? WHERE key = ?", (normalized, now, key))
+                self._bump_version(conn)
+        return {"key": key, "weight": normalized, "updated_at": now, "custom": True}
 
     def rename_category(self, key: Any, label: Any) -> dict[str, Any]:
         """Update a category's display label. Keys (and thus directories) are

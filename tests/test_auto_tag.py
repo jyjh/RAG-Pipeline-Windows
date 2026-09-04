@@ -141,6 +141,42 @@ class TestClassifyDocuments:
 
         assert set(decisions) == {"h2", "h3"}
 
+    def test_on_batch_failure_reports_each_failed_batch(self):
+        items = [AutoTagInput(f"h{i}", f"doc{i}.pdf") for i in range(6)]
+
+        def fake_chat_fn(*, model, messages, timeout=None):
+            batch_hashes = json.loads(messages[-1]["content"].split("\n\n", 1)[1])
+            if batch_hashes[0]["hash"] in {"h0", "h4"}:
+                raise RuntimeError("boom")
+            return _reply(
+                [{"hash": row["hash"], "source_group": "official", "confidence": 0.9} for row in batch_hashes]
+            )
+
+        failures: list[tuple[int, str]] = []
+        decisions = classify_documents(
+            items,
+            chat_fn=fake_chat_fn,
+            batch_size=2,
+            on_batch_failure=lambda index, exc: failures.append((index, str(exc))),
+        )
+
+        assert [index for index, _ in failures] == [0, 2]
+        assert all(message == "boom" for _, message in failures)
+        assert set(decisions) == {"h2", "h3"}
+
+    def test_on_batch_failure_callback_error_is_swallowed(self):
+        items = [AutoTagInput("h0", "doc0.pdf")]
+
+        def broken_callback(index, exc):
+            raise RuntimeError("callback bug")
+
+        def fake_chat_fn(*, model, messages, timeout=None):
+            raise RuntimeError("backend down")
+
+        assert classify_documents(
+            items, chat_fn=fake_chat_fn, on_batch_failure=broken_callback
+        ) == {}
+
     def test_prompt_carries_filename_and_excerpt(self):
         prompt = build_user_prompt([AutoTagInput("h1", "Rules 2026.pdf", "FSAE rules part T")])
         assert "h1" in prompt
@@ -174,3 +210,32 @@ def test_decision_dataclass_fields():
     assert decision.source_group == "official"
     assert decision.confidence == 0.9
     assert decision.reason == "rules"
+
+
+def test_max_output_tokens_scales_with_batch_and_caps():
+    from src.auto_tag import max_output_tokens
+
+    assert max_output_tokens(1) == 256
+    assert max_output_tokens(5) == 1000
+    assert max_output_tokens(20) == 2048  # cap: a 20-doc budget cannot explode
+    assert max_output_tokens(0) == 256
+    assert max_output_tokens(-3) == 256
+
+
+def test_default_chat_fn_sizes_num_predict_to_batch(monkeypatch):
+    # The default transport derives its generation budget from the batch in
+    # the user message, so a derailed generation cannot blow the timeout.
+    import src.local_rag as local_rag_module
+
+    captured: dict = {}
+
+    def fake_llm_chat(*, model, messages, options, stream, timeout):
+        captured["options"] = options
+        return {"message": {"content": "[]"}}
+
+    monkeypatch.setattr(local_rag_module, "_llm_chat", fake_llm_chat)
+
+    items = [AutoTagInput(f"h{i}", f"doc{i}.pdf") for i in range(3)]
+    classify_documents(items, batch_size=3)
+
+    assert captured["options"]["num_predict"] == 600

@@ -27,6 +27,7 @@ async function refreshHealth() {
     if (data.notModified) {
       return;
     }
+    updateShutdownBanner(data.shutting_down || null);
     applyServerConfig(data.server || {});
     applyChatConfig(data.chat || {});
     const queue = data.queue || {};
@@ -36,8 +37,90 @@ async function refreshHealth() {
       `${queue.queued_count || 0} queued jobs`;
     notePollSuccess();
   } catch (error) {
+    // If a shutdown was already announced, a failing health poll most likely
+    // means the server has now stopped — switch the banner to its offline
+    // form instead of the generic error line. (No-op when not latched.)
+    noteShutdownOffline();
     notePollFailure();
     els.statusLine.textContent = `Health check failed: ${error.message}`;
+  }
+}
+
+
+// -- server shutdown banner ---------------------------------------------------
+// The banner is driven by /api/health (the one endpoint every open tab polls),
+// so anyone using the app sees that the server is stopping. Once a shutdown is
+// seen it is latched for the page's lifetime: a transient poll failure keeps
+// the warning on screen instead of hiding it.
+
+let shutdownLatched = false;
+
+let shutdownCountdownTimer = null;
+
+
+function stopShutdownCountdown() {
+  if (shutdownCountdownTimer) {
+    clearInterval(shutdownCountdownTimer);
+    shutdownCountdownTimer = null;
+  }
+}
+
+
+function updateShutdownBanner(shutdown) {
+  const banner = els.shutdownBanner;
+  if (!banner) {
+    return;
+  }
+  if (shutdown && shutdown.active) {
+    shutdownLatched = true;
+    stopShutdownCountdown();
+    banner.hidden = false;
+    banner.classList.remove("offline");
+    const deadline = Date.parse(String(shutdown.shutdown_at || ""));
+    const text = els.shutdownBannerText;
+    if (Number.isFinite(deadline)) {
+      const render = () => {
+        const remaining = Math.max(0, Math.round((deadline - Date.now()) / 1000));
+        if (text) {
+          text.textContent = remaining > 0
+            ? `The server stops in ~${remaining}s. Active jobs are being finalized so they do not restart on the next boot.`
+            : "The server is stopping now. Start it again manually to keep working.";
+        }
+        if (remaining <= 0) {
+          stopShutdownCountdown();
+        }
+      };
+      render();
+      shutdownCountdownTimer = setInterval(render, 1000);
+    } else if (text) {
+      text.textContent =
+        "The server is shutting down. Active jobs are being finalized so they do not restart on the next boot.";
+    }
+    return;
+  }
+  // A successful poll with no active shutdown: either nothing was ever
+  // requested or a fresh server process answered after a restart — clear the
+  // latch so the stale warning does not stick around forever.
+  if (shutdownLatched) {
+    shutdownLatched = false;
+    stopShutdownCountdown();
+    banner.hidden = true;
+    banner.classList.remove("offline");
+  }
+}
+
+
+function noteShutdownOffline() {
+  const banner = els.shutdownBanner;
+  if (!banner || !shutdownLatched) {
+    return;
+  }
+  stopShutdownCountdown();
+  banner.hidden = false;
+  banner.classList.add("offline");
+  if (els.shutdownBannerText) {
+    els.shutdownBannerText.textContent =
+      "The server is offline. Start it again manually to keep working; this page will reconnect once it is back.";
   }
 }
 
@@ -73,7 +156,16 @@ function updateComposerSettingsSummary() {
   const temp = numericSetting(els.temperatureInput, 0.3, 0);
   const topK = Math.trunc(numericSetting(els.maxKInput, 40, 1));
   const web = els.webSearchInput.checked ? "web on" : "web off";
-  els.composerSettingsSummary.textContent = `${label} · temp ${temp} · top-k ${topK} · ${web}`;
+  // Category scope: General + custom indexes. A subset selection narrows what
+  // an answer can see, so surface it next to the other sampler facts.
+  const totalCategories = Array.isArray(state.categoriesCache)
+    ? state.categoriesCache.filter((entry) => entry && entry.key !== "general").length + 1
+    : 0;
+  let scope = "";
+  if (totalCategories > 1 && Array.isArray(state.chatSelectedCategories)) {
+    scope = ` · ${state.chatSelectedCategories.length}/${totalCategories} categories`;
+  }
+  els.composerSettingsSummary.textContent = `${label} · temp ${temp} · top-k ${topK} · ${web}${scope}`;
 }
 
 
@@ -295,6 +387,19 @@ function trackJobTransitions(jobs) {
         break;
       }
       state.jobWatch.delete(key);
+      dropped += 1;
+    }
+  }
+  // Keep the log-hydration timestamps bounded with the same discipline: one
+  // entry per job ever rendered would otherwise live for the tab's lifetime.
+  if (jobLogHydratedAt.size > JOB_WATCH_LIMIT) {
+    const excess = jobLogHydratedAt.size - JOB_WATCH_LIMIT;
+    let dropped = 0;
+    for (const key of jobLogHydratedAt.keys()) {
+      if (dropped >= excess) {
+        break;
+      }
+      jobLogHydratedAt.delete(key);
       dropped += 1;
     }
   }
@@ -718,6 +823,7 @@ export {
   jobLogHydratedAt,
   notePollFailure,
   notePollSuccess,
+  noteShutdownOffline,
   notifyJobOutcome,
   pollBackoffMultiplier,
   positiveInterval,
@@ -735,5 +841,6 @@ export {
   trackJobTransitions,
   updateComposerSettingsSummary,
   updateJobsStrip,
+  updateShutdownBanner,
   waitForRestart,
 };

@@ -16,6 +16,8 @@
 # PDF/document parsing and OCR
 docling~=2.105.0
 pypdf~=6.14.0
+# No direct imports: pypdf's AES decryption of encrypted PDFs requires it.
+cryptography~=50.0.1
 # No direct imports: RapidOCR's onnxruntime backend (OCR of scanned PDFs).
 onnxruntime~=1.27.0
 

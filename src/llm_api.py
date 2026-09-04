@@ -417,11 +417,14 @@ def _request(url: str, *, headers: dict[str, str], body: Any = None,
     try:
         return urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as exc:
-        detail = ""
         try:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
         except Exception:
-            pass
+            detail = ""
+        finally:
+            # HTTPError wraps a live response socket; without an explicit
+            # close it lingers until GC and 4xx/5xx paths run on every retry.
+            exc.close()
         raise SoclaasError(f"SoCLAaS returned HTTP {exc.code} at {url}: {detail}") from exc
     except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
         raise SoclaasError(f"SoCLAaS request failed at {url}: {exc}") from exc

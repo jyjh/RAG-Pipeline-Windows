@@ -1,6 +1,7 @@
 // Documents tab: drop zone, zip handling, source-group staging, uploads.
 
 import { CHUNKED_UPLOAD_CHUNK_SIZE, CHUNKED_UPLOAD_THRESHOLD, SOURCE_GROUP_OPTIONS_HTML, ZIP_IGNORED_NAMES, ZIP_IGNORED_PREFIXES, els, errorFromText, getApiKey, markIndexDirty, parseSourceGroupInput, promptForApiKey, requestJson, setStatus, state } from "./core.js";
+import { categoryLabel } from "./categories.js";
 import { refreshJobs } from "./status.js";
 import { pdfFilesFromList, refreshPdfs } from "./library.js";
 
@@ -215,15 +216,31 @@ async function extractPdfsFromZip(file) {
 // through to `rejected` exactly as the legacy path did.
 
 function updateSelectedFilesLabel() {
+  // The staging card (category + per-file source groups) only makes sense once
+  // files exist, so its visibility is driven here where every selection change
+  // already flows through.
   const files = Array.from(els.fileInput.files || []);
+  if (els.uploadStagingPanel) {
+    els.uploadStagingPanel.hidden = files.length === 0;
+  }
+  const target = categoryLabel(
+    (els.uploadCategorySelect && els.uploadCategorySelect.value) || "general",
+  );
   if (!files.length) {
-    els.selectedFilesLabel.textContent = "Drop PDFs";
+    if (els.uploadStagingCount) {
+      els.uploadStagingCount.textContent = "";
+    }
+    els.selectedFilesLabel.textContent = "";
     return;
   }
   const names = files.map((file) => file.name || "unnamed.pdf");
   const shown = names.slice(0, 3).join(", ");
   const extra = names.length > 3 ? ` +${names.length - 3} more` : "";
-  els.selectedFilesLabel.textContent = `${names.length} selected: ${shown}${extra}`;
+  els.selectedFilesLabel.textContent = `${names.length} staged: ${shown}${extra}`;
+  if (els.uploadStagingCount) {
+    els.uploadStagingCount.textContent =
+      `${files.length} file${files.length === 1 ? "" : "s"} ready — indexing into “${target}”`;
+  }
 }
 
 // Option list used by both standalone-PDF and zip-level selectors.
@@ -300,6 +317,7 @@ function renderUploadGroupSelectors() {
     header.append(label, defaultLabel, defaultSelect);
     els.uploadGroupsPanel.appendChild(header);
 
+    let lastRow = header;
     for (const file of members) {
       const row = document.createElement("label");
       row.className = "upload-group-row upload-group-row--member";
@@ -313,7 +331,8 @@ function renderUploadGroupSelectors() {
       // Remember which zip this member inherits from, by identity.
       selectZipOrigin.set(select, zip);
       row.append(name, select);
-      header.after(row); // keep header immediately above its members
+      lastRow.after(row); // keep members directly under the header, in order
+      lastRow = row;
     }
   }
 }
@@ -388,6 +407,11 @@ async function setSelectedUploadFiles(files) {
   els.fileInput.files = transfer.files;
   updateSelectedFilesLabel();
   renderUploadGroupSelectors();
+  // The staging card (category + source groups) just appeared below the drop
+  // zone; bring it into view so the next step of the flow is obvious.
+  if (els.uploadStagingPanel && !els.uploadStagingPanel.hidden) {
+    els.uploadStagingPanel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
   const messages = errors.slice();
   if (rejected.length) {
     messages.push(`Skipped non-PDF file(s): ${rejected.join(", ")}`);
@@ -397,6 +421,21 @@ async function setSelectedUploadFiles(files) {
   } else {
     setStatus(els.uploadStatus, "");
   }
+}
+
+
+// Discard a staged selection (files picked but not yet sent): clears the file
+// input, hides the staging card, and resets the batch target so the next
+// upload starts fresh.
+function clearStagedUploadFiles() {
+  clearDuplicatePrompt();
+  els.fileInput.value = "";
+  if (els.uploadCategorySelect) {
+    els.uploadCategorySelect.value = "general";
+  }
+  updateSelectedFilesLabel();
+  renderUploadGroupSelectors();
+  setStatus(els.uploadStatus, "");
 }
 
 
@@ -460,6 +499,9 @@ async function uploadFiles(forceDuplicates = false, forceToken = "") {
 
   els.uploadButton.disabled = true;
   els.forceUploadButton.disabled = true;
+  if (els.cancelUploadButton) {
+    els.cancelUploadButton.disabled = true;
+  }
 
   // Upload each file as its own request so a network drop only loses the
   // current file, not the whole batch. The server dedupes per-file via the
@@ -580,6 +622,9 @@ async function uploadFiles(forceDuplicates = false, forceToken = "") {
   await refreshPdfs({ force: true });
   els.uploadButton.disabled = false;
   els.forceUploadButton.disabled = !state.pendingForceUploadToken;
+  if (els.cancelUploadButton) {
+    els.cancelUploadButton.disabled = false;
+  }
 }
 
 
@@ -603,6 +648,7 @@ async function enqueueReindex() {
 export {
   buildGroupSelect,
   clearDuplicatePrompt,
+  clearStagedUploadFiles,
   clearUploadDrag,
   duplicateUploadMessage,
   enqueueReindex,

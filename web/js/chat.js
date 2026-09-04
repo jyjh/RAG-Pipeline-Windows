@@ -1,6 +1,6 @@
 // Ask tab: saved chats, streaming answers, presets, sources/citations, message actions.
 
-import { ANSWER_PRESETS, ANSWER_PRESET_STORAGE_KEY, CHAT_AUTO_SCROLL_THRESHOLD, CHAT_HISTORY_LIMIT, CHAT_MESSAGE_LIMIT, CHAT_STORAGE_KEY, CHAT_UI_STORAGE_KEY, CITATION_PATTERN, LIVE_RENDER_INTERVAL_MS, STREAM_TAIL_HOLD_CHARS, STREAM_TAIL_MAX_CHARS, applyApiKeyHeaders, blockBoundariesBefore, confirmAction, copyTextToClipboard, els, escapeHtml, formatBytes, isDebugMode, isSafeMarkdownCommit, newId, nowIso, numericSetting, patchTableRows, promptForApiKey, promptText, renderMarkdown, showToast, softBoundariesBefore, sourceGroupTitle, sourceGroupWeight, stableJson, state } from "./core.js";
+import { ANSWER_PRESETS, ANSWER_PRESET_STORAGE_KEY, CHAT_AUTO_SCROLL_THRESHOLD, CHAT_HISTORY_LIMIT, CHAT_MESSAGE_LIMIT, CHAT_STORAGE_KEY, CHAT_UI_STORAGE_KEY, CITATION_PATTERN, LIVE_RENDER_INTERVAL_MS, STREAM_TAIL_HOLD_CHARS, STREAM_TAIL_MAX_CHARS, applyApiKeyHeaders, blockBoundariesBefore, confirmAction, copyTextToClipboard, els, errorFromResponse, escapeHtml, formatBytes, isDebugMode, isSafeMarkdownCommit, mediaUrlWithToken, newId, nowIso, numericSetting, patchTableRows, promptForApiKey, promptText, renderMarkdown, showToast, softBoundariesBefore, sourceGroupTitle, sourceGroupWeight, stableJson, state } from "./core.js";
 import { createJobRow, refreshHealth, rememberJobLogOpenState, updateComposerSettingsSummary } from "./status.js";
 import { ensureWalkthroughFakePdf, removeWalkthroughFakePdf } from "./library.js";
 import { adminCard, adminMetricRow, adminStatusBadge } from "./admin.js";
@@ -927,7 +927,10 @@ function openImageLightbox(url, description) {
   figure.append(image, caption);
   overlay.appendChild(figure);
   document.body.appendChild(overlay);
-  const close = () => overlay.remove();
+  const close = () => {
+    overlay.remove();
+    document.removeEventListener("keydown", onKey);
+  };
   overlay.addEventListener("click", (event) => {
     if (event.target === overlay) {
       close();
@@ -936,7 +939,6 @@ function openImageLightbox(url, description) {
   const onKey = (event) => {
     if (event.key === "Escape") {
       close();
-      document.removeEventListener("keydown", onKey);
     }
   };
   document.addEventListener("keydown", onKey);
@@ -991,10 +993,10 @@ function renderSourcePanel(parts) {
       }
     }
     if (source.kind === "local" && source.open_url) {
-      links.push(`<a href="${escapeHtml(source.open_url)}" target="_blank">Open page</a>`);
+      links.push(`<a href="${escapeHtml(mediaUrlWithToken(source.open_url))}" target="_blank">Open page</a>`);
     }
     if (source.kind === "local" && source.download_url) {
-      links.push(`<a href="${escapeHtml(source.download_url)}">Download PDF</a>`);
+      links.push(`<a href="${escapeHtml(mediaUrlWithToken(source.download_url))}">Download PDF</a>`);
     }
     if (source.kind === "local" && (source.source_pdf_name || source.file_path)) {
       const searchTarget = escapeHtml(
@@ -1615,7 +1617,9 @@ async function runChatExchange(chat, question, {
   renderSavedChats();
 
   try {
-    const chatHeaders = { "Content-Type": "application/json" };
+    // applyApiKeyHeaders mutates a Headers instance with .set().
+    // A plain object works for fetch(), but not for the shared auth helper.
+    const chatHeaders = new Headers({ "Content-Type": "application/json" });
     applyApiKeyHeaders(chatHeaders, { method: "POST" });
     const response = await fetch("/api/chat/stream", {
       method: "POST",
@@ -1670,7 +1674,9 @@ async function runChatExchange(chat, question, {
       }
     }
     if (!response.ok || !response.body) {
-      throw new Error(await response.text());
+      // Surface a readable message (the stream may still carry a JSON error
+      // body) instead of dumping the raw payload into the notice.
+      throw await errorFromResponse(response);
     }
 
     const reader = response.body.getReader();

@@ -13,7 +13,7 @@ from typing import Any
 from src import llm_api
 from src.coerce import as_positive_float, as_positive_int
 from src.console import status as _status
-from src.defaults import DEFAULT_EMBEDDING_BATCH_SIZE
+from src.defaults import DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_MODEL
 # Re-exported from src.config, which owns the definition now that llm_api and
 # local_rag share it. Kept as a module attribute so existing
 # ``src.embeddings.default_config_path`` consumers -- and tests that patch it

@@ -61,6 +61,23 @@ def test_create_list_rename_delete_lifecycle(tmp_path):
         store.delete_category("fsae_design")
 
 
+def test_category_weights_have_named_defaults_and_are_adjustable(tmp_path):
+    store = _store(tmp_path)
+    store.create_category("historical-documents", "Historical Documents")
+    store.create_category("design-2026-2027", "2026/2027 Design Documentation")
+
+    entries = {entry["key"]: entry for entry in store.list_categories()}
+    assert entries["general"]["weight"] == 1.0
+    assert entries["historical-documents"]["weight"] == 0.1
+    assert entries["design-2026-2027"]["weight"] == 1.5
+
+    updated = store.update_weight("historical-documents", 0.25)
+    assert updated["weight"] == 0.25
+    assert store.get_category("historical-documents")["weight"] == 0.25
+    with pytest.raises(ValueError, match="fixed"):
+        store.update_weight("general", 2)
+
+
 @pytest.mark.parametrize(
     "bad_key",
     ["", "Has Space", "slash/slash", "ümlaut", "-leading", "x" * 65],

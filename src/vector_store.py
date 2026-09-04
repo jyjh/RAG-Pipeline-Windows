@@ -140,14 +140,20 @@ class MultiVectorStore:
         *,
         labels: list[str] | None = None,
         keys: list[str] | None = None,
+        weights: list[float] | None = None,
     ):
         if not stores:
             raise ValueError("MultiVectorStore requires at least one store.")
         self.stores = list(stores)
         self.labels = list(labels) if labels is not None else [f"store{i}" for i in range(len(stores))]
         self.keys = list(keys) if keys is not None else [str(index) for index in range(len(stores))]
-        if len(self.labels) != len(self.stores) or len(self.keys) != len(self.stores):
-            raise ValueError("labels/keys must align with stores.")
+        self.weights = list(weights) if weights is not None else [1.0] * len(stores)
+        if (
+            len(self.labels) != len(self.stores)
+            or len(self.keys) != len(self.stores)
+            or len(self.weights) != len(self.stores)
+        ):
+            raise ValueError("labels/keys/weights must align with stores.")
 
     def _store_for(self, record: dict[str, Any]):
         """Route a previously-returned record back to the store it came from."""
@@ -172,7 +178,7 @@ class MultiVectorStore:
 
     def search(self, vector: list[float], *, top_k: int) -> list[dict[str, Any]]:
         merged: dict[str, dict[str, Any]] = {}
-        for label, store in zip(self.labels, self.stores):
+        for label, weight, store in zip(self.labels, self.weights, self.stores):
             for row in store.search(vector, top_k=top_k):
                 record_id = str(row.get("id") or "")
                 if not record_id:
@@ -187,10 +193,12 @@ class MultiVectorStore:
                         continue
                     row = dict(row)
                     row["category"] = label
+                    row["category_weight"] = float(weight)
                     merged[record_id] = row
                     continue
                 row = dict(row)
                 row["category"] = label
+                row["category_weight"] = float(weight)
                 merged[record_id] = row
         return sorted(
             merged.values(),
@@ -201,8 +209,8 @@ class MultiVectorStore:
     def child_chunks(self, parent: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
         store = self._store_for(parent)
         rows = store.child_chunks(parent, limit=limit)
-        label = self.labels[self.stores.index(store)] if store in self.stores else ""
-        return [dict(row, category=label) for row in rows]
+        index = self.stores.index(store) if store in self.stores else 0
+        return [dict(row, category=self.labels[index], category_weight=float(self.weights[index])) for row in rows]
 
 
 def default_store(working_dir: str | Path, *, prefer_lancedb: bool = True) -> VectorStore:

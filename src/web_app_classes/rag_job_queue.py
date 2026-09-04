@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import time
 
@@ -158,6 +159,64 @@ class RagJobQueue:
         if payload["status"] == "cancelled":
             self._record_interrupted(job, "Job cancelled by user.")
         return payload
+
+    def shutdown_finalize(
+        self,
+        *,
+        reason: str = "Server shutting down.",
+        grace_seconds: float = 3.0,
+    ) -> dict[str, int]:
+        """Terminal-state every queued/running job so a restart cannot resurrect it.
+
+        Called once during a graceful server shutdown. Cancellation is requested
+        first so in-flight workers stop at their next checkpoint and run their
+        own terminal bookkeeping (registry "interrupted" statuses + durable-ledger
+        removal); after a bounded grace, any straggler stuck inside a phase that
+        never checks the cancel event is force-finalized here with the same
+        bookkeeping. Without this, a deliberate restart would look exactly like
+        a crash to startup recovery, which re-enqueues every non-terminal job and
+        re-runs indexing. Idempotent: terminal jobs are left untouched, and a
+        second call after the workers settled finds nothing active.
+        """
+        with self._condition:
+            active = [
+                job for job in self._jobs.values()
+                if job.status not in TERMINAL_JOB_STATUSES
+            ]
+            for job in active:
+                job.cancel_requested = True
+                job._cancel_event.set()
+            if active:
+                self._bump_state_version_locked()
+                self._condition.notify_all()
+        if not active:
+            return {"finalized": 0, "forced": 0}
+
+        # Give the workers a moment to observe the cancel event and take the
+        # normal cancellation path (their bookkeeping is the authoritative one).
+        deadline = time.monotonic() + max(0.0, float(grace_seconds))
+        while time.monotonic() < deadline:
+            with self._condition:
+                pending = [job for job in active if job.status not in TERMINAL_JOB_STATUSES]
+            if not pending:
+                break
+            time.sleep(0.05)
+
+        forced: list[QueueJob] = []
+        with self._condition:
+            for job in active:
+                if job.status in TERMINAL_JOB_STATUSES:
+                    continue
+                self._mark_cancelled_locked(job, reason)
+                forced.append(job)
+        for job in forced:
+            # Same best-effort bookkeeping the worker's cancel path runs. If the
+            # worker wakes up later and re-runs it, both paths are idempotent.
+            self._best_effort_bookkeeping(
+                job, "interrupted-status", lambda job=job: self._record_interrupted(job, reason)
+            )
+            self._best_effort_bookkeeping(job, "ledger-remove", lambda job=job: self._ledger_remove(job))
+        return {"finalized": len(active), "forced": len(forced)}
 
     def _mark_cancelled_locked(self, job: QueueJob, message: str) -> None:
         job.status = "cancelled"
@@ -389,14 +448,28 @@ class RagJobQueue:
         return self._enqueue(job, auto_start=auto_start)
 
     def _enqueue(self, job: QueueJob, *, auto_start: bool) -> QueueJob:
-        # Persist non-upload jobs BEFORE the job becomes visible to a worker.
-        # Recording after enqueue raced the worker's terminal-state removal: a
-        # fast job (small backup/restore) could finish and de-ledger before
-        # the record landed, leaving a DONE job in the ledger that startup
-        # recovery re-enqueued on every restart. Done outside the condition
-        # lock because the ledger has its own lock and is best-effort.
-        self._ledger_record(job)
+        # Equivalent active jobs share one queue entry. In particular, a full
+        # reindex is a corpus-wide operation, so running it N times cannot
+        # produce a different result from running it once. Check and insert
+        # under the same condition lock so concurrent HTTP requests cannot
+        # race each other into duplicate work.
         with self._condition:
+            duplicate = self._find_active_duplicate_locked(job)
+            if duplicate is not None:
+                logger.info(
+                    "Coalescing duplicate %s job %s into active job %s.",
+                    job.kind, job.id, duplicate.id,
+                )
+                return duplicate
+
+            # Persist non-upload jobs BEFORE the job becomes visible to a
+            # worker. Recording after enqueue raced the worker's
+            # terminal-state removal: a fast job (small backup/restore) could
+            # finish and de-ledger before the record landed, leaving a DONE
+            # job in the ledger that startup recovery re-enqueued on every
+            # restart. The ledger call is best-effort and is kept inside this
+            # critical section so duplicate requests cannot race the check.
+            self._ledger_record(job)
             self._jobs[job.id] = job
             self._queue.append(job.id)
             self._prune_jobs_locked()
@@ -405,6 +478,30 @@ class RagJobQueue:
             self._bump_state_version_locked()
             self._condition.notify_all()
         return job
+
+    @staticmethod
+    def _job_identity(job: QueueJob) -> str:
+        """Return a stable identity for work that may be coalesced."""
+        payload = {
+            "kind": job.kind,
+            "source_hashes": sorted({str(value) for value in job.source_hashes if value}),
+            "backup_name": str(job.backup_name or ""),
+            "options": job.options or {},
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+    def _find_active_duplicate_locked(self, job: QueueJob) -> QueueJob | None:
+        """Find an equivalent queued/running job; caller holds ``_condition``."""
+        if job.kind == "upload":
+            # Uploads have distinct staging state and must never be coalesced.
+            return None
+        identity = self._job_identity(job)
+        for existing in self._jobs.values():
+            if existing.status in TERMINAL_JOB_STATUSES or existing.cancel_requested:
+                continue
+            if self._job_identity(existing) == identity:
+                return existing
+        return None
 
     def _prune_jobs_locked(self) -> None:
         # /api/jobs re-serializes every job ever created (log tails included),
@@ -1653,6 +1750,7 @@ class RagJobQueue:
     def recover_pending_uploads(self, *, auto_start: bool = True) -> dict[str, Any]:
         jobs = self._recovery_jobs_from_registry()
         recovered: list[QueueJob] = []
+        duplicate_ledger_ids: list[str] = []
         with self._condition:
             for job in jobs:
                 if job.id in self._jobs:
@@ -1667,6 +1765,13 @@ class RagJobQueue:
             for job in self._recovery_jobs_from_ledger():
                 if job.id in self._jobs:
                     continue
+                duplicate = self._find_active_duplicate_locked(job)
+                if duplicate is not None:
+                    # The duplicate ledger entry would otherwise resurrect on
+                    # every restart. It is safe to discard because the
+                    # equivalent active entry is already being recovered.
+                    duplicate_ledger_ids.append(job.id)
+                    continue
                 self._jobs[job.id] = job
                 self._queue.append(job.id)
                 recovered.append(job)
@@ -1678,6 +1783,11 @@ class RagJobQueue:
             if recovered:
                 self._bump_state_version_locked()
                 self._condition.notify_all()
+        for job_id in duplicate_ledger_ids:
+            try:
+                self.ledger.remove(job_id)
+            except Exception:  # noqa: BLE001 - cleanup must not block startup
+                logger.exception("Failed to remove duplicate recovered job %s", job_id)
         return {
             "recovered": len(recovered),
             "jobs": [job.to_dict() for job in recovered],
@@ -1816,4 +1926,3 @@ class RagJobQueue:
 
 RagJobQueue.__module__ = _source_module.__name__
 finalize_split_class(_source_module, RagJobQueue)
-

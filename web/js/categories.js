@@ -1,8 +1,9 @@
 // Source categories: selects, chat chips, admin management (user feature work).
 
 import { confirmAction, els, escapeHtml, requestJson, setStatus, showToast, state } from "./core.js";
-import { refreshJobs } from "./status.js";
+import { refreshJobs, updateComposerSettingsSummary } from "./status.js";
 import { clearPdfSelection, refreshPdfs } from "./library.js";
+import { updateSelectedFilesLabel } from "./upload.js";
 
 async function refreshCategories(options = {}) {
   // Lightweight registry fetch backing every category control (upload target,
@@ -15,6 +16,7 @@ async function refreshCategories(options = {}) {
     state.categoriesLoaded = true;
     renderCategoryControls();
     renderAdminCategories();
+    relabelCategoryBadges();
     if (options.onLoaded) options.onLoaded();
   } catch (error) {
     if (options.quiet !== false) return;
@@ -31,6 +33,53 @@ function categoryLabel(key) {
 
 function customCategoryEntries() {
   return state.categoriesCache.filter((entry) => entry.key !== "general");
+}
+
+
+function categoryHue(key) {
+  // Deterministic hue per category key so badges stay recognizable across
+  // sessions without storing colors anywhere.
+  let hash = 0;
+  const text = String(key || "");
+  for (let index = 0; index < text.length; index += 1) {
+    hash = (hash * 31 + text.charCodeAt(index)) % 360;
+  }
+  return hash;
+}
+
+
+function categoryBadgeHtml(key, { interactive = true } = {}) {
+  const normalized = String(key || "general");
+  const isGeneral = normalized === "general";
+  const label = categoryLabel(normalized);
+  const attrs = ` class="category-badge${isGeneral ? " category-badge-general" : " category-badge-custom"}"`
+    + ` style="--cat-hue:${categoryHue(normalized)}"`
+    + ` data-category-key="${escapeHtml(normalized)}"`
+    + ` title="${escapeHtml(badgeTitle(normalized, label, interactive))}"`;
+  if (!interactive) {
+    return `<span${attrs}>${escapeHtml(label)}</span>`;
+  }
+  return `<button type="button"${attrs} data-category-filter="${escapeHtml(normalized)}">${escapeHtml(label)}</button>`;
+}
+
+
+function badgeTitle(key, label, clickable) {
+  if (String(key || "general") === "general") {
+    return `Category: ${label} (default index)`;
+  }
+  return `Category: ${label}${clickable ? " — click to show only this category" : ""}`;
+}
+
+
+// Rows can render before /api/categories resolves (cold boot race), at which
+// point badges fall back to the raw key; re-label them once the cache lands.
+function relabelCategoryBadges() {
+  document.querySelectorAll(".category-badge[data-category-key]").forEach((badge) => {
+    const key = badge.dataset.categoryKey || "general";
+    const label = categoryLabel(key);
+    badge.textContent = label;
+    badge.title = badgeTitle(key, label, badge.tagName === "BUTTON");
+  });
 }
 
 
@@ -65,9 +114,31 @@ function renderCategoryControls() {
     includeAll: true,
     allLabel: "All categories",
   });
-  _populateCategorySelect(els.pdfBulkCategorySelect, { value: "general" });
+  // Preserve the user's pending "Move to" choice across re-renders instead
+  // of snapping back to General before they can click Move.
+  _populateCategorySelect(els.pdfBulkCategorySelect, {
+    value: (els.pdfBulkCategorySelect && els.pdfBulkCategorySelect.value) || "general",
+  });
   _populateCategorySelect(els.indexCategorySelect, { value: state.indexCategory });
   renderChatCategoryChips();
+  // Repopulation can change the upload target (e.g. a deleted category
+  // falling back to General); keep the drop-zone label honest.
+  updateSelectedFilesLabel();
+}
+
+
+function toggleChatCategory(key) {
+  const current = new Set(Array.isArray(state.chatSelectedCategories) ? state.chatSelectedCategories : []);
+  if (current.has(key)) {
+    current.delete(key);
+  } else {
+    current.add(key);
+  }
+  // An empty explicit set would search nothing local; treat "untick
+  // the last one" as back to All instead of a surprising no-context answer.
+  state.chatSelectedCategories = current.size ? Array.from(current) : null;
+  renderChatCategoryChips();
+  updateComposerSettingsSummary();
 }
 
 
@@ -75,12 +146,6 @@ function renderChatCategoryChips() {
   const container = els.chatCategoryChips;
   if (!container) return;
   const custom = customCategoryEntries();
-  if (!custom.length) {
-    container.hidden = true;
-    container.replaceChildren();
-    return;
-  }
-  container.hidden = false;
   const selected = state.chatSelectedCategories;
   const chip = (label, title, active, onClick) => {
     const button = document.createElement("button");
@@ -91,6 +156,17 @@ function renderChatCategoryChips() {
     button.addEventListener("click", onClick);
     return button;
   };
+  if (!custom.length) {
+    // Only the General index exists, so there is nothing to choose — but
+    // showing the scope keeps categorization visible where answers happen.
+    container.hidden = false;
+    const hint = document.createElement("span");
+    hint.className = "category-chip category-chip-static";
+    hint.textContent = "Searching: General (all documents)";
+    container.replaceChildren(hint);
+    return;
+  }
+  container.hidden = false;
   const allActive = !Array.isArray(selected);
   const nodes = [
     chip(
@@ -100,9 +176,22 @@ function renderChatCategoryChips() {
       () => {
         state.chatSelectedCategories = null;
         renderChatCategoryChips();
+        updateComposerSettingsSummary();
       },
     ),
   ];
+  // General is a real index like any other: offer it as a chip so a subset
+  // selection can keep searching the default corpus (the server searches
+  // only the keys the request sends).
+  const generalActive = Array.isArray(selected) && selected.includes("general");
+  nodes.push(
+    chip(
+      `${generalActive ? "✓ " : ""}General`,
+      'Toggle searching "General" (the default index)',
+      generalActive,
+      () => toggleChatCategory("general"),
+    ),
+  );
   for (const entry of custom) {
     const active = Array.isArray(selected) && selected.includes(entry.key);
     nodes.push(
@@ -110,18 +199,7 @@ function renderChatCategoryChips() {
         `${active ? "✓ " : ""}${entry.label || entry.key}`,
         `Toggle searching "${entry.label || entry.key}"`,
         active,
-        () => {
-          const current = new Set(Array.isArray(state.chatSelectedCategories) ? state.chatSelectedCategories : []);
-          if (current.has(entry.key)) {
-            current.delete(entry.key);
-          } else {
-            current.add(entry.key);
-          }
-          // An empty explicit set would search nothing local; treat "untick
-          // the last one" as back to All instead of a surprising no-context answer.
-          state.chatSelectedCategories = current.size ? Array.from(current) : null;
-          renderChatCategoryChips();
-        },
+        () => toggleChatCategory(entry.key),
       ),
     );
   }
@@ -186,6 +264,7 @@ function renderAdminCategories() {
         <td>${Number(entry.source_count || 0)}</td>
         <td>${Number(entry.record_count || 0)}</td>
         <td>${embedding}</td>
+        <td><input type="number" min="0.01" max="100" step="0.01" value="${Number(entry.weight ?? 1)}" data-category-weight-key="${escapeHtml(entry.key)}" aria-label="Retrieval weight for ${escapeHtml(entry.label || entry.key)}"${isGeneral ? " disabled" : ""} /></td>
         <td>${
           isGeneral
             ? '<span class="hint">default index</span>'
@@ -195,6 +274,22 @@ function renderAdminCategories() {
       return row;
     })
   );
+}
+
+
+async function updateCategoryWeight(key, value) {
+  try {
+    await requestJson(`/api/categories/${encodeURIComponent(key)}/weight`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ weight: Number(value) }),
+    });
+    setStatus(els.adminCategoriesStatus, `Updated retrieval weight for "${categoryLabel(key)}".`);
+    await refreshCategories();
+  } catch (error) {
+    setStatus(els.adminCategoriesStatus, error.message, true);
+    await refreshCategories();
+  }
 }
 
 
@@ -245,6 +340,7 @@ async function deleteCategoryFromAdmin(key) {
 export {
   _populateCategorySelect,
   bulkMoveSelectedToCategory,
+  categoryBadgeHtml,
   categoryLabel,
   createCategoryFromAdmin,
   customCategoryEntries,
@@ -253,4 +349,5 @@ export {
   renderAdminCategories,
   renderCategoryControls,
   renderChatCategoryChips,
+  updateCategoryWeight,
 };

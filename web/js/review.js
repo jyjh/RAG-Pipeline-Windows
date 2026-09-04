@@ -1,7 +1,8 @@
 // Review tab: index browsing, search, in-place record editing.
 
-import { els, escapeHtml, indexChildCountLabel, indexNodeLabel, indexPageRange, indexParentRow, indexReliabilityLabel, indexRowContent, indexRowsForParent, indexScoreLabel, isAbortError, markIndexDirty, numericSetting, patchTableRows, requestJson, setStatus, showToast, stableJsonHash, state, toastError, sourceGroupTitle } from "./core.js";
+import { els, escapeHtml, indexChildCountLabel, indexNodeLabel, indexPageRange, indexParentRow, indexReliabilityLabel, indexRowContent, indexRowsForParent, indexScoreLabel, isAbortError, markIndexDirty, mediaUrlWithToken, numericSetting, patchTableRows, requestJson, setStatus, showToast, stableJsonHash, state, toastError, sourceGroupTitle } from "./core.js";
 import { appendAssetPreviewGrid } from "./chat.js";
+import { categoryBadgeHtml } from "./categories.js";
 
 const INDEX_STREAM_BATCH_SIZE = 250;
 
@@ -39,6 +40,19 @@ function abortIndexLoad() {
     state.indexAbortController.abort();
     state.indexAbortController = null;
   }
+}
+
+
+function handleIndexLoadError(load, error) {
+  // Shared by loadIndex / loadAllIndexSummaries / runIndexVectorSearch:
+  // stale or aborted loads stay silent, fresh failures clear the table and
+  // surface the message in the review status line.
+  if (isAbortError(error) || !isActiveIndexLoad(load)) {
+    return;
+  }
+  els.indexBody.innerHTML = "";
+  els.pageLabel.textContent = "";
+  setStatus(els.indexStatus, error.message, true);
 }
 
 
@@ -86,12 +100,7 @@ async function loadIndex() {
       setStatus(els.indexStatus, `Embedding model: ${data.embedding_model || "unknown"}`);
     }
   } catch (error) {
-    if (isAbortError(error) || !isActiveIndexLoad(load)) {
-      return;
-    }
-    els.indexBody.innerHTML = "";
-    els.pageLabel.textContent = "";
-    setStatus(els.indexStatus, error.message, true);
+    handleIndexLoadError(load, error);
   } finally {
     finishIndexLoad(load);
   }
@@ -134,12 +143,7 @@ async function loadAllIndexSummaries(load) {
     els.nextPageButton.disabled = true;
     setStatus(els.indexStatus, `Embedding model: ${data.embedding_model || "unknown"}`);
   } catch (error) {
-    if (isAbortError(error) || !isActiveIndexLoad(load)) {
-      return;
-    }
-    els.indexBody.innerHTML = "";
-    els.pageLabel.textContent = "";
-    setStatus(els.indexStatus, error.message, true);
+    handleIndexLoadError(load, error);
   } finally {
     finishIndexLoad(load);
   }
@@ -163,7 +167,7 @@ function createIndexRow(item, options = {}) {
   }
 
   const download = item.source_hash
-    ? `<br /><a class="download-link" href="/api/pdfs/${encodeURIComponent(item.source_hash)}/download">Download PDF</a>`
+    ? `<br /><a class="download-link" href="${escapeHtml(mediaUrlWithToken(`/api/pdfs/${encodeURIComponent(item.source_hash)}/download`))}">Download PDF</a>`
     : "";
   const hasChildren = Number(item.child_count || 0) > 0;
   const toggle = hasChildren && options.allowToggle
@@ -430,12 +434,7 @@ async function runIndexVectorSearch() {
       `Vector search complete. Relevance floor: ${Number(data.relevance_floor || relevanceFloor).toFixed(2)}`
     );
   } catch (error) {
-    if (isAbortError(error) || !isActiveIndexLoad(load)) {
-      return;
-    }
-    els.indexBody.innerHTML = "";
-    els.pageLabel.textContent = "";
-    setStatus(els.indexStatus, error.message, true);
+    handleIndexLoadError(load, error);
   } finally {
     els.vectorSearchButton.disabled = false;
     finishIndexLoad(load);
@@ -509,7 +508,13 @@ async function loadIndexChildren(parentRow, offset = 0, toggleButton = null) {
     nodes.push(createIndexLoadMoreRow(parentId, nextOffset, Number(data.total || 0)));
   }
   insertIndexRowsAfter(anchor, nodes);
-  if (toggleButton) {
+  // The user may have collapsed the parent while the fetch was in flight;
+  // respect its current state instead of forcing the rows visible.
+  const collapsedWhileLoading = toggleButton && toggleButton.getAttribute("aria-expanded") === "false";
+  if (collapsedWhileLoading) {
+    setIndexChildrenVisible(parentId, false);
+  }
+  if (toggleButton && !collapsedWhileLoading) {
     setIndexToggle(toggleButton, true);
   }
 }
@@ -532,6 +537,9 @@ async function toggleIndexChildren(parentRow, button) {
   }
 
   button.disabled = true;
+  // Mark expanded before the fetch: a collapse clicked mid-load flips this
+  // back to "false", which loadIndexChildren respects when the rows arrive.
+  setIndexToggle(button, true);
   try {
     await loadIndexChildren(parentRow, 0, button);
   } catch (error) {
@@ -642,6 +650,10 @@ export function setReviewViewMode(mode) {
   document.getElementById("docsTable").hidden = state.reviewViewMode !== "documents";
   document.getElementById("indexTable").hidden = state.reviewViewMode !== "chunks";
   document.getElementById("indexStatus").hidden = state.reviewViewMode !== "chunks";
+  const docsPager = document.getElementById("docsPager");
+  if (docsPager) {
+    docsPager.hidden = state.reviewViewMode !== "documents";
+  }
   if (state.reviewViewMode === "documents") {
     abortIndexLoad();
     refreshDocumentList({ force: true });
@@ -709,6 +721,7 @@ function renderDocumentList(docs, total) {
     const chunks = Number(doc.quality?.chunk_count || 0);
     const status = String(doc.status || "");
     const group = String(doc.trust?.source_group || "ungrouped");
+    const category = String(doc.category || "general");
     row.innerHTML = `
       <td class="doc-expand-cell">
         <button type="button" class="tree-toggle" data-action="toggle-doc" aria-expanded="false" title="Show this document's indexed records">+</button>
@@ -718,7 +731,10 @@ function renderDocumentList(docs, total) {
         <span class="index-node-meta">${escapeHtml(chunks ? chunks + " chunks" : "")}</span>
       </td>
       <td>${escapeHtml(status)}</td>
-      <td><span class="source-group-badge group-${escapeHtml(group)}">${escapeHtml(sourceGroupTitle(group))}</span></td>
+      <td>
+        <span class="source-group-badge group-${escapeHtml(group)}">${escapeHtml(sourceGroupTitle(group))}</span>
+        ${categoryBadgeHtml(category, { interactive: false })}
+      </td>
     `;
     body.appendChild(row);
   }

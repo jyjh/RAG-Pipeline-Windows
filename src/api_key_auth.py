@@ -20,9 +20,19 @@ Design follows the rest of the pipeline:
   to disk every N increments and on shutdown, so a request never blocks on disk
   for bookkeeping.
 
-Backward compatibility: if the master token is empty **and** the key store has
-no active keys, :func:`authenticate` returns ``None`` for any supplied value
-and the middleware becomes a no-op -- a fresh deployment stays fully open.
+Permission sets: every key is assigned a named permission set that defines an
+allowlist of document categories (or ``["*"]`` for all), a ``can_write`` flag
+(upload/edit/delete inside the allowed categories), and an ``admin`` flag (key
+and permission-set management, category management, maintenance). Sets live in
+the same store under ``"permission_sets"``; two builtin sets (``admin`` and
+``user``) are provisioned automatically and act as the migration target for the
+legacy two-value ``role`` field, which is still persisted (derived from the
+set's admin flag) so older tooling keeps working.
+
+The server is always in an authentication posture: loopback clients are
+auto-authenticated as the synthetic ``LOCAL_KEY_ID`` admin identity (built by
+:func:`local_auth_result`), and every other client must present the master
+token or a valid key. There is no open mode.
 """
 
 from __future__ import annotations
@@ -30,6 +40,8 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import hmac
+import logging
+import re
 import secrets
 import threading
 import time
@@ -45,19 +57,83 @@ from src.file_lock import acquire_registry_lock
 # The synthetic identity the master token authenticates as. Never a real key id.
 MASTER_KEY_ID = "__master__"
 MASTER_PREFIX = "master"
+# The synthetic identity auto-assigned to loopback (127.0.0.1/::1) clients.
+LOCAL_KEY_ID = "__local__"
+LOCAL_LABEL = "localhost"
 
 # Key format: "<prefix>_<base62 secret>". The secret is opaque and unguessable.
 DEFAULT_KEY_PREFIX = "rag_"
 SECRET_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 SECRET_LENGTH = 32
 
-STORE_VERSION = 1
+logger = logging.getLogger(__name__)
+
+STORE_VERSION = 2
 STORE_FILENAME = ".api_keys.json"
 STATUS_ACTIVE = "active"
 STATUS_DISABLED = "disabled"
 ROLE_USER = "user"
 ROLE_ADMIN = "admin"
 VALID_ROLES = {ROLE_USER, ROLE_ADMIN}
+
+# Permission sets ----------------------------------------------------------------
+# A set's ``categories`` is either the wildcard ["*"] (every category, including
+# ones created later) or an explicit list of category keys. ``can_write`` gates
+# uploads/edits/deletes inside the allowed categories; ``admin`` gates key and
+# permission-set management, category management, and index maintenance.
+PERMSET_WILDCARD = "*"
+PERMSET_ADMIN = "admin"
+PERMSET_USER = "user"
+BUILTIN_PERMSETS = (PERMSET_ADMIN, PERMSET_USER)
+# Same slug rules as category keys (src/categories.normalize_category_key).
+_PERMSET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_CATEGORY_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+GENERAL_CATEGORY_KEY = "general"
+
+
+def normalize_permission_set_name(raw: Any) -> str:
+    """Validate + normalize a permission-set name (slug); raises ``ValueError``."""
+    name = str(raw or "").strip().lower()
+    if not _PERMSET_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid permission set name {raw!r}; expected a short slug "
+            "(lowercase letters, digits, '-', '_')."
+        )
+    return name
+
+
+def normalize_permission_categories(raw: Any) -> list[str]:
+    """Coerce a category allowlist into a stored list.
+
+    Accepts ``["*"]`` (all categories), a list of slugs, a comma-separated
+    string, or ``None`` (treated as the wildcard). ``general`` is always
+    allowed as an entry. Raises ``ValueError`` on malformed entries.
+    """
+    if raw is None or raw == "":
+        return [PERMSET_WILDCARD]
+    if isinstance(raw, str):
+        items = [part for part in (chunk.strip().lower() for chunk in raw.split(",")) if part]
+    elif isinstance(raw, (list, tuple, set)):
+        items = [str(part or "").strip().lower() for part in raw]
+        items = [part for part in items if part]
+    else:
+        raise ValueError(f"Invalid category list: {raw!r}")
+    if not items or PERMSET_WILDCARD in items:
+        return [PERMSET_WILDCARD]
+    normalized: list[str] = []
+    for item in items:
+        if item == GENERAL_CATEGORY_KEY:
+            key = item
+        elif not _CATEGORY_KEY_RE.match(item):
+            raise ValueError(
+                f"Invalid category key {item!r}; expected a short slug "
+                "(lowercase letters, digits, '-', '_') or '*'."
+            )
+        else:
+            key = item
+        if key not in normalized:
+            normalized.append(key)
+    return normalized
 
 # Window (seconds) for the sliding rate-limit bucket.
 RATE_WINDOW_SECONDS = 60
@@ -76,9 +152,14 @@ def _parse_iso(value: str | None) -> datetime | None:
         return None
     try:
         # fromisoformat handles the "seconds" precision we write (no tz tricks).
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except (TypeError, ValueError):
         return None
+    # Hand-edited stores may hold tz-less timestamps; comparing those against
+    # the aware _utcnow() raises TypeError, so anchor them to UTC first.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _is_expired(expires_at: str | None) -> bool:
@@ -158,6 +239,29 @@ class AuthResult:
     # Effective per-minute rate limit for this identity (override or default).
     rate_limit_per_minute: int
     is_master: bool
+    # Name of the permission set this identity resolves to. ``role`` is kept in
+    # sync (admin iff the set has the admin flag) for legacy callers.
+    permission_set: str = PERMSET_USER
+    # True for the synthetic loopback identity (127.0.0.1/::1 auto-auth).
+    is_local: bool = False
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == ROLE_ADMIN
+
+
+def local_auth_result(*, default_rate_limit: int) -> AuthResult:
+    """Full-admin identity for loopback clients (never rate-limited or tracked;
+    the middleware returns it before ``authenticate`` is consulted)."""
+    return AuthResult(
+        key_id=LOCAL_KEY_ID,
+        role=ROLE_ADMIN,
+        label=LOCAL_LABEL,
+        rate_limit_per_minute=max(1, int(default_rate_limit)),
+        is_master=False,
+        permission_set=PERMSET_ADMIN,
+        is_local=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -175,16 +279,23 @@ class Rejection:
 
 
 class KeyStore:
-    """JSON-backed registry of API keys, keyed by ``sha256`` hash.
+    """JSON-backed registry of API keys and permission sets, keyed by ``sha256`` hash.
 
     The on-disk shape is::
 
-        {"version": 1, "keys": {
+        {"version": 2,
+         "permission_sets": {
+            "admin": {"name": "admin", "label": "Administrator",
+                      "categories": ["*"], "can_write": true, "admin": true,
+                      "builtin": true, "created_at": "...", "updated_at": "..."},
+            "user": {...}, ...},
+         "keys": {
             "<sha256 hex>": {
                 "label": "alice laptop",
                 "prefix": "rag_…a1b2",
                 "status": "active",
                 "role": "user",
+                "permission_set": "user",
                 "created_at": "2026-07-30T...",
                 "expires_at": null,
                 "rate_limit_per_minute": null,
@@ -265,7 +376,71 @@ class KeyStore:
 
     @staticmethod
     def _empty() -> dict[str, Any]:
-        return {"version": STORE_VERSION, "keys": {}}
+        # A missing store (fresh deployment) still resolves the builtin
+        # permission sets, so key creation works before the first write.
+        return {
+            "version": STORE_VERSION,
+            "keys": {},
+            "permission_sets": KeyStore._default_permission_sets(),
+        }
+
+    @staticmethod
+    def _default_permission_sets() -> dict[str, dict[str, Any]]:
+        """The two builtin sets provisioned into every (fresh or v1) store."""
+        now = _utcnow_iso()
+        return {
+            PERMSET_ADMIN: {
+                "name": PERMSET_ADMIN,
+                "label": "Administrator",
+                "categories": [PERMSET_WILDCARD],
+                "can_write": True,
+                "admin": True,
+                "builtin": True,
+                "created_at": now,
+                "updated_at": now,
+            },
+            PERMSET_USER: {
+                "name": PERMSET_USER,
+                "label": "Standard user",
+                "categories": [PERMSET_WILDCARD],
+                "can_write": True,
+                "admin": False,
+                "builtin": True,
+                "created_at": now,
+                "updated_at": now,
+            },
+        }
+
+    @staticmethod
+    def _normalize_permission_set(name: str, record: Any) -> dict[str, Any] | None:
+        """Coerce one stored set record into shape; ``None`` drops garbage rows."""
+        if not isinstance(record, dict):
+            return None
+        try:
+            name = normalize_permission_set_name(name)
+        except ValueError:
+            return None
+        record = dict(record)
+        record["name"] = name
+        label = str(record.get("label") or "").strip()
+        record["label"] = label or name
+        try:
+            categories = normalize_permission_categories(record.get("categories"))
+        except ValueError:
+            categories = [PERMSET_WILDCARD]
+        record["categories"] = categories
+        record["can_write"] = bool(record.get("can_write", True))
+        record["admin"] = bool(record.get("admin", False))
+        if name == PERMSET_ADMIN:
+            # The builtin admin set can be renamed in label only; its powers
+            # are part of the bootstrap story and must never be edited away.
+            record["admin"] = True
+            record["can_write"] = True
+            record["categories"] = [PERMSET_WILDCARD]
+        record["builtin"] = bool(record.get("builtin", False)) or name in BUILTIN_PERMSETS
+        record.setdefault("created_at", _utcnow_iso())
+        record["updated_at"] = str(record.get("updated_at") or record["created_at"])
+        return record
 
     @staticmethod
     def _normalize(payload: dict[str, Any]) -> dict[str, Any]:
@@ -273,14 +448,42 @@ class KeyStore:
         keys = payload.get("keys")
         if not isinstance(keys, dict):
             payload["keys"] = {}
-        # Ensure each record has the expected fields.
+        # Permission sets: provision builtins into fresh/v1 stores, then coerce
+        # every record (hand-edited or written by an older version).
+        sets = payload.get("permission_sets")
+        if not isinstance(sets, dict):
+            sets = {}
+            payload["permission_sets"] = sets
+        defaults = KeyStore._default_permission_sets()
+        for name, record in defaults.items():
+            sets.setdefault(name, record)
+        for name in list(sets):
+            normalized = KeyStore._normalize_permission_set(name, sets[name])
+            if normalized is None:
+                del sets[name]
+            else:
+                sets[name] = normalized
+        # Ensure each record has the expected fields. The legacy two-value
+        # ``role`` migrates to a permission set once; ``role`` itself stays
+        # stored (derived from the set's admin flag) for older tooling.
         for record in payload["keys"].values():
             if not isinstance(record, dict):
                 continue
             record.setdefault("label", "")
             record.setdefault("prefix", "")
             record.setdefault("status", STATUS_ACTIVE)
-            record.setdefault("role", ROLE_USER)
+            legacy_role = record.get("role", ROLE_USER)
+            record.setdefault(
+                "permission_set",
+                PERMSET_ADMIN if legacy_role == ROLE_ADMIN else PERMSET_USER,
+            )
+            if record["permission_set"] not in sets:
+                # Unknown set (hand-edited store): fail toward the builtin user
+                # set rather than a 401 on every request from a typo.
+                record["permission_set"] = (
+                    PERMSET_ADMIN if legacy_role == ROLE_ADMIN else PERMSET_USER
+                )
+            record["role"] = ROLE_ADMIN if sets[record["permission_set"]].get("admin") else ROLE_USER
             record.setdefault("created_at", _utcnow_iso())
             record.setdefault("expires_at", None)
             record.setdefault("rate_limit_per_minute", None)
@@ -339,6 +542,31 @@ class KeyStore:
             if record.get("prefix") == prefix:
                 return record
         return None
+
+    # -- permission sets: read --------------------------------------------
+    def list_permission_sets(self) -> list[dict[str, Any]]:
+        """All permission set records, builtin sets first, then by name."""
+        sets = self.load().get("permission_sets", {})
+        ordered = sorted(
+            sets.values(),
+            key=lambda record: (0 if record.get("builtin") else 1, str(record.get("name"))),
+        )
+        return [dict(record) for record in ordered]
+
+    def get_permission_set(self, name: str) -> dict[str, Any] | None:
+        record = self.load().get("permission_sets", {}).get(str(name or "").strip().lower())
+        return dict(record) if record else None
+
+    def permission_set_key_counts(self) -> dict[str, int]:
+        """Keys assigned per permission-set name (for delete guarding + UI)."""
+        counts: dict[str, int] = {}
+        for record in self.load().get("keys", {}).values():
+            name = str(
+                record.get("permission_set")
+                or (PERMSET_ADMIN if record.get("role") == ROLE_ADMIN else PERMSET_USER)
+            )
+            counts[name] = counts.get(name, 0) + 1
+        return counts
 
     # -- public mutation API ----------------------------------------------
     def add(self, record: dict[str, Any]) -> None:
@@ -429,6 +657,102 @@ class KeyStore:
                 changed = True
             if changed:
                 self._save_raw(payload)
+
+    # -- permission sets: mutation ----------------------------------------
+    def add_permission_set(
+        self,
+        *,
+        name: str,
+        label: str = "",
+        categories: Any = None,
+        can_write: bool = True,
+        admin: bool = False,
+    ) -> dict[str, Any]:
+        """Create a permission set. Raises ``ValueError`` on bad name/dup."""
+        name = normalize_permission_set_name(name)
+        if name in BUILTIN_PERMSETS:
+            raise ValueError(f"Permission set {name!r} is built in; it always exists.")
+        normalized_categories = normalize_permission_categories(categories)
+        with self._lock_for():
+            payload = self._load_raw()
+            sets = payload["permission_sets"]
+            if name in sets:
+                raise ValueError(f"Permission set {name!r} already exists.")
+            now = _utcnow_iso()
+            record = {
+                "name": name,
+                "label": str(label or "").strip() or name,
+                "categories": normalized_categories,
+                "can_write": bool(can_write),
+                "admin": bool(admin),
+                "builtin": False,
+                "created_at": now,
+                "updated_at": now,
+            }
+            sets[name] = record
+            self._save_raw(payload)
+            return dict(record)
+
+    def update_permission_set(self, name: str, mutate: dict[str, Any]) -> dict[str, Any] | None:
+        """Merge ``mutate`` into a set. Builtins keep their structural flags."""
+        name = normalize_permission_set_name(name)
+        with self._lock_for():
+            payload = self._load_raw()
+            sets = payload["permission_sets"]
+            record = sets.get(name)
+            if record is None:
+                return None
+            merged = {**record, **(mutate or {})}
+            if "categories" in mutate:
+                merged["categories"] = normalize_permission_categories(mutate["categories"])
+            if name == PERMSET_ADMIN:
+                merged["admin"] = True
+                merged["can_write"] = True
+                merged["categories"] = [PERMSET_WILDCARD]
+            merged["name"] = name
+            merged["label"] = str(merged.get("label") or "").strip() or name
+            merged["can_write"] = bool(merged.get("can_write", True))
+            merged["admin"] = bool(merged.get("admin", False))
+            merged["builtin"] = bool(merged.get("builtin", False)) or name in BUILTIN_PERMSETS
+            merged["created_at"] = str(record.get("created_at") or _utcnow_iso())
+            merged["updated_at"] = _utcnow_iso()
+            sets[name] = merged
+            self._sync_key_roles(payload, name)
+            self._save_raw(payload)
+            return dict(merged)
+
+    def delete_permission_set(self, name: str) -> bool:
+        """Delete a custom set. Raises ``ValueError`` for builtins and for sets
+        still assigned to at least one key (deleting those would orphan the
+        keys' authorization); returns False when the set does not exist."""
+        name = normalize_permission_set_name(name)
+        if name in BUILTIN_PERMSETS:
+            raise ValueError(f"Permission set {name!r} is built in and cannot be deleted.")
+        with self._lock_for():
+            payload = self._load_raw()
+            sets = payload["permission_sets"]
+            if name not in sets:
+                return False
+            in_use = any(
+                str(record.get("permission_set")) == name
+                for record in payload["keys"].values()
+            )
+            if in_use:
+                raise ValueError(
+                    f"Permission set {name!r} is still assigned to at least one API key."
+                )
+            del sets[name]
+            self._save_raw(payload)
+            return True
+
+    @staticmethod
+    def _sync_key_roles(payload: dict[str, Any], set_name: str) -> None:
+        """Keep the legacy ``role`` field in step with a set's admin flag."""
+        admin = bool(payload["permission_sets"].get(set_name, {}).get("admin"))
+        role = ROLE_ADMIN if admin else ROLE_USER
+        for record in payload["keys"].values():
+            if isinstance(record, dict) and record.get("permission_set") == set_name:
+                record["role"] = role
 
     def repair_leaked_prefixes(self) -> int:
         """Rewrite legacy prefixes that embedded the whole secret.
@@ -621,30 +945,26 @@ class ApiKeyAuthenticator:
 
         * If ``master_token`` is set and matches (constant-time) -> admin.
         * Else look up ``sha256(supplied)`` in the store; must be active,
-          unexpired, and (optionally) role-tagged.
-        * If neither path applies AND the store has no keys AND no master token
-          is set, the whole system is disabled: returns ``(None, None)`` so the
-          middleware becomes a no-op (fresh-deploy backward compatibility).
+          unexpired, and its permission set must still exist (fail closed).
+          The resulting ``role`` mirrors the set's ``admin`` flag.
+
+        Authentication has no open mode: with no master token and an empty
+        store every supplied credential is simply rejected. Loopback clients
+        are handled before this method (see :func:`local_auth_result`).
 
         On success, the rate limit is enforced and usage is recorded (unless
-        ``track`` is False). Returns ``(AuthResult, None)`` on success,
-        ``(None, Rejection)`` on rejection, or ``(None, None)`` when auth is
-        fully disabled.
+        ``track`` is False). Returns ``(AuthResult, None)`` on success or
+        ``(None, Rejection)`` on rejection.
         """
-        master_active = bool(master_token)
-        store_has_keys = self.store.has_any_key()
-        # Fresh-deploy no-op: nothing to check against.
-        if not master_active and not store_has_keys:
-            return None, None
-
         supplied_str = (supplied or "").strip()
+        if not supplied_str:
+            return None, Rejection(401, "An API key is required. Provide it via the X-API-Token header.")
 
         # Master bypass. compare_digest on str inputs requires ASCII-only text
         # and raises TypeError otherwise (a non-ASCII credential must yield a
         # clean rejection, not a 500), so compare encoded bytes instead.
         if (
-            master_active
-            and supplied_str
+            master_token
             and hmac.compare_digest(supplied_str.encode("utf-8"), master_token.encode("utf-8"))
         ):
             result = AuthResult(
@@ -653,11 +973,9 @@ class ApiKeyAuthenticator:
                 label="master",
                 rate_limit_per_minute=self.default_rate_limit,
                 is_master=True,
+                permission_set=PERMSET_ADMIN,
             )
             return self._enforce_limit_and_track(result, client_ip, track)
-
-        if not supplied_str:
-            return None, Rejection(401, "An API key is required. Provide it via the X-API-Token header.")
 
         key_hash = hash_key(supplied_str)
         record = self.store.get_by_hash(key_hash)
@@ -671,6 +989,12 @@ class ApiKeyAuthenticator:
         if _is_expired(record.get("expires_at")):
             return None, Rejection(401, "This API key has expired.")
 
+        permission_set = self.resolve_permission_set(record)
+        if permission_set is None:
+            # Should be unreachable (normalize reassigns unknown sets), but a
+            # hand-edited store must fail closed, never open.
+            return None, Rejection(401, "This API key's permission set no longer exists.")
+
         per_key_limit = record.get("rate_limit_per_minute")
         try:
             limit = int(per_key_limit) if per_key_limit else self.default_rate_limit
@@ -679,12 +1003,24 @@ class ApiKeyAuthenticator:
 
         result = AuthResult(
             key_id=key_hash,
-            role=record.get("role", ROLE_USER),
+            role=ROLE_ADMIN if permission_set.get("admin") else ROLE_USER,
             label=str(record.get("label", "")),
             rate_limit_per_minute=limit,
             is_master=False,
+            permission_set=str(permission_set.get("name") or PERMSET_USER),
         )
         return self._enforce_limit_and_track(result, client_ip, track)
+
+    def resolve_permission_set(self, record: dict[str, Any]) -> dict[str, Any] | None:
+        """The permission-set record a key record resolves to, or ``None``."""
+        name = str(
+            record.get("permission_set")
+            or (PERMSET_ADMIN if record.get("role") == ROLE_ADMIN else PERMSET_USER)
+        )
+        found = self.store.get_permission_set(name)
+        if found is None:
+            return None
+        return found
 
     def _enforce_limit_and_track(
         self, result: AuthResult, client_ip: str | None, track: bool
@@ -706,21 +1042,35 @@ class ApiKeyAuthenticator:
         expires_at: str | None = None,
         rate_limit_per_minute: int | None = None,
         prefix: str = DEFAULT_KEY_PREFIX,
+        permission_set: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Generate + store a new key. Returns ``(full_key_plaintext, record)``.
 
         The plaintext is returned here and nowhere else -- the store keeps only
-        the hash. Callers (the admin script) print it once.
+        the hash. Callers (the admin script) print it once. ``permission_set``
+        wins over the legacy ``role`` argument; when both are empty the role
+        maps onto the builtin sets (admin -> ``admin``, else ``user``).
         """
-        if role not in VALID_ROLES:
-            raise ValueError(f"Invalid role {role!r}; expected one of {sorted(VALID_ROLES)}")
+        if permission_set:
+            set_record = self.store.get_permission_set(permission_set)
+            if set_record is None:
+                raise ValueError(f"Unknown permission set {permission_set!r}")
+        else:
+            if role not in VALID_ROLES:
+                raise ValueError(f"Invalid role {role!r}; expected one of {sorted(VALID_ROLES)}")
+            set_record = self.store.get_permission_set(
+                PERMSET_ADMIN if role == ROLE_ADMIN else PERMSET_USER
+            )
+            if set_record is None:  # builtins are provisioned on load; belt+braces
+                raise ValueError("Built-in permission sets are missing from the store.")
         full_key = generate_full_key(prefix=prefix)
         key_hash = hash_key(full_key)
         stored = {
             "label": str(label or "").strip(),
             "prefix": make_prefix(full_key, prefix=prefix),
             "status": STATUS_ACTIVE,
-            "role": role,
+            "role": ROLE_ADMIN if set_record.get("admin") else ROLE_USER,
+            "permission_set": str(set_record["name"]),
             "created_at": _utcnow_iso(),
             "expires_at": _parse_expires(expires_at),
             "rate_limit_per_minute": _coerce_optional_int(rate_limit_per_minute),
@@ -733,7 +1083,7 @@ class ApiKeyAuthenticator:
     def rotate_key(self, key_hash: str, *, prefix: str = DEFAULT_KEY_PREFIX) -> tuple[str, dict[str, Any]] | None:
         """Atomically issue a fresh secret for an existing key and drop the old one.
 
-        Preserves label/role/expiry/rate-limit; resets usage and bumps
+        Preserves label/permission set/expiry/rate-limit; resets usage and bumps
         ``created_at`` + ``prefix``. The old secret stops working in the SAME
         single locked write (``KeyStore.rotate_stored``), and the record the
         new secret is derived from is read inside that same lock, so a
@@ -744,6 +1094,17 @@ class ApiKeyAuthenticator:
         """
         generated: list[tuple[str, dict[str, Any]]] = []
 
+        # Resolve the permission set BEFORE the locked write: _build runs inside
+        # rotate_stored's lock, and any KeyStore read there (load() takes the
+        # same non-reentrant threading.Lock) would deadlock the caller.
+        existing = self.store.get_by_hash(key_hash)
+        set_name = str(
+            (existing or {}).get("permission_set")
+            or (PERMSET_ADMIN if (existing or {}).get("role") == ROLE_ADMIN else PERMSET_USER)
+        )
+        set_record = self.store.get_permission_set(set_name)
+        role = ROLE_ADMIN if (set_record or {}).get("admin") else ROLE_USER
+
         def _build(record: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             full_key = generate_full_key(prefix=prefix)
             new_hash = hash_key(full_key)
@@ -751,7 +1112,8 @@ class ApiKeyAuthenticator:
                 "label": str(record.get("label", "")),
                 "prefix": make_prefix(full_key, prefix=prefix),
                 "status": STATUS_ACTIVE,
-                "role": record.get("role", ROLE_USER),
+                "role": role,
+                "permission_set": set_name,
                 "created_at": _utcnow_iso(),
                 "expires_at": record.get("expires_at"),
                 "rate_limit_per_minute": _coerce_optional_int(record.get("rate_limit_per_minute")),
@@ -773,9 +1135,63 @@ class ApiKeyAuthenticator:
         return self.store.update(key_hash, {"status": status})
 
     def set_role(self, key_hash: str, role: str) -> dict[str, Any] | None:
+        """Legacy two-value role assignment; maps onto the builtin sets."""
         if role not in VALID_ROLES:
             raise ValueError(f"Invalid role {role!r}")
-        return self.store.update(key_hash, {"role": role})
+        return self.set_permission_set(
+            key_hash, PERMSET_ADMIN if role == ROLE_ADMIN else PERMSET_USER
+        )
+
+    def set_permission_set(self, key_hash: str, permission_set: str) -> dict[str, Any] | None:
+        """Assign a key to a permission set; raises ``ValueError`` if unknown."""
+        set_record = self.store.get_permission_set(permission_set)
+        if set_record is None:
+            raise ValueError(f"Unknown permission set {permission_set!r}")
+        updated = self.store.update(
+            key_hash,
+            {
+                "permission_set": str(set_record["name"]),
+                "role": ROLE_ADMIN if set_record.get("admin") else ROLE_USER,
+            },
+        )
+        return updated
+
+    # -- permission set management (thin, validated wrappers over the store) -
+    def create_permission_set(
+        self,
+        *,
+        name: str,
+        label: str = "",
+        categories: Any = None,
+        can_write: bool = True,
+        admin: bool = False,
+    ) -> dict[str, Any]:
+        return self.store.add_permission_set(
+            name=name,
+            label=label,
+            categories=categories,
+            can_write=can_write,
+            admin=admin,
+        )
+
+    def update_permission_set(self, name: str, mutate: dict[str, Any]) -> dict[str, Any] | None:
+        if "categories" in (mutate or {}):
+            # Validate before taking the store lock so a bad list raises the
+            # same ValueError the create path raises.
+            normalize_permission_categories(mutate["categories"])
+        return self.store.update_permission_set(name, mutate)
+
+    def delete_permission_set(self, name: str) -> bool:
+        return self.store.delete_permission_set(name)
+
+    def list_permission_sets(self) -> list[dict[str, Any]]:
+        return self.store.list_permission_sets()
+
+    def get_permission_set(self, name: str) -> dict[str, Any] | None:
+        return self.store.get_permission_set(name)
+
+    def permission_set_key_counts(self) -> dict[str, int]:
+        return self.store.permission_set_key_counts()
 
     def delete_key(self, key_hash: str) -> bool:
         return self.store.delete(key_hash)
@@ -816,6 +1232,11 @@ __all__ = [
     "DEFAULT_KEY_PREFIX",
     "MASTER_KEY_ID",
     "MASTER_PREFIX",
+    "LOCAL_KEY_ID",
+    "PERMSET_ADMIN",
+    "PERMSET_USER",
+    "PERMSET_WILDCARD",
+    "BUILTIN_PERMSETS",
     "ROLE_ADMIN",
     "ROLE_USER",
     "STATUS_ACTIVE",
@@ -827,7 +1248,10 @@ __all__ = [
     "generate_full_key",
     "generate_secret",
     "hash_key",
+    "local_auth_result",
     "make_prefix",
+    "normalize_permission_categories",
+    "normalize_permission_set_name",
 ]
 
 
@@ -845,8 +1269,8 @@ def create_default_authenticator(
         # whole secret (see repair_leaked_prefixes). Best-effort: a read-only
         # or corrupt store must not block startup.
         store.repair_leaked_prefixes()
-    except Exception:
-        pass
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        logger.debug("API key prefix repair skipped: %s", exc)
     return ApiKeyAuthenticator(
         store,
         default_rate_limit=default_rate_limit,

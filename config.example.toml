@@ -165,8 +165,10 @@ max_results = 5
 enabled = true
 # Empty = [models].llm_model (gemma4:26b).
 model = ""
-# Documents per classification request.
-batch_size = 20
+# Documents per classification request. Small batches matter: a valid reply
+# is ~40-60 tokens per document, and large batches (20) make local models
+# overrun the per-request timeout with malformed output, dropping every PDF.
+batch_size = 5
 # Decisions below this confidence are dropped and the PDF stays ungrouped.
 min_confidence = 0.6
 # First-page text budget per PDF (filename-only classification when 0).
@@ -258,11 +260,17 @@ query_wait_timeout_seconds = 1800
 
 # Per-user API-key auth, rate limiting, and usage tracking. Layers on top of the
 # single shared [server] api_token above, which stays available as an admin/
-# owner master bypass. Keys are issued offline by scripts/manage_api_keys.py and
-# stored hashed in data/.api_keys.json. INERT BY DEFAULT: until an admin creates
-# at least one key (or sets [server] api_token), all requests pass through open.
+# owner master bypass. Keys are issued from the admin panel or by
+# scripts/manage_api_keys.py and stored hashed in data/.api_keys.json.
+# AUTH IS ALWAYS ON: requests from the local machine (127.0.0.1/::1) are
+# auto-authenticated as full admin; every other client must present the master
+# token or an API key. Each key is assigned a permission set that restricts
+# category access/visibility and carries admin/write flags.
 [api_keys]
 enabled = true
+# Auto-authenticate loopback clients as a full-admin localhost identity. Set to
+# false to force even local callers to present a credential.
+localhost_auto_auth = true
 # Default requests/minute per key (sliding 60s window). Override per key with
 # --rate-limit when issuing a key.
 rate_limit_per_minute = 60
