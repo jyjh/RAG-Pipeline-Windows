@@ -6,6 +6,7 @@ stubs scoped to the test's own context). Run via `python -m pytest tests/browser
 """
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -285,3 +286,174 @@ def test_upload_cancel_button_clears_staged_files(page):
     assert page.eval_on_selector("#fileInput", "el => el.files.length") == 0
     # The batch target resets so the next upload starts fresh.
     assert page.locator("#uploadCategorySelect").input_value() == "general"
+
+
+# ---------------------------------------------------------------------------
+# Engineer usability: templates, follow-up chips, feedback, recent questions,
+# and ask-about-selection. All server calls are stubbed per context.
+# ---------------------------------------------------------------------------
+
+
+def test_question_templates_dialog_fills_composer(page):
+    activate_tab(page, "chat")
+    page.locator("#promptTemplatesButton").click()
+    page.wait_for_selector("#templatesOverlay .template-row", state="visible")
+    assert page.locator("#templatesList .template-row").count() >= 7, "seed templates must be listed"
+
+    # "Compare design options" carries two {{...}} placeholders, so Use first
+    # opens the fill-in form and Insert composes the final prompt.
+    row = page.locator("#templatesList .template-row", has_text="Compare design options")
+    row.get_by_role("button", name="Use").click()
+    fill_form = row.locator(".template-fill")
+    fill_form.wait_for(state="visible")
+    fill_form.get_by_role("textbox").nth(0).fill("steel")
+    fill_form.get_by_role("textbox").nth(1).fill("aluminium")
+    fill_form.get_by_role("button", name="Insert into composer").click()
+
+    value = page.locator("#questionInput").input_value()
+    assert "Compare steel and aluminium" in value, "placeholders must be replaced"
+    assert "{{" not in value
+    assert page.locator("#templatesOverlay").is_hidden(), "dialog closes on insert"
+    # The chat tab is the ask surface; it must be front and the composer focused.
+    assert page.locator("#chat.panel").is_visible()
+    assert page.evaluate("() => document.activeElement && document.activeElement.id") == "questionInput"
+
+
+def test_template_new_and_delete_roundtrip(page):
+    activate_tab(page, "chat")
+    page.locator("#promptTemplatesButton").click()
+    page.wait_for_selector("#templatesOverlay .template-row", state="visible")
+
+    page.locator("#templateNewButton").click()
+    name_input = page.locator("#templateEditorHost .template-name-input")
+    name_input.wait_for(state="visible")
+    name_input.fill("Upright check")
+    page.locator("#templateEditorHost .template-text-input").fill("Summarise upright design guidance.")
+    page.locator("#templateEditorHost").get_by_role("button", name="Save").click()
+
+    saved_row = page.locator("#templatesList .template-row", has_text="Upright check")
+    saved_row.wait_for(state="visible")
+    # Persisted in localStorage, so the dialog reopens with it still present.
+    page.locator("#templatesCloseButton").click()
+    page.locator("#promptTemplatesButton").click()
+    page.wait_for_selector("#templatesOverlay .template-row", state="visible")
+    assert page.locator("#templatesList .template-row", has_text="Upright check").count() == 1
+
+    # Deletion goes through the in-DOM confirmAction dialog (not a native one).
+    saved_row.get_by_role("button", name="Delete").click()
+    confirm = page.locator(".modal-actions button", has_text="Delete")
+    confirm.wait_for(state="visible")
+    confirm.click()
+    page.wait_for_timeout(300)
+    assert page.locator("#templatesList .template-row", has_text="Upright check").count() == 0
+
+
+def _stub_ask_pipeline(page) -> dict:
+    """Stub chat streaming, followups, and feedback; capture POST bodies."""
+    captured: dict = {"feedback": [], "questions": []}
+
+    def fulfill_stream(route):
+        body = (
+            json.dumps(
+                {
+                    "type": "sources",
+                    "sources": [
+                        {
+                            "id": "S1",
+                            "label": "[S1]",
+                            "kind": "local",
+                            "title": "Aero notes",
+                            "source_group": "official",
+                            "snippet": "Drag rises with the square of speed.",
+                        }
+                    ],
+                }
+            )
+            + "\n"
+            + json.dumps({"type": "answer", "text": "Downforce rises roughly with the square of speed [S1]."})
+            + "\n"
+        )
+        route.fulfill(content_type="application/x-ndjson", body=body)
+
+    def capture_feedback(route):
+        captured["feedback"].append(route.request.post_data or "")
+        route.fulfill(content_type="application/json", json={"ok": True, "record": {}})
+
+    page.route(re.compile(r"/api/chat/stream$"), fulfill_stream)
+    page.route(
+        re.compile(r"/api/chat/followups$"),
+        lambda route: route.fulfill(
+            content_type="application/json",
+            json={"suggestions": ["How does wing angle change the coefficient?", "What corner speed does the library assume?"]},
+        ),
+    )
+    page.route(re.compile(r"/api/feedback$"), capture_feedback)
+    return captured
+
+
+def test_followup_chips_and_feedback_flow(page):
+    captured = _stub_ask_pipeline(page)
+    activate_tab(page, "chat")
+    page.locator("#questionInput").fill("How does downforce scale with speed?")
+    page.locator("#sendButton").click()
+
+    # Follow-ups arrive after the answer and render as clickable chips.
+    page.wait_for_selector(".followup-chip", state="visible")
+    assert page.locator(".followup-chip").count() == 2
+
+    # Feedback: a 👍 records the rating and marks the message voted.
+    page.locator(".feedback-button", has_text="Helpful").first.click()
+    page.wait_for_selector(".feedback-bar.feedback-voted", state="visible")
+    page.wait_for_timeout(300)
+    assert captured["feedback"], "the vote must reach POST /api/feedback"
+    assert json.loads(captured["feedback"][0])["rating"] == "up"
+
+    # A follow-up chip asks the next question through the same pipeline.
+    page.locator(".followup-chip").first.click()
+    page.wait_for_timeout(600)
+    user_messages = page.locator("#chatMessages .message[data-role='user']")
+    assert user_messages.count() == 2
+    assert "wing angle" in user_messages.nth(1).inner_text()
+
+
+def test_recent_questions_render_and_rerun(page):
+    _stub_ask_pipeline(page)
+    page.evaluate(
+        "qs => localStorage.setItem('rag.recentQuestions.v1', JSON.stringify(qs))",
+        ["What battery should we run?", "How stiff should the uprights be?"],
+    )
+    page.reload()
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_timeout(400)
+    activate_tab(page, "chat")
+
+    recent = page.locator(".chat-recent .chat-recent-suggestion")
+    assert recent.count() == 2
+
+    recent.first.click()
+    page.wait_for_timeout(600)
+    # Clicking re-runs the question through the (stubbed) ask pipeline.
+    assert page.locator("#chatMessages .message[data-role='user']").count() == 1
+    assert page.locator(".assistant-message").count() == 1
+
+
+def test_ask_about_selection_quotes_excerpt_into_composer(page):
+    _seed_chat_with_saved_answer(page)
+    assert page.locator("#askSelectionPill").is_hidden()
+
+    # Select the saved answer's text (triple-click selects the paragraph).
+    # The answer stable sits in the body; the thinking stable above it stays
+    # empty/hidden for a seeded answer without reasoning text.
+    paragraph = page.locator("#chatMessages .assistant-message .body .stream-stable").first
+    paragraph.click(click_count=3)
+
+    pill = page.locator("#askSelectionPill")
+    pill.wait_for(state="visible")
+    pill.click()
+
+    value = page.locator("#questionInput").input_value()
+    assert "selected excerpt" in value
+    assert "lift [S5] and drag [S7]." in value
+    assert page.locator("#askSelectionPill").is_hidden()
+    # The selection is quoted; the caret sits at the end ready for the question.
+    page.wait_for_function("() => document.activeElement && document.activeElement.id === 'questionInput'")

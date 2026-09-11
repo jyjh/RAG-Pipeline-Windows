@@ -59,6 +59,12 @@ from src.coerce import as_bool, as_optional_int, as_positive_float, as_positive_
 from src.disk_space import DiskSpaceError, check_disk_space, estimate_dir_bytes
 from src.file_lock import acquire_index_lock
 from src.job_logging import log_event, setup_job_logging
+from src.system_logging import (
+    _TokenRedactingLogFilter,
+    log_access_event,
+    redact_token_query,
+    setup_system_logging,
+)
 from src.defaults import (
     DEFAULT_ASSET_DIR,
     DEFAULT_ASSET_TRIGGERS,
@@ -73,6 +79,7 @@ from src.defaults import (
     DEFAULT_FORMULA_ENRICHMENT,
     DEFAULT_LLM_MODEL,
     DEFAULT_LLM_TIMEOUT,
+    DEFAULT_LOG_LEVEL,
     DEFAULT_NUM_PREDICT,
     DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL,
     DEFAULT_OLLAMA_KEEP_ALIVE,
@@ -339,6 +346,8 @@ STAGING_DIR = DATA_DIR / ".upload_queue"
 PDF_REGISTRY_PATH = DATA_DIR / ".pdf_upload_registry.json"
 JOB_LEDGER_PATH = DATA_DIR / ".job_ledger.json"
 DOCUMENT_TRUST_PATH = DATA_DIR / ".document_trust.json"
+# Engineer answer-feedback log (one JSON line per 👍/👎 rating; see /api/feedback).
+FEEDBACK_LOG_PATH = DATA_DIR / "feedback.jsonl"
 
 
 def _contained_client_path(raw_path: Any, default: str) -> str:
@@ -699,6 +708,24 @@ def _load_api_keys_config(config_path: Path | None = None) -> dict[str, Any]:
     }
 
 
+def _load_logging_config(config_path: Path | None = None) -> dict[str, Any]:
+    """Load the ``[logging]`` section (system log + per-request access log).
+
+    An empty file/access_file string disables that stream. An unrecognized
+    level falls back to INFO rather than failing startup -- a typo in a log
+    level must never keep the UI from booting.
+    """
+    cfg = _pipeline_config(config_path).logging
+    level = str(cfg.level or DEFAULT_LOG_LEVEL).strip().upper()
+    if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+        level = DEFAULT_LOG_LEVEL
+    return {
+        "level": level,
+        "file": str(cfg.file or "").strip(),
+        "access_file": str(cfg.access_file or "").strip(),
+    }
+
+
 def _load_chat_config(config_path: Path | None = None) -> dict[str, Any]:
     cfg = _pipeline_config(config_path)
     chat = cfg.chat
@@ -820,6 +847,21 @@ _local_rag_module._ACTIVE_OLLAMA_KEEP_ALIVE = CHAT_CONFIG["ollama_keep_alive"]
 INGESTION_CONFIG = _load_ingestion_config()
 UPLOADS_CONFIG = _load_uploads_config()
 INDEXING_CONFIG = _load_indexing_config()
+LOGGING_SETTINGS = _load_logging_config()
+# Persist application logs (timestamped lines; per-request client IPs in the
+# access log) from the moment the module loads: without this, application
+# log records under the server go nowhere -- the root logger has no handlers
+# and uvicorn only shows its own startup/access lines on the console. Runs at
+# import so config-parse warnings and import-time notices are captured too.
+# Best-effort: a read-only workspace degrades to console-only logging.
+try:
+    setup_system_logging(
+        level=LOGGING_SETTINGS["level"],
+        file=LOGGING_SETTINGS["file"],
+        access_file=LOGGING_SETTINGS["access_file"],
+    )
+except OSError:
+    pass
 
 # Embedding model for query-side defaults: the configured model (matching the
 # built index), not the repo default -- a mismatch silently degrades every
@@ -5089,10 +5131,21 @@ async def lifespan(app: FastAPI):
     # Configure a persistent server log so background-worker errors and
     # startup recovery are diagnosable after a crash (the in-memory job-log
     # tail is lost on restart). Best-effort: a read-only workspace won't fail.
+    # When [logging].file already points here, setup_job_logging reuses the
+    # system logger's rotating handler for the same file instead of opening a
+    # second one.
     try:
         setup_job_logging(ROOT_DIR / "logs" / "server.log")
     except OSError:
         pass
+    logger.info(
+        "Web server starting: pid=%d host=%s port=%s data_dir=%s db_dir=%s",
+        os.getpid(),
+        SERVER_CONFIG["host"],
+        SERVER_CONFIG["port"],
+        DATA_DIR,
+        DB_DIR,
+    )
     # Recover crash-orphaned publish components BEFORE the GC sweep and
     # before job recovery re-enqueues interrupted builds, so the repair can
     # never race a live one.
@@ -5164,6 +5217,7 @@ async def lifespan(app: FastAPI):
             authenticator.usage.flush()
         except Exception:
             pass
+    logger.info("Web server stopped cleanly: pid=%d", os.getpid())
 
 
 app = FastAPI(title="Local FSAE RAG Pipeline", lifespan=lifespan)
@@ -5231,7 +5285,7 @@ _NON_MUTATING_POST_PATHS = {"/api/render"}
 # GET routes that exfiltrate bulk data or server internals and so are gated.
 # Most GETs (health, update status) stay open; these stream the entire index or
 # expose filesystem paths/config and are full-corpus or server-recon surfaces.
-_SENSITIVE_GET_PATHS = {"/api/index/stream", "/api/metrics", "/api/metrics/history"}
+_SENSITIVE_GET_PATHS = {"/api/index/stream", "/api/metrics", "/api/metrics/history", "/api/feedback"}
 
 # Prefix-gated GETs: these routes expose the corpus (full chunk text, PDF
 # registry, job history). They are fetch-based, so the UI carries its
@@ -5503,6 +5557,55 @@ async def _enforce_request_body_limit(request: Request, call_next):
             status_code=413,
             content={"detail": f"Request body exceeds limit ({total} > {max_bytes} bytes)."},
         )
+    return response
+
+
+# Structured access-log middleware.
+#
+# Registered LAST, so it is the OUTERMOST middleware and observes the final
+# status even when an inner layer short-circuits the request (auth 401/403/
+# 429, body-limit 413). One JSON line per request lands in the access log
+# ([logging] access_file, default logs/access.log) carrying the client IP --
+# X-Forwarded-For honored only from loopback peers, mirroring usage
+# attribution -- plus method, path, the token-redacted query string, status,
+# duration, user agent, and the API-key identity when the request carried
+# one. Streaming endpoints log when response HEADERS are produced (call_next
+# returns before the body streams), so long chat streams report
+# time-to-first-byte rather than total generation time.
+ACCESS_LOG_ENABLED = bool(LOGGING_SETTINGS["access_file"])
+
+
+def _emit_access_record(request: Request, status: int, elapsed_s: float) -> None:
+    identity = getattr(request.state, "api_identity", None)
+    payload = {
+        "ip": _client_ip(request),
+        "method": request.method,
+        "path": request.url.path,
+        "query": redact_token_query(request.url.query),
+        "status": status,
+        "duration_ms": round(elapsed_s * 1000.0, 1),
+        "user_agent": (request.headers.get("user-agent") or "")[:200],
+        "key_id": getattr(identity, "key_id", None),
+        "role": getattr(identity, "role", None),
+    }
+    try:
+        log_access_event(payload)
+    except Exception:  # noqa: BLE001 - access logging must never break a request
+        pass
+
+
+@app.middleware("http")
+async def _access_log_request(request: Request, call_next):
+    # Read dynamically so tests (and future config reloads) can flip it.
+    if not globals().get("ACCESS_LOG_ENABLED", True):
+        return await call_next(request)
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        _emit_access_record(request, 500, time.perf_counter() - started)
+        raise
+    _emit_access_record(request, response.status_code, time.perf_counter() - started)
     return response
 
 
@@ -8811,36 +8914,275 @@ def chat_stream(request: Request, payload: ChatRequest):
     return StreamingResponse(generate(), media_type="application/x-ndjson; charset=utf-8")
 
 
-class _TokenRedactingLogFilter(logging.Filter):
-    """Redact ``token=<secret>`` query strings from access-log records.
+# -- Engineer usability: follow-up suggestions + answer feedback --------------
+#
+# Two small endpoints that keep engineers iterating on a design question:
+#   * /api/chat/followups turns a finished Q/A into 3 clickable follow-up
+#     questions (one cheap non-streaming LLM call, grounded in the answer).
+#   * /api/feedback records per-answer 👍/👎 ratings (plus an optional note)
+#     to data/feedback.jsonl so the team can see which answers held up.
 
-    ``?token=`` is a documented credential transport for GET consumers that
-    cannot set headers; uvicorn's default access logging prints the full
-    request line, which would write the secret into the console/log capture.
+FOLLOWUP_SUGGESTION_COUNT = 3
+FOLLOWUP_MAX_ANSWER_CHARS = 6000
+FOLLOWUP_MAX_TITLE_CHARS = 120
+
+_feedback_write_lock = threading.Lock()
+
+
+class FollowupRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+    answer: str = Field(min_length=1, max_length=40_000)
+    history: list[ChatTurn] = Field(default_factory=list)
+    source_titles: list[str] = Field(default_factory=list, max_length=12)
+    llm_model: str = DEFAULT_LLM_MODEL
+
+
+class FeedbackRequest(BaseModel):
+    rating: str = Field(pattern="^(up|down)$")
+    question: str = Field(min_length=1, max_length=4000)
+    answer_excerpt: str = Field(default="", max_length=8000)
+    note: str = Field(default="", max_length=2000)
+    chat_id: str = Field(default="", max_length=64)
+    message_id: str = Field(default="", max_length=64)
+    sources_count: int = Field(default=0, ge=0, le=10_000)
+    llm_model: str = Field(default="", max_length=120)
+
+
+def _parse_followup_suggestions(raw: Any) -> list[str]:
+    """Extract up to N clean question strings from a model reply.
+
+    The model is asked for a JSON array; fenced or prose-wrapped arrays are
+    recovered with a bracket scan, and a numbered/bulleted line scan is the
+    fallback. Every suggestion is whitespace-normalised, length-bounded, and
+    de-duplicated (case-insensitive).
     """
-
-    _TOKEN_PATTERN = re.compile(r"([?&])token=[^&\s]+")
-
-    def filter(self, record: logging.LogRecord) -> bool:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    candidates: list[str] = []
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match:
         try:
-            if record.args:
-                record.args = tuple(
-                    self._TOKEN_PATTERN.sub(r"\1token=***", str(arg)) if isinstance(arg, str) else arg
-                    for arg in record.args
-                )
-            message = record.getMessage()
-            if "token=" in message:
-                record.msg = self._TOKEN_PATTERN.sub(r"\1token=***", message)
-                record.args = None
-        except Exception:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, list):
+                candidates = [str(item) for item in parsed]
+        except json.JSONDecodeError:
             pass
-        return True
+    if not candidates:
+        for line in text.splitlines():
+            marker = re.match(r"\s*(?:\d+[.)]|[-*•])\s+", line or "")
+            stripped = re.sub(r"^\s*(?:\d+[.)]|[-*•])\s*", "", line or "").strip().strip('"').strip()
+            if not stripped:
+                continue
+            # A bare prose reply (a preamble like "Here are three ideas:")
+            # is not suggestions; require a list marker or a question mark.
+            if not (marker or stripped.endswith("?")):
+                continue
+            candidates.append(stripped)
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        suggestion = re.sub(r"\s+", " ", str(item)).strip()
+        if len(suggestion) < 8 or len(suggestion) > 200:
+            continue
+        key = suggestion.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(suggestion)
+        if len(cleaned) == FOLLOWUP_SUGGESTION_COUNT:
+            break
+    return cleaned
+
+
+def _generate_followup_suggestions(
+    *,
+    question: str,
+    answer: str,
+    history: list[dict[str, str]],
+    source_titles: list[str],
+    model: str,
+) -> list[str]:
+    from src.local_rag import _llm_chat, _ollama_response_content
+
+    lines: list[str] = []
+    if history:
+        lines.append("Recent conversation:")
+        for turn in history[-4:]:
+            speaker = "Engineer" if turn["role"] == "user" else "Assistant"
+            lines.append(f"{speaker}: {turn['content'][:500]}")
+        lines.append("")
+    lines.append(f"Question the engineer asked: {question}")
+    lines.append("")
+    lines.append("Answer that was given:")
+    lines.append(answer[:FOLLOWUP_MAX_ANSWER_CHARS])
+    if source_titles:
+        lines.append("")
+        lines.append("Cited sources: " + "; ".join(source_titles))
+    lines.extend(
+        [
+            "",
+            f"Suggest exactly {FOLLOWUP_SUGGESTION_COUNT} follow-up questions this engineer would most likely ask next.",
+            "Each suggestion must be one self-contained sentence under 25 words that digs deeper into the design",
+            "topic — concrete numbers, trade-offs, rules constraints, failure modes, or how to apply the finding.",
+            'Respond with ONLY a JSON array of strings, e.g. ["...", "...", "..."].',
+        ]
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You generate concise follow-up questions for a design engineer working with a local technical "
+                "document library. Ground every suggestion in the question, the answer, and the cited sources; "
+                "never invent facts."
+            ),
+        },
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+    response = _llm_chat(
+        model=model,
+        messages=messages,
+        options={"temperature": 0.5, "num_predict": 400},
+        stream=False,
+        timeout=CHAT_CONFIG["llm_timeout"],
+    )
+    return _parse_followup_suggestions(_ollama_response_content(response))
+
+
+@app.post("/api/chat/followups")
+def chat_followups(payload: FollowupRequest):
+    question = payload.question.strip()
+    answer = payload.answer.strip()
+    if not question or not answer:
+        raise HTTPException(status_code=400, detail="Question and answer are required.")
+    history = _sanitize_chat_history(payload.history)
+    titles: list[str] = []
+    for raw_title in payload.source_titles:
+        title = str(raw_title or "").strip()[:FOLLOWUP_MAX_TITLE_CHARS]
+        if title and title not in titles:
+            titles.append(title)
+        if len(titles) == 8:
+            break
+    model = _safe_client_model(payload.llm_model, fallback=CHAT_CONFIG["llm_model"])
+    # Count the LLM call as a query so the index-job drain watchdog sees it,
+    # exactly like /api/chat/stream.
+    job_queue.begin_query()
+    try:
+        suggestions = _generate_followup_suggestions(
+            question=question,
+            answer=answer,
+            history=history,
+            source_titles=titles,
+            model=model,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Follow-up suggestions unavailable: {exc}"
+        ) from exc
+    finally:
+        job_queue.finish_query()
+    return {"suggestions": suggestions}
+
+
+def _read_feedback_records() -> list[dict[str, Any]]:
+    if not FEEDBACK_LOG_PATH.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    with FEEDBACK_LOG_PATH.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+    return records
+
+
+@app.post("/api/feedback")
+def submit_answer_feedback(request: Request, payload: FeedbackRequest):
+    identity = getattr(request.state, "api_identity", None)
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "rating": payload.rating,
+        "question": payload.question.strip()[:4000],
+        "answer_excerpt": payload.answer_excerpt.strip()[:8000],
+        "note": payload.note.strip()[:2000],
+        "chat_id": str(payload.chat_id or "").strip()[:64],
+        "message_id": str(payload.message_id or "").strip()[:64],
+        "sources_count": int(payload.sources_count or 0),
+        "llm_model": str(payload.llm_model or "").strip()[:120] or str(CHAT_CONFIG["llm_model"]),
+        "identity": str(getattr(identity, "label", "") or "") or (
+            "local" if getattr(identity, "is_local", False) else ""
+        ),
+    }
+    FEEDBACK_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    with _feedback_write_lock:
+        with FEEDBACK_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+    return {"ok": True, "record": record}
+
+
+@app.get("/api/feedback")
+def list_answer_feedback(offset: int = 0, limit: int = 50):
+    records = _read_feedback_records()
+    total = len(records)
+    ups = sum(1 for record in records if record.get("rating") == "up")
+    limit = max(1, min(int(limit), 200))
+    offset = max(0, int(offset))
+    newest_first = list(reversed(records))
+    return {
+        "total": total,
+        "up": ups,
+        "down": total - ups,
+        "offset": offset,
+        "limit": limit,
+        "records": newest_first[offset : offset + limit],
+    }
 
 
 def _install_access_log_token_redaction() -> None:
     access_logger = logging.getLogger("uvicorn.access")
     if not any(isinstance(existing, _TokenRedactingLogFilter) for existing in access_logger.filters):
         access_logger.addFilter(_TokenRedactingLogFilter())
+
+
+def _uvicorn_log_config() -> dict[str, Any]:
+    """Uvicorn logging config that routes uvicorn's records into the system log.
+
+    Uvicorn's default log config installs its own console handlers on its
+    loggers, which keeps its startup/error/access records out of the system
+    log file and out of the shared timestamped format. Emptying the handlers
+    and setting propagate=True sends those records through the root logger
+    (system file + console via setup_system_logging); the token-redaction
+    filter on ``uvicorn.access`` applies to the records before propagation,
+    so ``?token=`` secrets still never reach disk.
+    """
+    import copy
+
+    try:
+        import uvicorn.config
+    except ImportError:
+        # ``uvicorn`` resolved to a stub without a ``config`` submodule (the
+        # run_server regression test fakes the module). Returning None makes
+        # uvicorn.run skip logging configuration entirely -- harmless under
+        # the fake, and unreachable with the real package.
+        return None
+
+    config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    config["disable_existing_loggers"] = False
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        entry = config["loggers"].get(name)
+        if entry is not None:
+            entry["handlers"] = []
+            entry["propagate"] = True
+    return config
 
 
 def run_server() -> None:
@@ -8853,6 +9195,7 @@ def run_server() -> None:
         "src.web_app:app",
         host=str(SERVER_CONFIG["host"]),
         port=int(SERVER_CONFIG["port"]),
+        log_config=_uvicorn_log_config(),
     )
 
 

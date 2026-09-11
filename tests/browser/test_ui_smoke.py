@@ -24,7 +24,7 @@ def test_app_boots_with_all_modules_and_tabs(page):
     )
     assert set(modules) == {
         "core.js", "status.js", "upload.js", "categories.js", "library.js",
-        "review.js", "chat.js", "admin.js", "shell.js",
+        "review.js", "chat.js", "admin.js", "shell.js", "usability.js",
     }
     for target in ["upload", "library", "index", "chat", "admin", "guide"]:
         activate_tab(page, target)

@@ -2130,6 +2130,10 @@ def test_retrieval_bm25_promotes_lexical_match_over_dense_only():
     engine.context_token_fraction = 0.6
     engine.reliability_registry = None
     engine._reliability_details = lambda record: {"key": "ungrouped", "weight": 1.0}
+    # Category weighting (read during retrieval since per-category indexes
+    # landed); this fake bypasses __init__, so seed the neutral default.
+    engine.category_weights = {}
+    engine.default_category_key = "general"
 
     results = engine._retrieve("viscous damping")
 

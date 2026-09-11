@@ -337,12 +337,31 @@ health_poll_interval_ms = 60000
 jobs_poll_interval_ms = 60000
 ```
 
+### Logging
+
+Application logs are persisted to `logs/server.log` (rotating at 10 MiB, 5
+backups) — every application, uvicorn, and library record with a timestamp,
+level, and logger name, plus server start/stop lines. Every HTTP request is
+additionally written as one structured JSON line to `logs/access.log` with
+the client IP (`X-Forwarded-For` is honored only from loopback reverse
+proxies), method, path, `?token=`-redacted query string, status code,
+duration, user agent, and the API-key identity when one was used. Both are
+configured under `[logging]` in `config.toml` (`level`, `file`,
+`access_file`; an empty path disables that stream). Per-run ingestion/index
+jobs keep writing their own `logs/job_<mode>_<pid>.log` files.
+
 Open `http://127.0.0.1:8000`. The UI is a dependency-free ES-module app served from `web/` (`web/app.js` entry + `web/js/*` modules; no build step). It is organized as a collapsible sidebar with six views:
 
 - **Documents** — drag-and-drop PDF/zip upload with per-file source-group and category staging, plus the jobs table with live progress bars, rate/ETA, cancellation, and completion toasts; a global banner shows the active job from any tab.
 - **Library** — the PDF trust/review table: server-side search plus group/trust/category facet filters, sortable columns, bulk tag/move/re-run/delete (destructive bulk uses typed confirmation), quality and trust badges with a legend, per-row actions (approve, flag stale with an inline note, re-run, re-index, delete), and an in-app preview that shows the original PDF or the extracted Markdown text.
 - **Review** — index browsing with a Chunks view (search, pagination, vector-search diagnostics, in-place record editing with Markdown preview) and a Documents view (one row per source document, expandable to that document's records).
 - **Ask** — multi-turn chat: the last exchanges are sent with each question and the retrieval planner resolves follow-up references against them; answer modes (Precise/Balanced/Deep) map to sampler presets; answers stream with Markdown/LaTeX rendering, a Sources panel (group badges, scores, page links, extracted-image lightbox, stale-source warnings, per-answer settings/duration meta), copy/regenerate/edit-and-resend actions, and a saved-chat sidebar with search, pin, rename-in-place, and Markdown export. Chats persist in the browser's localStorage.
+- **Engineer usability features** (Ask tab and beyond):
+  - **Follow-up suggestions** — after each answer the server proposes three deeper questions (`POST /api/chat/followups`, one cheap non-streaming LLM call grounded in the answer and its cited sources) rendered as one-click chips under the answer and persisted with the chat. Failures degrade silently to no chips.
+  - **Answer feedback** — every answer carries 👍 Helpful / 👎 Not helpful controls; a 👎 can attach an optional note. Ratings are appended to `data/feedback.jsonl` (`POST /api/feedback`) with a timestamp, the question, an answer excerpt, and the submitter's API-key identity; `GET /api/feedback` returns tallies and the newest records (auth-gated like other sensitive GETs) for team review.
+  - **Question templates** — the composer's Templates button opens a library of reusable question scaffolds (compare options, rules check, requirements digest, failure modes, specs extraction, material selection…) with `{{Placeholder}}` fill-in fields. Templates are editable and stored per browser (`rag.promptTemplates.v1`).
+  - **Recent questions** — the empty chat state lists the last questions asked in that browser for one-click re-runs.
+  - **Ask about this** — selecting text in any answer, source panel, Review row, or Library extracted-text preview raises an "Ask about this" pill that quotes the excerpt into the composer with its source named (PDF-page selections inside the embedded viewer are not visible to the app — copy them manually).
 - **Admin** — ops dashboard (index/queue/LLM/embedding/disk/category cards with 24 h trend sparklines), security-posture and startup-repair banners, permission-set management (category allowlists plus write/admin flags per set) and API key management (issue with a permission set, reassign, disable, delete; plaintext shown once), update manager (branch, current vs. target commit, blocking reasons), and guarded maintenance (backup/restore, compact, rebuild vector index, full re-ingest/rebuild with typed confirmation).
 - **Guide** — new-user walkthrough (replayable from Settings).
 

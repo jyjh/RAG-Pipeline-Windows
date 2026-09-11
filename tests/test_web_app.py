@@ -2007,7 +2007,7 @@ def test_startup_recovery_resumes_saved_upload(workspace_tmp):
     registry.register_queued(
         job_id="job-saved",
         files=[file_upload],
-        options={"ocr_backend": "tesseract_cli", "embedding_model": "persisted-embed"},
+        options={"ocr_backend": "tesseract_cli", "embedding_model": "stale-embed"},
     )
     registry.mark_job_status(job_id="job-saved", files=[file_upload], status="saving_uploads")
 
@@ -2034,9 +2034,12 @@ def test_startup_recovery_resumes_saved_upload(workspace_tmp):
     entry = web_app.PdfRegistry(registry_path).load()["pdfs"]["hash-saved"]
     assert recovered["recovered"] == 1
     assert recovered["jobs"][0]["resume_status"] == "saving_uploads"
+    # Non-embedding options survive recovery verbatim; a stale embedding
+    # model is re-resolved from the current config (see
+    # test_startup_recovery_drops_stale_embedding_model).
     assert calls == [
         ("ingest", upload_dir, "tesseract_cli"),
-        ("index", processed_dir, "persisted-embed"),
+        ("index", processed_dir, web_app.CONFIGURED_EMBEDDING_MODEL),
     ]
     assert entry["status"] == "indexed"
     assert entry["upload_path"] == str(upload_path)
@@ -2062,7 +2065,7 @@ def test_startup_recovery_resumes_ingested_upload_at_indexing(workspace_tmp):
     registry.register_queued(
         job_id="job-ingested",
         files=[file_upload],
-        options={"embedding_model": "persisted-embed"},
+        options={"embedding_model": "stale-embed"},
     )
     registry.mark_job_status(job_id="job-ingested", files=[file_upload], status="ingested")
 
@@ -2087,8 +2090,94 @@ def test_startup_recovery_resumes_ingested_upload_at_indexing(workspace_tmp):
     entry = web_app.PdfRegistry(registry_path).load()["pdfs"]["hash-ingested"]
     assert recovered["recovered"] == 1
     assert recovered["jobs"][0]["resume_status"] == "ingested"
-    assert calls == [("index", processed_dir, db_dir, "persisted-embed")]
+    assert calls == [
+        ("index", processed_dir, db_dir, web_app.CONFIGURED_EMBEDDING_MODEL)
+    ]
     assert entry["status"] == "indexed"
+
+
+def test_startup_recovery_drops_stale_embedding_model(workspace_tmp):
+    """Recovered uploads re-resolve a stale embedding model from the config.
+
+    An upload captures the embedding model configured when it was accepted.
+    If the config later moves to a different model, keeping the stale tag in
+    the recovered job makes its indexing phase preflight/embed with a model
+    the live index no longer uses; the job then fails while staying
+    recoverable and re-queues on every server boot. A captured model that
+    still matches the config must survive recovery untouched.
+    """
+    calls = []
+    registry_path = workspace_tmp / "registry.json"
+    upload_root = workspace_tmp / "uploads"
+    processed_dir = workspace_tmp / "processed"
+    db_dir = workspace_tmp / "db"
+    processed_dir.mkdir()
+    stale_path = processed_dir / "stale.md"
+    stale_path.write_text("stale markdown", encoding="utf-8")
+    fresh_path = processed_dir / "fresh.md"
+    fresh_path.write_text("fresh markdown", encoding="utf-8")
+    registry = web_app.PdfRegistry(registry_path)
+    registry.register_queued(
+        job_id="job-stale",
+        files=[{
+            "filename": "stale.pdf",
+            "hash": "hash-stale",
+            "staging_path": "",
+            "upload_path": "",
+            "processed_markdown_path": str(stale_path),
+        }],
+        options={"embedding_model": "nomic-embed-text"},
+    )
+    registry.register_queued(
+        job_id="job-fresh",
+        files=[{
+            "filename": "fresh.pdf",
+            "hash": "hash-fresh",
+            "staging_path": "",
+            "upload_path": "",
+            "processed_markdown_path": str(fresh_path),
+        }],
+        options={"embedding_model": web_app.CONFIGURED_EMBEDDING_MODEL},
+    )
+    registry.mark_job_status(
+        job_id="job-stale",
+        files=[{"filename": "stale.pdf", "hash": "hash-stale"}],
+        status="ingested",
+    )
+    registry.mark_job_status(
+        job_id="job-fresh",
+        files=[{"filename": "fresh.pdf", "hash": "hash-fresh"}],
+        status="ingested",
+    )
+
+    def fake_index(md_dir, db_dir_arg, **kwargs):
+        calls.append(kwargs["embedding_model"])
+
+    queue = web_app.RagJobQueue(
+        upload_root=upload_root,
+        processed_dir=processed_dir,
+        db_dir=db_dir,
+        registry_path=registry_path,
+        run_indexing_func=fake_index,
+    )
+
+    recovered = queue.recover_pending_uploads()
+    _wait_for(lambda: queue.get_job("job-stale")["status"] == "done")
+    _wait_for(lambda: queue.get_job("job-fresh")["status"] == "done")
+
+    recovered_options = {
+        job["id"]: job.get("options") or {} for job in recovered["jobs"]
+    }
+    assert "embedding_model" not in recovered_options["job-stale"]
+    assert (
+        recovered_options["job-fresh"].get("embedding_model")
+        == web_app.CONFIGURED_EMBEDDING_MODEL
+    )
+    # Both jobs index with the model the live config resolves to.
+    assert calls == [
+        web_app.CONFIGURED_EMBEDDING_MODEL,
+        web_app.CONFIGURED_EMBEDDING_MODEL,
+    ]
 
 
 def test_upload_endpoint_enqueues_pdf_batch(monkeypatch, workspace_tmp):

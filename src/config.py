@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from src.defaults import (
+    DEFAULT_ACCESS_LOG_FILE,
     DEFAULT_AUTO_TAG_BATCH_SIZE,
     DEFAULT_AUTO_TAG_EXCERPT_CHARS,
     DEFAULT_AUTO_TAG_MAX_ITEMS_PER_RUN,
@@ -40,6 +41,8 @@ from src.defaults import (
     DEFAULT_LLM_MODEL,
     DEFAULT_LLM_TIMEOUT,
     DEFAULT_LOCAL_LLM_MODEL,
+    DEFAULT_LOG_FILE,
+    DEFAULT_LOG_LEVEL,
     DEFAULT_NUM_PREDICT,
     DEFAULT_OCR_BACKEND,
     DEFAULT_OCR_BITMAP_AREA_THRESHOLD,
@@ -442,9 +445,33 @@ class BackupsConfig:
 
 
 @dataclass
+class LoggingConfig:
+    """``[logging]`` section: persisted system + request logging.
+
+    The system log collects every application/uvicorn/library record with a
+    timestamp, level, and logger name; the access log collects one
+    structured JSON line per HTTP request (client IP, method, path with
+    ``token=`` redacted, status, duration, user agent, API-key identity).
+    Paths are relative to the workspace root; an empty string disables that
+    stream. Both files rotate at 10 MiB with 5 backups. The job logger keeps
+    writing per-run ``logs/job_*.log`` files regardless of this section.
+    """
+
+    # Root-logger level: DEBUG | INFO | WARNING | ERROR.
+    level: str = DEFAULT_LOG_LEVEL
+    # System log file. Defaults to the same file the job logger uses on the
+    # server, so startup/job/application records share one timeline (they
+    # share one rotating handler, which keeps rotation consistent).
+    file: str = DEFAULT_LOG_FILE
+    # Per-request access log. Empty disables request logging.
+    access_file: str = DEFAULT_ACCESS_LOG_FILE
+
+
+@dataclass
 class PipelineConfig:
     paths: PathsConfig = field(default_factory=PathsConfig)
     backups: BackupsConfig = field(default_factory=BackupsConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
     ingestion: IngestionConfig = field(default_factory=IngestionConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-import logging.handlers
 import os
 import time
 from datetime import datetime, timezone
@@ -19,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from src.atomic_io import write_json_atomic
+from src.system_logging import shared_file_handler
 
 
 # Formatter tag appended to every record so log scrapers can tell structured
@@ -26,10 +26,10 @@ from src.atomic_io import write_json_atomic
 JOB_LOGGER_NAME = "local_rag.job"
 JOB_EVENT_MARKER = "JOB_EVENT"
 
-# Rotate job/server logs so a multi-day 100GB ingest cannot grow them without
-# bound. 10 MiB × 5 backups = ~50 MiB ceiling per log file.
-JOB_LOG_MAX_BYTES = 10 * 1024 * 1024
-JOB_LOG_BACKUP_COUNT = 5
+# Rotation ceilings (10 MiB x 5 backups) live in src.system_logging, whose
+# shared per-path handler registry this module now uses -- one handler per
+# log file per process, so the job logger and the root/system logger can
+# target the same file without two RotatingFileHandlers racing one rotation.
 
 _CONFIGURED_PATHS: set[str] = set()
 
@@ -44,6 +44,8 @@ def setup_job_logging(log_path: str | Path) -> logging.Logger:
     Idempotent per ``log_path``: calling it repeatedly (e.g. across imports in
     the same subprocess) does not stack handlers. The parent directory is
     created. Returns the configured logger so callers can emit events directly.
+    When the system logger already targets the same file, the SAME rotating
+    handler is reused rather than opening a second one.
     """
     resolved = str(Path(log_path).resolve())
     logger = logging.getLogger(JOB_LOGGER_NAME)
@@ -53,16 +55,7 @@ def setup_job_logging(log_path: str | Path) -> logging.Logger:
     if resolved in _CONFIGURED_PATHS:
         return logger
 
-    Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.handlers.RotatingFileHandler(
-        log_path,
-        maxBytes=JOB_LOG_MAX_BYTES,
-        backupCount=JOB_LOG_BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    handler.setLevel(logging.INFO)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(handler)
+    logger.addHandler(shared_file_handler(log_path))
     _CONFIGURED_PATHS.add(resolved)
     return logger
 

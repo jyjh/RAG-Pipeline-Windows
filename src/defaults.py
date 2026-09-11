@@ -71,6 +71,14 @@ DEFAULT_AUTO_TAG_MAX_ITEMS_PER_RUN = 200
 DEFAULT_OLLAMA_HEALTH_CHECK_INTERVAL = 5.0
 DEFAULT_OLLAMA_MAX_LOST_HEALTH_CHECKS = 5
 
+# System logging ([logging] section). The system log collects every
+# application/uvicorn/library record (timestamped, level, logger name); the
+# access log collects one structured line per HTTP request with the client
+# IP. Paths are workspace-root relative; empty string disables that stream.
+DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_LOG_FILE = "logs/server.log"
+DEFAULT_ACCESS_LOG_FILE = "logs/access.log"
+
 DEFAULT_PDF_PARSER_MODE = "hybrid"
 DEFAULT_DOCLING_ACCELERATOR = "auto"
 DEFAULT_ASSET_TRIGGERS = "auto"

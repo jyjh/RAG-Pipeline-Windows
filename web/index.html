@@ -406,6 +406,7 @@
                     <option value="custom">Custom</option>
                   </select>
                 </label>
+                <button id="promptTemplatesButton" type="button" title="Reusable question templates for design work">Templates</button>
                 <div id="chatCategoryChips" class="category-chips" role="group" aria-label="Categories to search"></div>
                 <span id="composerSettingsSummary" class="composer-settings-summary" aria-live="off"></span>
               </div>
@@ -682,6 +683,24 @@
     </div>
 
     <div id="citationPopover" class="citation-popover" hidden></div>
+
+    <button id="askSelectionPill" class="ask-selection-pill" type="button" hidden>Ask about this</button>
+
+    <div id="templatesOverlay" class="modal-overlay" hidden>
+      <div class="modal-dialog templates-dialog" role="dialog" aria-modal="true" aria-labelledby="templatesTitle">
+        <div class="templates-header">
+          <h2 id="templatesTitle">Question templates</h2>
+          <button id="templatesCloseButton" type="button">Close</button>
+        </div>
+        <p class="hint">Reusable question scaffolds for design work — click <strong>Use</strong> to put one into the Ask composer and fill in its placeholders. Templates are saved in this browser.</p>
+        <div id="templatesList" class="templates-list"></div>
+        <div id="templateEditorHost"></div>
+        <div class="templates-footer">
+          <button id="templateNewButton" type="button">New template</button>
+          <button id="templateSaveCurrentButton" type="button">Save current composer text</button>
+        </div>
+      </div>
+    </div>
 
     <div id="pdfPreviewOverlay" class="modal-overlay" hidden>
       <div class="modal-dialog pdf-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="pdfPreviewTitle">

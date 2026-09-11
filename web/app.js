@@ -10,6 +10,7 @@ import { endInlineEdit, handleIndexAction, loadIndex, runIndexVectorSearch, hand
 import { applyAnswerPreset, assistantMessageParts, cancelInlineMessageEdit, createChat, focusSourceForCitation, hideCitationPopover, loadChatState, persistChatState, renderActiveChat, renderSavedChats, restoreAnswerPreset, sendQuestion, setChatSidebarCollapsed, showCitationPopover } from "./js/chat.js";
 import { createAdminApiKey, enqueueBackup, enqueueRebuild, enqueueReingest, handleAdminKeyAction, handleAdminPermSetAction, handleBackupAction, loadIndexBackups, refreshAdminPanel, resetPermSetEditor, saveAdminPermSet, toggleRestorePanel, refreshUpdatePanel, enqueueCompact, enqueueRebuildVectorIndex, shutdownServer } from "./js/admin.js";
 import { acceptWelcomeTutorialPrompt, activateTab, applyTheme, closeCachePrompt, closeSettingsDialog, closeWalkthrough, closeWelcomeTutorialPrompt, handleGlobalShortcut, loadAppSidebarCollapsed, loadThemePreference, markComposerSettingsCustom, maybeStartFirstVisitWalkthrough, nextWalkthroughStep, openSettingsDialog, previousWalkthroughStep, resolveTheme, setAppSidebarCollapsed, setThemePreference, startWalkthrough, welcomeTutorialPromptOpen, handleSidebarKeydown } from "./js/shell.js";
+import { closeTemplatesDialog, initUsabilityHelpers } from "./js/usability.js";
 
 document.querySelectorAll("[data-tab-target]").forEach((button) => {
   button.addEventListener("click", () => {
@@ -64,6 +65,10 @@ document.addEventListener("keydown", (event) => {
   }
   if (event.key === "Escape" && els.citationPopover && !els.citationPopover.hidden) {
     hideCitationPopover();
+    return;
+  }
+  if (event.key === "Escape" && els.templatesOverlay && !els.templatesOverlay.hidden) {
+    closeTemplatesDialog();
     return;
   }
   // An in-flight inline edit (review row or chat bubble) cancels on Esc.
@@ -790,4 +795,6 @@ if (els.pdfBulkDeleteButton) {
 // Preview mode toggle: PDF page vs extracted Markdown text.
 els.pdfPreviewModePdf.addEventListener("click", () => setPdfPreviewMode("pdf"));
 els.pdfPreviewModeText.addEventListener("click", () => setPdfPreviewMode("text"));
+// Templates dialog + "Ask about this" selection pill (see web/js/usability.js).
+initUsabilityHelpers();
 document.addEventListener("visibilitychange", handleVisibilityChange);

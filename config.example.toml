@@ -258,6 +258,23 @@ job_workers = 1
 # but legitimate generation. Set to 0 to disable the watchdog (not recommended).
 query_wait_timeout_seconds = 1800
 
+# Persisted system + request logging. The system log collects every
+# application/uvicorn/library record with a timestamp, level, and logger name
+# (console output is unchanged); the access log collects one structured JSON
+# line per HTTP request with the client IP (X-Forwarded-For honored only from
+# loopback reverse proxies), method, path, token-redacted query string, HTTP
+# status, duration, user agent, and the API-key identity when one was used.
+# Both rotate at 10 MiB with 5 backups. Paths are workspace-root relative;
+# an empty string disables that stream. Per-run job logs (logs/job_*.log)
+# are separate and unaffected by this section.
+[logging]
+# Root log level: DEBUG | INFO | WARNING | ERROR | CRITICAL.
+level = "INFO"
+# System log file. Empty disables file logging (console only).
+file = "logs/server.log"
+# Per-request access log. Empty disables request logging.
+access_file = "logs/access.log"
+
 # Per-user API-key auth, rate limiting, and usage tracking. Layers on top of the
 # single shared [server] api_token above, which stays available as an admin/
 # owner master bypass. Keys are issued from the admin panel or by

@@ -14,6 +14,7 @@ from src.coerce import (
     as_positive_int as _as_positive_int,
     as_string_list as _as_langs,
 )
+from src.system_logging import setup_system_logging
 from src.defaults import (
     DEFAULT_ASSET_DIR,
     DEFAULT_ASSET_TRIGGERS,
@@ -63,7 +64,15 @@ from src.defaults import (
 )
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Timestamped console output plus a rotating CLI log (logs/cli.log) so
+# library warnings/errors from CLI runs persist like the web server's system
+# log. Per-run job detail still goes to logs/job_<mode>_<pid>.log; the
+# per-request access log is web-only and stays disabled here. Relative log
+# paths resolve against the repo root, not the process cwd.
+try:
+    setup_system_logging(file="logs/cli.log", access_file=None)
+except OSError:
+    pass
 
 
 def run_ingestion(*args, **kwargs):

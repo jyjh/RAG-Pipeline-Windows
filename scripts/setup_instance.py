@@ -1466,6 +1466,22 @@ def run_checks(
     return all(status != "FAIL" for _, status, _ in checks)
 
 
+# Ctrl+C reaches the web server directly (it shares this console), and its own
+# graceful shutdown -- finalizing queued/running jobs into the durable ledger,
+# then terminating its subprocesses -- can legitimately take ~30s. Wait that
+# long before escalating to terminate()/kill(), which on Windows is
+# TerminateProcess and kills the server mid-shutdown; startup recovery then
+# mistakes the stop for a crash and re-enqueues every interrupted job.
+GRACEFUL_SHUTDOWN_WAIT_SECONDS = 45.0
+
+
+def _exited_within(child: subprocess.Popen, timeout: float) -> bool:
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while child.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.25)
+    return child.poll() is not None
+
+
 def start_instance(path: Path, values: SetupValues) -> int:
     children: list[subprocess.Popen[str]] = []
     environment = dict(os.environ)
@@ -1480,6 +1496,13 @@ def start_instance(path: Path, values: SetupValues) -> int:
         ))
         return children[-1].wait()
     except KeyboardInterrupt:
+        if children:
+            print(
+                f"Ctrl+C received; giving the web server up to "
+                f"{GRACEFUL_SHUTDOWN_WAIT_SECONDS:.0f}s to finish shutting down..."
+            )
+            if not _exited_within(children[-1], GRACEFUL_SHUTDOWN_WAIT_SECONDS):
+                print("Web server did not exit in time; forcing it to stop.")
         return 130
     finally:
         for child in reversed(children):

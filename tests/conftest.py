@@ -116,6 +116,31 @@ def _isolated_local_model_cache():
 
 
 @pytest.fixture(autouse=True)
+def _isolated_job_queue_state(monkeypatch, tmp_path):
+    """Keep the app-level job queue's durable state out of the real data dir.
+
+    ``src.web_app`` owns a module-level RagJobQueue rooted at the live
+    ``data/`` directory. Endpoint tests are supposed to stub
+    ``web_app.job_queue``, but any test that slips past a stub and enqueues
+    through the real queue would persist jobs into
+    ``data/.job_ledger.json`` / the real PDF-registry database; the next
+    server boot then recovers those entries and re-runs them against the
+    live corpus (a test-suite reindex resurrecting on every restart).
+    Redirect the queue's durable stores to a per-test tmp dir so test
+    jobs die with the test session and can never re-queue on restart.
+    """
+    import src.web_app as web_app
+    from src.job_ledger import JobLedger
+    from src.pdf_registry import PdfRegistry
+
+    queue = web_app.job_queue
+    monkeypatch.setattr(queue, "ledger", JobLedger(tmp_path / "job_ledger.json"))
+    monkeypatch.setattr(
+        queue, "registry", PdfRegistry(tmp_path / "pdf_upload_registry.json")
+    )
+
+
+@pytest.fixture(autouse=True)
 def _local_operator(request, monkeypatch):
     """Run server tests as the trusted local operator by default.
 

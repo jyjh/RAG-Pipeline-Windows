@@ -734,7 +734,12 @@ def _stub_queue(monkeypatch):
             return Job()
 
         def summary(self):
-            return {"indexing_job_ids": []}
+            return {
+                "indexing_job_ids": [],
+                "running_job_ids": [],
+                "queued_count": 0,
+                "active_query_count": 0,
+            }
 
         def state_version(self):
             return "stub-1"
@@ -742,7 +747,28 @@ def _stub_queue(monkeypatch):
         def list_jobs(self, **kwargs):
             return []
 
+        def begin_query(self):
+            pass
+
+        def finish_query(self):
+            pass
+
     monkeypatch.setattr(web_app, "job_queue", StubQueue())
+
+
+@pytest.fixture(autouse=True)
+def _no_real_job_queue(monkeypatch):
+    """Route every test in this module away from the app-level job queue.
+
+    These tests authenticate against the real app object, and several
+    exercise POST endpoints (e.g. /api/reindex) whose handlers enqueue real
+    jobs once auth passes. Routed to the real queue, a passing test records
+    a reindex in the live durable ledger (data/.job_ledger.json); the next
+    server boot recovers that entry and re-indexes the whole corpus. The
+    stub keeps middleware assertions meaningful without touching real job
+    state; tests that assert on enqueue kwargs read ``enqueued`` off it.
+    """
+    _stub_queue(monkeypatch)
 
 
 def test_middleware_gates_even_when_store_empty(patched_authenticator):
@@ -760,22 +786,20 @@ def test_middleware_requires_key_when_store_nonempty(patched_authenticator):
     assert "api key" in response.json()["detail"].lower()
 
 
-def test_middleware_accepts_valid_key(patched_authenticator, monkeypatch):
+def test_middleware_accepts_valid_key(patched_authenticator):
     full_key, _ = patched_authenticator.create_key(label="alice")
-    _stub_queue(monkeypatch)
     response = TestClient(web_app.app).post(
         "/api/reindex", headers={"X-API-Token": full_key}
     )
     assert response.status_code != 401  # auth passed
 
 
-def test_middleware_accepts_key_via_query_param(patched_authenticator, monkeypatch):
+def test_middleware_accepts_key_via_query_param(patched_authenticator):
     """The ?token= transport exists for GET consumers that cannot set headers
     (EventSource/media), so gated GETs accept it -- but mutating requests must
     present the header: a credential in a URL leaks into access logs and
     browser history, so it is never accepted for state changes."""
     full_key, _ = patched_authenticator.create_key(label="alice")
-    _stub_queue(monkeypatch)
     client = TestClient(web_app.app)
     # Gated GET: query param authenticates.
     get_response = client.get(f"/api/jobs?token={full_key}")

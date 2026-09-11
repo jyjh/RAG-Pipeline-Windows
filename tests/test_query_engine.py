@@ -48,6 +48,7 @@ def test_query_engine_delegates_to_local_query_engine(monkeypatch):
             "working_dir": "db",
             "working_dirs": None,
             "category_labels": None,
+            "category_weights": None,
             "asset_dir": None,
             "trust_path": None,
             "model": "gemma4",

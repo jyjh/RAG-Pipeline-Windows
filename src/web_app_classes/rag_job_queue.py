@@ -1831,6 +1831,9 @@ class RagJobQueue:
         return jobs
 
     def _recovery_jobs_from_registry(self) -> list[QueueJob]:
+        from src.embeddings import configured_embedding_model
+
+        configured_model = configured_embedding_model()
         payload = self.registry.load()
         groups: dict[str, dict[str, Any]] = {}
         for source_hash, entry in payload.get("pdfs", {}).items():
@@ -1884,6 +1887,17 @@ class RagJobQueue:
                     }
                 )
             staging_dir = staging_dirs[0] if staging_dirs else None
+            options = dict(group["options"])
+            # An upload job captures the embedding model configured when it
+            # was accepted. If the configured model has since changed (e.g.
+            # nomic-embed-text -> all-minilm), the stale tag must not survive
+            # into the recovered job: its indexing phase would preflight or
+            # embed with a model the live index no longer uses, fail, and
+            # leave the file recoverable again -- re-queuing on every boot.
+            # Unset, the phase re-resolves the model from the current config.
+            captured_model = str(options.get("embedding_model") or "")
+            if captured_model and captured_model != configured_model:
+                options.pop("embedding_model", None)
             jobs.append(
                 QueueJob(
                     id=str(group["job_id"]),
@@ -1896,7 +1910,7 @@ class RagJobQueue:
                     upload_dir=upload_dir or None,
                     resume_status=str(group["resume_status"]),
                     recovered=True,
-                    options=dict(group["options"]),
+                    options=options,
                     created_at=str(group["created_at"]),
                 )
             )

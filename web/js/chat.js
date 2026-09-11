@@ -1,6 +1,6 @@
 // Ask tab: saved chats, streaming answers, presets, sources/citations, message actions.
 
-import { ANSWER_PRESETS, ANSWER_PRESET_STORAGE_KEY, CHAT_AUTO_SCROLL_THRESHOLD, CHAT_HISTORY_LIMIT, CHAT_MESSAGE_LIMIT, CHAT_STORAGE_KEY, CHAT_UI_STORAGE_KEY, CITATION_PATTERN, LIVE_RENDER_INTERVAL_MS, STREAM_TAIL_HOLD_CHARS, STREAM_TAIL_MAX_CHARS, applyApiKeyHeaders, blockBoundariesBefore, confirmAction, copyTextToClipboard, els, errorFromResponse, escapeHtml, formatBytes, isDebugMode, isSafeMarkdownCommit, mediaUrlWithToken, newId, nowIso, numericSetting, patchTableRows, promptForApiKey, promptText, renderMarkdown, showToast, softBoundariesBefore, sourceGroupTitle, sourceGroupWeight, stableJson, state } from "./core.js";
+import { ANSWER_PRESETS, ANSWER_PRESET_STORAGE_KEY, CHAT_AUTO_SCROLL_THRESHOLD, CHAT_HISTORY_LIMIT, CHAT_MESSAGE_LIMIT, CHAT_STORAGE_KEY, CHAT_UI_STORAGE_KEY, CITATION_PATTERN, LIVE_RENDER_INTERVAL_MS, STREAM_TAIL_HOLD_CHARS, STREAM_TAIL_MAX_CHARS, applyApiKeyHeaders, blockBoundariesBefore, confirmAction, copyTextToClipboard, els, errorFromResponse, escapeHtml, formatBytes, inlineNotePrompt, isDebugMode, isSafeMarkdownCommit, mediaUrlWithToken, newId, nowIso, numericSetting, patchTableRows, promptForApiKey, promptText, renderMarkdown, requestJson, showToast, softBoundariesBefore, sourceGroupTitle, sourceGroupWeight, stableJson, state } from "./core.js";
 import { createJobRow, refreshHealth, rememberJobLogOpenState, updateComposerSettingsSummary } from "./status.js";
 import { ensureWalkthroughFakePdf, removeWalkthroughFakePdf } from "./library.js";
 import { adminCard, adminMetricRow, adminStatusBadge } from "./admin.js";
@@ -558,8 +558,11 @@ function addUserMessageToChat(chat, text) {
 
 
 function addAssistantMessageToChat(chat, parts) {
-  chat.messages.push({
+  const record = {
     role: "assistant",
+    // Stable id so per-message actions (answer feedback) can find their
+    // record again after reloads and re-renders.
+    id: newId(),
     text: parts.rawAnswer,
     thinking: parts.rawThinking,
     answerHtml: parts.answerStable.innerHTML,
@@ -572,13 +575,52 @@ function addAssistantMessageToChat(chat, parts) {
     failed: Boolean(parts.failed),
     settingsSummary: parts.settingsSummary || "",
     durationSeconds: parts.durationSeconds || 0,
+    feedback: parts.feedback || "",
+    followups: Array.isArray(parts.followups) ? parts.followups : [],
     createdAt: nowIso(),
-  });
+  };
+  parts.messageId = record.id;
+  chat.messages.push(record);
   touchChat(chat);
   persistChatState();
   renderSavedChats();
 }
 
+
+// -- recent questions ----------------------------------------------------------
+// Light-weight re-run history for the empty chat state: the last few questions
+// asked in this browser, newest first, deduplicated case-insensitively.
+
+const RECENT_QUESTIONS_STORAGE_KEY = "rag.recentQuestions.v1";
+const RECENT_QUESTIONS_LIMIT = 8;
+
+function loadRecentQuestions() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(RECENT_QUESTIONS_STORAGE_KEY) || "[]");
+    return Array.isArray(parsed) ? parsed.filter((q) => typeof q === "string" && q.trim()) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function rememberQuestion(question) {
+  const trimmed = String(question || "").trim();
+  if (!trimmed) {
+    return;
+  }
+  const recent = loadRecentQuestions().filter(
+    (existing) => existing.toLowerCase() !== trimmed.toLowerCase(),
+  );
+  recent.unshift(trimmed);
+  try {
+    localStorage.setItem(
+      RECENT_QUESTIONS_STORAGE_KEY,
+      JSON.stringify(recent.slice(0, RECENT_QUESTIONS_LIMIT)),
+    );
+  } catch (_) {
+    // Storage unavailable (private mode): the feature just stays session-less.
+  }
+}
 
 const SUGGESTED_QUESTIONS = [
   "Summarise the braking system design guidance in the library.",
@@ -611,6 +653,30 @@ function renderEmptyChatState() {
     chips.appendChild(chip);
   }
   wrap.append(heading, sub, chips);
+  const recent = loadRecentQuestions();
+  if (recent.length) {
+    const recentHeading = document.createElement("h3");
+    recentHeading.className = "chat-recent-heading";
+    recentHeading.textContent = "Recent questions";
+    const recentChips = document.createElement("div");
+    recentChips.className = "chat-suggestions chat-recent";
+    for (const question of recent) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chat-suggestion chat-recent-suggestion";
+      chip.textContent = question;
+      chip.title = "Ask this again";
+      chip.addEventListener("click", () => {
+        if (state.streamingChatId) {
+          return;
+        }
+        els.questionInput.value = question;
+        els.chatForm.requestSubmit();
+      });
+      recentChips.appendChild(chip);
+    }
+    wrap.append(recentHeading, recentChips);
+  }
   return wrap;
 }
 
@@ -1368,6 +1434,9 @@ function renderToolResultsPanel(parts) {
 function addSavedAssistantMessage(saved) {
   const parts = addAssistantMessage();
   parts.finalized = true;
+  parts.messageId = saved.id || "";
+  parts.feedback = saved.feedback || "";
+  parts.followups = Array.isArray(saved.followups) ? saved.followups : [];
   parts.rawAnswer = saved.text || "";
   parts.rawThinking = saved.thinking || "";
   parts.sources = saved.sources || [];
@@ -1783,6 +1852,11 @@ async function runChatExchange(chat, question, {
     setSendButtonStreaming(false);
     renderSavedChats();
     await refreshHealth();
+    // Suggestions arrive after the answer is already usable, so the exchange
+    // is not gated on them (fire-and-forget; failures leave no trace).
+    if (!assistantParts.failed && assistantParts.rawAnswer && chat.id === state.activeChatId) {
+      fetchFollowupSuggestions(chat, assistantParts, question, chatHistory);
+    }
   }
 }
 
@@ -1798,6 +1872,7 @@ async function sendQuestion(event) {
   }
   const chat = activeChat() || createChat({ activate: true });
   els.questionInput.value = "";
+  rememberQuestion(question);
   await runChatExchange(chat, question);
 }
 
@@ -1852,6 +1927,184 @@ function attachAssistantMessageActions(messageEl, chat) {
     });
   }
   messageEl.appendChild(buildMessageActions(actions));
+  attachFeedbackControls(messageEl, chat, parts);
+  attachFollowupRow(messageEl, chat, parts);
+}
+
+
+// -- answer feedback + follow-up suggestions ----------------------------------
+// Both turn a finished answer into the next action: a 👍/👎 rating that the
+// team can review server-side, and clickable follow-up questions generated
+// from the answer.
+
+function attachFeedbackControls(messageEl, chat, parts) {
+  if (!messageEl || messageEl.querySelector(".feedback-bar") || !parts || parts.failed) {
+    return;
+  }
+  const bar = document.createElement("div");
+  bar.className = "feedback-bar";
+  const upButton = document.createElement("button");
+  upButton.type = "button";
+  upButton.className = "feedback-button";
+  upButton.textContent = "👍 Helpful";
+  const downButton = document.createElement("button");
+  downButton.type = "button";
+  downButton.className = "feedback-button";
+  downButton.textContent = "👎 Not helpful";
+  bar.append(upButton, downButton);
+
+  const markVoted = (rating) => {
+    bar.classList.add("feedback-voted");
+    for (const [button, value] of [[upButton, "up"], [downButton, "down"]]) {
+      button.disabled = true;
+      button.classList.toggle("feedback-selected", value === rating);
+    }
+  };
+  if (parts.feedback) {
+    markVoted(parts.feedback);
+  }
+
+  const submitRating = async (rating, note = "") => {
+    // The question for this answer is the nearest preceding user message.
+    let question = "";
+    const messageIndex = chat.messages.findIndex(
+      (message) => message.role === "assistant" && message.id === parts.messageId,
+    );
+    for (let index = messageIndex >= 0 ? messageIndex : chat.messages.length - 1; index >= 0; index -= 1) {
+      if (chat.messages[index].role === "user") {
+        question = chat.messages[index].text || "";
+        break;
+      }
+    }
+    try {
+      await requestJson("/api/feedback", {
+        method: "POST",
+        body: JSON.stringify({
+          rating,
+          question: question || "(unknown question)",
+          answer_excerpt: (parts.rawAnswer || "").slice(0, 8000),
+          note,
+          chat_id: chat.id || "",
+          message_id: parts.messageId || "",
+          sources_count: Array.isArray(parts.sources) ? parts.sources.length : 0,
+        }),
+      });
+    } catch (error) {
+      // Feedback is best-effort telemetry: a failure must never suggest the
+      // vote was recorded, but it also should not disrupt the conversation.
+      showToast(`Feedback could not be saved: ${error.message}`, { kind: "error" });
+      return;
+    }
+    parts.feedback = rating;
+    const record = chat.messages.find(
+      (message) => message.role === "assistant" && message.id === parts.messageId,
+    );
+    if (record) {
+      record.feedback = rating;
+      persistChatState();
+    }
+    markVoted(rating);
+    showToast(rating === "up" ? "Thanks — glad it helped." : "Thanks — noted for review.", { kind: "success" });
+  };
+
+  upButton.addEventListener("click", () => {
+    if (parts.feedback) {
+      return;
+    }
+    submitRating("up");
+  });
+  downButton.addEventListener("click", async () => {
+    if (parts.feedback) {
+      return;
+    }
+    // Cancel (null) means "changed my mind": no vote is recorded.
+    const note = await inlineNotePrompt(downButton, {
+      title: "What was wrong? (optional)",
+      placeholder: "e.g. wrong numbers, missed the rules section, bad source…",
+    });
+    if (note === null) {
+      return;
+    }
+    submitRating("down", note);
+  });
+  messageEl.appendChild(bar);
+}
+
+
+function attachFollowupRow(messageEl, chat, parts) {
+  if (!messageEl || messageEl.querySelector(".followup-row")) {
+    return;
+  }
+  const suggestions = Array.isArray(parts.followups) ? parts.followups : [];
+  if (!suggestions.length || parts.failed) {
+    return;
+  }
+  const row = document.createElement("div");
+  row.className = "followup-row";
+  const label = document.createElement("span");
+  label.className = "followup-label";
+  label.textContent = "Follow-ups";
+  row.appendChild(label);
+  for (const suggestion of suggestions) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "followup-chip";
+    chip.textContent = suggestion;
+    chip.title = "Ask this follow-up";
+    chip.addEventListener("click", () => {
+      if (state.streamingChatId) {
+        return;
+      }
+      rememberQuestion(suggestion);
+      runChatExchange(chat, suggestion);
+    });
+    row.appendChild(chip);
+  }
+  messageEl.appendChild(row);
+}
+
+
+// Best-effort: one cheap non-streaming LLM call after a successful answer.
+// Any failure (offline, rate limit, timeout) quietly leaves the answer as-is.
+async function fetchFollowupSuggestions(chat, parts, question, history) {
+  const messageEl = parts.body.closest(".message");
+  if (!messageEl) {
+    return;
+  }
+  try {
+    const data = await requestJson("/api/chat/followups", {
+      method: "POST",
+      timeoutMs: 120000,
+      body: JSON.stringify({
+        question,
+        answer: (parts.rawAnswer || "").slice(0, 20000),
+        history: history.slice(-4),
+        source_titles: (Array.isArray(parts.sources) ? parts.sources : [])
+          .map((source) =>
+            String(
+              source.title || source.source_pdf_name || source.label || source.id || "",
+            ).trim(),
+          )
+          .filter(Boolean)
+          .slice(0, 8),
+      }),
+    });
+    const suggestions = Array.isArray(data?.suggestions) ? data.suggestions : [];
+    if (!suggestions.length) {
+      return;
+    }
+    parts.followups = suggestions;
+    const record = chat.messages.find(
+      (message) => message.role === "assistant" && message.id === parts.messageId,
+    );
+    if (record) {
+      record.followups = suggestions;
+      persistChatState();
+    }
+    attachFollowupRow(messageEl, chat, parts);
+  } catch (_) {
+    // Suggestions are a convenience; silence is the right failure mode.
+  }
 }
 
 
